@@ -1,7 +1,7 @@
 #pragma once
 #include "common/config.hpp"
 
-namespace learneddb {
+namespace shilmandb {
 
 struct RID {
     page_id_t page_id{INVALID_PAGE_ID};
@@ -20,4 +20,4 @@ struct RID {
 };
 
 
-} //namespace learneddb
+} //namespace shilmandb

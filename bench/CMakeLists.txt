@@ -1,2 +1,2 @@
 add_executable(load_tpch load_tpch.cpp)
-target_link_libraries(load_tpch PRIVATE learneddb_core)
+target_link_libraries(load_tpch PRIVATE shilmandb_core)

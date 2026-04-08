@@ -2,7 +2,7 @@
 #include <stdexcept>
 
 
-namespace learneddb {
+namespace shilmandb {
 
 
 class DatabaseException : public std::runtime_error {
@@ -21,4 +21,4 @@ class OutOfMemoryException : public DatabaseException {
 };
 
 
-} //namespace learneddb
+} //namespace shilmandb

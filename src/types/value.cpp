@@ -78,7 +78,7 @@ int32_t DateToDays(int year, int month, int day) {
 
 
 
-namespace learneddb {
+namespace shilmandb {
 
 //constructors
 
@@ -335,4 +335,4 @@ uint32_t Value::GetFixedLength() const {
 
 bool Value::IsNull() const { return type_ == TypeId::INVALID; }
 
-}  // namespace learneddb
+}  // namespace shilmandb

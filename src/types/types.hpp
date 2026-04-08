@@ -1,7 +1,7 @@
 #pragma once
 #include <cstdint>
 
-namespace learneddb {
+namespace shilmandb {
 
 enum class TypeId : uint8_t {
     INVALID = 0,    //null type

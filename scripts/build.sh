@@ -7,7 +7,7 @@ ENABLE_ML="${2:-OFF}"
 
 cmake -S . -B build -G Ninja \
     -DCMAKE_BUILD_TYPE="$BUILD_TYPE" \
-    -DLEARNEDDB_ENABLE_ML="$ENABLE_ML"
+    -DSHILMANDB_ENABLE_ML="$ENABLE_ML"
 
 cmake --build build -j "$(sysctl -n hw.logicalcpu)"
 

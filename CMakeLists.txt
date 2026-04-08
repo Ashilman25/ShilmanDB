@@ -1,21 +1,21 @@
 cmake_minimum_required(VERSION 3.24)
-project(learneddb LANGUAGES CXX)
+project(shilmandb LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # Options 
-option(LEARNEDDB_ENABLE_ML "Build with LibTorch for learned components" OFF)
-option(LEARNEDDB_BUILD_TESTS "Build unit and integration tests" ON)
-option(LEARNEDDB_BUILD_BENCH "Build benchmark tools" ON)
+option(SHILMANDB_ENABLE_ML "Build with LibTorch for learned components" OFF)
+option(SHILMANDB_BUILD_TESTS "Build unit and integration tests" ON)
+option(SHILMANDB_BUILD_BENCH "Build benchmark tools" ON)
 
 # LibTorch 
-if(LEARNEDDB_ENABLE_ML)
+if(SHILMANDB_ENABLE_ML)
     list(APPEND CMAKE_PREFIX_PATH "${CMAKE_SOURCE_DIR}/third_party/libtorch")
     find_package(Torch REQUIRED)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${TORCH_CXX_FLAGS}")
-    add_compile_definitions(LEARNEDDB_HAS_LIBTORCH)
+    add_compile_definitions(SHILMANDB_HAS_LIBTORCH)
 endif()
 
 # Core library 
@@ -34,21 +34,21 @@ file(GLOB_RECURSE CORE_SOURCES
     src/engine/*.cpp
 )
 
-add_library(learneddb_core STATIC ${CORE_SOURCES})
-target_include_directories(learneddb_core PUBLIC ${CMAKE_SOURCE_DIR}/src)
+add_library(shilmandb_core STATIC ${CORE_SOURCES})
+target_include_directories(shilmandb_core PUBLIC ${CMAKE_SOURCE_DIR}/src)
 
-if(LEARNEDDB_ENABLE_ML)
+if(SHILMANDB_ENABLE_ML)
     # ML source files
-    target_sources(learneddb_core PRIVATE
+    target_sources(shilmandb_core PRIVATE
         src/planner/learned_join_optimizer.cpp
         src/buffer/learned_eviction_policy.cpp
     )
-    target_link_libraries(learneddb_core PUBLIC "${TORCH_LIBRARIES}")
-    target_include_directories(learneddb_core PUBLIC "${TORCH_INCLUDE_DIRS}")
+    target_link_libraries(shilmandb_core PUBLIC "${TORCH_LIBRARIES}")
+    target_include_directories(shilmandb_core PUBLIC "${TORCH_INCLUDE_DIRS}")
 endif()
 
 
-if(LEARNEDDB_BUILD_TESTS)
+if(SHILMANDB_BUILD_TESTS)
     include(FetchContent)
     FetchContent_Declare(
         googletest
@@ -63,6 +63,6 @@ if(LEARNEDDB_BUILD_TESTS)
 endif()
 
 # Benchmark stuff
-if(LEARNEDDB_BUILD_BENCH)
+if(SHILMANDB_BUILD_BENCH)
     add_subdirectory(bench)
 endif()

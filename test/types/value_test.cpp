@@ -5,7 +5,7 @@
 #include <limits>
 #include <unordered_set>
 
-namespace learneddb {
+namespace shilmandb {
 
 // --- Construction & IsNull ---
 
@@ -253,4 +253,4 @@ TEST(ValueTest, GetFixedLength) {
     EXPECT_EQ(Value(std::string("")).GetFixedLength(), 0u);
 }
 
-}  // namespace learneddb
+}  // namespace shilmandb

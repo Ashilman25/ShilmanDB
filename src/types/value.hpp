@@ -4,7 +4,7 @@
 #include <cstdint>
 #include <functional>
 
-namespace learneddb {
+namespace shilmandb {
 
 class Value {
 
@@ -46,13 +46,13 @@ public:
     bool IsNull() const;
 };
 
-}  // namespace learneddb
+}  // namespace shilmandb
 
 namespace std {
 
 template<>
-struct hash<learneddb::Value> {
-    size_t operator()(const learneddb::Value& v) const { return v.Hash(); }
+struct hash<shilmandb::Value> {
+    size_t operator()(const shilmandb::Value& v) const { return v.Hash(); }
 };
 
 }  // namespace std
