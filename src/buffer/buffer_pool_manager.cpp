@@ -166,4 +166,9 @@ uint64_t BufferPoolManager::GetMissCount() const { return miss_count_; }
 void BufferPoolManager::ResetStats() { hit_count_ = 0; miss_count_ = 0; }
 size_t BufferPoolManager::GetPoolSize() const { return pool_size_; }
 
+const Page& BufferPoolManager::GetPage(frame_id_t frame_id) const {
+    assert(frame_id < pool_size_ && "frame_id out of bounds");
+    return pages_[frame_id];
+}
+
 }  // namespace shilmandb

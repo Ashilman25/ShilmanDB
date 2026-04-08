@@ -31,6 +31,7 @@ public:
     void ResetStats();
 
     size_t GetPoolSize() const;
+    const Page& GetPage(frame_id_t frame_id) const;
 
 private:
     size_t pool_size_;
