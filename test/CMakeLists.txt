@@ -17,8 +17,8 @@ shilmandb_add_test(slotted_page_test storage/slotted_page_test.cpp)
 # shilmandb_add_test(table_heap_test storage/table_heap_test.cpp)
 
 # Buffer tests
-# shilmandb_add_test(lru_eviction_policy_test buffer/lru_eviction_policy_test.cpp)
-# shilmandb_add_test(buffer_pool_manager_test buffer/buffer_pool_manager_test.cpp)
+shilmandb_add_test(lru_eviction_policy_test buffer/lru_eviction_policy_test.cpp)
+shilmandb_add_test(buffer_pool_manager_test buffer/buffer_pool_manager_test.cpp)
 
 # Index tests
 # shilmandb_add_test(btree_index_test index/btree_index_test.cpp)
