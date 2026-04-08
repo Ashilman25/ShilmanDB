@@ -1,5 +1,6 @@
 .claude
 _docs
+docs
 build/
 third_party/libtorch/
 bench/tpch_data/*.tbl

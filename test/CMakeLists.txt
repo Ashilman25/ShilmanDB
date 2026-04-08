@@ -7,6 +7,9 @@ endmacro()
 
 # Uncomment each line as you create the corresponding test file:
 
+# Types tests
+learneddb_add_test(value_test types/value_test.cpp)
+
 # Storage tests
 # learneddb_add_test(disk_manager_test storage/disk_manager_test.cpp)
 # learneddb_add_test(slotted_page_test storage/slotted_page_test.cpp)
