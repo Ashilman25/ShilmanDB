@@ -12,8 +12,8 @@ shilmandb_add_test(value_test types/value_test.cpp)
 shilmandb_add_test(tuple_test types/tuple_test.cpp)
 
 # Storage tests
-# shilmandb_add_test(disk_manager_test storage/disk_manager_test.cpp)
-# shilmandb_add_test(slotted_page_test storage/slotted_page_test.cpp)
+shilmandb_add_test(disk_manager_test storage/disk_manager_test.cpp)
+shilmandb_add_test(slotted_page_test storage/slotted_page_test.cpp)
 # shilmandb_add_test(table_heap_test storage/table_heap_test.cpp)
 
 # Buffer tests
