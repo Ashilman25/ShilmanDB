@@ -29,6 +29,7 @@ public:
         Iterator& operator++();
         bool operator==(const Iterator& other) const;
         bool operator!=(const Iterator& other) const;
+        [[nodiscard]] RID GetRID() const;
 
     private:
         TableHeap* table_;

@@ -25,6 +25,9 @@ shilmandb_add_test(btree_internal_page_test index/btree_internal_page_test.cpp)
 shilmandb_add_test(btree_leaf_page_test index/btree_leaf_page_test.cpp)
 shilmandb_add_test(btree_index_test index/btree_index_test.cpp)
 
+# Catalog tests
+shilmandb_add_test(catalog_test catalog/catalog_test.cpp)
+
 # Parser tests
 # shilmandb_add_test(lexer_test parser/lexer_test.cpp)
 # shilmandb_add_test(parser_test parser/parser_test.cpp)

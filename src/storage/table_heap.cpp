@@ -148,6 +148,10 @@ bool TableHeap::Iterator::operator!=(const Iterator& other) const {
     return current_rid_ != other.current_rid_;
 }
 
+RID TableHeap::Iterator::GetRID() const {
+    return current_rid_;
+}
+
 void TableHeap::Iterator::AdvancePastDeleted() {
     while (current_rid_.page_id != INVALID_PAGE_ID) {
         auto* page = table_->bpm_->FetchPage(current_rid_.page_id);
