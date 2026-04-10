@@ -33,16 +33,20 @@ shilmandb_add_test(lexer_test parser/lexer_test.cpp)
 shilmandb_add_test(parser_test parser/parser_test.cpp)
 
 # Planner tests
-# shilmandb_add_test(planner_test planner/planner_test.cpp)
+shilmandb_add_test(join_order_optimizer_test planner/join_order_optimizer_test.cpp)
+shilmandb_add_test(planner_test planner/planner_test.cpp)
 
 # Executor tests
-# shilmandb_add_test(seq_scan_executor_test executor/seq_scan_executor_test.cpp)
-# shilmandb_add_test(filter_executor_test executor/filter_executor_test.cpp)
-# shilmandb_add_test(hash_join_executor_test executor/hash_join_executor_test.cpp)
-# shilmandb_add_test(sort_executor_test executor/sort_executor_test.cpp)
-# shilmandb_add_test(aggregate_executor_test executor/aggregate_executor_test.cpp)
-# shilmandb_add_test(projection_executor_test executor/projection_executor_test.cpp)
+shilmandb_add_test(seq_scan_executor_test executor/seq_scan_executor_test.cpp)
+shilmandb_add_test(index_scan_executor_test executor/index_scan_executor_test.cpp)
+shilmandb_add_test(filter_executor_test executor/filter_executor_test.cpp)
+shilmandb_add_test(hash_join_executor_test executor/hash_join_executor_test.cpp)
+shilmandb_add_test(nested_loop_join_executor_test executor/nested_loop_join_executor_test.cpp)
+shilmandb_add_test(sort_executor_test executor/sort_executor_test.cpp)
+shilmandb_add_test(aggregate_executor_test executor/aggregate_executor_test.cpp)
+shilmandb_add_test(projection_executor_test executor/projection_executor_test.cpp)
+shilmandb_add_test(limit_executor_test executor/limit_executor_test.cpp)
 
 # Integration tests
-# shilmandb_add_test(end_to_end_test integration/end_to_end_test.cpp)
+shilmandb_add_test(end_to_end_test integration/end_to_end_test.cpp)
 # shilmandb_add_test(sqlite_comparison_test integration/sqlite_comparison_test.cpp)
