@@ -147,7 +147,7 @@ auto DeriveColumnName(const Expression* expr) -> std::string {
         if (const auto* arg_col = dynamic_cast<const ColumnRef*>(agg->arg.get())) {
             return prefix + "_" + arg_col->column_name;
         }
-        return prefix;
+        return prefix + "_expr";
     }
     return "expr";
 }
@@ -325,16 +325,7 @@ auto Planner::Plan(SelectStatement stmt) -> std::unique_ptr<PlanNode> {
                 agg_funcs.push_back(agg->func);
 
                 if (agg->arg) {
-                    if (const auto* arg_col = dynamic_cast<const ColumnRef*>(agg->arg.get())) {
-                        auto new_ref = std::make_unique<ColumnRef>();
-                        new_ref->table_name = arg_col->table_name;
-                        new_ref->column_name = arg_col->column_name;
-                        agg_exprs.push_back(std::move(new_ref));
-
-                    } else {
-                        agg_exprs.push_back(nullptr);
-                    }
-
+                    agg_exprs.push_back(agg->arg->Clone());
                 } else {
                     agg_exprs.push_back(nullptr);  // COUNT(*)
                 }
@@ -443,6 +434,14 @@ auto Planner::Plan(SelectStatement stmt) -> std::unique_ptr<PlanNode> {
     }
 
     if (!stmt.order_by.empty()) {
+        for (auto& ob_item : stmt.order_by) {
+            if (const auto* agg = dynamic_cast<const Aggregate*>(ob_item.expr.get())) {
+                auto cr = std::make_unique<ColumnRef>();
+                cr->column_name = DeriveColumnName(agg);
+                ob_item.expr = std::move(cr);
+            }
+        }
+        
         auto sort = std::make_unique<SortPlanNode>(current->output_schema, std::move(stmt.order_by));
         sort->children.push_back(std::move(current));
         current = std::move(sort);

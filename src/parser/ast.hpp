@@ -15,6 +15,8 @@ struct Expression {
     ExprType type;
     virtual ~Expression() = default;
 
+    [[nodiscard]] virtual std::unique_ptr<Expression> Clone() const = 0;
+
 protected:
     explicit Expression(ExprType t) : type(t) {}
 };
@@ -23,11 +25,24 @@ struct ColumnRef : Expression {
     std::optional<std::string> table_name;
     std::string column_name;
     ColumnRef() : Expression(ExprType::COLUMN_REF) {}
+
+    [[nodiscard]] std::unique_ptr<Expression> Clone() const override {
+        auto c = std::make_unique<ColumnRef>();
+        c->table_name = table_name;
+        c->column_name = column_name;
+        return c;
+    }
 };
 
 struct Literal : Expression {
     Value value;
     Literal() : Expression(ExprType::LITERAL) {}
+
+    [[nodiscard]] std::unique_ptr<Expression> Clone() const override {
+        auto c = std::make_unique<Literal>();
+        c->value = value;
+        return c;
+    }
 };
 
 struct BinaryOp : Expression {
@@ -37,6 +52,14 @@ struct BinaryOp : Expression {
     std::unique_ptr<Expression> left;
     std::unique_ptr<Expression> right;
     BinaryOp() : Expression(ExprType::BINARY_OP) {}
+
+    [[nodiscard]] std::unique_ptr<Expression> Clone() const override {
+        auto c = std::make_unique<BinaryOp>();
+        c->op = op;
+        c->left = left ? left->Clone() : nullptr;
+        c->right = right ? right->Clone() : nullptr;
+        return c;
+    }
 };
 
 struct UnaryOp : Expression {
@@ -45,6 +68,13 @@ struct UnaryOp : Expression {
     
     std::unique_ptr<Expression> operand;
     UnaryOp() : Expression(ExprType::UNARY_OP) {}
+
+    [[nodiscard]] std::unique_ptr<Expression> Clone() const override {
+        auto c = std::make_unique<UnaryOp>();
+        c->op = op;
+        c->operand = operand ? operand->Clone() : nullptr;
+        return c;
+    }
 };
 
 struct Aggregate : Expression {
@@ -53,11 +83,22 @@ struct Aggregate : Expression {
 
     std::unique_ptr<Expression> arg; //nullptr for COUNT(*)
     Aggregate() : Expression(ExprType::AGGREGATE) {}
+
+    [[nodiscard]] std::unique_ptr<Expression> Clone() const override {
+        auto c = std::make_unique<Aggregate>();
+        c->func = func;
+        c->arg = arg ? arg->Clone() : nullptr;
+        return c;
+    }
 };
 
 
 struct StarExpr : Expression {
     StarExpr() : Expression(ExprType::STAR) {}
+
+    [[nodiscard]] std::unique_ptr<Expression> Clone() const override {
+        return std::make_unique<StarExpr>();
+    }
 };
 
 

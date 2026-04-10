@@ -80,6 +80,37 @@ int32_t DateToDays(int year, int month, int day) {
 
 namespace shilmandb {
 
+namespace {
+
+
+constexpr TypeId CommonType(TypeId a, TypeId b) {
+    if (a == b) return a;
+
+    if ((a == TypeId::DATE && b == TypeId::VARCHAR) ||
+        (a == TypeId::VARCHAR && b == TypeId::DATE))
+        return TypeId::DATE;
+
+    auto rank = [](TypeId t) -> int {
+        switch (t) {
+            case TypeId::INTEGER: 
+                return 1;
+            case TypeId::BIGINT:  
+                return 2;
+            case TypeId::DECIMAL: 
+                return 3;
+            default:              
+                return 0;
+        }
+    };
+
+    int ra = rank(a), rb = rank(b);
+    if (ra > 0 && rb > 0) return (ra >= rb) ? a : b;
+
+    return TypeId::INVALID;
+}
+
+} // anonymous namespace
+
 //constructors
 
 Value::Value() : type_{TypeId::INVALID}, bigint_{0} {}
@@ -103,20 +134,25 @@ Value Value::MakeDate(int32_t days_since_epoch) {
 
 bool Value::operator==(const Value& other) const {
     if (type_ != other.type_) {
-        throw DatabaseException("Type mismatch in comparison");
+        auto ct = CommonType(type_, other.type_);
+        if (ct == TypeId::INVALID) {
+            throw DatabaseException("Type mismatch in comparison");
+        }
+        return CastTo(ct) == other.CastTo(ct);
     }
+
     switch (type_) {
-        case TypeId::INTEGER: 
+        case TypeId::INTEGER:
             return integer_ == other.integer_;
-        case TypeId::BIGINT:  
+        case TypeId::BIGINT:
             return bigint_ == other.bigint_;
-        case TypeId::DECIMAL: 
+        case TypeId::DECIMAL:
             return decimal_ == other.decimal_;
         case TypeId::VARCHAR:
             return varchar_ == other.varchar_;
         case TypeId::DATE:
             return date_ == other.date_;
-        case TypeId::INVALID: 
+        case TypeId::INVALID:
             return true;  // NULL == NULL for hashmap key
     }
 
@@ -129,21 +165,25 @@ bool Value::operator!=(const Value& other) const {
 
 bool Value::operator<(const Value& other) const {
     if (type_ != other.type_) {
-        throw DatabaseException("Type mismatch in comparison");
+        auto ct = CommonType(type_, other.type_);
+        if (ct == TypeId::INVALID) {
+            throw DatabaseException("Type mismatch in comparison");
+        }
+        return CastTo(ct) < other.CastTo(ct);
     }
 
     switch (type_) {
-        case TypeId::INTEGER: 
+        case TypeId::INTEGER:
             return integer_ < other.integer_;
-        case TypeId::BIGINT:  
+        case TypeId::BIGINT:
             return bigint_ < other.bigint_;
-        case TypeId::DECIMAL: 
+        case TypeId::DECIMAL:
             return decimal_ < other.decimal_;
-        case TypeId::VARCHAR: 
+        case TypeId::VARCHAR:
             return varchar_ < other.varchar_;
-        case TypeId::DATE:    
+        case TypeId::DATE:
             return date_ < other.date_;
-        case TypeId::INVALID: 
+        case TypeId::INVALID:
             return false;
     }
 
@@ -158,14 +198,16 @@ bool Value::operator>=(const Value& other) const { return !(*this < other); }
 
 Value Value::Add(const Value& other) const {
     if (type_ != other.type_) {
-        throw DatabaseException("Type mismatch in arithmetic");
+        auto ct = CommonType(type_, other.type_);
+        if (ct == TypeId::INVALID) throw DatabaseException("Type mismatch in arithmetic");
+        return CastTo(ct).Add(other.CastTo(ct));
     }
     switch (type_) {
         case TypeId::INTEGER:
             return Value(integer_ + other.integer_);
-        case TypeId::BIGINT:  
+        case TypeId::BIGINT:
             return Value(bigint_ + other.bigint_);
-        case TypeId::DECIMAL: 
+        case TypeId::DECIMAL:
             return Value(decimal_ + other.decimal_);
         default:
             throw DatabaseException("Arithmetic not supported for this type");
@@ -174,14 +216,16 @@ Value Value::Add(const Value& other) const {
 
 Value Value::Subtract(const Value& other) const {
     if (type_ != other.type_) {
-        throw DatabaseException("Type mismatch in arithmetic");
+        auto ct = CommonType(type_, other.type_);
+        if (ct == TypeId::INVALID) throw DatabaseException("Type mismatch in arithmetic");
+        return CastTo(ct).Subtract(other.CastTo(ct));
     }
     switch (type_) {
-        case TypeId::INTEGER: 
+        case TypeId::INTEGER:
             return Value(integer_ - other.integer_);
-        case TypeId::BIGINT:  
+        case TypeId::BIGINT:
             return Value(bigint_ - other.bigint_);
-        case TypeId::DECIMAL: 
+        case TypeId::DECIMAL:
             return Value(decimal_ - other.decimal_);
         default:
             throw DatabaseException("Arithmetic not supported for this type");
@@ -190,12 +234,14 @@ Value Value::Subtract(const Value& other) const {
 
 Value Value::Multiply(const Value& other) const {
     if (type_ != other.type_) {
-        throw DatabaseException("Type mismatch in arithmetic");
+        auto ct = CommonType(type_, other.type_);
+        if (ct == TypeId::INVALID) throw DatabaseException("Type mismatch in arithmetic");
+        return CastTo(ct).Multiply(other.CastTo(ct));
     }
     switch (type_) {
-        case TypeId::INTEGER: 
+        case TypeId::INTEGER:
             return Value(integer_ * other.integer_);
-        case TypeId::BIGINT:  
+        case TypeId::BIGINT:
             return Value(bigint_ * other.bigint_);
         case TypeId::DECIMAL:
             return Value(decimal_ * other.decimal_);
@@ -206,8 +252,11 @@ Value Value::Multiply(const Value& other) const {
 
 Value Value::Divide(const Value& other) const {
     if (type_ != other.type_) {
-        throw DatabaseException("Type mismatch in arithmetic");
+        auto ct = CommonType(type_, other.type_);
+        if (ct == TypeId::INVALID) throw DatabaseException("Type mismatch in arithmetic");
+        return CastTo(ct).Divide(other.CastTo(ct));
     }
+    
     switch (type_) {
         case TypeId::INTEGER:
             if (other.integer_ == 0) throw DatabaseException("Division by zero");
@@ -314,6 +363,29 @@ size_t Value::Hash() const {
 }
 
 
+
+Value Value::CastTo(TypeId target) const {
+    if (type_ == target) return *this;
+
+    switch (target) {
+        case TypeId::DECIMAL:
+            if (type_ == TypeId::INTEGER) return Value(static_cast<double>(integer_));
+            if (type_ == TypeId::BIGINT)  return Value(static_cast<double>(bigint_));
+            break;
+        case TypeId::BIGINT:
+            if (type_ == TypeId::INTEGER) return Value(static_cast<int64_t>(integer_));
+            break;
+        case TypeId::DATE:
+            if (type_ == TypeId::VARCHAR) return FromString(TypeId::DATE, varchar_);
+            break;
+        case TypeId::VARCHAR:
+            if (type_ == TypeId::DATE) return Value(ToString());
+            break;
+        default:
+            break;
+    }
+    throw DatabaseException("Cannot cast " + ToString() + " to target type");
+}
 
 uint32_t Value::GetFixedLength() const {
     switch (type_) {

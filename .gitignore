@@ -3,7 +3,7 @@ _docs
 docs
 build/
 third_party/libtorch/
-bench/tpch_data/*.tbl
+bench/tpch_data/
 bench/results/
 ml/join_optimizer/models/*.pt
 ml/eviction_policy/models/*.pt

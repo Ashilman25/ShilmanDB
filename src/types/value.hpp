@@ -44,6 +44,8 @@ public:
     uint32_t GetFixedLength() const;
     size_t Hash() const;
     bool IsNull() const;
+
+    [[nodiscard]] Value CastTo(TypeId target) const;
 };
 
 }  // namespace shilmandb

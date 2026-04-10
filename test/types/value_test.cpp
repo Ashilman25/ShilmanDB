@@ -98,11 +98,16 @@ TEST(ValueTest, DateComparison) {
     EXPECT_TRUE(a == a);
 }
 
-TEST(ValueTest, TypeMismatchComparisonThrows) {
+TEST(ValueTest, CrossTypeComparisonCoerces) {
     Value i(static_cast<int32_t>(1));
     Value d(1.0);
-    EXPECT_THROW((void)(i == d), DatabaseException);
-    EXPECT_THROW((void)(i < d), DatabaseException);
+    // INTEGER promotes to DECIMAL for comparison
+    EXPECT_TRUE(i == d);
+    EXPECT_FALSE(i < d);
+
+    // Incompatible types still throw
+    Value s(std::string("hello"));
+    EXPECT_THROW((void)(i == s), DatabaseException);
 }
 
 // --- Arithmetic ---
@@ -168,10 +173,17 @@ TEST(ValueTest, ArithmeticOnDateThrows) {
     EXPECT_THROW(a.Add(b), DatabaseException);
 }
 
-TEST(ValueTest, ArithmeticTypeMismatchThrows) {
-    Value i(static_cast<int32_t>(1));
-    Value d(1.0);
-    EXPECT_THROW(i.Add(d), DatabaseException);
+TEST(ValueTest, CrossTypeArithmeticCoerces) {
+    Value i(static_cast<int32_t>(3));
+    Value d(1.5);
+    // INTEGER promotes to DECIMAL for arithmetic
+    Value result = i.Add(d);
+    EXPECT_EQ(result.type_, TypeId::DECIMAL);
+    EXPECT_DOUBLE_EQ(result.decimal_, 4.5);
+
+    // Incompatible types still throw
+    Value s(std::string("hello"));
+    EXPECT_THROW(i.Add(s), DatabaseException);
 }
 
 // --- ToString / FromString round-trips ---
