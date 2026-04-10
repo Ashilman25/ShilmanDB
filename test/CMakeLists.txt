@@ -37,9 +37,11 @@ shilmandb_add_test(join_order_optimizer_test planner/join_order_optimizer_test.c
 shilmandb_add_test(planner_test planner/planner_test.cpp)
 
 # Executor tests
-# shilmandb_add_test(seq_scan_executor_test executor/seq_scan_executor_test.cpp)
-# shilmandb_add_test(filter_executor_test executor/filter_executor_test.cpp)
-# shilmandb_add_test(hash_join_executor_test executor/hash_join_executor_test.cpp)
+shilmandb_add_test(seq_scan_executor_test executor/seq_scan_executor_test.cpp)
+shilmandb_add_test(index_scan_executor_test executor/index_scan_executor_test.cpp)
+shilmandb_add_test(filter_executor_test executor/filter_executor_test.cpp)
+shilmandb_add_test(hash_join_executor_test executor/hash_join_executor_test.cpp)
+shilmandb_add_test(nested_loop_join_executor_test executor/nested_loop_join_executor_test.cpp)
 # shilmandb_add_test(sort_executor_test executor/sort_executor_test.cpp)
 # shilmandb_add_test(aggregate_executor_test executor/aggregate_executor_test.cpp)
 # shilmandb_add_test(projection_executor_test executor/projection_executor_test.cpp)
