@@ -11,7 +11,7 @@ fi
 echo "Downloading LibTorch for macOS ARM..."
 cd /tmp
 
-curl -L -o libtorch.zip "https://download.pytorch.org/libtorch/cpu/libtorch-macos-arm64-2.2.0.zip"
+curl -L -o libtorch.zip "https://download.pytorch.org/libtorch/cpu/libtorch-macos-arm64-2.11.0.zip"
 unzip -o libtorch.zip
 
 rm -rf "$LIBTORCH_DIR"
