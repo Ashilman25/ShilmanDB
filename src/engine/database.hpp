@@ -10,6 +10,10 @@
 #include <vector>
 #include <memory>
 
+#ifdef SHILMANDB_HAS_LIBTORCH
+#include "planner/learned_join_optimizer.hpp"
+#endif
+
 namespace shilmandb {
 
 struct QueryResult {
@@ -21,6 +25,11 @@ class Database {
 public:
     explicit Database(const std::string& db_file, size_t buffer_pool_size = DEFAULT_BUFFER_POOL_SIZE);
     ~Database();
+
+#ifdef SHILMANDB_HAS_LIBTORCH
+    Database(const std::string& db_file, size_t buffer_pool_size,
+             bool use_learned_join, const std::string& join_model_path);
+#endif
 
     Database(const Database&) = delete;
     Database& operator=(const Database&) = delete;
@@ -38,6 +47,10 @@ private:
     std::unique_ptr<DiskManager> disk_manager_;
     std::unique_ptr<BufferPoolManager> bpm_;
     std::unique_ptr<Catalog> catalog_;
+
+#ifdef SHILMANDB_HAS_LIBTORCH
+    std::unique_ptr<LearnedJoinOptimizer> learned_join_optimizer_;
+#endif
 };
 
 }  // namespace shilmandb

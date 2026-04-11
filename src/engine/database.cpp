@@ -21,11 +21,25 @@ Database::Database(const std::string& db_file, size_t buffer_pool_size) {
 
 Database::~Database() = default;
 
+#ifdef SHILMANDB_HAS_LIBTORCH
+Database::Database(const std::string& db_file, size_t buffer_pool_size,
+                   bool use_learned_join, const std::string& join_model_path)
+    : Database(db_file, buffer_pool_size) {
+    if (use_learned_join) {
+        learned_join_optimizer_ = std::make_unique<LearnedJoinOptimizer>(join_model_path);
+    }
+}
+#endif
+
 QueryResult Database::ExecuteSQL(const std::string& sql) {
     Parser parser(sql);
     auto stmt = parser.Parse();
 
+#ifdef SHILMANDB_HAS_LIBTORCH
+    Planner planner(catalog_.get(), learned_join_optimizer_.get());
+#else
     Planner planner(catalog_.get());
+#endif
     auto plan = planner.Plan(std::move(*stmt));
 
     ExecutorContext ctx{bpm_.get(), catalog_.get()};
