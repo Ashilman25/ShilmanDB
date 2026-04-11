@@ -1,2 +1,5 @@
 add_executable(load_tpch load_tpch.cpp)
 target_link_libraries(load_tpch PRIVATE shilmandb_core)
+
+add_executable(generate_join_training_data generate_join_training_data.cpp)
+target_link_libraries(generate_join_training_data PRIVATE shilmandb_core)

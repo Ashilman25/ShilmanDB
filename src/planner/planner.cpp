@@ -4,6 +4,10 @@
 #include <algorithm>
 #include <unordered_set>
 
+#ifdef SHILMANDB_HAS_LIBTORCH
+#include "planner/learned_join_optimizer.hpp"
+#endif
+
 namespace shilmandb {
 
 namespace {
@@ -186,6 +190,10 @@ auto ResolveExprType(const Expression* expr, const Schema& schema) -> TypeId {
 
 Planner::Planner(Catalog* catalog) : catalog_(catalog) {}
 
+#ifdef SHILMANDB_HAS_LIBTORCH
+Planner::Planner(Catalog* catalog, LearnedJoinOptimizer* learned_optimizer) : catalog_(catalog), learned_optimizer_(learned_optimizer) {}
+#endif
+
 auto Planner::Plan(SelectStatement stmt) -> std::unique_ptr<PlanNode> {
     std::vector<TableRef> tables;
     std::vector<TableInfo*> table_infos;
@@ -258,7 +266,32 @@ auto Planner::Plan(SelectStatement stmt) -> std::unique_ptr<PlanNode> {
             stats.push_back(info->stats);
         }
 
-        auto order = JoinOrderOptimizer::FindBestOrder(tables, stmt.joins, stats);
+        std::vector<int> order;
+
+#ifdef SHILMANDB_HAS_LIBTORCH
+        if (learned_optimizer_ != nullptr) {
+            try {
+                auto features = JoinOrderOptimizer::BuildFeatureVector(tables, stmt.joins, stats);
+                auto learned_order = learned_optimizer_->PredictJoinOrder(features, static_cast<int>(tables.size()));
+
+                double learned_cost = JoinOrderOptimizer::EstimateCost(learned_order, tables, stmt.joins, stats);
+                auto exhaustive_order = JoinOrderOptimizer::FindBestOrder(tables, stmt.joins, stats);
+                double exhaustive_cost = JoinOrderOptimizer::EstimateCost(exhaustive_order, tables, stmt.joins, stats);
+
+                if (learned_cost <= 2.0 * exhaustive_cost) {
+                    order = std::move(learned_order);
+                } else {
+                    order = std::move(exhaustive_order);
+                }
+            } catch (const std::exception&) {
+                order = JoinOrderOptimizer::FindBestOrder(tables, stmt.joins, stats);
+            }
+        } else {
+            order = JoinOrderOptimizer::FindBestOrder(tables, stmt.joins, stats);
+        }
+#else
+        order = JoinOrderOptimizer::FindBestOrder(tables, stmt.joins, stats);
+#endif
 
         current = std::move(scans[order[0]]);
 

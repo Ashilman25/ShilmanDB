@@ -130,10 +130,18 @@ struct Args {
     std::string db_file;
     std::string data_dir;
     bool verify{true};
+#ifdef SHILMANDB_HAS_LIBTORCH
+    bool use_learned_join{false};
+    std::string join_model_path;
+#endif
 };
 
 static void PrintUsage(const char* prog) {
-    std::cerr << "Usage: " << prog << " --sf <scale_factor> --db-file <path> --data-dir <path> [--no-verify]\n";
+    std::cerr << "Usage: " << prog << " --sf <scale_factor> --db-file <path> --data-dir <path> [--no-verify]"
+#ifdef SHILMANDB_HAS_LIBTORCH
+              << " [--use-learned-join --join-model-path <path>]"
+#endif
+              << "\n";
 }
 
 static Args ParseArgs(int argc, char* argv[]) {
@@ -148,6 +156,12 @@ static Args ParseArgs(int argc, char* argv[]) {
             args.data_dir = argv[++i];
         } else if (arg == "--no-verify") {
             args.verify = false;
+#ifdef SHILMANDB_HAS_LIBTORCH
+        } else if (arg == "--use-learned-join") {
+            args.use_learned_join = true;
+        } else if (arg == "--join-model-path" && i + 1 < argc) {
+            args.join_model_path = argv[++i];
+#endif
         } else {
             PrintUsage(argv[0]);
             std::exit(1);
@@ -157,6 +171,12 @@ static Args ParseArgs(int argc, char* argv[]) {
         PrintUsage(argv[0]);
         std::exit(1);
     }
+#ifdef SHILMANDB_HAS_LIBTORCH
+    if (args.use_learned_join && args.join_model_path.empty()) {
+        std::cerr << "Error: --use-learned-join requires --join-model-path\n";
+        std::exit(1);
+    }
+#endif
     // Ensure data_dir ends with '/'
     if (args.data_dir.back() != '/') {
         args.data_dir += '/';
@@ -172,7 +192,15 @@ int main(int argc, char* argv[]) {
     std::cout << "=== ShilmanDB TPC-H Loader (SF=" << args.sf << ") ===\n";
 
     constexpr size_t kLoadBufferPoolSize = 4096;
+#ifdef SHILMANDB_HAS_LIBTORCH
+    Database db(args.db_file, kLoadBufferPoolSize,
+                args.use_learned_join, args.join_model_path);
+    if (args.use_learned_join) {
+        std::cout << "Learned join optimizer: ON (model: " << args.join_model_path << ")\n";
+    }
+#else
     Database db(args.db_file, kLoadBufferPoolSize);
+#endif
 
 
     auto tables = BuildTableDescs();
