@@ -7,6 +7,10 @@
 #include "executor/executor_context.hpp"
 #include "common/exception.hpp"
 
+#ifdef SHILMANDB_HAS_LIBTORCH
+#include "buffer/learned_eviction_policy.hpp"
+#endif
+
 #include <fstream>
 #include <sstream>
 
@@ -22,9 +26,19 @@ Database::Database(const std::string& db_file, size_t buffer_pool_size) {
 Database::~Database() = default;
 
 #ifdef SHILMANDB_HAS_LIBTORCH
-Database::Database(const std::string& db_file, size_t buffer_pool_size,
-                   bool use_learned_join, const std::string& join_model_path)
-    : Database(db_file, buffer_pool_size) {
+Database::Database(const std::string& db_file, size_t buffer_pool_size, bool use_learned_join, const std::string& join_model_path, bool use_learned_eviction, const std::string& eviction_model_path) {
+    disk_manager_ = std::make_unique<DiskManager>(db_file);
+
+    std::unique_ptr<EvictionPolicy> eviction;
+    if (use_learned_eviction) {
+        eviction = std::make_unique<LearnedEvictionPolicy>(eviction_model_path);
+    } else {
+        eviction = std::make_unique<LRUEvictionPolicy>(buffer_pool_size);
+    }
+    
+    bpm_ = std::make_unique<BufferPoolManager>(buffer_pool_size, disk_manager_.get(), std::move(eviction));
+    catalog_ = std::make_unique<Catalog>(bpm_.get());
+
     if (use_learned_join) {
         learned_join_optimizer_ = std::make_unique<LearnedJoinOptimizer>(join_model_path);
     }

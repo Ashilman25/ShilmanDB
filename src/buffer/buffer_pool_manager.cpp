@@ -1,4 +1,5 @@
 #include "buffer/buffer_pool_manager.hpp"
+#include "common/exception.hpp"
 
 namespace shilmandb {
 
@@ -9,6 +10,7 @@ BufferPoolManager::BufferPoolManager(size_t pool_size, DiskManager* disk_manager
 }
 
 BufferPoolManager::~BufferPoolManager() {
+    DisableTracing();
     try {
         FlushAllPages();
     } catch (...) {
@@ -22,9 +24,12 @@ Page* BufferPoolManager::FetchPage(page_id_t page_id) {
     if (auto it = page_table_.find(page_id); it != page_table_.end()) {
         auto frame_id = it->second;
         pages_[frame_id].Pin();
-        eviction_policy_->RecordAccess(frame_id);
+        eviction_policy_->RecordAccess(frame_id, page_id);
         eviction_policy_->SetEvictable(frame_id, false);
         ++hit_count_;
+        if (trace_enabled_) {
+            trace_file_ << access_counter_++ << ',' << page_id << '\n';
+        }
         return &pages_[frame_id];
     }
 
@@ -50,9 +55,12 @@ Page* BufferPoolManager::FetchPage(page_id_t page_id) {
     frame.Pin();
 
     page_table_[page_id] = frame_id;
-    eviction_policy_->RecordAccess(frame_id);
+    eviction_policy_->RecordAccess(frame_id, page_id);
     eviction_policy_->SetEvictable(frame_id, false);
     ++miss_count_;
+    if (trace_enabled_) {
+        trace_file_ << access_counter_++ << ',' << page_id << '\n';
+    }
     return &frame;
 }
 
@@ -78,7 +86,7 @@ Page* BufferPoolManager::NewPage(page_id_t* page_id) {
     frame.Pin();
 
     page_table_[new_page_id] = frame_id;
-    eviction_policy_->RecordAccess(frame_id);
+    eviction_policy_->RecordAccess(frame_id, new_page_id);
     eviction_policy_->SetEvictable(frame_id, false);
 
     *page_id = new_page_id;
@@ -169,6 +177,25 @@ size_t BufferPoolManager::GetPoolSize() const { return pool_size_; }
 const Page& BufferPoolManager::GetPage(frame_id_t frame_id) const {
     assert(frame_id < pool_size_ && "frame_id out of bounds");
     return pages_[frame_id];
+}
+
+void BufferPoolManager::EnableTracing(const std::string& trace_path) {
+    DisableTracing();
+    trace_file_.open(trace_path, std::ios::out | std::ios::trunc);
+    if (!trace_file_.is_open()) {
+        throw DatabaseException("Failed to open trace file: " + trace_path);
+    }
+    trace_file_ << "timestamp,page_id\n";
+    access_counter_ = 0;
+    trace_enabled_ = true;
+}
+
+void BufferPoolManager::DisableTracing() {
+    if (trace_enabled_) {
+        trace_file_.flush();
+        trace_file_.close();
+        trace_enabled_ = false;
+    }
 }
 
 }  // namespace shilmandb

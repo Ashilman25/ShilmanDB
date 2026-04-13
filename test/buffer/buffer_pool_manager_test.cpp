@@ -3,6 +3,7 @@
 #include "buffer/lru_eviction_policy.hpp"
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 
 namespace shilmandb {
@@ -425,6 +426,84 @@ TEST_F(BufferPoolManagerTest, NewPageViaEvictionPath) {
             << "Mismatch at byte " << i;
     }
     (void)bpm->UnpinPage(pid0, false);
+}
+
+// ---------------------------------------------------------------------------
+// Test 18: TracingWritesCorrectEntries
+// ---------------------------------------------------------------------------
+TEST_F(BufferPoolManagerTest, TracingWritesCorrectEntries) {
+    auto trace_path = (std::filesystem::temp_directory_path() / "shilmandb_trace_test.csv").string();
+    auto [dm, bpm] = MakeBPM(10);
+
+    bpm->EnableTracing(trace_path);
+
+    // NewPage should NOT produce trace entries
+    page_id_t pid0, pid1, pid2;
+    auto* p0 = bpm->NewPage(&pid0);
+    ASSERT_NE(p0, nullptr);
+    (void)bpm->UnpinPage(pid0, false);
+
+    auto* p1 = bpm->NewPage(&pid1);
+    ASSERT_NE(p1, nullptr);
+    (void)bpm->UnpinPage(pid1, false);
+
+    auto* p2 = bpm->NewPage(&pid2);
+    ASSERT_NE(p2, nullptr);
+    (void)bpm->UnpinPage(pid2, false);
+
+    // FetchPage SHOULD produce trace entries
+    auto* f0 = bpm->FetchPage(pid0);
+    ASSERT_NE(f0, nullptr);
+    (void)bpm->UnpinPage(pid0, false);
+
+    auto* f1 = bpm->FetchPage(pid1);
+    ASSERT_NE(f1, nullptr);
+    (void)bpm->UnpinPage(pid1, false);
+
+    auto* f2 = bpm->FetchPage(pid2);
+    ASSERT_NE(f2, nullptr);
+    (void)bpm->UnpinPage(pid2, false);
+
+    // Fetch pid0 again — second access
+    auto* f0b = bpm->FetchPage(pid0);
+    ASSERT_NE(f0b, nullptr);
+    (void)bpm->UnpinPage(pid0, false);
+
+    bpm->DisableTracing();
+
+    // Read and verify trace file
+    std::ifstream trace(trace_path);
+    ASSERT_TRUE(trace.is_open());
+
+    std::string header;
+    std::getline(trace, header);
+    EXPECT_EQ(header, "timestamp,page_id");
+
+    // Should have 4 entries (4 FetchPage calls, 0 for NewPage)
+    std::vector<std::pair<uint64_t, page_id_t>> entries;
+    std::string line;
+    while (std::getline(trace, line)) {
+        auto comma = line.find(',');
+        ASSERT_NE(comma, std::string::npos);
+        auto ts = std::stoull(line.substr(0, comma));
+        auto pid = static_cast<page_id_t>(std::stoul(line.substr(comma + 1)));
+        entries.emplace_back(ts, pid);
+    }
+
+    ASSERT_EQ(entries.size(), 4u);
+
+    // Timestamps monotonically increasing
+    for (size_t i = 1; i < entries.size(); ++i) {
+        EXPECT_GT(entries[i].first, entries[i - 1].first);
+    }
+
+    // Page IDs match fetch order: pid0, pid1, pid2, pid0
+    EXPECT_EQ(entries[0].second, pid0);
+    EXPECT_EQ(entries[1].second, pid1);
+    EXPECT_EQ(entries[2].second, pid2);
+    EXPECT_EQ(entries[3].second, pid0);
+
+    std::filesystem::remove(trace_path);
 }
 
 }  // namespace shilmandb

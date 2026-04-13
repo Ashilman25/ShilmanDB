@@ -130,16 +130,22 @@ struct Args {
     std::string db_file;
     std::string data_dir;
     bool verify{true};
+    std::string trace_path;
+    size_t pool_size{4096};
 #ifdef SHILMANDB_HAS_LIBTORCH
     bool use_learned_join{false};
     std::string join_model_path;
+    bool use_learned_eviction{false};
+    std::string eviction_model_path;
 #endif
 };
 
 static void PrintUsage(const char* prog) {
     std::cerr << "Usage: " << prog << " --sf <scale_factor> --db-file <path> --data-dir <path> [--no-verify]"
+              << " [--enable-tracing <path>] [--pool-size <N>]"
 #ifdef SHILMANDB_HAS_LIBTORCH
               << " [--use-learned-join --join-model-path <path>]"
+              << " [--use-learned-eviction --eviction-model-path <path>]"
 #endif
               << "\n";
 }
@@ -156,11 +162,19 @@ static Args ParseArgs(int argc, char* argv[]) {
             args.data_dir = argv[++i];
         } else if (arg == "--no-verify") {
             args.verify = false;
+        } else if (arg == "--enable-tracing" && i + 1 < argc) {
+            args.trace_path = argv[++i];
+        } else if (arg == "--pool-size" && i + 1 < argc) {
+            args.pool_size = std::stoul(argv[++i]);
 #ifdef SHILMANDB_HAS_LIBTORCH
         } else if (arg == "--use-learned-join") {
             args.use_learned_join = true;
         } else if (arg == "--join-model-path" && i + 1 < argc) {
             args.join_model_path = argv[++i];
+        } else if (arg == "--use-learned-eviction") {
+            args.use_learned_eviction = true;
+        } else if (arg == "--eviction-model-path" && i + 1 < argc) {
+            args.eviction_model_path = argv[++i];
 #endif
         } else {
             PrintUsage(argv[0]);
@@ -174,6 +188,10 @@ static Args ParseArgs(int argc, char* argv[]) {
 #ifdef SHILMANDB_HAS_LIBTORCH
     if (args.use_learned_join && args.join_model_path.empty()) {
         std::cerr << "Error: --use-learned-join requires --join-model-path\n";
+        std::exit(1);
+    }
+    if (args.use_learned_eviction && args.eviction_model_path.empty()) {
+        std::cerr << "Error: --use-learned-eviction requires --eviction-model-path\n";
         std::exit(1);
     }
 #endif
@@ -191,15 +209,18 @@ int main(int argc, char* argv[]) {
 
     std::cout << "=== ShilmanDB TPC-H Loader (SF=" << args.sf << ") ===\n";
 
-    constexpr size_t kLoadBufferPoolSize = 4096;
 #ifdef SHILMANDB_HAS_LIBTORCH
-    Database db(args.db_file, kLoadBufferPoolSize,
-                args.use_learned_join, args.join_model_path);
+    Database db(args.db_file, args.pool_size,
+                args.use_learned_join, args.join_model_path,
+                args.use_learned_eviction, args.eviction_model_path);
     if (args.use_learned_join) {
         std::cout << "Learned join optimizer: ON (model: " << args.join_model_path << ")\n";
     }
+    if (args.use_learned_eviction) {
+        std::cout << "Learned eviction policy: ON (model: " << args.eviction_model_path << ")\n";
+    }
 #else
-    Database db(args.db_file, kLoadBufferPoolSize);
+    Database db(args.db_file, args.pool_size);
 #endif
 
 
@@ -242,7 +263,16 @@ int main(int argc, char* argv[]) {
 
 
 
-    if (args.verify) {
+    bool run_queries = args.verify || !args.trace_path.empty();
+
+    if (!args.trace_path.empty()) {
+        if (!args.verify) {
+            std::cout << "\nTracing enabled — running verification queries for trace generation\n";
+        }
+        db.GetBufferPoolManager()->EnableTracing(args.trace_path);
+    }
+
+    if (run_queries) {
         std::cout << "\n=== Row Counts ===\n";
         std::vector<std::string> verify_tables = {
             "region", "nation", "supplier", "customer", "orders", "lineitem"
@@ -348,6 +378,11 @@ int main(int argc, char* argv[]) {
         }
 
         std::cout << "\n=== " << passed << "/" << queries.size() << " TPC-H queries passed ===\n";
+    }
+
+    if (!args.trace_path.empty()) {
+        db.GetBufferPoolManager()->DisableTracing();
+        std::cout << "\nTrace written to " << args.trace_path << "\n";
     }
 
     std::cout << "\nDone.\n";

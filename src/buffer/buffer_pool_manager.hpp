@@ -6,6 +6,7 @@
 #include <memory>
 #include <unordered_map>
 #include <list>
+#include <fstream>
 #include <cstdint>
 
 namespace shilmandb {
@@ -30,6 +31,10 @@ public:
     uint64_t GetMissCount() const;
     void ResetStats();
 
+    // Access tracing for ML training data generation
+    void EnableTracing(const std::string& trace_path);
+    void DisableTracing();
+
     size_t GetPoolSize() const;
     const Page& GetPage(frame_id_t frame_id) const;
 
@@ -42,6 +47,11 @@ private:
     std::list<frame_id_t> free_list_;
     uint64_t hit_count_{0};
     uint64_t miss_count_{0};
+
+    // Access tracing
+    bool trace_enabled_{false};
+    std::ofstream trace_file_;
+    uint64_t access_counter_{0};
 
     bool FindVictimFrame(frame_id_t* frame_id);
 };

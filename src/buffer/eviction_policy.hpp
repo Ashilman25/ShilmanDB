@@ -14,6 +14,11 @@ public:
     //record that frame_id was accessed (move to MRU position in LRU)
     virtual void RecordAccess(frame_id_t frame_id) = 0;
 
+    //record access with page_id context (learned policies need page identity)
+    virtual void RecordAccess(frame_id_t frame_id, page_id_t page_id) {
+        RecordAccess(frame_id);
+    }
+
     //mark frame as evicitable or not
     virtual void SetEvictable(frame_id_t frame_id, bool evictable) = 0;
 

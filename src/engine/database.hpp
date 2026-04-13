@@ -28,7 +28,8 @@ public:
 
 #ifdef SHILMANDB_HAS_LIBTORCH
     Database(const std::string& db_file, size_t buffer_pool_size,
-             bool use_learned_join, const std::string& join_model_path);
+             bool use_learned_join, const std::string& join_model_path,
+             bool use_learned_eviction, const std::string& eviction_model_path);
 #endif
 
     Database(const Database&) = delete;
