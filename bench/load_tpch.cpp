@@ -2,11 +2,15 @@
 #include "common/exception.hpp"
 
 #include <iostream>
+#include <fstream>
+#include <iomanip>
 #include <string>
 #include <vector>
 #include <chrono>
+#include <filesystem>
 
 using namespace shilmandb;
+namespace fs = std::filesystem;
 
 
 static Schema LineitemSchema() {
@@ -131,6 +135,7 @@ struct Args {
     std::string data_dir;
     bool verify{true};
     std::string trace_path;
+    std::string results_dir;
     size_t pool_size{4096};
 #ifdef SHILMANDB_HAS_LIBTORCH
     bool use_learned_join{false};
@@ -142,7 +147,7 @@ struct Args {
 
 static void PrintUsage(const char* prog) {
     std::cerr << "Usage: " << prog << " --sf <scale_factor> --db-file <path> --data-dir <path> [--no-verify]"
-              << " [--enable-tracing <path>] [--pool-size <N>]"
+              << " [--enable-tracing <path>] [--pool-size <N>] [--results-dir <path>]"
 #ifdef SHILMANDB_HAS_LIBTORCH
               << " [--use-learned-join --join-model-path <path>]"
               << " [--use-learned-eviction --eviction-model-path <path>]"
@@ -166,6 +171,8 @@ static Args ParseArgs(int argc, char* argv[]) {
             args.trace_path = argv[++i];
         } else if (arg == "--pool-size" && i + 1 < argc) {
             args.pool_size = std::stoul(argv[++i]);
+        } else if (arg == "--results-dir" && i + 1 < argc) {
+            args.results_dir = argv[++i];
 #ifdef SHILMANDB_HAS_LIBTORCH
         } else if (arg == "--use-learned-join") {
             args.use_learned_join = true;
@@ -263,7 +270,7 @@ int main(int argc, char* argv[]) {
 
 
 
-    bool run_queries = args.verify || !args.trace_path.empty();
+    bool run_queries = args.verify || !args.trace_path.empty() || !args.results_dir.empty();
 
     if (!args.trace_path.empty()) {
         if (!args.verify) {
@@ -295,25 +302,31 @@ int main(int argc, char* argv[]) {
 
         struct TpchQuery {
             std::string name;
+            std::string tag;   // short identifier: "Q1", "Q3", etc.
             std::string sql;
+            std::string canonical_header;
         };
 
+        // Canonical headers match bench/run_sqlite_benchmarks.py QUERY_HEADERS
+        // (hardcoded rather than using planner-derived schema names for stable cross-engine comparison)
         std::vector<TpchQuery> queries = {
-            {"Q1 (Pricing Summary)",
+            {"Q1 (Pricing Summary)", "Q1",
              "SELECT l_returnflag, l_linestatus, SUM(l_quantity), SUM(l_extendedprice), "
              "SUM(l_discount), COUNT(*) "
              "FROM lineitem "
              "WHERE l_shipdate <= '1998-09-02' "
              "GROUP BY l_returnflag, l_linestatus "
-             "ORDER BY l_returnflag, l_linestatus"},
+             "ORDER BY l_returnflag, l_linestatus",
+             "l_returnflag,l_linestatus,sum_quantity,sum_extendedprice,sum_discount,count_star"},
 
-            {"Q6 (Revenue Forecast)",
+            {"Q6 (Revenue Forecast)", "Q6",
              "SELECT SUM(l_extendedprice * l_discount) "
              "FROM lineitem "
              "WHERE l_shipdate >= '1994-01-01' AND l_shipdate < '1995-01-01' "
-             "AND l_discount >= 0.05 AND l_discount <= 0.07 AND l_quantity < 24"},
+             "AND l_discount >= 0.05 AND l_discount <= 0.07 AND l_quantity < 24",
+             "sum_disc_price"},
 
-            {"Q3 (Shipping Priority)",
+            {"Q3 (Shipping Priority)", "Q3",
              "SELECT l_orderkey, SUM(l_extendedprice * (1 - l_discount)), o_orderdate, o_shippriority "
              "FROM customer c "
              "JOIN orders o ON c.c_custkey = o.o_custkey "
@@ -323,9 +336,10 @@ int main(int argc, char* argv[]) {
              "AND l.l_shipdate > '1995-03-15' "
              "GROUP BY l_orderkey, o_orderdate, o_shippriority "
              "ORDER BY SUM(l_extendedprice * (1 - l_discount)) DESC "
-             "LIMIT 10"},
+             "LIMIT 10",
+             "l_orderkey,sum_disc_price,o_orderdate,o_shippriority"},
 
-            {"Q5 (Local Supplier Volume)",
+            {"Q5 (Local Supplier Volume)", "Q5",
              "SELECT n_name, SUM(l_extendedprice * (1 - l_discount)) "
              "FROM customer c "
              "JOIN orders o ON c.c_custkey = o.o_custkey "
@@ -334,8 +348,49 @@ int main(int argc, char* argv[]) {
              "JOIN nation n ON s.s_nationkey = n.n_nationkey "
              "WHERE o.o_orderdate >= '1994-01-01' AND o.o_orderdate < '1995-01-01' "
              "GROUP BY n_name "
-             "ORDER BY SUM(l_extendedprice * (1 - l_discount)) DESC"},
+             "ORDER BY SUM(l_extendedprice * (1 - l_discount)) DESC",
+             "n_name,sum_disc_price"},
         };
+
+        // Create results directory if requested
+        const bool export_csv = !args.results_dir.empty();
+        if (export_csv) {
+            std::error_code ec;
+            fs::create_directories(args.results_dir, ec);
+            if (ec) {
+                std::cerr << "Error: could not create results directory '"
+                          << args.results_dir << "': " << ec.message() << "\n";
+                return 1;
+            }
+        }
+
+        // CSV value formatter: RFC 4180 quoting for VARCHAR fields
+        auto csv_value = [](const Value& v, const Schema& schema, uint32_t col) -> std::string {
+            auto str = v.ToString();
+            if (schema.GetColumn(col).type == TypeId::VARCHAR) {
+                bool needs_quoting = str.find(',')  != std::string::npos
+                                  || str.find('"')  != std::string::npos
+                                  || str.find('\n') != std::string::npos;
+                if (needs_quoting) {
+                    std::string escaped;
+                    escaped.reserve(str.size() + 2);
+                    for (char ch : str) {
+                        if (ch == '"') escaped += '"';
+                        escaped += ch;
+                    }
+                    return "\"" + escaped + "\"";
+                }
+            }
+            return str;
+        };
+
+        // Latency records for latencies.csv
+        struct LatencyRecord {
+            std::string tag;
+            size_t rows;
+            double latency_ms;
+        };
+        std::vector<LatencyRecord> latencies;
 
         int passed = 0;
         for (const auto& q : queries) {
@@ -344,9 +399,9 @@ int main(int argc, char* argv[]) {
             try {
                 auto result = db.ExecuteSQL(q.sql);
                 auto elapsed = std::chrono::steady_clock::now() - start;
-                auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
+                double ms = std::chrono::duration<double, std::milli>(elapsed).count();
 
-                std::cout << "OK — " << result.tuples.size() << " rows (" << ms << " ms)\n";
+                std::cout << "OK — " << result.tuples.size() << " rows (" << static_cast<int64_t>(ms) << " ms)\n";
 
                 // Print first few rows for inspection
                 const auto& schema = result.schema;
@@ -369,15 +424,52 @@ int main(int argc, char* argv[]) {
                 if (result.tuples.size() > show) {
                     std::cout << "    ... (" << result.tuples.size() - show << " more rows)\n";
                 }
+
+                // Export query results to CSV
+                if (export_csv) {
+                    auto csv_path = fs::path(args.results_dir) / (q.tag + ".csv");
+                    std::ofstream ofs(csv_path);
+                    if (ofs) {
+                        ofs << q.canonical_header << "\n";
+                        for (const auto& tuple : result.tuples) {
+                            for (uint32_t c = 0; c < schema.GetColumnCount(); ++c) {
+                                if (c > 0) ofs << ",";
+                                ofs << csv_value(tuple.GetValue(schema, c), schema, c);
+                            }
+                            ofs << "\n";
+                        }
+                        std::cout << "    -> Exported to " << csv_path.string() << "\n";
+                    } else {
+                        std::cerr << "    Warning: could not open " << csv_path.string() << " for writing\n";
+                    }
+                }
+
+                latencies.push_back({q.tag, result.tuples.size(), ms});
                 ++passed;
             } catch (const std::exception& e) {
                 auto elapsed = std::chrono::steady_clock::now() - start;
-                auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
-                std::cerr << "FAILED (" << ms << " ms) — " << e.what() << "\n";
+                double ms = std::chrono::duration<double, std::milli>(elapsed).count();
+                std::cerr << "FAILED (" << static_cast<int64_t>(ms) << " ms) — " << e.what() << "\n";
             }
         }
 
         std::cout << "\n=== " << passed << "/" << queries.size() << " TPC-H queries passed ===\n";
+
+        // Write latencies.csv
+        if (export_csv && !latencies.empty()) {
+            auto lat_path = fs::path(args.results_dir) / "latencies.csv";
+            std::ofstream ofs(lat_path);
+            if (ofs) {
+                ofs << "query,rows,latency_ms\n";
+                ofs << std::fixed << std::setprecision(4);
+                for (const auto& rec : latencies) {
+                    ofs << rec.tag << "," << rec.rows << "," << rec.latency_ms << "\n";
+                }
+                std::cout << "\nLatencies written to " << lat_path.string() << "\n";
+            } else {
+                std::cerr << "Warning: could not open " << lat_path.string() << " for writing\n";
+            }
+        }
     }
 
     if (!args.trace_path.empty()) {
