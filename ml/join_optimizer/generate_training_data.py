@@ -76,6 +76,8 @@ def concatenate_csvs(csv_paths: list[str], output_path: str) -> int:
 
 
 def validate_csv(path: str) -> bool:
+    import numpy as np
+
     passed = True
     warnings = 0
 
@@ -94,23 +96,28 @@ def validate_csv(path: str) -> bool:
         print(f"Row count: {row_count} (< 500) ERROR")
         passed = False
 
-
+    # Parse features, num_tables, orders
     bad_features = 0
     bad_num_tables = 0
     bad_orders = 0
     num_tables_dist: dict[int, int] = {}
     unique_orderings: set[tuple[int, ...]] = set()
+    feat_matrix = []
 
     for row_idx, row in enumerate(rows):
+        row_feats = []
         for j in range(48):
             try:
                 val = float(row[j])
                 if not math.isfinite(val):
                     bad_features += 1
                     
+                row_feats.append(val)
             except (ValueError, IndexError):
                 bad_features += 1
-
+                row_feats.append(0.0)
+                
+        feat_matrix.append(row_feats)
 
         try:
             nt = int(row[48])
@@ -146,17 +153,52 @@ def validate_csv(path: str) -> bool:
         print(f"num_tables: {bad_num_tables} invalid rows WARNING")
         warnings += 1
 
-    print(f"num_tables distribution: {dict(sorted(num_tables_dist.items()))}")
+    # Per num_tables distribution with bucket warnings
+    print(f"\nPer num_tables distribution:")
+    for nt in sorted(num_tables_dist.keys()):
+        count = num_tables_dist[nt]
+        suffix = "" if count >= 100 else "  WARNING (< 100 samples)"
+        print(f"  {nt} tables: {count}{suffix}")
+        if count < 100:
+            warnings += 1
 
     if bad_orders > 0:
         print(f"Order values: {bad_orders} invalid rows WARNING")
         warnings += 1
 
+    # Feature range statistics
+    feat_np = np.array(feat_matrix)
+    constant_features = [j for j in range(48) if feat_np[:, j].min() == feat_np[:, j].max()]
+    
+    if constant_features:
+        names = ", ".join(f"feature_{j}" for j in constant_features)
+        print(f"\nConstant features: {names} WARNING")
+        warnings += 1
+    else:
+        print(f"\nConstant features: none")
+
+    # Correlation check
+    print(f"\nCorrelation check (|r| > 0.99):")
+    corr = np.corrcoef(feat_np.T)
+    high_corr = []
+    
+    for i in range(48):
+        for j in range(i + 1, 48):
+            if np.isfinite(corr[i, j]) and abs(corr[i, j]) > 0.99:
+                high_corr.append((i, j, corr[i, j]))
+                
+    if high_corr:
+        for i, j, r in high_corr:
+            print(f"  feature_{i} ~ feature_{j}: r={r:.4f} WARNING")
+        warnings += 1
+    else:
+        print("  No high-correlation pairs found")
+
     n_unique = len(unique_orderings)
     if n_unique > 10:
-        print(f"Unique optimal orderings: {n_unique}")
+        print(f"\nUnique optimal orderings: {n_unique}")
     else:
-        print(f"Unique optimal orderings: {n_unique} (< 10) WARNING")
+        print(f"\nUnique optimal orderings: {n_unique} (< 10) WARNING")
         warnings += 1
 
     if passed and warnings == 0:
@@ -174,7 +216,7 @@ def main() -> None:
     parser.add_argument("--binary", default="build/bench/generate_join_training_data", help="Path to C++ generator binary")
     parser.add_argument("--data-base-dir", default="bench/tpch_data", help="Base directory containing sf*/ data dirs")
     parser.add_argument("--output", default="bench/tpch_data/join_training_data.csv", help="Output CSV path")
-    parser.add_argument("--perturbations", type=int, default=40, help="Perturbations per subset")
+    parser.add_argument("--perturbations", type=int, default=80, help="Perturbations per subset")
     parser.add_argument("--seed", type=int, default=42, help="Base random seed")
     args = parser.parse_args()
 
