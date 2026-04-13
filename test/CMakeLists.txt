@@ -49,4 +49,4 @@ shilmandb_add_test(limit_executor_test executor/limit_executor_test.cpp)
 
 # Integration tests
 shilmandb_add_test(end_to_end_test integration/end_to_end_test.cpp)
-# shilmandb_add_test(sqlite_comparison_test integration/sqlite_comparison_test.cpp)
+shilmandb_add_test(sqlite_comparison_test integration/sqlite_comparison_test.cpp)
