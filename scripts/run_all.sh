@@ -144,6 +144,7 @@ echo ""
 echo "--- 5b: Eviction policy — Zipfian access trace ---"
 echo ""
 $PYTHON ml/eviction_policy/generate_zipfian_trace.py \
+    --num-accesses 1000000 \
     --output "$ZIPFIAN_TRACE"
 check_file "$ZIPFIAN_TRACE" "Zipfian access trace"
 echo ""
