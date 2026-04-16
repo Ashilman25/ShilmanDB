@@ -180,7 +180,7 @@ def train(args: argparse.Namespace) -> None:
     val_features = data["val_features"]
     val_labels = data["val_labels"]
 
-    best_val_mse = float("inf")
+    best_val_loss = float("inf")
     best_epoch = 0
     patience_counter = 0
 
@@ -207,7 +207,7 @@ def train(args: argparse.Namespace) -> None:
         model.eval()
         with torch.no_grad():
             val_preds = model(val_features)
-            val_mse = criterion(val_preds, val_labels).item()
+            val_loss = criterion(val_preds, val_labels).item()
 
         if scheduler is not None:
             scheduler.step()
@@ -217,13 +217,13 @@ def train(args: argparse.Namespace) -> None:
         if epoch % 10 == 0 or epoch == 1:
             print(
                 f"Epoch {epoch:>3d}/{args.epochs}  "
-                f"train_mse={avg_train_loss:.4f}  "
-                f"val_mse={val_mse:.4f}  "
+                f"train_loss={avg_train_loss:.4f}  "
+                f"val_loss={val_loss:.4f}  "
                 f"lr={current_lr:.2e}"
             )
 
-        if val_mse < best_val_mse:
-            best_val_mse = val_mse
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
             best_epoch = epoch
             patience_counter = 0
             os.makedirs(args.output_dir, exist_ok=True)
@@ -237,14 +237,14 @@ def train(args: argparse.Namespace) -> None:
                 print(f"\nEarly stopping at epoch {epoch} (patience={args.patience}, best epoch={best_epoch})")
                 break
 
-    print(f"\nBest validation MSE: {best_val_mse:.4f} (epoch {best_epoch})")
+    print(f"\nBest validation loss: {best_val_loss:.4f} (epoch {best_epoch})")
     print(f"Model saved to {os.path.join(args.output_dir, 'eviction_model_v2_best.pt')}")
     print(f"Stats saved to {os.path.join(args.output_dir, 'feature_stats_v2.pt')}")
 
-    if best_val_mse < 2.0:
-        print(f"\nGate: PASSED (val MSE {best_val_mse:.4f} < 2.0)")
+    if best_val_loss < 2.0:
+        print(f"\nGate: PASSED (val loss {best_val_loss:.4f} < 2.0)")
     else:
-        print(f"\nGate: WARNING (val MSE {best_val_mse:.4f} >= 2.0)")
+        print(f"\nGate: WARNING (val loss {best_val_loss:.4f} >= 2.0)")
 
 
 def main() -> None:

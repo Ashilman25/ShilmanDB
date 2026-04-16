@@ -42,6 +42,7 @@ if(SHILMANDB_ENABLE_ML)
     target_sources(shilmandb_core PRIVATE
         src/planner/learned_join_optimizer.cpp
         src/buffer/learned_eviction_policy.cpp
+        src/buffer/learned_eviction_policy_v2.cpp
     )
     target_link_libraries(shilmandb_core PUBLIC "${TORCH_LIBRARIES}")
     target_include_directories(shilmandb_core PUBLIC "${TORCH_INCLUDE_DIRS}")
