@@ -9,6 +9,7 @@
 
 #ifdef SHILMANDB_HAS_LIBTORCH
 #include "buffer/learned_eviction_policy.hpp"
+#include "buffer/learned_eviction_policy_v2.hpp"
 #endif
 
 #include <fstream>
@@ -26,12 +27,16 @@ Database::Database(const std::string& db_file, size_t buffer_pool_size) {
 Database::~Database() = default;
 
 #ifdef SHILMANDB_HAS_LIBTORCH
-Database::Database(const std::string& db_file, size_t buffer_pool_size, bool use_learned_join, const std::string& join_model_path, bool use_learned_eviction, const std::string& eviction_model_path) {
+Database::Database(const std::string& db_file, size_t buffer_pool_size, bool use_learned_join, const std::string& join_model_path, bool use_learned_eviction, const std::string& eviction_model_path, const std::string& eviction_version) {
     disk_manager_ = std::make_unique<DiskManager>(db_file);
 
     std::unique_ptr<EvictionPolicy> eviction;
     if (use_learned_eviction) {
-        eviction = std::make_unique<LearnedEvictionPolicy>(eviction_model_path);
+        if (eviction_version == "v2") {
+            eviction = std::make_unique<LearnedEvictionPolicyV2>(eviction_model_path);
+        } else {
+            eviction = std::make_unique<LearnedEvictionPolicy>(eviction_model_path);
+        }
     } else {
         eviction = std::make_unique<LRUEvictionPolicy>(buffer_pool_size);
     }
