@@ -142,6 +142,7 @@ struct Args {
     std::string join_model_path;
     bool use_learned_eviction{false};
     std::string eviction_model_path;
+    std::string eviction_version{"v2"};
 #endif
 };
 
@@ -151,6 +152,7 @@ static void PrintUsage(const char* prog) {
 #ifdef SHILMANDB_HAS_LIBTORCH
               << " [--use-learned-join --join-model-path <path>]"
               << " [--use-learned-eviction --eviction-model-path <path>]"
+              << " [--eviction-model-version <v1|v2>]"
 #endif
               << "\n";
 }
@@ -182,6 +184,8 @@ static Args ParseArgs(int argc, char* argv[]) {
             args.use_learned_eviction = true;
         } else if (arg == "--eviction-model-path" && i + 1 < argc) {
             args.eviction_model_path = argv[++i];
+        } else if (arg == "--eviction-model-version" && i + 1 < argc) {
+            args.eviction_version = argv[++i];
 #endif
         } else {
             PrintUsage(argv[0]);
@@ -219,12 +223,13 @@ int main(int argc, char* argv[]) {
 #ifdef SHILMANDB_HAS_LIBTORCH
     Database db(args.db_file, args.pool_size,
                 args.use_learned_join, args.join_model_path,
-                args.use_learned_eviction, args.eviction_model_path);
+                args.use_learned_eviction, args.eviction_model_path,
+                args.eviction_version);
     if (args.use_learned_join) {
         std::cout << "Learned join optimizer: ON (model: " << args.join_model_path << ")\n";
     }
     if (args.use_learned_eviction) {
-        std::cout << "Learned eviction policy: ON (model: " << args.eviction_model_path << ")\n";
+        std::cout << "Learned eviction policy: ON (" << args.eviction_version << ", model: " << args.eviction_model_path << ")\n";
     }
 #else
     Database db(args.db_file, args.pool_size);
