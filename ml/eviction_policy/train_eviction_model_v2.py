@@ -16,12 +16,12 @@ class ReusePredictionModelV2(nn.Module):
         super().__init__()
         self.num_features = num_features
         self.net = nn.Sequential(
-            nn.Linear(num_features, 32),
+            nn.Linear(num_features, 128),
             nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(32, 16),
+            nn.Dropout(0.1),
+            nn.Linear(128, 64),
             nn.ReLU(),
-            nn.Linear(16, 1),
+            nn.Linear(64, 1),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -51,10 +51,18 @@ def parse_args() -> argparse.Namespace:
         "--lr-schedule", choices=["cosine", "constant"], default="cosine",
         help="LR schedule: cosine or constant (default: cosine)",
     )
+    parser.add_argument(
+        "--loss", choices=["mse", "huber"], default="huber",
+        help="Loss function: mse or huber (default: huber)",
+    )
+    parser.add_argument(
+        "--label-cap", type=float, default=9.21,
+        help="Cap labels at this value, 0 = no cap (default: 9.21 ~ log(10001))",
+    )
     return parser.parse_args()
 
 
-def load_and_split(data_path: str, val_split: float, seed: int) -> dict:
+def load_and_split(data_path: str, val_split: float, seed: int, label_cap: float = 0.0) -> dict:
     print(f"Loading data from {data_path} ...")
     data = np.load(data_path)
     features = data["features"]   # (N, 4) float32
@@ -86,6 +94,13 @@ def load_and_split(data_path: str, val_split: float, seed: int) -> dict:
     train_labels = torch.from_numpy(labels[train_idx]).float()
     val_features = torch.from_numpy(features[val_idx]).float()
     val_labels = torch.from_numpy(labels[val_idx]).float()
+
+    if label_cap > 0:
+        n_capped_train = int((train_labels > label_cap).sum())
+        n_capped_val = int((val_labels > label_cap).sum())
+        train_labels = torch.clamp(train_labels, max=label_cap)
+        val_labels = torch.clamp(val_labels, max=label_cap)
+        print(f"  Label cap={label_cap:.2f}: capped {n_capped_train:,} train, {n_capped_val:,} val samples")
 
     print(f"  Stratified split: {len(train_idx):,} train, {len(val_idx):,} val")
 
@@ -128,7 +143,7 @@ def train(args: argparse.Namespace) -> None:
     torch.manual_seed(args.seed)
     random.seed(args.seed)
 
-    data = load_and_split(args.data, args.val_split, args.seed)
+    data = load_and_split(args.data, args.val_split, args.seed, args.label_cap)
     data = standardize_features(data, args.output_dir)
 
     model = ReusePredictionModelV2()
@@ -137,14 +152,18 @@ def train(args: argparse.Namespace) -> None:
     n_val = len(data["val_features"])
 
     print(f"\n=== V2 Eviction Model Training ===")
-    print(f"Model: MLP(4->32->16->1) -- {n_params:,} params")
+    print(f"Model: MLP(4->128->64->1) -- {n_params:,} params")
     print(
         f"Hyperparams: epochs={args.epochs}, batch_size={args.batch_size}, "
-        f"lr={args.lr}, schedule={args.lr_schedule}, patience={args.patience}\n"
+        f"lr={args.lr}, schedule={args.lr_schedule}, patience={args.patience}, "
+        f"loss={args.loss}, label_cap={args.label_cap}\n"
     )
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    criterion = nn.MSELoss()
+    if args.loss == "huber":
+        criterion = nn.SmoothL1Loss()
+    else:
+        criterion = nn.MSELoss()
 
     scheduler = None
     if args.lr_schedule == "cosine":
