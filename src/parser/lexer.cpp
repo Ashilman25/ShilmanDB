@@ -214,6 +214,10 @@ Token Lexer::NextToken() {
             Advance();
             return {TokenType::LESS_EQUAL, "<=", start_line, start_col};
         }
+        if (CurrentChar() == '>') {
+            Advance();
+            return {TokenType::NOT_EQUALS, "<>", start_line, start_col};
+        }
         return {TokenType::LESS_THAN, "<", start_line, start_col};
     }
     

@@ -159,6 +159,146 @@ auto DeriveColumnName(const Expression* expr) -> std::string {
 }
 
 
+bool ExpressionEquals(const Expression* a, const Expression* b) {
+    if (a == b) return true;
+    if (!a || !b) return false;
+    if (a->type != b->type) return false;
+
+    switch (a->type) {
+        case ExprType::COLUMN_REF: {
+            const auto* ac = static_cast<const ColumnRef*>(a);
+            const auto* bc = static_cast<const ColumnRef*>(b);
+            return ac->table_name == bc->table_name && ac->column_name == bc->column_name;
+        }
+        case ExprType::LITERAL: {
+            const auto* al = static_cast<const Literal*>(a);
+            const auto* bl = static_cast<const Literal*>(b);
+            return al->value == bl->value;
+        }
+        case ExprType::BINARY_OP: {
+            const auto* ab = static_cast<const BinaryOp*>(a);
+            const auto* bb = static_cast<const BinaryOp*>(b);
+            return ab->op == bb->op && ExpressionEquals(ab->left.get(), bb->left.get()) && ExpressionEquals(ab->right.get(), bb->right.get());
+        }
+        case ExprType::UNARY_OP: {
+            const auto* au = static_cast<const UnaryOp*>(a);
+            const auto* bu = static_cast<const UnaryOp*>(b);
+            return au->op == bu->op && ExpressionEquals(au->operand.get(), bu->operand.get()); 
+        }
+        case ExprType::AGGREGATE: {
+            const auto* aa = static_cast<const Aggregate*>(a);
+            const auto* ba = static_cast<const Aggregate*>(b);
+            return aa->func == ba->func && ExpressionEquals(aa->arg.get(), ba->arg.get());
+        }
+        case ExprType::STAR:
+            return true;
+        case ExprType::CASE: {
+            const auto* ac = static_cast<const CaseExpression*>(a);
+            const auto* bc = static_cast<const CaseExpression*>(b);
+            if (ac->when_clauses.size() != bc->when_clauses.size()) return false;
+            for (size_t i = 0; i < ac->when_clauses.size(); ++i) {
+                if (!ExpressionEquals(ac->when_clauses[i].first.get(), bc->when_clauses[i].first.get())) return false;
+                if (!ExpressionEquals(ac->when_clauses[i].second.get(), bc->when_clauses[i].second.get())) return false;
+            }
+            return ExpressionEquals(ac->else_clause.get(), bc->else_clause.get());
+        }
+    }
+    return false;
+}
+
+// Tree-walking aggregate detector. Returns true if `expr` contains an
+// Aggregate node anywhere in its tree.
+bool HasAggregate(const Expression* expr) {
+    if (!expr) return false;
+    if (dynamic_cast<const Aggregate*>(expr)) return true;
+
+    if (const auto* bin = dynamic_cast<const BinaryOp*>(expr)) {
+        return HasAggregate(bin->left.get()) || HasAggregate(bin->right.get());
+    }
+    if (const auto* un = dynamic_cast<const UnaryOp*>(expr)) {
+        return HasAggregate(un->operand.get());
+    }
+    if (const auto* ce = dynamic_cast<const CaseExpression*>(expr)) {
+        for (const auto& [cond, result] : ce->when_clauses) {
+            if (HasAggregate(cond.get()) || HasAggregate(result.get())) return true;
+        }
+        return HasAggregate(ce->else_clause.get());
+    }
+    return false;
+}
+
+// In-place tree rewrite. For every Aggregate node reachable from `expr`
+// so like select sum, count, etc
+void ExtractAggregates(std::unique_ptr<Expression>& expr, std::vector<std::unique_ptr<Expression>>& agg_exprs, std::vector<Aggregate::Func>& agg_funcs, std::vector<std::string>& agg_out_names) {
+    if (!expr) return;
+
+    if (auto* agg = dynamic_cast<Aggregate*>(expr.get())) {
+        for (size_t i = 0; i < agg_funcs.size(); ++i) {
+            if (agg_funcs[i] == agg->func && ExpressionEquals(agg_exprs[i].get(), agg->arg.get())) {
+                auto cr = std::make_unique<ColumnRef>();
+                cr->column_name = agg_out_names[i];
+                expr = std::move(cr);
+                return;
+            }
+        }
+
+        std::string prefix;
+        switch (agg->func) {
+            case Aggregate::Func::COUNT: 
+                prefix = "count"; 
+                break;
+            case Aggregate::Func::SUM:   
+                prefix = "sum";   
+                break;
+            case Aggregate::Func::AVG:   
+                prefix = "avg";   
+                break;
+            case Aggregate::Func::MIN:   
+                prefix = "min";   
+                break;
+            case Aggregate::Func::MAX:   
+                prefix = "max";   
+                break;
+        }
+
+        std::string out_name;
+        if (!agg->arg) {
+            out_name = prefix + "_star";
+        } else if (const auto* col = dynamic_cast<const ColumnRef*>(agg->arg.get())) {
+            out_name = prefix + "_" + col->column_name;
+        } else {
+            out_name = prefix + "_expr_" + std::to_string(agg_exprs.size());
+        }
+
+        agg_funcs.push_back(agg->func);
+        agg_exprs.push_back(agg->arg ? agg->arg->Clone() : nullptr);
+        agg_out_names.push_back(out_name);
+
+        auto cr = std::make_unique<ColumnRef>();
+        cr->column_name = out_name;
+        expr = std::move(cr);
+        return;
+    }
+
+    if (auto* bin = dynamic_cast<BinaryOp*>(expr.get())) {
+        ExtractAggregates(bin->left, agg_exprs, agg_funcs, agg_out_names);
+        ExtractAggregates(bin->right, agg_exprs, agg_funcs, agg_out_names);
+        return;
+    }
+    if (auto* un = dynamic_cast<UnaryOp*>(expr.get())) {
+        ExtractAggregates(un->operand, agg_exprs, agg_funcs, agg_out_names);
+        return;
+    }
+    if (auto* ce = dynamic_cast<CaseExpression*>(expr.get())) {
+        for (auto& [cond, result] : ce->when_clauses) {
+            ExtractAggregates(cond, agg_exprs, agg_funcs, agg_out_names);
+            ExtractAggregates(result, agg_exprs, agg_funcs, agg_out_names);
+        }
+        ExtractAggregates(ce->else_clause, agg_exprs, agg_funcs, agg_out_names);
+        return;
+    }
+}
+
 auto ResolveExprType(const Expression* expr, const Schema& schema) -> TypeId {
     if (const auto* col = dynamic_cast<const ColumnRef*>(expr)) {
         for (uint32_t i = 0; i < schema.GetColumnCount(); ++i) {
@@ -205,6 +345,25 @@ auto ResolveExprType(const Expression* expr, const Schema& schema) -> TypeId {
             if (merged != TypeId::INVALID) resolved = merged;
         }
         return resolved;
+    }
+    if (const auto* bin = dynamic_cast<const BinaryOp*>(expr)) {
+        using Op = BinaryOp::Op;
+        switch (bin->op) {
+            case Op::EQ: case Op::NEQ: case Op::LT: case Op::GT:
+            case Op::LTE: case Op::GTE: case Op::AND: case Op::OR:
+            case Op::LIKE:
+                return TypeId::INTEGER;  // boolean result
+            case Op::ADD: case Op::SUB: case Op::MUL: case Op::DIV: {
+                auto lt = ResolveExprType(bin->left.get(), schema);
+                auto rt = ResolveExprType(bin->right.get(), schema);
+                auto merged = CommonType(lt, rt);
+                return merged == TypeId::INVALID ? lt : merged;
+            }
+        }
+    }
+    if (const auto* un = dynamic_cast<const UnaryOp*>(expr)) {
+        if (un->op == UnaryOp::Op::NOT) return TypeId::INTEGER;
+        return ResolveExprType(un->operand.get(), schema);
     }
     return TypeId::INTEGER;
 }
@@ -367,18 +526,39 @@ auto Planner::Plan(SelectStatement stmt) -> std::unique_ptr<PlanNode> {
             joined_set.insert(new_idx);
 
             auto join_schema = BuildJoinSchema(current->output_schema, scans[new_idx]->output_schema);
-            std::unique_ptr<Expression> join_pred = CombinePredicates(join_preds);
-            std::unique_ptr<PlanNode> join_node;
-            
-            if (join_pred && IsEquiJoin(join_pred.get())) {
-                join_node = std::make_unique<HashJoinPlanNode>(std::move(join_schema), std::move(join_pred));
-            } else {
-                join_node = std::make_unique<NestedLoopJoinPlanNode>(std::move(join_schema), std::move(join_pred));
+
+            std::vector<std::unique_ptr<Expression>> equi_preds;
+            std::vector<std::unique_ptr<Expression>> post_filter_preds;
+            for (auto& p : join_preds) {
+                if (IsEquiJoin(p.get())) {
+                    equi_preds.push_back(std::move(p));
+                } else {
+                    post_filter_preds.push_back(std::move(p));
+                }
             }
 
-            join_node->children.push_back(std::move(current));
-            join_node->children.push_back(std::move(scans[new_idx]));
-            current = std::move(join_node);
+            std::unique_ptr<Expression> equi_pred = CombinePredicates(equi_preds);
+            std::unique_ptr<PlanNode> join_node;
+            auto post_filter = CombinePredicates(post_filter_preds);
+
+            if (equi_pred) {
+                auto schema_for_join = join_schema;
+                join_node = std::make_unique<HashJoinPlanNode>(std::move(join_schema), std::move(equi_pred));
+                join_node->children.push_back(std::move(current));
+                join_node->children.push_back(std::move(scans[new_idx]));
+                if (post_filter) {
+                    auto filter = std::make_unique<FilterPlanNode>(std::move(schema_for_join), std::move(post_filter));
+                    filter->children.push_back(std::move(join_node));
+                    current = std::move(filter);
+                } else {
+                    current = std::move(join_node);
+                }
+            } else {
+                join_node = std::make_unique<NestedLoopJoinPlanNode>(std::move(join_schema), std::move(post_filter));
+                join_node->children.push_back(std::move(current));
+                join_node->children.push_back(std::move(scans[new_idx]));
+                current = std::move(join_node);
+            }
         }
 
         if (!residual_predicates.empty()) {
@@ -390,25 +570,32 @@ auto Planner::Plan(SelectStatement stmt) -> std::unique_ptr<PlanNode> {
     }
 
     auto has_aggregate_in_select = [&]() {
-        return std::any_of(stmt.select_list.begin(), stmt.select_list.end(),[](const SelectItem& item) {
-            return dynamic_cast<const Aggregate*>(item.expr.get()) != nullptr;
-        });
+        return std::any_of(stmt.select_list.begin(), stmt.select_list.end(),
+            [](const SelectItem& item) {
+                return HasAggregate(item.expr.get());
+            });
+    };
+    auto has_aggregate_in_order_by = [&]() {
+        return std::any_of(stmt.order_by.begin(), stmt.order_by.end(),
+            [](const OrderByItem& item) {
+                return HasAggregate(item.expr.get());
+            });
     };
 
-    if (!stmt.group_by.empty() || has_aggregate_in_select()) {
+    if (!stmt.group_by.empty() || has_aggregate_in_select() || has_aggregate_in_order_by()) {
         std::vector<std::unique_ptr<Expression>> agg_exprs;
         std::vector<Aggregate::Func> agg_funcs;
+        std::vector<std::string> agg_out_names;
 
-        for (const auto& item : stmt.select_list) {
-            if (const auto* agg = dynamic_cast<const Aggregate*>(item.expr.get())) {
-                agg_funcs.push_back(agg->func);
-
-                if (agg->arg) {
-                    agg_exprs.push_back(agg->arg->Clone());
-                } else {
-                    agg_exprs.push_back(nullptr);  // COUNT(*)
-                }
-            }
+        // In-place rewrite: aggregates inside SELECT/ORDER BY expressions are
+        // replaced with ColumnRefs pointing at the AggregatePlanNode's output
+        // columns. ORDER BY is walked here (not after projection) so the Sort
+        // node above it can resolve the column names against the agg schema.
+        for (auto& item : stmt.select_list) {
+            ExtractAggregates(item.expr, agg_exprs, agg_funcs, agg_out_names);
+        }
+        for (auto& ob_item : stmt.order_by) {
+            ExtractAggregates(ob_item.expr, agg_exprs, agg_funcs, agg_out_names);
         }
 
         std::vector<Column> agg_columns;
@@ -425,36 +612,23 @@ auto Planner::Plan(SelectStatement stmt) -> std::unique_ptr<PlanNode> {
         }
 
         for (size_t i = 0; i < agg_funcs.size(); ++i) {
-            std::string col_name;
             TypeId col_type = TypeId::INTEGER;
-
             switch (agg_funcs[i]) {
                 case Aggregate::Func::COUNT:
                     col_type = TypeId::INTEGER;
-                    if (agg_exprs[i]) {
-                        col_name = "count_" + DeriveColumnName(agg_exprs[i].get());
-                    } else {
-                        col_name = "count_star";
-                    }
                     break;
                 case Aggregate::Func::SUM:
-                    col_type = TypeId::DECIMAL;
-                    col_name = "sum_" + (agg_exprs[i] ? DeriveColumnName(agg_exprs[i].get()) : "expr");
-                    break;
                 case Aggregate::Func::AVG:
                     col_type = TypeId::DECIMAL;
-                    col_name = "avg_" + (agg_exprs[i] ? DeriveColumnName(agg_exprs[i].get()) : "expr");
                     break;
                 case Aggregate::Func::MIN:
-                    col_name = "min_" + (agg_exprs[i] ? DeriveColumnName(agg_exprs[i].get()) : "expr");
-                    col_type = agg_exprs[i] ? ResolveExprType(agg_exprs[i].get(), current->output_schema) : TypeId::INTEGER;
-                    break;
                 case Aggregate::Func::MAX:
-                    col_name = "max_" + (agg_exprs[i] ? DeriveColumnName(agg_exprs[i].get()) : "expr");
-                    col_type = agg_exprs[i] ? ResolveExprType(agg_exprs[i].get(), current->output_schema) : TypeId::INTEGER;
+                    col_type = agg_exprs[i]
+                        ? ResolveExprType(agg_exprs[i].get(), current->output_schema)
+                        : TypeId::INTEGER;
                     break;
             }
-            agg_columns.emplace_back(col_name, col_type);
+            agg_columns.emplace_back(agg_out_names[i], col_type);
         }
 
         Schema agg_schema(std::move(agg_columns));
@@ -490,18 +664,13 @@ auto Planner::Plan(SelectStatement stmt) -> std::unique_ptr<PlanNode> {
                 }
 
             } else {
-                std::string col_name = item.alias.has_value() ? item.alias.value() : DeriveColumnName(item.expr.get());
+                std::string col_name = item.alias.has_value()
+                    ? item.alias.value()
+                    : DeriveColumnName(item.expr.get());
                 auto col_type = ResolveExprType(item.expr.get(), current->output_schema);
 
                 proj_columns.emplace_back(col_name, col_type);
-
-                if (dynamic_cast<Aggregate*>(item.expr.get())) {
-                    auto cr = std::make_unique<ColumnRef>();
-                    cr->column_name = DeriveColumnName(item.expr.get());
-                    proj_exprs.push_back(std::move(cr));
-                } else {
-                    proj_exprs.push_back(std::move(item.expr));
-                }
+                proj_exprs.push_back(std::move(item.expr));
             }
         }
 
@@ -513,14 +682,11 @@ auto Planner::Plan(SelectStatement stmt) -> std::unique_ptr<PlanNode> {
     }
 
     if (!stmt.order_by.empty()) {
-        for (auto& ob_item : stmt.order_by) {
-            if (const auto* agg = dynamic_cast<const Aggregate*>(ob_item.expr.get())) {
-                auto cr = std::make_unique<ColumnRef>();
-                cr->column_name = DeriveColumnName(agg);
-                ob_item.expr = std::move(cr);
-            }
-        }
-        
+        // ORDER BY aggregates were already extracted into ColumnRefs during
+        // the aggregate-extraction pass above. Those ColumnRefs must resolve
+        // to columns present in the projection output — when an ORDER BY
+        // aggregate matches one in SELECT, the shared name ensures both
+        // resolve to the same column.
         auto sort = std::make_unique<SortPlanNode>(current->output_schema, std::move(stmt.order_by));
         sort->children.push_back(std::move(current));
         current = std::move(sort);

@@ -219,19 +219,30 @@ std::unique_ptr<Expression> Parser::ParseComparison() {
             Advance();  // consume IN (reads next token from input)
             return ParseInTail(std::move(left), /*negated=*/true);
         }
-        
+        if (peek.type == TokenType::LIKE) {
+            Advance();  // consume NOT (returns cached LIKE)
+            Advance();  // consume LIKE (reads next token from input)
+            return ParseLikeTail(std::move(left), /*negated=*/true);
+        }
+
     }
 
-    // BETWEEN — 
+    // BETWEEN —
     if (current_token_.type == TokenType::BETWEEN) {
         Advance();
         return ParseBetweenTail(std::move(left), /*negated=*/false);
     }
 
-    // IN 
+    // IN
     if (current_token_.type == TokenType::IN) {
         Advance();
         return ParseInTail(std::move(left), /*negated=*/false);
+    }
+
+    // LIKE
+    if (current_token_.type == TokenType::LIKE) {
+        Advance();
+        return ParseLikeTail(std::move(left), /*negated=*/false);
     }
 
     while (true) {
@@ -563,8 +574,7 @@ std::optional<int64_t> Parser::ParseLimit() {
 // Desugar `lhs BETWEEN low AND high` into `(lhs >= low) AND (lhs <= high)`.
 // `low` / `high` are parsed via ParseAddSub so the BETWEEN's required AND
 // is not greedily swallowed when the surrounding expression is an AND chain.
-std::unique_ptr<Expression> Parser::ParseBetweenTail(
-    std::unique_ptr<Expression> lhs, bool negated) {
+std::unique_ptr<Expression> Parser::ParseBetweenTail(std::unique_ptr<Expression> lhs, bool negated) {
     auto low = ParseAddSub();
     Expect(TokenType::AND);
     auto high = ParseAddSub();
@@ -593,15 +603,7 @@ std::unique_ptr<Expression> Parser::ParseBetweenTail(
     return and_node;
 }
 
-// Desugar `lhs IN (v1, v2, v3)` into `EQ(lhs,v1) OR (EQ(lhs,v2) OR EQ(lhs,v3))`.
-// For NOT IN, swap leaf op (EQ -> NEQ) and glue op (OR -> AND) — De Morgan
-// applied at parse time so the executor short-circuits AND on first false.
-//
-// NOTE: For very large IN lists (hundreds of values), a Value-keyed
-// unordered_set lookup AST node would beat the linear OR-chain at runtime.
-// Out of scope for this slice — TPC-H IN lists are <= 4 values.
-std::unique_ptr<Expression> Parser::ParseInTail(
-    std::unique_ptr<Expression> lhs, bool negated) {
+std::unique_ptr<Expression> Parser::ParseInTail(std::unique_ptr<Expression> lhs, bool negated) {
     Expect(TokenType::LPAREN);
 
     std::vector<std::unique_ptr<Expression>> values;
@@ -637,6 +639,23 @@ std::unique_ptr<Expression> Parser::ParseInTail(
     // `lhs` is cloned once per IN value; the original is never moved and is
     // destroyed via RAII when this function returns.
     return result;
+}
+
+std::unique_ptr<Expression> Parser::ParseLikeTail(std::unique_ptr<Expression> lhs, bool negated) {
+    auto pattern = ParseAddSub();
+
+    auto like = std::make_unique<BinaryOp>();
+    like->op = BinaryOp::Op::LIKE;
+    like->left = std::move(lhs);
+    like->right = std::move(pattern);
+
+    if (negated) {
+        auto not_node = std::make_unique<UnaryOp>();
+        not_node->op = UnaryOp::Op::NOT;
+        not_node->operand = std::move(like);
+        return not_node;
+    }
+    return like;
 }
 
 }  // namespace shilmandb

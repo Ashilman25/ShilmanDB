@@ -32,6 +32,7 @@ private:
     [[nodiscard]] std::unique_ptr<Expression> ParseComparison();
     [[nodiscard]] std::unique_ptr<Expression> ParseBetweenTail(std::unique_ptr<Expression> lhs, bool negated);
     [[nodiscard]] std::unique_ptr<Expression> ParseInTail(std::unique_ptr<Expression> lhs, bool negated);
+    [[nodiscard]] std::unique_ptr<Expression> ParseLikeTail(std::unique_ptr<Expression> lhs, bool negated);
 
     [[nodiscard]] std::unique_ptr<Expression> ParseAddSub();
     [[nodiscard]] std::unique_ptr<Expression> ParseMulDiv();

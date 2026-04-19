@@ -47,7 +47,7 @@ struct Literal : Expression {
 };
 
 struct BinaryOp : Expression {
-    enum class Op {EQ, NEQ, LT, GT, LTE, GTE, AND, OR, ADD, SUB, MUL, DIV};
+    enum class Op {EQ, NEQ, LT, GT, LTE, GTE, AND, OR, ADD, SUB, MUL, DIV, LIKE};
     Op op;
 
     std::unique_ptr<Expression> left;
