@@ -124,6 +124,8 @@ static std::vector<IndexDesc> BuildIndexDescs() {
         {"customer", "idx_customer_custkey",  "c_custkey"},
         {"supplier", "idx_supplier_nationkey","s_nationkey"},
         {"nation",   "idx_nation_nationkey",  "n_nationkey"},
+        {"lineitem", "idx_lineitem_shipdate", "l_shipdate"},
+        {"orders",   "idx_orders_orderdate",  "o_orderdate"},
     };
 }
 

@@ -30,6 +30,8 @@ file(GLOB_RECURSE CORE_SOURCES
     src/parser/*.cpp
     src/planner/planner.cpp
     src/planner/join_order_optimizer.cpp
+    src/planner/cost_model.cpp
+    src/planner/index_selector.cpp
     src/executor/*.cpp
     src/engine/*.cpp
 )

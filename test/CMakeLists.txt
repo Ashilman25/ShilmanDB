@@ -35,6 +35,7 @@ shilmandb_add_test(parser_test parser/parser_test.cpp)
 # Planner tests
 shilmandb_add_test(join_order_optimizer_test planner/join_order_optimizer_test.cpp)
 shilmandb_add_test(planner_test planner/planner_test.cpp)
+shilmandb_add_test(index_selection_test planner/index_selection_test.cpp)
 
 # Executor tests
 shilmandb_add_test(seq_scan_executor_test executor/seq_scan_executor_test.cpp)

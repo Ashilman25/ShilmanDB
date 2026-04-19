@@ -1,5 +1,6 @@
 #include "planner/planner.hpp"
 #include "planner/join_order_optimizer.hpp"
+#include "planner/index_selector.hpp"
 #include "common/exception.hpp"
 #include <algorithm>
 #include <unordered_set>
@@ -221,11 +222,6 @@ auto Planner::Plan(SelectStatement stmt) -> std::unique_ptr<PlanNode> {
         throw DatabaseException("Empty select list");
     }
 
-    std::vector<std::unique_ptr<PlanNode>> scans;
-    for (size_t i = 0; i < tables.size(); ++i) {
-        scans.push_back(std::make_unique<SeqScanPlanNode>(table_infos[i]->schema, tables[i].table_name));
-    }
-
     std::vector<std::vector<std::unique_ptr<Expression>>> table_predicates(tables.size());
     std::vector<std::unique_ptr<Expression>> residual_predicates;
 
@@ -244,13 +240,19 @@ auto Planner::Plan(SelectStatement stmt) -> std::unique_ptr<PlanNode> {
         }
     }
 
+    std::vector<std::unique_ptr<PlanNode>> scans;
+    scans.reserve(tables.size());
     for (size_t i = 0; i < tables.size(); ++i) {
-        if (!table_predicates[i].empty()) {
-            auto pred = CombinePredicates(table_predicates[i]);
-            auto filter = std::make_unique<FilterPlanNode>(scans[i]->output_schema, std::move(pred));
-            filter->children.push_back(std::move(scans[i]));
-            scans[i] = std::move(filter);
+        std::vector<std::unique_ptr<Expression>> residual;
+        auto scan = IndexSelector::SelectScanStrategy(tables[i].table_name, table_infos[i]->schema, table_predicates[i], residual, catalog_);
+
+        if (!residual.empty()) {
+            auto pred = CombinePredicates(residual);
+            auto filter = std::make_unique<FilterPlanNode>(scan->output_schema, std::move(pred));
+            filter->children.push_back(std::move(scan));
+            scan = std::move(filter);
         }
+        scans.push_back(std::move(scan));
     }
 
     //join tree

@@ -522,4 +522,72 @@ TEST_F(PlannerTest, EmptyFromClauseThrows) {
     EXPECT_THROW((void)planner.Plan(std::move(stmt)), DatabaseException);
 }
 
+TEST_F(PlannerTest, IndexScanWhenSelective) {
+    auto bundle = MakeBPM(test_file_);
+    Catalog catalog(bundle.bpm.get());
+
+    auto* ti = catalog.CreateTable("t", Schema({Column("id", TypeId::INTEGER)}));
+    ASSERT_NE(ti, nullptr);
+    ti->stats.row_count = 1'000'000;
+    ti->stats.distinct_counts["id"] = 10'000;
+    (void)catalog.CreateIndex("idx_t_id", "t", "id");
+
+    Parser parser("SELECT * FROM t WHERE id = 42");
+    auto stmt = parser.Parse();
+
+    Planner planner(&catalog);
+    auto plan = planner.Plan(std::move(*stmt));
+
+    ASSERT_EQ(plan->type, PlanNodeType::PROJECTION);
+    ASSERT_EQ(plan->children.size(), 1u);
+    ASSERT_EQ(plan->children[0]->type, PlanNodeType::INDEX_SCAN);
+
+    auto* scan = dynamic_cast<IndexScanPlanNode*>(plan->children[0].get());
+    ASSERT_NE(scan, nullptr);
+    EXPECT_EQ(scan->table_name, "t");
+    EXPECT_EQ(scan->index_name, "idx_t_id");
+    ASSERT_TRUE(scan->low_key.has_value());
+    ASSERT_TRUE(scan->high_key.has_value());
+    EXPECT_EQ(scan->low_key.value(),  Value(static_cast<int32_t>(42)));
+    EXPECT_EQ(scan->high_key.value(), Value(static_cast<int32_t>(42)));
+}
+
+TEST_F(PlannerTest, IndexScanWithResidualFilter) {
+    auto bundle = MakeBPM(test_file_);
+    Catalog catalog(bundle.bpm.get());
+
+    auto* ti = catalog.CreateTable("t", Schema({
+        Column("id",    TypeId::INTEGER),
+        Column("other", TypeId::INTEGER)
+    }));
+    ASSERT_NE(ti, nullptr);
+    ti->stats.row_count = 1'000'000;
+    ti->stats.distinct_counts["id"]    = 10'000;
+    ti->stats.distinct_counts["other"] = 100;
+    (void)catalog.CreateIndex("idx_t_id", "t", "id");
+
+    Parser parser("SELECT * FROM t WHERE id = 5 AND other > 7");
+    auto stmt = parser.Parse();
+
+    Planner planner(&catalog);
+    auto plan = planner.Plan(std::move(*stmt));
+
+    ASSERT_EQ(plan->type, PlanNodeType::PROJECTION);
+    ASSERT_EQ(plan->children.size(), 1u);
+    ASSERT_EQ(plan->children[0]->type, PlanNodeType::FILTER);
+
+    auto* filter = dynamic_cast<FilterPlanNode*>(plan->children[0].get());
+    ASSERT_NE(filter, nullptr);
+    ASSERT_EQ(filter->children.size(), 1u);
+    ASSERT_EQ(filter->children[0]->type, PlanNodeType::INDEX_SCAN);
+
+    auto* scan = dynamic_cast<IndexScanPlanNode*>(filter->children[0].get());
+    ASSERT_NE(scan, nullptr);
+    EXPECT_EQ(scan->index_name, "idx_t_id");
+    ASSERT_TRUE(scan->low_key.has_value());
+    ASSERT_TRUE(scan->high_key.has_value());
+    EXPECT_EQ(scan->low_key.value(),  Value(static_cast<int32_t>(5)));
+    EXPECT_EQ(scan->high_key.value(), Value(static_cast<int32_t>(5)));
+}
+
 }  // namespace shilmandb
