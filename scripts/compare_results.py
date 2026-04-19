@@ -11,7 +11,7 @@ from typing import List, Optional, Tuple
 
 
 ALL_SCALE_FACTORS = ["0.01", "0.1", "1.0"]
-ALL_QUERIES = ["Q1", "Q3", "Q5", "Q6"]
+ALL_QUERIES = ["Q1", "Q3", "Q5", "Q6", "Q10", "Q12", "Q14", "Q19"]
 
 DEFAULT_SHILMANDB_DIR = "bench/results/shilmandb_results"
 DEFAULT_SQLITE_DIR = "bench/results/sqlite_results"
@@ -227,7 +227,7 @@ def parse_args() -> argparse.Namespace:
         "--queries",
         nargs="+",
         default=["all"],
-        help="Queries: Q1, Q3, Q5, Q6, or 'all' (default: all)",
+        help="Queries: Q1, Q3, Q5, Q6, Q10, Q12, Q14, Q19, or 'all' (default: all)",
     )
     parser.add_argument(
         "--configs",

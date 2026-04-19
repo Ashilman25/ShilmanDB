@@ -3,6 +3,7 @@
 #include "types/tuple.hpp"
 #include "catalog/schema.hpp"
 #include "common/exception.hpp"
+#include <string>
 
 namespace shilmandb {
 
@@ -12,6 +13,28 @@ inline bool IsTruthy(const Value& v) {
 
 inline Value MakeBool(bool b) {
     return Value(static_cast<int32_t>(b ? 1 : 0));
+}
+
+inline bool MatchLike(const std::string& str, const std::string& pattern) {
+    size_t si = 0, pi = 0;
+    size_t star_p = std::string::npos, match_s = 0;
+
+    while (si < str.size()) {
+        if (pi < pattern.size() &&
+            (pattern[pi] == '_' || pattern[pi] == str[si])) {
+            ++si; ++pi;
+        } else if (pi < pattern.size() && pattern[pi] == '%') {
+            star_p = pi++;
+            match_s = si;
+        } else if (star_p != std::string::npos) {
+            pi = star_p + 1;
+            si = ++match_s;
+        } else {
+            return false;
+        }
+    }
+    while (pi < pattern.size() && pattern[pi] == '%') ++pi;
+    return pi == pattern.size();
 }
 
 inline Value EvaluateExpression(const Expression* expr, const Tuple& tuple, const Schema& schema) {
@@ -55,9 +78,14 @@ inline Value EvaluateExpression(const Expression* expr, const Tuple& tuple, cons
                     return MakeBool(left > right);
                 case BinaryOp::Op::LTE: 
                     return MakeBool(left <= right);
-                case BinaryOp::Op::GTE: 
+                case BinaryOp::Op::GTE:
                     return MakeBool(left >= right);
-                case BinaryOp::Op::ADD: 
+                case BinaryOp::Op::LIKE: {
+                    auto lhs_str = left.ToString();
+                    auto pattern = right.ToString();
+                    return MakeBool(MatchLike(lhs_str, pattern));
+                }
+                case BinaryOp::Op::ADD:
                     return left.Add(right);
                 case BinaryOp::Op::SUB: 
                     return left.Subtract(right);
@@ -90,6 +118,19 @@ inline Value EvaluateExpression(const Expression* expr, const Tuple& tuple, cons
                     }
             }
             break;
+        }
+
+        case ExprType::CASE: {
+            const auto* case_expr = static_cast<const CaseExpression*>(expr);
+            for (const auto& [cond, result] : case_expr->when_clauses) {
+                if (IsTruthy(EvaluateExpression(cond.get(), tuple, schema))) {
+                    return EvaluateExpression(result.get(), tuple, schema);
+                }
+            }
+            if (case_expr->else_clause) {
+                return EvaluateExpression(case_expr->else_clause.get(), tuple, schema);
+            }
+            return Value(int32_t{0});  // zero-default (no NULL)
         }
 
         case ExprType::AGGREGATE:

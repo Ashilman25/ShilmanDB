@@ -48,6 +48,34 @@ public:
     [[nodiscard]] Value CastTo(TypeId target) const;
 };
 
+[[nodiscard]] constexpr TypeId CommonType(TypeId a, TypeId b) {
+    if (a == b) return a;
+
+    if ((a == TypeId::DATE && b == TypeId::VARCHAR) || (a == TypeId::VARCHAR && b == TypeId::DATE)) {
+        return TypeId::DATE;
+    }
+        
+
+    auto rank = [](TypeId t) -> int {
+        switch (t) {
+            case TypeId::INTEGER: 
+                return 1;
+            case TypeId::BIGINT:  
+                return 2;
+            case TypeId::DECIMAL: 
+                return 3;
+            default:              
+                return 0;
+        }
+    };
+
+    const int ra = rank(a);
+    const int rb = rank(b);
+    if (ra > 0 && rb > 0) return (ra >= rb) ? a : b;
+
+    return TypeId::INVALID;
+}
+
 }  // namespace shilmandb
 
 namespace std {

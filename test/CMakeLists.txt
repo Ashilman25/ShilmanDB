@@ -31,11 +31,16 @@ shilmandb_add_test(catalog_test catalog/catalog_test.cpp)
 # Parser tests
 shilmandb_add_test(lexer_test parser/lexer_test.cpp)
 shilmandb_add_test(parser_test parser/parser_test.cpp)
+shilmandb_add_test(between_in_test parser/between_in_test.cpp)
+shilmandb_add_test(case_test parser/case_test.cpp)
+shilmandb_add_test(between_in_case_test parser/between_in_case_test.cpp)
+shilmandb_add_test(like_test parser/like_test.cpp)
 
 # Planner tests
 shilmandb_add_test(join_order_optimizer_test planner/join_order_optimizer_test.cpp)
 shilmandb_add_test(planner_test planner/planner_test.cpp)
 shilmandb_add_test(index_selection_test planner/index_selection_test.cpp)
+shilmandb_add_test(nested_aggregate_test planner/nested_aggregate_test.cpp)
 
 # Executor tests
 shilmandb_add_test(seq_scan_executor_test executor/seq_scan_executor_test.cpp)
@@ -47,6 +52,8 @@ shilmandb_add_test(sort_executor_test executor/sort_executor_test.cpp)
 shilmandb_add_test(aggregate_executor_test executor/aggregate_executor_test.cpp)
 shilmandb_add_test(projection_executor_test executor/projection_executor_test.cpp)
 shilmandb_add_test(limit_executor_test executor/limit_executor_test.cpp)
+shilmandb_add_test(case_expression_test executor/case_expression_test.cpp)
+shilmandb_add_test(like_expression_test executor/like_expression_test.cpp)
 
 # Integration tests
 shilmandb_add_test(end_to_end_test integration/end_to_end_test.cpp)

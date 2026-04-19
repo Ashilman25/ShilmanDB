@@ -177,4 +177,104 @@ TEST_F(EndToEndTest, NonexistentTableThrows) {
     EXPECT_THROW((void)db.ExecuteSQL("SELECT id FROM nonexistent"), DatabaseException);
 }
 
+// ---------------------------------------------------------------------------
+// Q10 shape: four-table implicit join with GROUP BY, ORDER BY DESC, LIMIT.
+// Verifies implicit-join plumbing (18.4) end-to-end.
+// ---------------------------------------------------------------------------
+TEST_F(EndToEndTest, Q10ShapeOnSyntheticData) {
+    Database db(test_file_);
+
+    Schema customer_schema({
+        Column("c_custkey", TypeId::INTEGER),
+        Column("c_name", TypeId::VARCHAR),
+        Column("c_nationkey", TypeId::INTEGER)
+    });
+    LoadSimpleTable(db, "customer", customer_schema, {
+        {Value(1), Value(std::string("alice")), Value(10)},
+        {Value(2), Value(std::string("bob")),   Value(20)}
+    });
+
+    Schema orders_schema({
+        Column("o_orderkey", TypeId::INTEGER),
+        Column("o_custkey", TypeId::INTEGER)
+    });
+    LoadSimpleTable(db, "orders", orders_schema, {
+        {Value(100), Value(1)},
+        {Value(101), Value(1)},
+        {Value(102), Value(2)}
+    });
+
+    Schema lineitem_schema({
+        Column("l_orderkey", TypeId::INTEGER),
+        Column("l_price", TypeId::INTEGER)
+    });
+    LoadSimpleTable(db, "lineitem", lineitem_schema, {
+        {Value(100), Value(5)},
+        {Value(101), Value(7)},
+        {Value(102), Value(3)}
+    });
+
+    Schema nation_schema({
+        Column("n_nationkey", TypeId::INTEGER),
+        Column("n_name", TypeId::VARCHAR)
+    });
+    LoadSimpleTable(db, "nation", nation_schema, {
+        {Value(10), Value(std::string("US"))},
+        {Value(20), Value(std::string("UK"))}
+    });
+
+    auto result = db.ExecuteSQL(
+        "SELECT c_custkey, SUM(l_price) "
+        "FROM customer, orders, lineitem, nation "
+        "WHERE c_custkey = o_custkey "
+        "AND l_orderkey = o_orderkey "
+        "AND c_nationkey = n_nationkey "
+        "GROUP BY c_custkey "
+        "ORDER BY SUM(l_price) DESC "
+        "LIMIT 1");
+
+    ASSERT_EQ(result.tuples.size(), 1u);
+    // alice should be top: 5 + 7 = 12; bob: 3
+    EXPECT_EQ(result.tuples[0].GetValue(result.schema, 0).integer_, 1);
+}
+
+// ---------------------------------------------------------------------------
+// CASE inside SUM, grouped by a second column. Q12 shape.
+// ---------------------------------------------------------------------------
+TEST_F(EndToEndTest, CaseInSumGroupedByKey) {
+    Database db(test_file_);
+
+    Schema schema({
+        Column("mode", TypeId::VARCHAR),
+        Column("priority", TypeId::VARCHAR)
+    });
+    LoadSimpleTable(db, "t", schema, {
+        {Value(std::string("AIR")),  Value(std::string("URGENT"))},
+        {Value(std::string("AIR")),  Value(std::string("URGENT"))},
+        {Value(std::string("AIR")),  Value(std::string("LOW"))},
+        {Value(std::string("RAIL")), Value(std::string("URGENT"))},
+        {Value(std::string("RAIL")), Value(std::string("LOW"))},
+        {Value(std::string("RAIL")), Value(std::string("LOW"))}
+    });
+
+    auto result = db.ExecuteSQL(
+        "SELECT mode, "
+        "SUM(CASE WHEN priority = 'URGENT' THEN 1 ELSE 0 END) "
+        "FROM t GROUP BY mode ORDER BY mode");
+
+    ASSERT_EQ(result.tuples.size(), 2u);
+    // After ORDER BY mode: AIR (2 urgent), RAIL (1 urgent)
+    EXPECT_EQ(result.tuples[0].GetValue(result.schema, 0).varchar_, "AIR");
+    EXPECT_EQ(result.tuples[1].GetValue(result.schema, 0).varchar_, "RAIL");
+
+    // SUM(CASE WHEN priority = 'URGENT' THEN 1 ELSE 0 END) is a SUM, so the
+    // output column is DECIMAL per planner's aggregate-type rule.
+    auto urgent_air = result.tuples[0].GetValue(result.schema, 1);
+    auto urgent_rail = result.tuples[1].GetValue(result.schema, 1);
+    ASSERT_EQ(urgent_air.type_, TypeId::DECIMAL);
+    ASSERT_EQ(urgent_rail.type_, TypeId::DECIMAL);
+    EXPECT_DOUBLE_EQ(urgent_air.decimal_, 2.0);
+    EXPECT_DOUBLE_EQ(urgent_rail.decimal_, 1.0);
+}
+
 }  // namespace shilmandb

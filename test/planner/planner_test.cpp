@@ -7,6 +7,7 @@
 #include "storage/disk_manager.hpp"
 #include "common/exception.hpp"
 #include <filesystem>
+#include <functional>
 #include <memory>
 
 namespace shilmandb {
@@ -588,6 +589,143 @@ TEST_F(PlannerTest, IndexScanWithResidualFilter) {
     ASSERT_TRUE(scan->high_key.has_value());
     EXPECT_EQ(scan->low_key.value(),  Value(static_cast<int32_t>(5)));
     EXPECT_EQ(scan->high_key.value(), Value(static_cast<int32_t>(5)));
+}
+
+// ---------------------------------------------------------------------------
+// CASE output column type: CommonType fold across THEN/ELSE branches
+// ---------------------------------------------------------------------------
+TEST_F(PlannerTest, PlansCaseExpressionWithCommonType) {
+    auto bundle = MakeBPM(test_file_);
+    Catalog catalog(bundle.bpm.get());
+
+    (void)catalog.CreateTable("t", Schema({
+        Column("id", TypeId::INTEGER)
+    }));
+
+    // THEN = INTEGER literal 1, ELSE = DECIMAL literal 2.5.
+    // Expected: CommonType(INTEGER, DECIMAL) = DECIMAL.
+    Parser parser(
+        "SELECT CASE WHEN id > 0 THEN 1 ELSE 2.5 END AS flag FROM t");
+    auto stmt = parser.Parse();
+
+    Planner planner(&catalog);
+    auto plan = planner.Plan(std::move(*stmt));
+
+    ASSERT_NE(plan, nullptr);
+    ASSERT_EQ(plan->type, PlanNodeType::PROJECTION);
+    ASSERT_EQ(plan->output_schema.GetColumnCount(), 1u);
+    EXPECT_EQ(plan->output_schema.GetColumn(0).name, "flag");
+    EXPECT_EQ(plan->output_schema.GetColumn(0).type, TypeId::DECIMAL);
+}
+
+// ---------------------------------------------------------------------------
+// 18.4: Comma-separated FROM with a cross-table WHERE predicate lowers to a
+// join plan with two scans under a single join node.
+// ---------------------------------------------------------------------------
+TEST_F(PlannerTest, CommaFromTwoTablesBuildsJoin) {
+    auto bundle = MakeBPM(test_file_);
+    Catalog catalog(bundle.bpm.get());
+
+    (void)catalog.CreateTable("a", Schema({Column("x", TypeId::INTEGER)}));
+    (void)catalog.CreateTable("b", Schema({Column("y", TypeId::INTEGER)}));
+
+    Parser parser("SELECT * FROM a, b WHERE a.x = b.y");
+    auto stmt = parser.Parse();
+    Planner planner(&catalog);
+    auto plan = planner.Plan(std::move(*stmt));
+
+    // Top is Projection -> Join -> { Scan(a), Scan(b) }.
+    ASSERT_NE(plan, nullptr);
+    ASSERT_EQ(plan->type, PlanNodeType::PROJECTION);
+    ASSERT_EQ(plan->children.size(), 1u);
+
+    auto* join = plan->children[0].get();
+    ASSERT_TRUE(join->type == PlanNodeType::HASH_JOIN ||
+                join->type == PlanNodeType::NESTED_LOOP_JOIN);
+    ASSERT_EQ(join->children.size(), 2u);
+}
+
+// ---------------------------------------------------------------------------
+// 18.4: Self-join via aliases. Column references qualified by the alias
+// resolve to the correct TableRef, producing a two-scan join plan.
+// ---------------------------------------------------------------------------
+TEST_F(PlannerTest, SelfJoinWithAliasesResolvesColumns) {
+    auto bundle = MakeBPM(test_file_);
+    Catalog catalog(bundle.bpm.get());
+
+    (void)catalog.CreateTable("nation", Schema({
+        Column("n_nationkey", TypeId::INTEGER),
+        Column("n_name", TypeId::VARCHAR)
+    }));
+
+    Parser parser(
+        "SELECT n1.n_name FROM nation n1, nation n2 "
+        "WHERE n1.n_nationkey = n2.n_nationkey");
+    auto stmt = parser.Parse();
+    Planner planner(&catalog);
+    auto plan = planner.Plan(std::move(*stmt));
+
+    ASSERT_NE(plan, nullptr);
+    ASSERT_EQ(plan->type, PlanNodeType::PROJECTION);
+    ASSERT_EQ(plan->children.size(), 1u);
+
+    auto* join = plan->children[0].get();
+    ASSERT_TRUE(join->type == PlanNodeType::HASH_JOIN ||
+                join->type == PlanNodeType::NESTED_LOOP_JOIN);
+    ASSERT_EQ(join->children.size(), 2u);
+}
+
+// ---------------------------------------------------------------------------
+// 18.4: Four-table implicit join (Q10 shape) produces a four-leaf join tree
+// and consumes every cross-table WHERE conjunct as a join condition.
+// ---------------------------------------------------------------------------
+TEST_F(PlannerTest, FourTableImplicitJoinShape) {
+    auto bundle = MakeBPM(test_file_);
+    Catalog catalog(bundle.bpm.get());
+
+    (void)catalog.CreateTable("customer", Schema({
+        Column("c_custkey", TypeId::INTEGER),
+        Column("c_nationkey", TypeId::INTEGER)
+    }));
+    (void)catalog.CreateTable("orders", Schema({
+        Column("o_orderkey", TypeId::INTEGER),
+        Column("o_custkey", TypeId::INTEGER)
+    }));
+    (void)catalog.CreateTable("lineitem", Schema({
+        Column("l_orderkey", TypeId::INTEGER)
+    }));
+    (void)catalog.CreateTable("nation", Schema({
+        Column("n_nationkey", TypeId::INTEGER)
+    }));
+
+    Parser parser(
+        "SELECT c_custkey FROM customer, orders, lineitem, nation "
+        "WHERE c_custkey = o_custkey "
+        "AND l_orderkey = o_orderkey "
+        "AND c_nationkey = n_nationkey");
+    auto stmt = parser.Parse();
+    Planner planner(&catalog);
+    auto plan = planner.Plan(std::move(*stmt));
+
+    ASSERT_NE(plan, nullptr);
+    ASSERT_EQ(plan->type, PlanNodeType::PROJECTION);
+
+    // Walk the join tree and count SEQ_SCAN / INDEX_SCAN leaves.
+    std::function<int(const PlanNode*)> count_leaves =
+        [&](const PlanNode* node) -> int {
+            if (!node) return 0;
+            if (node->type == PlanNodeType::SEQ_SCAN ||
+                node->type == PlanNodeType::INDEX_SCAN) {
+                return 1;
+            }
+            int total = 0;
+            for (const auto& child : node->children) {
+                total += count_leaves(child.get());
+            }
+            return total;
+        };
+
+    EXPECT_EQ(count_leaves(plan.get()), 4);
 }
 
 }  // namespace shilmandb

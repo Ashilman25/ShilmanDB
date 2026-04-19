@@ -234,4 +234,24 @@ TEST(LexerTest, PunctuationTokens) {
     EXPECT_EQ(tokens[6].type, TokenType::END_OF_INPUT);
 }
 
+// -----------------------------------------------------------------------
+// CaseKeywords: CASE / WHEN / THEN / ELSE / END recognised as keywords
+// (case-insensitive)
+// -----------------------------------------------------------------------
+TEST(LexerTest, CaseKeywords) {
+    auto tokens = Tokenize("CASE WHEN THEN ELSE END case when then else end");
+    ASSERT_EQ(tokens.size(), 11u);
+    EXPECT_EQ(tokens[0].type, TokenType::CASE);
+    EXPECT_EQ(tokens[1].type, TokenType::WHEN);
+    EXPECT_EQ(tokens[2].type, TokenType::THEN);
+    EXPECT_EQ(tokens[3].type, TokenType::ELSE);
+    EXPECT_EQ(tokens[4].type, TokenType::END);
+    EXPECT_EQ(tokens[5].type, TokenType::CASE);
+    EXPECT_EQ(tokens[6].type, TokenType::WHEN);
+    EXPECT_EQ(tokens[7].type, TokenType::THEN);
+    EXPECT_EQ(tokens[8].type, TokenType::ELSE);
+    EXPECT_EQ(tokens[9].type, TokenType::END);
+    EXPECT_EQ(tokens[10].type, TokenType::END_OF_INPUT);
+}
+
 }  // namespace shilmandb

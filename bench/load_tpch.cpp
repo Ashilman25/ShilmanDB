@@ -90,6 +90,20 @@ static Schema RegionSchema() {
     });
 }
 
+static Schema PartSchema() {
+    return Schema({
+        {"p_partkey", TypeId::BIGINT},
+        {"p_name", TypeId::VARCHAR},
+        {"p_mfgr", TypeId::VARCHAR},
+        {"p_brand", TypeId::VARCHAR},
+        {"p_type", TypeId::VARCHAR},
+        {"p_size", TypeId::INTEGER},
+        {"p_container", TypeId::VARCHAR},
+        {"p_retailprice", TypeId::DECIMAL},
+        {"p_comment", TypeId::VARCHAR},
+    });
+}
+
 // ── Table descriptor ─────────────────────────────────────────────────
 
 struct TableDesc {
@@ -102,6 +116,7 @@ static std::vector<TableDesc> BuildTableDescs() {
     return {
         {"region", RegionSchema(), "region.tbl"},
         {"nation", NationSchema(), "nation.tbl"},
+        {"part", PartSchema(), "part.tbl"},
         {"supplier", SupplierSchema(), "supplier.tbl"},
         {"customer", CustomerSchema(), "customer.tbl"},
         {"orders", OrdersSchema(), "orders.tbl"},
@@ -126,6 +141,7 @@ static std::vector<IndexDesc> BuildIndexDescs() {
         {"nation",   "idx_nation_nationkey",  "n_nationkey"},
         {"lineitem", "idx_lineitem_shipdate", "l_shipdate"},
         {"orders",   "idx_orders_orderdate",  "o_orderdate"},
+        {"part",     "idx_part_partkey",      "p_partkey"},
     };
 }
 
@@ -289,7 +305,7 @@ int main(int argc, char* argv[]) {
     if (run_queries) {
         std::cout << "\n=== Row Counts ===\n";
         std::vector<std::string> verify_tables = {
-            "region", "nation", "supplier", "customer", "orders", "lineitem"
+            "region", "nation", "part", "supplier", "customer", "orders", "lineitem"
         };
         for (const auto& name : verify_tables) {
             std::string sql = "SELECT COUNT(*) FROM " + name;
@@ -357,6 +373,64 @@ int main(int argc, char* argv[]) {
              "GROUP BY n_name "
              "ORDER BY SUM(l_extendedprice * (1 - l_discount)) DESC",
              "n_name,sum_disc_price"},
+
+            {"Q10 (Returned Item Reporting)", "Q10",
+             "SELECT c_custkey, c_name, SUM(l_extendedprice * (1 - l_discount)), "
+             "c_acctbal, n_name, c_address, c_phone, c_comment "
+             "FROM customer, orders, lineitem, nation "
+             "WHERE c_custkey = o_custkey AND l_orderkey = o_orderkey "
+             "AND o_orderdate >= '1993-10-01' AND o_orderdate < '1994-01-01' "
+             "AND l_returnflag = 'R' AND c_nationkey = n_nationkey "
+             "GROUP BY c_custkey, c_name, c_acctbal, c_phone, n_name, c_address, c_comment "
+             "ORDER BY SUM(l_extendedprice * (1 - l_discount)) DESC "
+             "LIMIT 20",
+             "c_custkey,c_name,sum_disc_price,c_acctbal,n_name,c_address,c_phone,c_comment"},
+
+            {"Q12 (Shipping Modes and Order Priority)", "Q12",
+             "SELECT l_shipmode, "
+             "SUM(CASE WHEN o_orderpriority = '1-URGENT' OR o_orderpriority = '2-HIGH' THEN 1 ELSE 0 END), "
+             "SUM(CASE WHEN o_orderpriority <> '1-URGENT' AND o_orderpriority <> '2-HIGH' THEN 1 ELSE 0 END) "
+             "FROM orders, lineitem "
+             "WHERE o_orderkey = l_orderkey "
+             "AND l_shipmode IN ('MAIL', 'SHIP') "
+             "AND l_commitdate < l_receiptdate AND l_shipdate < l_commitdate "
+             "AND l_receiptdate >= '1994-01-01' AND l_receiptdate < '1995-01-01' "
+             "GROUP BY l_shipmode "
+             "ORDER BY l_shipmode",
+             "l_shipmode,high_line_count,low_line_count"},
+
+            {"Q14 (Promotion Effect)", "Q14",
+             "SELECT 100.00 * SUM(CASE WHEN p_type LIKE 'PROMO%' "
+             "THEN l_extendedprice * (1 - l_discount) ELSE 0 END) "
+             "/ SUM(l_extendedprice * (1 - l_discount)) "
+             "FROM lineitem, part "
+             "WHERE l_partkey = p_partkey "
+             "AND l_shipdate >= '1995-09-01' AND l_shipdate < '1995-10-01'",
+             "promo_revenue"},
+
+            {"Q19 (Discounted Revenue)", "Q19",
+             "SELECT SUM(l_extendedprice * (1 - l_discount)) "
+             "FROM lineitem, part "
+             "WHERE p_partkey = l_partkey "
+             "AND ((p_brand = 'Brand#12' "
+             "AND p_container IN ('SM CASE', 'SM BOX', 'SM PACK', 'SM PKG') "
+             "AND l_quantity >= 1 AND l_quantity <= 11 "
+             "AND p_size BETWEEN 1 AND 5 "
+             "AND l_shipmode IN ('AIR', 'AIR REG') "
+             "AND l_shipinstruct = 'DELIVER IN PERSON') "
+             "OR (p_brand = 'Brand#23' "
+             "AND p_container IN ('MED BAG', 'MED BOX', 'MED PKG', 'MED PACK') "
+             "AND l_quantity >= 10 AND l_quantity <= 20 "
+             "AND p_size BETWEEN 1 AND 10 "
+             "AND l_shipmode IN ('AIR', 'AIR REG') "
+             "AND l_shipinstruct = 'DELIVER IN PERSON') "
+             "OR (p_brand = 'Brand#34' "
+             "AND p_container IN ('LG CASE', 'LG BOX', 'LG PACK', 'LG PKG') "
+             "AND l_quantity >= 20 AND l_quantity <= 30 "
+             "AND p_size BETWEEN 1 AND 15 "
+             "AND l_shipmode IN ('AIR', 'AIR REG') "
+             "AND l_shipinstruct = 'DELIVER IN PERSON'))",
+             "revenue"},
         };
 
         // Create results directory if requested

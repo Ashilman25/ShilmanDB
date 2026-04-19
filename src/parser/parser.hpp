@@ -25,14 +25,20 @@ private:
     [[nodiscard]] std::vector<SelectItem> ParseSelectList();
     [[nodiscard]] std::vector<TableRef> ParseFromClause();
     [[nodiscard]] std::vector<JoinClause> ParseJoins();
+
     [[nodiscard]] std::unique_ptr<Expression> ParseWhereClause();
     [[nodiscard]] std::unique_ptr<Expression> ParseExpression();
     [[nodiscard]] std::unique_ptr<Expression> ParseAndExpr();
     [[nodiscard]] std::unique_ptr<Expression> ParseComparison();
+    [[nodiscard]] std::unique_ptr<Expression> ParseBetweenTail(std::unique_ptr<Expression> lhs, bool negated);
+    [[nodiscard]] std::unique_ptr<Expression> ParseInTail(std::unique_ptr<Expression> lhs, bool negated);
+    [[nodiscard]] std::unique_ptr<Expression> ParseLikeTail(std::unique_ptr<Expression> lhs, bool negated);
+
     [[nodiscard]] std::unique_ptr<Expression> ParseAddSub();
     [[nodiscard]] std::unique_ptr<Expression> ParseMulDiv();
     [[nodiscard]] std::unique_ptr<Expression> ParseUnary();
     [[nodiscard]] std::unique_ptr<Expression> ParsePrimary();
+    
     [[nodiscard]] std::vector<std::unique_ptr<Expression>> ParseGroupBy();
     [[nodiscard]] std::unique_ptr<Expression> ParseHaving();
     [[nodiscard]] std::vector<OrderByItem> ParseOrderBy();

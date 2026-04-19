@@ -27,6 +27,20 @@ static Schema NationSchema() {
     });
 }
 
+static Schema PartSchema() {
+    return Schema({
+        {"p_partkey", TypeId::BIGINT},
+        {"p_name", TypeId::VARCHAR},
+        {"p_mfgr", TypeId::VARCHAR},
+        {"p_brand", TypeId::VARCHAR},
+        {"p_type", TypeId::VARCHAR},
+        {"p_size", TypeId::INTEGER},
+        {"p_container", TypeId::VARCHAR},
+        {"p_retailprice", TypeId::DECIMAL},
+        {"p_comment", TypeId::VARCHAR},
+    });
+}
+
 static Schema SupplierSchema() {
     return Schema({
         {"s_suppkey", TypeId::BIGINT},
@@ -105,6 +119,7 @@ static std::vector<TableDesc> BuildTableDescs() {
     return {
         {"region",   RegionSchema(),   "region.tbl"},
         {"nation",   NationSchema(),   "nation.tbl"},
+        {"part",     PartSchema(),     "part.tbl"},
         {"supplier", SupplierSchema(), "supplier.tbl"},
         {"customer", CustomerSchema(), "customer.tbl"},
         {"orders",   OrdersSchema(),   "orders.tbl"},
@@ -119,6 +134,7 @@ static std::vector<IndexDesc> BuildIndexDescs() {
         {"idx_customer_custkey",  "customer", "c_custkey"},
         {"idx_supplier_nationkey","supplier", "s_nationkey"},
         {"idx_nation_nationkey",  "nation",   "n_nationkey"},
+        {"idx_part_partkey",      "part",     "p_partkey"},
     };
 }
 
@@ -311,6 +327,128 @@ TEST_F(SqliteComparisonTest, Q5LocalSupplierVolume) {
     auto row0_revenue = result.tuples[0].GetValue(result.schema, 1).decimal_;
     EXPECT_NEAR(row0_revenue, 26931889.33, 0.01)
         << "Q5 first-row SUM(revenue)";
+}
+
+// ── Q10: Returned Item Reporting ────────────────────────────────────
+
+TEST_F(SqliteComparisonTest, Q10ReturnedItemReporting) {
+    const std::string sql =
+        "SELECT c_custkey, c_name, SUM(l_extendedprice * (1 - l_discount)), "
+        "c_acctbal, n_name, c_address, c_phone, c_comment "
+        "FROM customer, orders, lineitem, nation "
+        "WHERE c_custkey = o_custkey AND l_orderkey = o_orderkey "
+        "AND o_orderdate >= '1993-10-01' AND o_orderdate < '1994-01-01' "
+        "AND l_returnflag = 'R' AND c_nationkey = n_nationkey "
+        "GROUP BY c_custkey, c_name, c_acctbal, c_phone, n_name, c_address, c_comment "
+        "ORDER BY SUM(l_extendedprice * (1 - l_discount)) DESC "
+        "LIMIT 20";
+
+    auto result = db_->ExecuteSQL(sql);
+    ASSERT_EQ(result.tuples.size(), 20u);
+
+    // First row: c_custkey=679, c_name="Customer#000000679",
+    //            sum_disc_price≈378211.33, c_acctbal=1394.44, n_name="IRAN".
+    EXPECT_EQ(result.tuples[0].GetValue(result.schema, 0).bigint_, 679)
+        << "Q10 first-row c_custkey";
+    EXPECT_EQ(result.tuples[0].GetValue(result.schema, 1).varchar_,
+              "Customer#000000679")
+        << "Q10 first-row c_name";
+    EXPECT_NEAR(result.tuples[0].GetValue(result.schema, 2).decimal_,
+                378211.33, 0.01)
+        << "Q10 first-row SUM(disc_price)";
+    EXPECT_NEAR(result.tuples[0].GetValue(result.schema, 3).decimal_,
+                1394.44, 0.01)
+        << "Q10 first-row c_acctbal";
+    EXPECT_EQ(result.tuples[0].GetValue(result.schema, 4).varchar_, "IRAN")
+        << "Q10 first-row n_name";
+}
+
+// ── Q12: Shipping Modes and Order Priority ──────────────────────────
+
+TEST_F(SqliteComparisonTest, Q12ShippingModes) {
+    const std::string sql =
+        "SELECT l_shipmode, "
+        "SUM(CASE WHEN o_orderpriority = '1-URGENT' OR "
+        "              o_orderpriority = '2-HIGH' THEN 1 ELSE 0 END), "
+        "SUM(CASE WHEN o_orderpriority <> '1-URGENT' AND "
+        "              o_orderpriority <> '2-HIGH' THEN 1 ELSE 0 END) "
+        "FROM orders, lineitem "
+        "WHERE o_orderkey = l_orderkey "
+        "AND l_shipmode IN ('MAIL', 'SHIP') "
+        "AND l_commitdate < l_receiptdate AND l_shipdate < l_commitdate "
+        "AND l_receiptdate >= '1994-01-01' AND l_receiptdate < '1995-01-01' "
+        "GROUP BY l_shipmode "
+        "ORDER BY l_shipmode";
+
+    auto result = db_->ExecuteSQL(sql);
+    ASSERT_EQ(result.tuples.size(), 2u);
+
+    // Row 0: MAIL, 64, 86
+    EXPECT_EQ(result.tuples[0].GetValue(result.schema, 0).varchar_, "MAIL");
+    EXPECT_NEAR(result.tuples[0].GetValue(result.schema, 1).decimal_, 64.0, 0.01)
+        << "Q12 MAIL high_line_count";
+    EXPECT_NEAR(result.tuples[0].GetValue(result.schema, 2).decimal_, 86.0, 0.01)
+        << "Q12 MAIL low_line_count";
+
+    // Row 1: SHIP, 61, 96
+    EXPECT_EQ(result.tuples[1].GetValue(result.schema, 0).varchar_, "SHIP");
+    EXPECT_NEAR(result.tuples[1].GetValue(result.schema, 1).decimal_, 61.0, 0.01)
+        << "Q12 SHIP high_line_count";
+    EXPECT_NEAR(result.tuples[1].GetValue(result.schema, 2).decimal_, 96.0, 0.01)
+        << "Q12 SHIP low_line_count";
+}
+
+// ── Q14: Promotion Effect ───────────────────────────────────────────
+
+TEST_F(SqliteComparisonTest, Q14PromotionEffect) {
+    const std::string sql =
+        "SELECT 100.00 * SUM(CASE WHEN p_type LIKE 'PROMO%' "
+        "       THEN l_extendedprice * (1 - l_discount) ELSE 0 END) "
+        "       / SUM(l_extendedprice * (1 - l_discount)) "
+        "FROM lineitem, part "
+        "WHERE l_partkey = p_partkey "
+        "AND l_shipdate >= '1995-09-01' AND l_shipdate < '1995-10-01'";
+
+    auto result = db_->ExecuteSQL(sql);
+    ASSERT_EQ(result.tuples.size(), 1u);
+
+    EXPECT_NEAR(result.tuples[0].GetValue(result.schema, 0).decimal_,
+                15.48654581228407, 0.01)
+        << "Q14 promo_revenue";
+}
+
+// ── Q19: Discounted Revenue ─────────────────────────────────────────
+
+TEST_F(SqliteComparisonTest, Q19DiscountedRevenue) {
+    const std::string sql =
+        "SELECT SUM(l_extendedprice * (1 - l_discount)) "
+        "FROM lineitem, part "
+        "WHERE p_partkey = l_partkey "
+        "AND ((p_brand = 'Brand#12' "
+        "  AND p_container IN ('SM CASE', 'SM BOX', 'SM PACK', 'SM PKG') "
+        "  AND l_quantity >= 1 AND l_quantity <= 11 "
+        "  AND p_size BETWEEN 1 AND 5 "
+        "  AND l_shipmode IN ('AIR', 'AIR REG') "
+        "  AND l_shipinstruct = 'DELIVER IN PERSON') "
+        "OR (p_brand = 'Brand#23' "
+        "  AND p_container IN ('MED BAG', 'MED BOX', 'MED PKG', 'MED PACK') "
+        "  AND l_quantity >= 10 AND l_quantity <= 20 "
+        "  AND p_size BETWEEN 1 AND 10 "
+        "  AND l_shipmode IN ('AIR', 'AIR REG') "
+        "  AND l_shipinstruct = 'DELIVER IN PERSON') "
+        "OR (p_brand = 'Brand#34' "
+        "  AND p_container IN ('LG CASE', 'LG BOX', 'LG PACK', 'LG PKG') "
+        "  AND l_quantity >= 20 AND l_quantity <= 30 "
+        "  AND p_size BETWEEN 1 AND 15 "
+        "  AND l_shipmode IN ('AIR', 'AIR REG') "
+        "  AND l_shipinstruct = 'DELIVER IN PERSON'))";
+
+    auto result = db_->ExecuteSQL(sql);
+    ASSERT_EQ(result.tuples.size(), 1u);
+
+    EXPECT_NEAR(result.tuples[0].GetValue(result.schema, 0).decimal_,
+                22923.028, 0.01)
+        << "Q19 revenue";
 }
 
 }  // namespace shilmandb

@@ -39,7 +39,7 @@ POOL_SIZES: Dict[str, int] = {
     "1.0": 2048,
 }
 
-QUERY_TAGS = ["Q1", "Q3", "Q5", "Q6"]
+QUERY_TAGS = ["Q1", "Q3", "Q5", "Q6", "Q10", "Q12", "Q14", "Q19"]
 
 
 

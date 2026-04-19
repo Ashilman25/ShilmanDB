@@ -4,11 +4,12 @@
 #include <vector>
 #include <memory>
 #include <optional>
+#include <utility>
 
 namespace shilmandb {
 
 enum class ExprType {
-    COLUMN_REF, LITERAL, BINARY_OP, UNARY_OP, AGGREGATE, STAR
+    COLUMN_REF, LITERAL, BINARY_OP, UNARY_OP, AGGREGATE, STAR, CASE
 };
 
 struct Expression {
@@ -46,7 +47,7 @@ struct Literal : Expression {
 };
 
 struct BinaryOp : Expression {
-    enum class Op {EQ, NEQ, LT, GT, LTE, GTE, AND, OR, ADD, SUB, MUL, DIV};
+    enum class Op {EQ, NEQ, LT, GT, LTE, GTE, AND, OR, ADD, SUB, MUL, DIV, LIKE};
     Op op;
 
     std::unique_ptr<Expression> left;
@@ -98,6 +99,23 @@ struct StarExpr : Expression {
 
     [[nodiscard]] std::unique_ptr<Expression> Clone() const override {
         return std::make_unique<StarExpr>();
+    }
+};
+
+struct CaseExpression : Expression {
+    CaseExpression() : Expression(ExprType::CASE) {}
+
+    // Each pair is (condition, result)
+    std::vector<std::pair<std::unique_ptr<Expression>, std::unique_ptr<Expression>>> when_clauses;
+    std::unique_ptr<Expression> else_clause;  // nullptr -> zero-default
+
+    [[nodiscard]] std::unique_ptr<Expression> Clone() const override {
+        auto c = std::make_unique<CaseExpression>();
+        for (const auto& [cond, result] : when_clauses) {
+            c->when_clauses.emplace_back(cond->Clone(), result->Clone());
+        }
+        if (else_clause) c->else_clause = else_clause->Clone();
+        return c;
     }
 };
 

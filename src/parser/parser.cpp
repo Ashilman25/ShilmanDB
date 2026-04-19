@@ -207,6 +207,44 @@ std::unique_ptr<Expression> Parser::ParseAndExpr() {
 std::unique_ptr<Expression> Parser::ParseComparison() {
     auto left = ParseAddSub();
 
+    if (current_token_.type == TokenType::NOT) {
+        Token peek = lexer_.PeekToken();
+        if (peek.type == TokenType::BETWEEN) {
+            Advance();  // consume NOT (returns cached BETWEEN)
+            Advance();  // consume BETWEEN (reads next token from input)
+            return ParseBetweenTail(std::move(left), /*negated=*/true);
+        }
+        if (peek.type == TokenType::IN) {
+            Advance();  // consume NOT (returns cached IN)
+            Advance();  // consume IN (reads next token from input)
+            return ParseInTail(std::move(left), /*negated=*/true);
+        }
+        if (peek.type == TokenType::LIKE) {
+            Advance();  // consume NOT (returns cached LIKE)
+            Advance();  // consume LIKE (reads next token from input)
+            return ParseLikeTail(std::move(left), /*negated=*/true);
+        }
+
+    }
+
+    // BETWEEN —
+    if (current_token_.type == TokenType::BETWEEN) {
+        Advance();
+        return ParseBetweenTail(std::move(left), /*negated=*/false);
+    }
+
+    // IN
+    if (current_token_.type == TokenType::IN) {
+        Advance();
+        return ParseInTail(std::move(left), /*negated=*/false);
+    }
+
+    // LIKE
+    if (current_token_.type == TokenType::LIKE) {
+        Advance();
+        return ParseLikeTail(std::move(left), /*negated=*/false);
+    }
+
     while (true) {
         BinaryOp::Op op;
         switch (current_token_.type) {
@@ -392,6 +430,35 @@ std::unique_ptr<Expression> Parser::ParsePrimary() {
         return expr;
     }
 
+    // CASE WHEN <cond> THEN <result> [WHEN <cond> THEN <result> ...]
+    // [ELSE <result>] END
+    if (current_token_.type == TokenType::CASE) {
+        Advance();  // consume CASE
+        auto case_expr = std::make_unique<CaseExpression>();
+
+        while (current_token_.type == TokenType::WHEN) {
+            Advance();  // consume WHEN
+            auto condition = ParseExpression();
+            Expect(TokenType::THEN);
+            auto result = ParseExpression();
+            case_expr->when_clauses.emplace_back(
+                std::move(condition), std::move(result));
+        }
+
+        if (case_expr->when_clauses.empty()) {
+            throw ParseException(
+                "CASE expression requires at least one WHEN clause",
+                current_token_.line, current_token_.column);
+        }
+
+        if (Match(TokenType::ELSE)) {
+            case_expr->else_clause = ParseExpression();
+        }
+
+        Expect(TokenType::END);
+        return case_expr;
+    }
+
     // agg funcs: COUNT, SUM, AVG, MIN, MAX
     if (IsAggregateFunc(current_token_.type)) {
         auto func = ToAggregateFunc(current_token_.type);
@@ -502,6 +569,93 @@ std::optional<int64_t> Parser::ParseLimit() {
     }
     Advance();
     return val;
+}
+
+// Desugar `lhs BETWEEN low AND high` into `(lhs >= low) AND (lhs <= high)`.
+// `low` / `high` are parsed via ParseAddSub so the BETWEEN's required AND
+// is not greedily swallowed when the surrounding expression is an AND chain.
+std::unique_ptr<Expression> Parser::ParseBetweenTail(std::unique_ptr<Expression> lhs, bool negated) {
+    auto low = ParseAddSub();
+    Expect(TokenType::AND);
+    auto high = ParseAddSub();
+
+    auto gte = std::make_unique<BinaryOp>();
+    gte->op = BinaryOp::Op::GTE;
+    gte->left = lhs->Clone();
+    gte->right = std::move(low);
+
+    auto lte = std::make_unique<BinaryOp>();
+    lte->op = BinaryOp::Op::LTE;
+    lte->left = std::move(lhs);
+    lte->right = std::move(high);
+
+    auto and_node = std::make_unique<BinaryOp>();
+    and_node->op = BinaryOp::Op::AND;
+    and_node->left = std::move(gte);
+    and_node->right = std::move(lte);
+
+    if (negated) {
+        auto not_node = std::make_unique<UnaryOp>();
+        not_node->op = UnaryOp::Op::NOT;
+        not_node->operand = std::move(and_node);
+        return not_node;
+    }
+    return and_node;
+}
+
+std::unique_ptr<Expression> Parser::ParseInTail(std::unique_ptr<Expression> lhs, bool negated) {
+    Expect(TokenType::LPAREN);
+
+    std::vector<std::unique_ptr<Expression>> values;
+    values.push_back(ParseAddSub());
+    while (Match(TokenType::COMMA)) {
+        values.push_back(ParseAddSub());
+    }
+    Expect(TokenType::RPAREN);
+
+    const BinaryOp::Op leaf = negated ? BinaryOp::Op::NEQ : BinaryOp::Op::EQ;
+    const BinaryOp::Op glue = negated ? BinaryOp::Op::AND : BinaryOp::Op::OR;
+
+    // Right-associative chain: leaf(lhs, v_last) glue (leaf(lhs, ...) glue (...))
+    auto result = std::make_unique<BinaryOp>();
+    result->op = leaf;
+    result->left = lhs->Clone();
+    result->right = std::move(values.back());
+    values.pop_back();
+
+    while (!values.empty()) {
+        auto next = std::make_unique<BinaryOp>();
+        next->op = leaf;
+        next->left = lhs->Clone();
+        next->right = std::move(values.back());
+        values.pop_back();
+
+        auto combined = std::make_unique<BinaryOp>();
+        combined->op = glue;
+        combined->left = std::move(next);
+        combined->right = std::move(result);
+        result = std::move(combined);
+    }
+    // `lhs` is cloned once per IN value; the original is never moved and is
+    // destroyed via RAII when this function returns.
+    return result;
+}
+
+std::unique_ptr<Expression> Parser::ParseLikeTail(std::unique_ptr<Expression> lhs, bool negated) {
+    auto pattern = ParseAddSub();
+
+    auto like = std::make_unique<BinaryOp>();
+    like->op = BinaryOp::Op::LIKE;
+    like->left = std::move(lhs);
+    like->right = std::move(pattern);
+
+    if (negated) {
+        auto not_node = std::make_unique<UnaryOp>();
+        not_node->op = UnaryOp::Op::NOT;
+        not_node->operand = std::move(like);
+        return not_node;
+    }
+    return like;
 }
 
 }  // namespace shilmandb
