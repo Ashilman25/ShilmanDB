@@ -10,6 +10,8 @@
 #include "executor/limit_executor.hpp"
 #include "executor/vectorized_seq_scan_executor.hpp"
 #include "executor/vectorized_filter_executor.hpp"
+#include "executor/vectorized_projection_executor.hpp"
+#include "executor/vectorized_aggregate_executor.hpp"
 #include "common/exception.hpp"
 
 namespace shilmandb {
@@ -86,7 +88,7 @@ std::unique_ptr<Executor> ExecutorFactory::CreateExecutor(const PlanNode* plan, 
             auto child = CreateExecutor(plan->children[0].get(), ctx, mode);
             switch (mode) {
                 case ExecutionMode::VECTORIZED:
-                    [[fallthrough]];
+                    return std::make_unique<VectorizedAggregateExecutor>(plan, ctx, std::move(child));
                 case ExecutionMode::TUPLE:
                     return std::make_unique<AggregateExecutor>(plan, ctx, std::move(child));
             }
@@ -97,7 +99,7 @@ std::unique_ptr<Executor> ExecutorFactory::CreateExecutor(const PlanNode* plan, 
             auto child = CreateExecutor(plan->children[0].get(), ctx, mode);
             switch (mode) {
                 case ExecutionMode::VECTORIZED:
-                    [[fallthrough]];
+                    return std::make_unique<VectorizedProjectionExecutor>(plan, ctx, std::move(child));
                 case ExecutionMode::TUPLE:
                     return std::make_unique<ProjectionExecutor>(plan, ctx, std::move(child));
             }
