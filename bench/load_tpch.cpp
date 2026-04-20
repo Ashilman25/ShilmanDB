@@ -1,4 +1,5 @@
 #include "engine/database.hpp"
+#include "executor/executor.hpp"
 #include "common/exception.hpp"
 
 #include <iostream>
@@ -155,6 +156,7 @@ struct Args {
     std::string trace_path;
     std::string results_dir;
     size_t pool_size{4096};
+    ExecutionMode exec_mode{ExecutionMode::TUPLE};
 #ifdef SHILMANDB_HAS_LIBTORCH
     bool use_learned_join{false};
     std::string join_model_path;
@@ -167,6 +169,7 @@ struct Args {
 static void PrintUsage(const char* prog) {
     std::cerr << "Usage: " << prog << " --sf <scale_factor> --db-file <path> --data-dir <path> [--no-verify]"
               << " [--enable-tracing <path>] [--pool-size <N>] [--results-dir <path>]"
+              << " [--execution-mode <tuple|vectorized>]"
 #ifdef SHILMANDB_HAS_LIBTORCH
               << " [--use-learned-join --join-model-path <path>]"
               << " [--use-learned-eviction --eviction-model-path <path>]"
@@ -193,6 +196,17 @@ static Args ParseArgs(int argc, char* argv[]) {
             args.pool_size = std::stoul(argv[++i]);
         } else if (arg == "--results-dir" && i + 1 < argc) {
             args.results_dir = argv[++i];
+        } else if (arg == "--execution-mode" && i + 1 < argc) {
+            std::string mode_str = argv[++i];
+            if (mode_str == "vectorized") {
+                args.exec_mode = ExecutionMode::VECTORIZED;
+            } else if (mode_str == "tuple") {
+                args.exec_mode = ExecutionMode::TUPLE;
+            } else {
+                std::cerr << "Error: unknown --execution-mode '" << mode_str
+                          << "' (expected 'tuple' or 'vectorized')\n";
+                std::exit(1);
+            }
 #ifdef SHILMANDB_HAS_LIBTORCH
         } else if (arg == "--use-learned-join") {
             args.use_learned_join = true;
@@ -237,6 +251,9 @@ int main(int argc, char* argv[]) {
     auto args = ParseArgs(argc, argv);
 
     std::cout << "=== ShilmanDB TPC-H Loader (SF=" << args.sf << ") ===\n";
+    std::cout << "Execution mode: "
+              << (args.exec_mode == ExecutionMode::VECTORIZED ? "VECTORIZED" : "TUPLE")
+              << "\n";
 
 #ifdef SHILMANDB_HAS_LIBTORCH
     Database db(args.db_file, args.pool_size,
@@ -478,7 +495,7 @@ int main(int argc, char* argv[]) {
             std::cout << "\n  " << q.name << " ... " << std::flush;
             auto start = std::chrono::steady_clock::now();
             try {
-                auto result = db.ExecuteSQL(q.sql);
+                auto result = db.ExecuteSQL(q.sql, args.exec_mode);
                 auto elapsed = std::chrono::steady_clock::now() - start;
                 double ms = std::chrono::duration<double, std::milli>(elapsed).count();
 

@@ -50,7 +50,7 @@ Database::Database(const std::string& db_file, size_t buffer_pool_size, bool use
 }
 #endif
 
-QueryResult Database::ExecuteSQL(const std::string& sql) {
+QueryResult Database::ExecuteSQL(const std::string& sql, ExecutionMode mode) {
     Parser parser(sql);
     auto stmt = parser.Parse();
 
@@ -62,7 +62,7 @@ QueryResult Database::ExecuteSQL(const std::string& sql) {
     auto plan = planner.Plan(std::move(*stmt));
 
     ExecutorContext ctx{bpm_.get(), catalog_.get()};
-    auto executor = ExecutorFactory::CreateExecutor(plan.get(), &ctx);
+    auto executor = ExecutorFactory::CreateExecutor(plan.get(), &ctx, mode);
 
     executor->Init();
     std::vector<Tuple> tuples;

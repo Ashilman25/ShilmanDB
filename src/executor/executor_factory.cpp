@@ -12,9 +12,34 @@
 #include "executor/vectorized_filter_executor.hpp"
 #include "executor/vectorized_projection_executor.hpp"
 #include "executor/vectorized_aggregate_executor.hpp"
+#include "executor/batch_to_tuple_adapter.hpp"
 #include "common/exception.hpp"
 
 namespace shilmandb {
+
+namespace {
+
+[[nodiscard]] constexpr bool IsNativelyVectorized(PlanNodeType t, ExecutionMode mode) {
+    if (mode != ExecutionMode::VECTORIZED) return false;
+    switch (t) {
+        case PlanNodeType::SEQ_SCAN:
+        case PlanNodeType::FILTER:
+        case PlanNodeType::PROJECTION:
+        case PlanNodeType::AGGREGATE:
+            return true;
+        default:
+            return false;
+    }
+}
+
+[[nodiscard]] std::unique_ptr<Executor> MaybeAdapt(std::unique_ptr<Executor> child, const PlanNode* child_plan, ExecutorContext* ctx, ExecutionMode mode) {
+    if (IsNativelyVectorized(child_plan->type, mode)) {
+        return std::make_unique<BatchToTupleAdapter>(child_plan, ctx, std::move(child));
+    }
+    return child;
+}
+
+}  // namespace
 
 std::unique_ptr<Executor> ExecutorFactory::CreateExecutor(const PlanNode* plan, ExecutorContext* ctx, ExecutionMode mode) {
     switch (plan->type) {
@@ -50,38 +75,25 @@ std::unique_ptr<Executor> ExecutorFactory::CreateExecutor(const PlanNode* plan, 
         }
 
         case PlanNodeType::HASH_JOIN: {
-            auto left = CreateExecutor(plan->children[0].get(), ctx, mode);
+            auto left  = CreateExecutor(plan->children[0].get(), ctx, mode);
             auto right = CreateExecutor(plan->children[1].get(), ctx, mode);
-            switch (mode) {
-                case ExecutionMode::VECTORIZED:
-                    [[fallthrough]];
-                case ExecutionMode::TUPLE:
-                    return std::make_unique<HashJoinExecutor>(plan, ctx, std::move(left), std::move(right));
-            }
-            throw DatabaseException("Unknown execution mode");
+            left  = MaybeAdapt(std::move(left),  plan->children[0].get(), ctx, mode);
+            right = MaybeAdapt(std::move(right), plan->children[1].get(), ctx, mode);
+            return std::make_unique<HashJoinExecutor>(plan, ctx, std::move(left), std::move(right));
         }
 
         case PlanNodeType::NESTED_LOOP_JOIN: {
-            auto left = CreateExecutor(plan->children[0].get(), ctx, mode);
+            auto left  = CreateExecutor(plan->children[0].get(), ctx, mode);
             auto right = CreateExecutor(plan->children[1].get(), ctx, mode);
-            switch (mode) {
-                case ExecutionMode::VECTORIZED:
-                    [[fallthrough]];
-                case ExecutionMode::TUPLE:
-                    return std::make_unique<NestedLoopJoinExecutor>(plan, ctx, std::move(left), std::move(right));
-            }
-            throw DatabaseException("Unknown execution mode");
+            left  = MaybeAdapt(std::move(left),  plan->children[0].get(), ctx, mode);
+            right = MaybeAdapt(std::move(right), plan->children[1].get(), ctx, mode);
+            return std::make_unique<NestedLoopJoinExecutor>(plan, ctx, std::move(left), std::move(right));
         }
 
         case PlanNodeType::SORT: {
             auto child = CreateExecutor(plan->children[0].get(), ctx, mode);
-            switch (mode) {
-                case ExecutionMode::VECTORIZED:
-                    [[fallthrough]];
-                case ExecutionMode::TUPLE:
-                    return std::make_unique<SortExecutor>(plan, ctx, std::move(child));
-            }
-            throw DatabaseException("Unknown execution mode");
+            child = MaybeAdapt(std::move(child), plan->children[0].get(), ctx, mode);
+            return std::make_unique<SortExecutor>(plan, ctx, std::move(child));
         }
 
         case PlanNodeType::AGGREGATE: {
@@ -108,13 +120,8 @@ std::unique_ptr<Executor> ExecutorFactory::CreateExecutor(const PlanNode* plan, 
 
         case PlanNodeType::LIMIT: {
             auto child = CreateExecutor(plan->children[0].get(), ctx, mode);
-            switch (mode) {
-                case ExecutionMode::VECTORIZED:
-                    [[fallthrough]];
-                case ExecutionMode::TUPLE:
-                    return std::make_unique<LimitExecutor>(plan, ctx, std::move(child));
-            }
-            throw DatabaseException("Unknown execution mode");
+            child = MaybeAdapt(std::move(child), plan->children[0].get(), ctx, mode);
+            return std::make_unique<LimitExecutor>(plan, ctx, std::move(child));
         }
 
         default:

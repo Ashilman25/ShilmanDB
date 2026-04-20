@@ -5,6 +5,7 @@
 #include "catalog/catalog.hpp"
 #include "types/tuple.hpp"
 #include "catalog/schema.hpp"
+#include "executor/executor.hpp"
 
 #include <string>
 #include <vector>
@@ -37,7 +38,7 @@ public:
     Database(Database&&) = delete;
     Database& operator=(Database&&) = delete;
 
-    [[nodiscard]] QueryResult ExecuteSQL(const std::string& sql);
+    [[nodiscard]] QueryResult ExecuteSQL(const std::string& sql, ExecutionMode mode = ExecutionMode::TUPLE);
 
     void LoadTable(const std::string& table_name, const Schema& schema, const std::string& tbl_file_path, char delimiter = '|');
 
