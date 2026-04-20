@@ -2,6 +2,7 @@
 _docs
 superpowers/
 build/
+build-release/
 third_party/libtorch/
 bench/tpch_data/
 bench/results/
