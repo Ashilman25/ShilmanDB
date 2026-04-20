@@ -8,19 +8,6 @@ namespace shilmandb {
 
 AggregateExecutor::AggregateExecutor(const PlanNode* plan, ExecutorContext* ctx, std::unique_ptr<Executor> child) : Executor(plan, ctx), child_(std::move(child)) {}
 
-double AggregateExecutor::ToDouble(const Value& v) {
-    switch (v.type_) {
-        case TypeId::INTEGER: 
-            return static_cast<double>(v.integer_);
-        case TypeId::BIGINT:  
-            return static_cast<double>(v.bigint_);
-        case TypeId::DECIMAL: 
-            return v.decimal_;
-        default:
-            throw DatabaseException("Cannot aggregate non-numeric type");
-    }
-}
-
 void AggregateExecutor::Init() {
     child_->Init();
     groups_.clear();
@@ -59,7 +46,7 @@ void AggregateExecutor::Init() {
                 case Aggregate::Func::SUM:
                 case Aggregate::Func::AVG: {
                     auto val = EvaluateExpression(agg_exprs[i].get(), tuple, child_schema);
-                    state.sum += ToDouble(val);
+                    state.sum += ValueToDouble(val);
                     state.count++;
                     break;
                 }
