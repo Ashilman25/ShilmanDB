@@ -4,6 +4,8 @@
 #include "common/exception.hpp"
 #include "types/value.hpp"
 #include <algorithm>
+#include <numeric>
+#include <string>
 #include <unordered_set>
 
 #ifdef SHILMANDB_HAS_LIBTORCH
@@ -110,39 +112,38 @@ auto BuildJoinSchema(const Schema& left, const Schema& right) -> Schema {
 }
 
 
-// Reject join orders whose position k>0 has no predicate tying the new table
-// back to the already-joined set — a Cartesian step inflates intermediate sizes
-// enough to dominate query time even when the executor tolerates it.
-auto OrderIsConnected(const std::vector<int>& order, const std::vector<TableRef>& tables, const std::vector<TableInfo*>& table_infos, const std::vector<JoinClause>& joins) -> bool {
-    if (order.size() <= 1) return true;
+// Adds an edge for every pair of tables in `refs`, each as (low, high).
+void AddTableEdges(const std::unordered_set<int>& refs, std::vector<TableEdge>& edges) {
+    std::vector<int> slots(refs.begin(), refs.end());
+    std::sort(slots.begin(), slots.end());
 
-    std::unordered_set<int> joined_set;
-    joined_set.insert(order[0]);
-
-    for (size_t k = 1; k < order.size(); ++k) {
-        const int new_idx = order[k];
-        bool connected = false;
-
-        for (const auto& join : joins) {
-            if (!join.on_condition) continue;
-
-            std::unordered_set<int> refs;
-            CollectTableIndices(join.on_condition.get(), tables, table_infos, refs);
-
-            const bool refs_new = refs.find(new_idx) != refs.end();
-            const bool refs_joined = std::any_of(refs.begin(), refs.end(), [&](int r) {
-                return joined_set.find(r) != joined_set.end();
-            });
-            if (refs_new && refs_joined) {
-                connected = true;
-                break;
-            }
+    for (size_t i = 0; i < slots.size(); ++i) {
+        for (size_t j = i + 1; j < slots.size(); ++j) {
+            edges.emplace_back(slots[i], slots[j]);
         }
-
-        if (!connected) return false;
-        joined_set.insert(new_idx);
     }
-    return true;
+}
+
+
+// A forced order must name every table exactly once, and each table after the first
+// must join to one already placed, so no step is a cross product.
+void ValidateForcedOrder(const std::vector<int>& order, size_t num_tables, const std::vector<TableEdge>& edges) {
+    const auto n = std::to_string(num_tables);
+    if (order.size() != num_tables) {
+        throw DatabaseException("forced join order has " + std::to_string(order.size()) + " tables but the query has " + n);
+    }
+
+    std::vector<int> sorted = order;
+    std::sort(sorted.begin(), sorted.end());
+    for (size_t i = 0; i < sorted.size(); ++i) {
+        if (sorted[i] != static_cast<int>(i)) {
+            throw DatabaseException("forced join order must list each of the " + n + " tables exactly once");
+        }
+    }
+
+    if (!IsConnectedOrder(order, edges)) {
+        throw DatabaseException("forced join order has a cross-product step");
+    }
 }
 
 
@@ -413,6 +414,10 @@ Planner::Planner(Catalog* catalog, LearnedJoinOptimizer* learned_optimizer) : ca
 #endif
 
 auto Planner::Plan(SelectStatement stmt) -> std::unique_ptr<PlanNode> {
+    join_info_ = JoinOrderInfo{};
+    step_nodes_.clear();
+    scan_nodes_.clear();
+
     std::vector<TableRef> tables;
     std::vector<TableInfo*> table_infos;
 
@@ -439,6 +444,22 @@ auto Planner::Plan(SelectStatement stmt) -> std::unique_ptr<PlanNode> {
         throw DatabaseException("Empty select list");
     }
 
+    auto& info = join_info_;
+    for (const auto& tref : tables) {
+        info.tables.push_back(tref.table_name);
+    }
+
+    // Explicit edges come from JOIN ... ON only. The full edges in info.edges also count
+    // WHERE predicates on exactly two tables. One on three or more tables only gets
+    // placed once all of them are joined, so it can't tie a new table in.
+    std::vector<TableEdge> explicit_edges;
+    for (const auto& join : stmt.joins) {
+        std::unordered_set<int> refs;
+        CollectTableIndices(join.on_condition.get(), tables, table_infos, refs);
+        AddTableEdges(refs, explicit_edges);
+    }
+    info.edges = explicit_edges;
+
     std::vector<std::vector<std::unique_ptr<Expression>>> table_predicates(tables.size());
     std::vector<std::unique_ptr<Expression>> residual_predicates;
 
@@ -452,9 +473,17 @@ auto Planner::Plan(SelectStatement stmt) -> std::unique_ptr<PlanNode> {
             if (refs.size() == 1) {
                 table_predicates[*refs.begin()].push_back(std::move(conj));
             } else {
+                if (refs.size() == 2) AddTableEdges(refs, info.edges);
                 residual_predicates.push_back(std::move(conj));
             }
         }
+    }
+
+    std::sort(info.edges.begin(), info.edges.end());
+    info.edges.erase(std::unique(info.edges.begin(), info.edges.end()), info.edges.end());
+
+    if (forced_order_) {
+        ValidateForcedOrder(*forced_order_, tables.size(), info.edges);
     }
 
     std::vector<std::unique_ptr<PlanNode>> scans;
@@ -472,28 +501,44 @@ auto Planner::Plan(SelectStatement stmt) -> std::unique_ptr<PlanNode> {
         scans.push_back(std::move(scan));
     }
 
+    for (const auto& scan : scans) {
+        scan_nodes_.push_back(scan.get());
+    }
+
     //join tree
     std::unique_ptr<PlanNode> current;
 
     if (tables.size() <= 1) {
+        info.order = {0};
+        info.source = forced_order_ ? JoinOrderSource::FORCED : JoinOrderSource::SINGLE_TABLE;
+        info.est_step_rows = {static_cast<double>(table_infos[0]->stats.row_count)};
+        info.est_cost = info.est_step_rows[0];
+
         current = std::move(scans[0]);
+        step_nodes_.push_back(current.get());
     } else {
         std::vector<TableStats> stats;
         stats.reserve(table_infos.size());
 
-        for (const auto* info : table_infos) {
-            stats.push_back(info->stats);
+        for (const auto* table_info : table_infos) {
+            stats.push_back(table_info->stats);
         }
 
         std::vector<int> order;
 
+        if (forced_order_) {
+            order = *forced_order_;
+            info.source = JoinOrderSource::FORCED;
 #ifdef SHILMANDB_HAS_LIBTORCH
-        if (learned_optimizer_ != nullptr) {
+        } else if (learned_optimizer_ != nullptr) {
+            // Every fallback below counts as rejected; only using the model's order changes that.
+            info.source = JoinOrderSource::LEARNED_REJECTED;
             try {
                 auto features = JoinOrderOptimizer::BuildFeatureVector(tables, stmt.joins, stats);
                 auto learned_order = learned_optimizer_->PredictJoinOrder(features, static_cast<int>(tables.size()));
+                info.model_order = learned_order;
 
-                if (!OrderIsConnected(learned_order, tables, table_infos, stmt.joins)) {
+                if (!IsConnectedOrder(learned_order, explicit_edges)) {
                     order = JoinOrderOptimizer::FindBestOrder(tables, stmt.joins, stats);
                 } else {
                     double learned_cost = JoinOrderOptimizer::EstimateCost(learned_order, tables, stmt.joins, stats);
@@ -502,6 +547,7 @@ auto Planner::Plan(SelectStatement stmt) -> std::unique_ptr<PlanNode> {
 
                     if (learned_cost <= 1.5 * exhaustive_cost) {
                         order = std::move(learned_order);
+                        info.source = JoinOrderSource::LEARNED;
                     } else {
                         order = std::move(exhaustive_order);
                     }
@@ -509,14 +555,19 @@ auto Planner::Plan(SelectStatement stmt) -> std::unique_ptr<PlanNode> {
             } catch (const std::exception&) {
                 order = JoinOrderOptimizer::FindBestOrder(tables, stmt.joins, stats);
             }
+#endif
         } else {
+            info.source = JoinOrderSource::CLASSICAL;
             order = JoinOrderOptimizer::FindBestOrder(tables, stmt.joins, stats);
         }
-#else
-        order = JoinOrderOptimizer::FindBestOrder(tables, stmt.joins, stats);
-#endif
+
+        // Record the estimates now: the loop below moves the ON conditions out of stmt.joins.
+        info.order = order;
+        info.est_step_rows = JoinOrderOptimizer::EstimateStepRows(order, tables, stmt.joins, stats);
+        info.est_cost = std::accumulate(info.est_step_rows.begin(), info.est_step_rows.end(), 0.0);
 
         current = std::move(scans[order[0]]);
+        step_nodes_.push_back(current.get());
 
         std::unordered_set<int> joined_set;
         joined_set.insert(order[0]);
@@ -599,6 +650,7 @@ auto Planner::Plan(SelectStatement stmt) -> std::unique_ptr<PlanNode> {
                 join_node->children.push_back(std::move(scans[new_idx]));
                 current = std::move(join_node);
             }
+            step_nodes_.push_back(current.get());
         }
 
         if (!residual_predicates.empty()) {

@@ -2,6 +2,7 @@
 _docs
 superpowers/
 docs/ToDo
+docs/playbooks/
 build/
 build-release/
 build-debug/

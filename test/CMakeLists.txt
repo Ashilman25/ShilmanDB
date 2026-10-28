@@ -39,7 +39,9 @@ shilmandb_add_test(like_test parser/like_test.cpp)
 
 # Planner tests
 shilmandb_add_test(join_order_optimizer_test planner/join_order_optimizer_test.cpp)
+shilmandb_add_test(join_graph_test planner/join_graph_test.cpp)
 shilmandb_add_test(planner_test planner/planner_test.cpp)
+shilmandb_add_test(forced_join_order_test planner/forced_join_order_test.cpp)
 shilmandb_add_test(index_selection_test planner/index_selection_test.cpp)
 shilmandb_add_test(nested_aggregate_test planner/nested_aggregate_test.cpp)
 
