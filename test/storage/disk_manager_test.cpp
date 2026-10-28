@@ -1,6 +1,10 @@
 #include <gtest/gtest.h>
+#include <string>
+#include <unistd.h>
 #include "storage/disk_manager.hpp"
+#include "common/exception.hpp"
 #include <array>
+#include <chrono>
 #include <cstring>
 #include <filesystem>
 
@@ -11,7 +15,8 @@ protected:
     std::string test_file_;
 
     void SetUp() override {
-        test_file_ = (std::filesystem::temp_directory_path() / "shilmandb_dm_test.db").string();
+        test_file_ = (std::filesystem::temp_directory_path() /
+                      ("shilmandb_dm_test_" + std::to_string(::getpid()) + ".db")).string();
         std::filesystem::remove(test_file_);
     }
 
@@ -136,6 +141,59 @@ TEST_F(DiskManagerTest, ReadBeyondAllocatedReturnsZeros) {
 
     std::array<char, PAGE_SIZE> zeros{};
     EXPECT_EQ(std::memcmp(buf.data(), zeros.data(), PAGE_SIZE), 0);
+}
+
+TEST_F(DiskManagerTest, FreshFileReadIsFast) {
+    // SetUp removed the file, so this goes through the create-new-file path
+    DiskManager dm(test_file_);
+    constexpr int kNumPages = 1000;
+
+    std::array<char, PAGE_SIZE> buf{};
+    for (int i = 0; i < kNumPages; ++i) {
+        std::memset(buf.data(), i % 251, PAGE_SIZE);
+        dm.WritePage(dm.AllocatePage(), buf.data());
+    }
+
+    auto start = std::chrono::steady_clock::now();
+    for (int i = 0; i < kNumPages; ++i) {
+        dm.ReadPage(static_cast<page_id_t>(i), buf.data());
+        ASSERT_EQ(static_cast<unsigned char>(buf[0]), i % 251) << "page " << i;
+        ASSERT_EQ(static_cast<unsigned char>(buf[PAGE_SIZE - 1]), i % 251) << "page " << i;
+    }
+    auto elapsed_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - start).count();
+
+    // A healthy read is about 1 us per page; the old reopened-stream bug was ~650 us
+    EXPECT_LT(elapsed_ms, 100.0) << "1000 page reads took " << elapsed_ms << " ms";
+}
+
+TEST_F(DiskManagerTest, OpenInvalidPathThrows) {
+    auto bad_path = (std::filesystem::temp_directory_path() /
+                     "shilmandb_no_such_dir" / "x.db").string();
+    EXPECT_THROW(DiskManager dm(bad_path), IOException);
+}
+
+TEST_F(DiskManagerTest, WriteBeyondEndLeavesZeroGap) {
+    std::array<char, PAGE_SIZE> pattern{};
+    std::memset(pattern.data(), 0x5A, PAGE_SIZE);
+    std::array<char, PAGE_SIZE> zeros{};
+
+    {
+        DiskManager dm(test_file_);
+        dm.WritePage(5, pattern.data());
+
+        std::array<char, PAGE_SIZE> buf{};
+        std::memset(buf.data(), 0xFF, PAGE_SIZE);
+        dm.ReadPage(2, buf.data());
+        EXPECT_EQ(std::memcmp(buf.data(), zeros.data(), PAGE_SIZE), 0);
+
+        dm.ReadPage(5, buf.data());
+        EXPECT_EQ(std::memcmp(buf.data(), pattern.data(), PAGE_SIZE), 0);
+    }
+
+    // File is now 6 pages long, so a reopen hands out page 6 next
+    DiskManager dm2(test_file_);
+    EXPECT_EQ(dm2.AllocatePage(), 6u);
 }
 
 }  // namespace shilmandb

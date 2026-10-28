@@ -1,4 +1,6 @@
 #include <gtest/gtest.h>
+#include <string>
+#include <unistd.h>
 #include "storage/table_heap.hpp"
 #include "buffer/buffer_pool_manager.hpp"
 #include "buffer/lru_eviction_policy.hpp"
@@ -16,7 +18,8 @@ protected:
     std::string test_file_;
 
     void SetUp() override {
-        test_file_ = (std::filesystem::temp_directory_path() / "shilmandb_table_heap_test.db").string();
+        test_file_ = (std::filesystem::temp_directory_path() /
+                      ("shilmandb_table_heap_test_" + std::to_string(::getpid()) + ".db")).string();
         std::filesystem::remove(test_file_);
     }
 

@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include <unistd.h>
 #include "executor/vectorized_filter_executor.hpp"
 #include "executor/vectorized_seq_scan_executor.hpp"
 #include "planner/plan_node.hpp"
@@ -47,7 +48,7 @@ protected:
 
     void SetUp() override {
         test_file_ = (std::filesystem::temp_directory_path() /
-                      "shilmandb_vec_filter_test.db").string();
+                      ("shilmandb_vec_filter_test_" + std::to_string(::getpid()) + ".db")).string();
         std::filesystem::remove(test_file_);
     }
 

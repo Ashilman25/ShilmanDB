@@ -1,5 +1,6 @@
 // test/planner/index_selection_test.cpp
 #include <gtest/gtest.h>
+#include <unistd.h>
 #include "planner/cost_model.hpp"
 #include "planner/index_selector.hpp"
 #include "parser/ast.hpp"
@@ -155,7 +156,7 @@ protected:
 
     void SetUp() override {
         test_file_ = (std::filesystem::temp_directory_path() /
-                      "shilmandb_index_selection_test.db").string();
+                      ("shilmandb_index_selection_test_" + std::to_string(::getpid()) + ".db")).string();
         std::filesystem::remove(test_file_);
     }
 

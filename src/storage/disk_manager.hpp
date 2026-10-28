@@ -1,7 +1,6 @@
 #pragma once
 #include "common/config.hpp"
 #include <atomic>
-#include <fstream>
 #include <string>
 
 namespace shilmandb {
@@ -22,7 +21,7 @@ public:
     const std::string& GetFileName() const { return file_name_; }
 
 private:
-    std::fstream db_io_;
+    int fd_{-1};
     std::string file_name_;
     std::atomic<page_id_t> next_page_id_{0};
 };

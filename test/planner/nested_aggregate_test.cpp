@@ -1,4 +1,6 @@
 #include <gtest/gtest.h>
+#include <string>
+#include <unistd.h>
 #include "planner/planner.hpp"
 #include "parser/parser.hpp"
 #include "catalog/catalog.hpp"
@@ -16,7 +18,7 @@ protected:
 
     void SetUp() override {
         test_file_ = (std::filesystem::temp_directory_path()
-                       / "shilmandb_nested_agg_test.db").string();
+                       / ("shilmandb_nested_agg_test_" + std::to_string(::getpid()) + ".db")).string();
         std::filesystem::remove(test_file_);
     }
 

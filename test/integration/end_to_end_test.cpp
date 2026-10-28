@@ -1,4 +1,6 @@
 #include <gtest/gtest.h>
+#include <string>
+#include <unistd.h>
 
 #include "engine/database.hpp"
 #include "common/exception.hpp"
@@ -14,7 +16,7 @@ protected:
 
     void SetUp() override {
         test_file_ = (std::filesystem::temp_directory_path() /
-                      "shilmandb_e2e_test.db").string();
+                      ("shilmandb_e2e_test_" + std::to_string(::getpid()) + ".db")).string();
         std::filesystem::remove(test_file_);
     }
 
