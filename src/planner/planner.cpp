@@ -110,6 +110,42 @@ auto BuildJoinSchema(const Schema& left, const Schema& right) -> Schema {
 }
 
 
+// Reject join orders whose position k>0 has no predicate tying the new table
+// back to the already-joined set — a Cartesian step inflates intermediate sizes
+// enough to dominate query time even when the executor tolerates it.
+auto OrderIsConnected(const std::vector<int>& order, const std::vector<TableRef>& tables, const std::vector<TableInfo*>& table_infos, const std::vector<JoinClause>& joins) -> bool {
+    if (order.size() <= 1) return true;
+
+    std::unordered_set<int> joined_set;
+    joined_set.insert(order[0]);
+
+    for (size_t k = 1; k < order.size(); ++k) {
+        const int new_idx = order[k];
+        bool connected = false;
+
+        for (const auto& join : joins) {
+            if (!join.on_condition) continue;
+
+            std::unordered_set<int> refs;
+            CollectTableIndices(join.on_condition.get(), tables, table_infos, refs);
+
+            const bool refs_new = refs.find(new_idx) != refs.end();
+            const bool refs_joined = std::any_of(refs.begin(), refs.end(), [&](int r) {
+                return joined_set.find(r) != joined_set.end();
+            });
+            if (refs_new && refs_joined) {
+                connected = true;
+                break;
+            }
+        }
+
+        if (!connected) return false;
+        joined_set.insert(new_idx);
+    }
+    return true;
+}
+
+
 auto IsEquiJoin(const Expression* expr) -> bool {
     if (!expr) return false;
     const auto* bin = dynamic_cast<const BinaryOp*>(expr);
@@ -457,14 +493,18 @@ auto Planner::Plan(SelectStatement stmt) -> std::unique_ptr<PlanNode> {
                 auto features = JoinOrderOptimizer::BuildFeatureVector(tables, stmt.joins, stats);
                 auto learned_order = learned_optimizer_->PredictJoinOrder(features, static_cast<int>(tables.size()));
 
-                double learned_cost = JoinOrderOptimizer::EstimateCost(learned_order, tables, stmt.joins, stats);
-                auto exhaustive_order = JoinOrderOptimizer::FindBestOrder(tables, stmt.joins, stats);
-                double exhaustive_cost = JoinOrderOptimizer::EstimateCost(exhaustive_order, tables, stmt.joins, stats);
-
-                if (learned_cost <= 1.5 * exhaustive_cost) {
-                    order = std::move(learned_order);
+                if (!OrderIsConnected(learned_order, tables, table_infos, stmt.joins)) {
+                    order = JoinOrderOptimizer::FindBestOrder(tables, stmt.joins, stats);
                 } else {
-                    order = std::move(exhaustive_order);
+                    double learned_cost = JoinOrderOptimizer::EstimateCost(learned_order, tables, stmt.joins, stats);
+                    auto exhaustive_order = JoinOrderOptimizer::FindBestOrder(tables, stmt.joins, stats);
+                    double exhaustive_cost = JoinOrderOptimizer::EstimateCost(exhaustive_order, tables, stmt.joins, stats);
+
+                    if (learned_cost <= 1.5 * exhaustive_cost) {
+                        order = std::move(learned_order);
+                    } else {
+                        order = std::move(exhaustive_order);
+                    }
                 }
             } catch (const std::exception&) {
                 order = JoinOrderOptimizer::FindBestOrder(tables, stmt.joins, stats);

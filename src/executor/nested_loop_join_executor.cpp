@@ -24,13 +24,16 @@ bool NestedLoopJoinExecutor::Next(Tuple* tuple) {
     const auto& right_schema = right_child_->GetOutputSchema();
     const auto& output_schema = plan_->output_schema;
 
+    const Expression* predicate = nlj_plan->predicate.get();
+
     while (!left_done_) {
         while (right_idx_ < right_tuples_.size()) {
             auto combined = CombineTuples(current_left_, left_schema, right_tuples_[right_idx_], right_schema, output_schema);
             ++right_idx_;
 
-            auto result = EvaluateExpression(nlj_plan->predicate.get(), combined, output_schema);
-            if (IsTruthy(result)) {
+            // Null predicate means an unconstrained cross join — emit every pair.
+            if (predicate == nullptr ||
+                IsTruthy(EvaluateExpression(predicate, combined, output_schema))) {
                 *tuple = std::move(combined);
                 return true;
             }
