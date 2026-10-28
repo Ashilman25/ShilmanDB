@@ -1,6 +1,7 @@
 .claude
 _docs
 superpowers/
+docs/ToDo
 build/
 build-release/
 third_party/libtorch/
