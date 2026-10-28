@@ -1,4 +1,17 @@
 #!/usr/bin/env python3
+"""
+Benchmark runner
+
+Runs a matrix of (scale factor x configuration x query) benchmarks, then
+emits three unified CSVs under bench/results/:
+
+- latencies.csv: (sf, query, config, median_latency_ms, rows, hits, misses)
+- hit_rates.csv: (sf, config, pool_size, hit_rate, improvement_over_lru)
+- correctness.csv: (sf, query, config, status)
+
+"""
+
+from __future__ import annotations
 
 import argparse
 import csv
@@ -9,36 +22,19 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Tuple
 
+# Constants 
 
+REPO_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_BINARY = REPO_ROOT / "build" / "bench" / "load_tpch"
+DEFAULT_DATA_DIR = REPO_ROOT / "bench" / "tpch_data"
+DEFAULT_OUTPUT_DIR = REPO_ROOT / "bench" / "results"
 
-ALL_SCALE_FACTORS = ["0.01", "0.1", "1.0"]
-QUERIES = ["Q1", "Q3", "Q5", "Q6"]
-
-SHILMANDB_CONFIGS: Dict[str, Dict[str, str]] = {
-    "lru_heuristic": {},
-    "lru_learned_join": {
-        "--use-learned-join": "",
-        "--join-model-path": "ml/join_optimizer/models/join_order_model.pt",
-    },
-    "learned_eviction_heuristic": {
-        "--use-learned-eviction": "",
-        "--eviction-model-path": "ml/eviction_policy/models/eviction_model.pt",
-    },
-    "learned_all": {
-        "--use-learned-join": "",
-        "--join-model-path": "ml/join_optimizer/models/join_order_model.pt",
-        "--use-learned-eviction": "",
-        "--eviction-model-path": "ml/eviction_policy/models/eviction_model.pt",
-    },
-}
-
-CONFIG_GROUPS = {
-    "baseline": ["lru_heuristic"],
-    "learned": ["lru_learned_join", "learned_eviction_heuristic", "learned_all"],
-    "all": list(SHILMANDB_CONFIGS.keys()),
-}
+ALL_SCALE_FACTORS: List[str] = ["0.01", "0.1", "1.0"]
+QUERIES: List[str] = ["Q1", "Q3", "Q5", "Q6", "Q10", "Q12", "Q14", "Q19"]
 
 POOL_SIZES: Dict[str, int] = {
     "0.01": 128,
@@ -46,723 +42,603 @@ POOL_SIZES: Dict[str, int] = {
     "1.0": 2048,
 }
 
+POOL_SWEEP_SIZES: List[int] = [128, 256, 512, 1024, 2048]
+POOL_SWEEP_SF: str = "0.1"
 
+JOIN_MODEL_PATH = "ml/join_optimizer/models/join_order_model.pt"
+EVICTION_V2_MODEL_PATH = "ml/eviction_policy/models/eviction_model_v2.pt"
+EVICTION_V1_MODEL_PATH = "ml/eviction_policy/models/eviction_model.pt"
 
+# Config name -> list of CLI flags to pass to load_tpch.
+PRIMARY_CONFIGS: Dict[str, List[str]] = {
+    "baseline": [
+        "--create-indexes", "false",
+        "--execution-mode", "tuple",
+    ],
+    "+index": [
+        "--create-indexes", "true",
+        "--execution-mode", "tuple",
+    ],
+    "+learned": [
+        "--create-indexes", "true",
+        "--execution-mode", "tuple",
+        "--use-learned-join", "--join-model-path", JOIN_MODEL_PATH,
+        "--use-learned-eviction",
+        "--eviction-model-path", EVICTION_V2_MODEL_PATH,
+        "--eviction-model-version", "v2",
+    ],
+    "+vectorized": [
+        "--create-indexes", "true",
+        "--execution-mode", "vectorized",
+    ],
+}
+
+SHILMANDB_CONFIG_NAMES: List[str] = list(PRIMARY_CONFIGS.keys())
+SQLITE_CONFIG_NAMES: List[str] = ["sqlite_disk", "sqlite_memory"]
+ALL_CONFIG_NAMES: List[str] = SHILMANDB_CONFIG_NAMES + SQLITE_CONFIG_NAMES
+
+#Helpers
+
+#format seconds as Hh Mm Ss / Mm Ss / Ss.S.
 def elapsed_str(seconds: float) -> str:
     if seconds < 60:
         return f"{seconds:.1f}s"
-    
-    minutes = int(seconds) // 60
-    secs = seconds - minutes * 60
-    if minutes < 60:
-        return f"{minutes}m {secs:.0f}s"
-    
-    hours = minutes // 60
-    mins = minutes % 60
-    return f"{hours}h {mins}m {secs:.0f}s"
+    mins, secs = divmod(int(seconds), 60)
+    if mins < 60:
+        return f"{mins}m {secs}s"
+    hrs, mins = divmod(mins, 60)
+    return f"{hrs}h {mins}m {secs}s"
 
 
-def section_header(title: str, width: int = 70) -> None:
-    print(f"\n{'=' * width}")
-    print(f"  {title}")
-    print(f"{'=' * width}")
+def section(title: str) -> None:
+    print(f"\n{'=' * 70}\n{title}\n{'=' * 70}", flush=True)
 
 
-def sub_header(title: str, width: int = 60) -> None:
-    print(f"\n  --- {title} {'-' * max(1, width - len(title) - 7)}")
+def subsection(title: str) -> None:
+    print(f"\n--- {title} ---", flush=True)
 
 
+def eprint(msg: str) -> None:
+    print(msg, file=sys.stderr, flush=True)
 
 
-def check_tpch_data(data_dir: str, sf: str) -> bool:
-    sf_dir = os.path.join(data_dir, f"sf{sf}")
-    marker = os.path.join(sf_dir, "lineitem.tbl")
-    return os.path.isfile(marker)
+# Per-query aggregated results
+
+@dataclass
+class QueryStats:
+    sf: str
+    config: str
+    query: str
+    median_latency_ms: Optional[float]   # None => all runs failed
+    rows: Optional[int]
+    median_hits: Optional[int]
+    median_misses: Optional[int]
 
 
-def generate_tpch_data(data_dir: str) -> bool:
-    script = os.path.join("bench", "generate_tpch_data.sh")
-    if not os.path.isfile(script):
-        print(f"    ERROR: Data generation script not found: {script}")
-        return False
-
-    print(f"    Generating TPC-H data (all scale factors) ...")
-    t0 = time.perf_counter()
-    try:
-        result = subprocess.run(
-            ["bash", script],
-            capture_output=True,
-            text=True,
-            timeout=600,
-        )
-    except subprocess.TimeoutExpired:
-        print(f"    ERROR: Data generation timed out after 600s")
-        return False
-    except OSError as e:
-        print(f"    ERROR: Could not run data generation script: {e}")
-        return False
-
-    if result.returncode != 0:
-        print(f"    ERROR: Data generation failed (exit {result.returncode})")
-        if result.stderr:
-            for line in result.stderr.strip().split("\n")[-5:]:
-                print(f"      | {line}")
-        return False
-
-    duration = time.perf_counter() - t0
-    print(f"    Data generation completed ({elapsed_str(duration)})")
-    return True
+@dataclass
+class RunOutput:
+    """All stats from a single load_tpch invocation."""
+    per_query: Dict[str, QueryStats] = field(default_factory=dict)
 
 
+def _median_int(values: Sequence[int]) -> int:
+    """Median rounded to int (used for hit/miss counts)."""
+    return int(round(statistics.median(values)))
 
 
-def build_load_tpch_cmd(binary: str, sf: str, config_name: str, data_dir: str, results_dir: str, db_file: str) -> List[str]:
-    pool_size = POOL_SIZES[sf]
-    sf_data_dir = os.path.join(data_dir, f"sf{sf}")
-
-    cmd = [
-        binary,
-        "--sf", sf,
-        "--db-file", db_file,
-        "--data-dir", sf_data_dir,
-        "--pool-size", str(pool_size),
-        "--results-dir", results_dir,
-    ]
-
-    for flag, value in SHILMANDB_CONFIGS[config_name].items():
-        cmd.append(flag)
-        if value:
-            cmd.append(value)
-
-    return cmd
-
-
-
-def parse_load_tpch_latencies(latencies_path: str) -> Dict[str, Tuple[float, int]]:
-    result = {}
-    if not os.path.isfile(latencies_path):
-        return result
-
-    with open(latencies_path, "r", newline="") as f:
+#Parse the per-run latencies.csv written by load_tpch
+# Schema: query,run,rows,latency_ms,hits,misses
+# Returns: {query_tag: QueryStats}
+def parse_shilmandb_latencies(path: Path, sf: str, config: str) -> Dict[str, QueryStats]:
+    per_query_runs: Dict[str, List[Tuple[float, int, int, int]]] = {}
+    with path.open() as f:
         reader = csv.DictReader(f)
         for row in reader:
-            try:
-                query = row["query"]
-                latency = float(row["latency_ms"])
-                rows = int(row["rows"])
-                result[query] = (latency, rows)
-            except (KeyError, ValueError, TypeError) as e:
-                print(f"    WARNING: Skipping malformed latency row: {e}")
-                continue
+            q = row["query"]
+            per_query_runs.setdefault(q, []).append((
+                float(row["latency_ms"]),
+                int(row["rows"]),
+                int(row["hits"]),
+                int(row["misses"]),
+            ))
 
+    result: Dict[str, QueryStats] = {}
+    for q, runs in per_query_runs.items():
+        if not runs:
+            continue
+        latencies = [r[0] for r in runs]
+        rows_vals = [r[1] for r in runs]
+        hits_vals = [r[2] for r in runs]
+        misses_vals = [r[3] for r in runs]
+        result[q] = QueryStats(
+            sf=sf,
+            config=config,
+            query=q,
+            median_latency_ms=statistics.median(latencies),
+            rows=rows_vals[0],                     # stable across runs
+            median_hits=_median_int(hits_vals),
+            median_misses=_median_int(misses_vals),
+        )
     return result
 
 
-def run_load_tpch(binary: str, sf: str, config_name: str, data_dir: str, results_dir: str, db_file: str, timeout_seconds: int = 3600) -> Tuple[bool, Optional[str]]:
-    cmd = build_load_tpch_cmd(binary, sf, config_name, data_dir, results_dir, db_file)
+# ShilmanDB runner 
+#Build the load_tpch CLI for a given config.
+def build_command(binary: Path, sf: str, config_name: str, data_dir: Path, results_dir: Path,
+                  db_file: Path, pool_size: int, warmup_runs: int, timed_runs: int) -> List[str]:
+    
+    if config_name not in PRIMARY_CONFIGS:
+        raise ValueError(f"unknown ShilmanDB config: {config_name}")
 
-    os.makedirs(results_dir, exist_ok=True)
-
-    try:
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout_seconds,
-        )
-    except subprocess.TimeoutExpired:
-        return False, f"Timed out after {timeout_seconds}s"
-    except OSError as e:
-        return False, f"Failed to execute binary: {e}"
-
-    if proc.returncode != 0:
-        stderr_tail = proc.stderr[-1500:] if proc.stderr else "(empty)"
-        stdout_tail = proc.stdout[-500:] if proc.stdout else "(empty)"
-        return False, (
-            f"Exit code {proc.returncode}\n"
-            f"  stderr: {stderr_tail}\n"
-            f"  stdout: {stdout_tail}"
-        )
-
-    return True, None
-
-
-
-
-def benchmark_shilmandb_config(binary: str, sf: str, config_name: str, data_dir: str, output_dir: str, num_runs: int, purge: bool) -> Tuple[bool, Optional[str], Dict[str, List[float]], Dict[str, int]]:
-    per_query_latencies: Dict[str, List[float]] = {}
-    per_query_rows: Dict[str, int] = {}
-
-
-    warmup_results = os.path.join(output_dir, "shilmandb_results", config_name)
-    warmup_db = f"/tmp/shilmandb_warmup_{config_name}_sf{sf}.db"
-
-
-    if os.path.exists(warmup_db):
-        os.remove(warmup_db)
-
-    print(f"    Run 0 (warmup) ... ", end="", flush=True)
-    t0 = time.perf_counter()
-    success, error = run_load_tpch(
-        binary, sf, config_name, data_dir, warmup_results, warmup_db,
-    )
-    warmup_time = time.perf_counter() - t0
-
-    # Clean up warmup db
-    _safe_remove(warmup_db)
-
-    if not success:
-        print(f"FAILED ({elapsed_str(warmup_time)})")
-        return False, f"Warmup failed: {error}", {}, {}
-
-    print(f"done ({elapsed_str(warmup_time)})")
-
-    # Rename warmup query CSVs to include SF (Q1.csv -> Q1_sf0.01.csv)
-    for tag in QUERIES:
-        src = os.path.join(warmup_results, f"{tag}.csv")
-        dst = os.path.join(warmup_results, f"{tag}_sf{sf}.csv")
-        if os.path.isfile(src):
-            shutil.move(src, dst)
-
-    # Parse warmup latencies for row counts (timing discarded)
-    warmup_lat_path = os.path.join(warmup_results, "latencies.csv")
-    warmup_lat = parse_load_tpch_latencies(warmup_lat_path)
-    for query, (_, rows) in warmup_lat.items():
-        per_query_rows[query] = rows
-    # Remove warmup latencies file (we don't want it in permanent results)
-    _safe_remove(warmup_lat_path)
-
-    # ---- Timed runs (1..N) ----
-    for run_idx in range(1, num_runs + 1):
-        if purge:
-            _run_purge()
-
-        with tempfile.TemporaryDirectory(prefix=f"shilmandb_run{run_idx}_") as tmp_dir:
-            run_db = os.path.join(tmp_dir, f"shilmandb_{config_name}_sf{sf}.db")
-
-            print(f"    Run {run_idx}/{num_runs} ... ", end="", flush=True)
-            t0 = time.perf_counter()
-            success, error = run_load_tpch(
-                binary, sf, config_name, data_dir, tmp_dir, run_db,
-            )
-            run_time = time.perf_counter() - t0
-
-            if not success:
-                print(f"FAILED ({elapsed_str(run_time)})")
-                print(f"      Error: {error.split(chr(10))[0][:100]}")
-                # Continue with remaining runs rather than aborting
-                continue
-
-            # Parse latencies from this run
-            lat_path = os.path.join(tmp_dir, "latencies.csv")
-            run_latencies = parse_load_tpch_latencies(lat_path)
-
-            query_summary = []
-            for query, (latency, rows) in run_latencies.items():
-                per_query_latencies.setdefault(query, []).append(latency)
-                per_query_rows.setdefault(query, rows)
-                query_summary.append(f"{query}={latency:.1f}ms")
-
-            print(f"done ({elapsed_str(run_time)})  [{', '.join(query_summary)}]")
-            # tmp_dir auto-cleaned by TemporaryDirectory context manager
-
-    if not per_query_latencies:
-        return False, "All timed runs failed", {}, {}
-
-    return True, None, per_query_latencies, per_query_rows
-
-
-
-
-def run_sqlite_benchmarks(data_dir: str, output_dir: str, num_runs: int, scale_factors: List[str]) -> Tuple[bool, Optional[str]]:
-    script = os.path.join("bench", "run_sqlite_benchmarks.py")
-    if not os.path.isfile(script):
-        return False, f"SQLite benchmark script not found: {script}"
-
-    cmd = [
-        sys.executable, script,
-        "--data-dir", data_dir,
-        "--output-dir", output_dir,
-        "--runs", str(num_runs),
-        "--sf",
-    ] + scale_factors
-
-    print(f"    Command: {' '.join(cmd)}")
-    try:
-        proc = subprocess.run(
-            cmd,
-            capture_output=False,  # Let SQLite script output directly to terminal
-            timeout=7200,
-        )
-    except subprocess.TimeoutExpired:
-        return False, "SQLite benchmarks timed out after 7200s"
-    except OSError as e:
-        return False, f"Failed to run SQLite script: {e}"
-
-    if proc.returncode != 0:
-        return False, f"SQLite benchmarks exited with code {proc.returncode}"
-
-    return True, None
-
-
-
-
-def run_correctness_comparison(sf: str, configs: List[str], output_dir: str) -> Tuple[bool, Optional[str]]:
-    script = os.path.join("scripts", "compare_results.py")
-    if not os.path.isfile(script):
-        return False, f"Comparison script not found: {script}"
-
-    shilmandb_dir = os.path.join(output_dir, "shilmandb_results")
-    sqlite_dir = os.path.join(output_dir, "sqlite_results")
-
-    cmd = [
-        sys.executable, script,
-        "--shilmandb-dir", shilmandb_dir,
-        "--sqlite-dir", sqlite_dir,
+    cmd: List[str] = [
+        str(binary),
         "--sf", sf,
-        "--configs",
-    ] + configs
+        "--db-file", str(db_file),
+        "--data-dir", str(data_dir / f"sf{sf}"),
+        "--pool-size", str(pool_size),
+        "--warmup", str(warmup_runs),
+        "--runs", str(timed_runs),
+        "--results-dir", str(results_dir),
+        "--no-verify",
+    ]
+    cmd += PRIMARY_CONFIGS[config_name]
+    return cmd
 
-    print(f"    Command: {' '.join(cmd)}")
-    try:
-        proc = subprocess.run(
-            cmd,
-            capture_output=False,  # Let comparison output directly to terminal
-            timeout=120,
+
+#spawn load_tpch for one (sf, config) combo
+#returns per query stats
+def run_shilmandb_config(binary: Path, sf: str, config_name: str, data_dir: Path, output_dir: Path, pool_size: int, 
+                         warmup_runs: int, timed_runs: int, timeout_seconds: Optional[int] = None) -> Optional[Dict[str, QueryStats]]:
+    
+    results_parent = output_dir / "shilmandb_results" / config_name
+    results_parent.mkdir(parents=True, exist_ok=True)
+
+    with tempfile.TemporaryDirectory(prefix=f"shilmandb_{config_name}_sf{sf}_") as tmp:
+        tmp_path = Path(tmp)
+        db_file = tmp_path / f"tpch_sf{sf}.db"
+
+        cmd = build_command(
+            binary=binary,
+            sf=sf,
+            config_name=config_name,
+            data_dir=data_dir,
+            results_dir=tmp_path,
+            db_file=db_file,
+            pool_size=pool_size,
+            warmup_runs=warmup_runs,
+            timed_runs=timed_runs,
         )
-    except subprocess.TimeoutExpired:
-        return False, "Correctness comparison timed out"
-    except OSError as e:
-        return False, f"Failed to run comparison script: {e}"
 
-    if proc.returncode != 0:
-        return False, "Correctness comparison found mismatches (see output above)"
+        print(f"  $ {' '.join(cmd)}", flush=True)
+        t0 = time.time()
+        try:
+            proc = subprocess.run(
+                cmd,
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                timeout=timeout_seconds,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            eprint(f"  ! TIMEOUT after {timeout_seconds}s")
+            return None
 
-    return True, None
+        wall = time.time() - t0
+        print(f"  (wall: {elapsed_str(wall)}, exit: {proc.returncode})", flush=True)
+
+        if proc.returncode != 0:
+            eprint(f"  ! load_tpch exited {proc.returncode}")
+            eprint("  --- last 40 lines of stderr ---")
+            for line in proc.stderr.splitlines()[-40:]:
+                eprint(f"    {line}")
+            return None
+
+        lat_csv = tmp_path / "latencies.csv"
+        if not lat_csv.exists():
+            eprint(f"  ! missing {lat_csv}")
+            return None
+
+        # Copy per-query CSVs to the canonical config dir with the
+        # sf-suffixed filename expected by compare_results.py.
+        for query in QUERIES:
+            src = tmp_path / f"{query}.csv"
+            if src.exists():
+                dst = results_parent / f"{query}_sf{sf}.csv"
+                shutil.copyfile(src, dst)
+
+        return parse_shilmandb_latencies(lat_csv, sf=sf, config=config_name)
 
 
+# SQLite runner adapter
+#Invoke bench/run_sqlite_benchmarks.py as a subprocess
+def run_sqlite_benchmarks(scale_factors: Sequence[str], data_dir: Path, output_dir: Path, timed_runs: int) -> bool:
+    subsection(f"SQLite benchmarks (SFs: {', '.join(scale_factors)})")
+    script = REPO_ROOT / "bench" / "run_sqlite_benchmarks.py"
+    if not script.exists():
+        eprint(f"! missing {script}")
+        return False
+
+    cmd: List[str] = [
+        sys.executable, str(script),
+        "--data-dir", str(data_dir),
+        "--output-dir", str(output_dir),
+        "--runs", str(timed_runs),
+    ]
+    for sf in scale_factors:
+        cmd += ["--sf", sf]
+
+    print(f"  $ {' '.join(cmd)}", flush=True)
+    t0 = time.time()
+    proc = subprocess.run(cmd, cwd=REPO_ROOT, check=False)
+    print(f"  (wall: {elapsed_str(time.time() - t0)}, exit: {proc.returncode})", flush=True)
+    return proc.returncode == 0
 
 
-def parse_sqlite_latencies(output_dir: str, scale_factors: List[str]) -> List[Dict]:
-    lat_path = os.path.join(output_dir, "sqlite_latencies.csv")
-    if not os.path.isfile(lat_path):
-        return []
+#Parse {output_dir}/sqlite_latencies.csv and produce a dict keyed by (sf, config, query)
+def parse_sqlite_latencies(output_dir: Path, scale_factors: Sequence[str]) -> Dict[Tuple[str, str, str], QueryStats]:
+    lat_path = output_dir / "sqlite_latencies.csv"
+    if not lat_path.exists():
+        eprint(f"! missing {lat_path}")
+        return {}
 
-    # Accumulate per-run latencies grouped by (sf, query, mode)
-    groups: Dict[Tuple[str, str, str], List[float]] = {}
-    with open(lat_path, "r", newline="") as f:
+    buckets: Dict[Tuple[str, str, str], List[float]] = {}
+    with lat_path.open() as f:
         reader = csv.DictReader(f)
         for row in reader:
-            try:
-                sf = row["sf"]
-                if sf not in scale_factors:
-                    continue
-                key = (sf, row["query"], row["mode"])
-                groups.setdefault(key, []).append(float(row["latency_ms"]))
-            except (KeyError, ValueError, TypeError) as e:
-                print(f"    WARNING: Skipping malformed SQLite latency row: {e}")
+            sf = row["sf"]
+            if sf not in scale_factors:
                 continue
+            mode = row["mode"]                 # 'memory' | 'disk'
+            config = "sqlite_memory" if mode == "memory" else "sqlite_disk"
+            key = (sf, config, row["query"])
+            buckets.setdefault(key, []).append(float(row["latency_ms"]))
 
-    # Count rows from result CSVs
-    row_counts: Dict[Tuple[str, str], int] = {}
-    sqlite_results_dir = os.path.join(output_dir, "sqlite_results")
-    for sf in scale_factors:
-        for query in QUERIES:
-            csv_path = os.path.join(sqlite_results_dir, f"{query}_sf{sf}.csv")
-            if os.path.isfile(csv_path):
-                with open(csv_path, "r") as f:
-                    # Count data rows (subtract header)
-                    count = sum(1 for line in f if line.strip()) - 1
-                    row_counts[(sf, query)] = max(0, count)
-
-    records = []
-    for (sf, query, mode), latencies in sorted(groups.items()):
-        config_name = f"sqlite_{mode}"
-        median = statistics.median(latencies)
-        rows = row_counts.get((sf, query), 0)
-        records.append({
-            "sf": sf,
-            "query": query,
-            "config": config_name,
-            "median_latency_ms": median,
-            "rows": rows,
-        })
-
-    return records
-
-
-
-
-def write_merged_latencies(records: List[Dict], output_path: str) -> None:
-    parent = os.path.dirname(output_path)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-
-    with open(output_path, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["sf", "query", "config", "median_latency_ms", "rows"])
-        for rec in sorted(records, key=lambda r: (r["sf"], r["query"], r["config"])):
-            writer.writerow([
-                rec["sf"],
-                rec["query"],
-                rec["config"],
-                f"{rec['median_latency_ms']:.4f}",
-                rec["rows"],
-            ])
-
-
-
-
-def _safe_remove(path: str) -> None:
-    try:
-        if os.path.isfile(path):
-            os.remove(path)
-    except OSError:
-        pass
-
-
-def _run_purge() -> None:
-    try:
-        result = subprocess.run(["sudo", "purge"], capture_output=True, timeout=30)
-        if result.returncode != 0:
-            print("    WARNING: 'sudo purge' failed -- cache may be warm")
-    except (subprocess.TimeoutExpired, OSError):
-        print("    WARNING: 'sudo purge' could not be executed -- cache may be warm")
-
-
-def trigger_build() -> bool:
-    print("  Building (Release + ML) ...")
-    try:
-        proc = subprocess.run(
-            ["bash", "scripts/build.sh", "Release", "ON"],
-            capture_output=False,
-            timeout=600,
+    out: Dict[Tuple[str, str, str], QueryStats] = {}
+    for (sf, config, query), lats in buckets.items():
+        out[(sf, config, query)] = QueryStats(
+            sf=sf, config=config, query=query,
+            median_latency_ms=statistics.median(lats),
+            rows=None,
+            median_hits=None,
+            median_misses=None,
         )
-    except subprocess.TimeoutExpired:
-        print("  ERROR: Build timed out after 600s")
-        return False
-    except OSError as e:
-        print(f"  ERROR: Could not run build script: {e}")
-        return False
-
-    if proc.returncode != 0:
-        print("  ERROR: Build failed.")
-        return False
-
-    print("  Build succeeded.")
-    return True
+    return out
 
 
+#Secondary sweeps
+#run baseline config at POOL_SWEEP_SF with each pool size
+def run_pool_size_sweep(binary: Path, data_dir: Path, output_dir: Path, 
+                        pool_sizes: Sequence[int], warmup_runs: int, timed_runs: int) -> Dict[Tuple[str, str, str], QueryStats]:
+    
+    sf = POOL_SWEEP_SF
+    section(f"Pool-size sweep (SF={sf}, pool_sizes={list(pool_sizes)})")
+    baseline_flags = list(PRIMARY_CONFIGS["baseline"])
+    results: Dict[Tuple[str, str, str], QueryStats] = {}
+    
+    for ps in pool_sizes:
+        config_label = f"baseline_pool{ps}"
+        subsection(f"{config_label}")
+        PRIMARY_CONFIGS[config_label] = baseline_flags  # shares flags; pool_size differs via --pool-size
+        try:
+            stats = run_shilmandb_config(
+                binary=binary, sf=sf, config_name=config_label,
+                data_dir=data_dir, output_dir=output_dir,
+                pool_size=ps, warmup_runs=warmup_runs, timed_runs=timed_runs,
+            )
+            
+        finally:
+            del PRIMARY_CONFIGS[config_label]
+            
+        if stats is None:
+            eprint(f"  pool-sweep {ps} failed — skipping")
+            continue
+        for query, qs in stats.items():
+            results[(sf, config_label, query)] = qs
+            
+    return results
 
+
+#run a +learned -like config but with V1 eviction model at each SF
+def run_v1_eviction_sweep(binary: Path, data_dir: Path, output_dir: Path, 
+                          scale_factors: Sequence[str], warmup_runs: int, timed_runs: int) -> Dict[Tuple[str, str, str], QueryStats]:
+    
+    section(f"V1 eviction sweep (SFs: {', '.join(scale_factors)})")
+    v1_flags = [
+        "--create-indexes", "true",
+        "--execution-mode", "tuple",
+        "--use-learned-join", "--join-model-path", JOIN_MODEL_PATH,
+        "--use-learned-eviction",
+        "--eviction-model-path", EVICTION_V1_MODEL_PATH,
+        "--eviction-model-version", "v1",
+    ]
+    PRIMARY_CONFIGS["+learned_v1"] = v1_flags
+    try:
+        results: Dict[Tuple[str, str, str], QueryStats] = {}
+        for sf in scale_factors:
+            subsection(f"+learned_v1 @ SF={sf}")
+            stats = run_shilmandb_config(
+                binary=binary, sf=sf, config_name="+learned_v1",
+                data_dir=data_dir, output_dir=output_dir,
+                pool_size=POOL_SIZES[sf], warmup_runs=warmup_runs, timed_runs=timed_runs,
+            )
+            if stats is None:
+                eprint(f"  +learned_v1 @ SF={sf} failed — skipping")
+                continue
+            for query, qs in stats.items():
+                results[(sf, "+learned_v1", query)] = qs
+    finally:
+        del PRIMARY_CONFIGS["+learned_v1"]
+    return results
+
+
+#  Output writers
+
+def _fmt_float(x: Optional[float]) -> str:
+    return "" if x is None else f"{x:.4f}"
+
+
+def _fmt_int(x: Optional[int]) -> str:
+    return "" if x is None else str(x)
+
+#write latencies.csv with schema: sf, query, config, median_latency_ms, rows, hits, misses
+def write_latencies_csv(path: Path, records: Dict[Tuple[str, str, str], QueryStats]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    query_order = {q: i for i, q in enumerate(QUERIES)}
+    keys = sorted(records.keys(), key=lambda k: (k[0], query_order.get(k[2], 999), k[1]))
+    with path.open("w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["sf", "query", "config", "median_latency_ms", "rows", "hits", "misses"])
+        for key in keys:
+            qs = records[key]
+            w.writerow([
+                qs.sf, qs.query, qs.config,
+                _fmt_float(qs.median_latency_ms),
+                _fmt_int(qs.rows),
+                _fmt_int(qs.median_hits),
+                _fmt_int(qs.median_misses),
+            ])
+    print(f"  -> {path}")
+
+
+#Aggregate per-query hit/miss counts into per-(sf,config) hit_rate and improvement_over_lru
+def write_hit_rates_csv(path: Path, records: Dict[Tuple[str, str, str], QueryStats], pool_sizes_by_config: Dict[Tuple[str, str], int]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    by_sc: Dict[Tuple[str, str], List[QueryStats]] = {}
+    for (sf, config, _q), qs in records.items():
+        by_sc.setdefault((sf, config), []).append(qs)
+
+    rates: Dict[Tuple[str, str], Optional[float]] = {}
+    for (sf, config), stats_list in by_sc.items():
+        is_sqlite = config.startswith("sqlite_")
+        if is_sqlite:
+            rates[(sf, config)] = None
+            continue
+        
+        total_hits = sum(s.median_hits for s in stats_list if s.median_hits is not None)
+        total_misses = sum(s.median_misses for s in stats_list if s.median_misses is not None)
+        total = total_hits + total_misses
+        rates[(sf, config)] = (total_hits / total) if total > 0 else 0.0
+
+    baseline_rates: Dict[str, Optional[float]] = {
+        sf: rates.get((sf, "baseline")) for sf in {k[0] for k in rates}
+    }
+
+    def _config_rank(name: str) -> int:
+        if name == "baseline": return 0
+        if name.startswith("+"): return 1
+        if name.startswith("baseline_pool"): return 2
+        if name.startswith("sqlite_"): return 3
+        return 4
+
+    keys = sorted(rates.keys(), key=lambda k: (k[0], _config_rank(k[1]), k[1]))
+
+    with path.open("w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["sf", "config", "pool_size", "hit_rate", "improvement_over_lru"])
+        
+        for (sf, config) in keys:
+            rate = rates[(sf, config)]
+            ps = pool_sizes_by_config.get((sf, config), "")
+            if rate is None:
+                w.writerow([sf, config, ps, "", ""])
+                continue
+            if config == "baseline":
+                improvement = ""
+            else:
+                base = baseline_rates.get(sf)
+                improvement = "" if base is None else f"{rate - base:.4f}"
+            w.writerow([sf, config, ps, f"{rate:.4f}", improvement])
+
+    print(f"  -> {path}")
+
+
+#For each ShilmanDB config in configs, invoke scripts/compare_results.py and capture per-query PASS/FAIL/SKIP.
+def write_correctness_csv(path: Path, sfs: Sequence[str], configs: Sequence[str], output_dir: Path, queries: Sequence[str] = tuple(QUERIES)) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    comparable = [c for c in configs if not c.startswith("sqlite_")]
+    sqlite_configs = [c for c in configs if c.startswith("sqlite_")]
+
+    rows: List[Tuple[str, str, str, str]] = []
+
+    for sf in sfs:
+        for q in queries:
+            for c in sqlite_configs:
+                rows.append((sf, q, c, "SKIP"))
+
+    script = REPO_ROOT / "scripts" / "compare_results.py"
+    # compare_results.py print_results() emits per-comparison lines of the form:
+    #   "  PASS  [<config>] <Qtag> SF=<sf>"
+    #   "  FAIL  [<config>] <Qtag> SF=<sf>  (N mismatch(es))"
+    #   "  SKIP  [<config>] <Qtag> SF=<sf>"
+    # followed by indented mismatch/error detail lines. We scan each line,
+    # strip leading whitespace, match the first token against {PASS,FAIL,SKIP},
+    # then extract the Qtag (the token after the [config] bracket).
+    import re
+    line_re = re.compile(r"^(PASS|FAIL|SKIP)\s+\[(?P<config>[^\]]+)\]\s+(?P<query>Q\d+)\s+SF=(?P<sf>\S+)")
+
+    for sf in sfs:
+        for cfg in comparable:
+            shilmandb_dir = output_dir / "shilmandb_results"
+            sqlite_dir = output_dir / "sqlite_results"
+            cmd = [
+                sys.executable, str(script),
+                "--shilmandb-dir", str(shilmandb_dir),
+                "--sqlite-dir", str(sqlite_dir),
+                "--sf", sf,
+                "--configs", cfg,
+            ]
+            print(f"  $ {' '.join(cmd)}", flush=True)
+            proc = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True, check=False,)
+            seen: Dict[str, str] = {}
+            
+            for raw_line in proc.stdout.splitlines():
+                m = line_re.match(raw_line.strip())
+                if not m:
+                    continue
+                status = m.group(1)
+                query = m.group("query")
+
+                if query not in seen:
+                    seen[query] = status
+                    
+            for q in queries:
+                rows.append((sf, q, cfg, seen.get(q, "SKIP")))
+
+    query_order = {q: i for i, q in enumerate(QUERIES)}
+    rows.sort(key=lambda r: (r[0], query_order.get(r[1], 999), r[2]))
+
+    with path.open("w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["sf", "query", "config", "status"])
+        for row in rows:
+            w.writerow(row)
+    print(f"  -> {path}")
+
+
+# ── CLI + main ────────────────────────────────────────────────────────
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Master benchmark orchestration for ShilmanDB vs SQLite.\n"
-            "Runs multi-run benchmarks, correctness verification, and produces\n"
-            "a merged latency CSV covering all configurations."
-        ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=(
-            "Examples:\n"
-            "  python bench/run_benchmarks.py                              # all configs, all SFs\n"
-            "  python bench/run_benchmarks.py --config baseline --sf 0.01  # quick baseline test\n"
-            "  python bench/run_benchmarks.py --config learned --runs 10   # learned configs, 10 runs\n"
-            "  python bench/run_benchmarks.py --purge --runs 5             # cold-start measurements\n"
-        ),
-    )
-    parser.add_argument(
-        "--config",
-        choices=["baseline", "learned", "all"],
-        default="all",
-        help="ShilmanDB configs to benchmark (default: all)",
-    )
-    parser.add_argument(
-        "--sf",
-        nargs="+",
-        default=["all"],
-        help="Scale factors: 0.01, 0.1, 1.0, or 'all' (default: all)",
-    )
-    parser.add_argument(
-        "--runs",
-        type=int,
-        default=5,
-        help="Number of timed runs per config (default: 5)",
-    )
-    parser.add_argument(
-        "--build",
-        action="store_true",
-        help="Trigger ML release build before running benchmarks",
-    )
-    parser.add_argument(
-        "--binary",
-        default="build/bench/load_tpch",
-        help="Path to load_tpch binary (default: build/bench/load_tpch)",
-    )
-    parser.add_argument(
-        "--data-dir",
-        default="bench/tpch_data",
-        help="TPC-H data directory (default: bench/tpch_data)",
-    )
-    parser.add_argument(
-        "--output-dir",
-        default="bench/results",
-        help="Output directory (default: bench/results)",
-    )
-    parser.add_argument(
-        "--purge",
-        action="store_true",
-        help="Run 'sudo purge' between timed runs for cold-start measurements",
-    )
-    parser.add_argument(
-        "--skip-sqlite",
-        action="store_true",
-        help="Skip SQLite benchmarks (use existing results if available)",
-    )
-    parser.add_argument(
-        "--skip-correctness",
-        action="store_true",
-        help="Skip correctness comparison step",
-    )
-    return parser.parse_args()
+    p = argparse.ArgumentParser(description="Phase 20.1 benchmark runner")
+    p.add_argument("--binary", type=Path, default=DEFAULT_BINARY, help=f"Path to load_tpch binary (default: {DEFAULT_BINARY})")
+    p.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR, help=f"TPC-H data dir (default: {DEFAULT_DATA_DIR})")
+    p.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR, help=f"Output dir (default: {DEFAULT_OUTPUT_DIR})")
+    p.add_argument("--sf", action="append", choices=ALL_SCALE_FACTORS + ["all"], help="Scale factor(s). Repeat flag or use 'all'. Default: 'all'.")
+    p.add_argument("--configs", default="all", help=("Comma-separated configs. Accepts 'all' or a subset of: " + ",".join(ALL_CONFIG_NAMES)))
+    p.add_argument("--warmup", type=int, default=1, help="Warmup runs per query (default 1)")
+    p.add_argument("--runs", type=int, default=5, help="Timed runs per query (default 5)")
+    p.add_argument("--pool-sweep", action="store_true", help=f"Also run baseline pool-size sweep at SF={POOL_SWEEP_SF}")
+    p.add_argument("--v1-eviction", action="store_true", help="Also run +learned with V1 eviction model per SF")
+    p.add_argument("--skip-sqlite", action="store_true", help="Skip the SQLite benchmark invocation (reuse existing output)")
+    p.add_argument("--skip-correctness", action="store_true", help="Skip the correctness comparison step")
+    p.add_argument("--timeout", type=int, default=None, help="Per-config subprocess timeout in seconds (default: none)")
+    return p.parse_args()
 
 
+def resolve_sfs(arg: Optional[Sequence[str]]) -> List[str]:
+    if not arg or "all" in arg:
+        return list(ALL_SCALE_FACTORS)
+    s = set(arg)
+    return [sf for sf in ALL_SCALE_FACTORS if sf in s]
 
 
-def main() -> None:
+def resolve_configs(arg: str) -> List[str]:
+    if arg == "all":
+        return list(ALL_CONFIG_NAMES)
+    requested = [c.strip() for c in arg.split(",") if c.strip()]
+    for c in requested:
+        if c not in ALL_CONFIG_NAMES:
+            raise SystemExit(f"unknown config: {c!r}. "
+                             f"Choose from: {','.join(ALL_CONFIG_NAMES)} or 'all'.")
+    return requested
+
+
+def main() -> int:
     args = parse_args()
+    sfs = resolve_sfs(args.sf)
+    configs = resolve_configs(args.configs)
 
-    if args.runs < 1:
-        print("Error: --runs must be at least 1.")
-        sys.exit(1)
+    output_dir: Path = args.output_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Resolve scale factors
-    if "all" in args.sf:
-        scale_factors = ALL_SCALE_FACTORS
-    else:
-        scale_factors = []
-        for sf in args.sf:
-            if sf not in ALL_SCALE_FACTORS:
-                print(f"Error: unknown scale factor '{sf}'. Choose from {ALL_SCALE_FACTORS} or 'all'.")
-                sys.exit(1)
-            scale_factors.append(sf)
-        # Deduplicate while preserving order
-        scale_factors = list(dict.fromkeys(scale_factors))
+    section(f"Phase 20.1 benchmark runner | SFs={sfs} | configs={configs}")
+    print(f"  warmup={args.warmup}, runs={args.runs}, "
+          f"pool_sweep={args.pool_sweep}, v1_eviction={args.v1_eviction}")
 
-    # Resolve ShilmanDB configs
-    shilmandb_configs = CONFIG_GROUPS[args.config]
+    shilmandb_configs = [c for c in configs if c in PRIMARY_CONFIGS]
+    need_sqlite = any(c.startswith("sqlite_") for c in configs)
 
-    overall_t0 = time.perf_counter()
-    print("=" * 70)
-    print("  ShilmanDB vs SQLite -- Master Benchmark Orchestration")
-    print("=" * 70)
-    print(f"  Timestamp:      {time.strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"  Config group:   {args.config} -> {shilmandb_configs}")
-    print(f"  Scale factors:  {scale_factors}")
-    print(f"  Timed runs:     {args.runs}")
-    print(f"  Binary:         {args.binary}")
-    print(f"  Data dir:       {args.data_dir}")
-    print(f"  Output dir:     {args.output_dir}")
-    print(f"  Purge caches:   {args.purge}")
-    print(f"  Skip SQLite:    {args.skip_sqlite}")
-    print(f"  Skip correct.:  {args.skip_correctness}")
+    if need_sqlite and not args.skip_sqlite:
+        ok = run_sqlite_benchmarks(sfs, args.data_dir, output_dir, args.runs)
+        if not ok:
+            eprint("! sqlite benchmarks failed — continuing (SQLite rows will be empty)")
+    elif need_sqlite and args.skip_sqlite:
+        print("  (--skip-sqlite: reusing existing sqlite_latencies.csv)")
 
-    if args.build:
-        section_header("BUILD")
-        if not trigger_build():
-            sys.exit(1)
+    all_records: Dict[Tuple[str, str, str], QueryStats] = {}
+    pool_sizes_by_config: Dict[Tuple[str, str], int] = {}
 
+    for sf in sfs:
+        for cfg in shilmandb_configs:
+            section(f"ShilmanDB {cfg} @ SF={sf}")
+            pool = POOL_SIZES[sf]
+            stats = run_shilmandb_config(
+                binary=args.binary, sf=sf, config_name=cfg,
+                data_dir=args.data_dir, output_dir=output_dir,
+                pool_size=pool, warmup_runs=args.warmup, timed_runs=args.runs,
+                timeout_seconds=args.timeout,
+            )
+            pool_sizes_by_config[(sf, cfg)] = pool
+            if stats is None:
+                continue
+            for q, qs in stats.items():
+                all_records[(sf, cfg, q)] = qs
 
-    if not os.path.isfile(args.binary):
-        print(f"\nError: binary not found at '{args.binary}'.")
-        print("  Run with --build to build it, or pass --binary <path>.")
-        sys.exit(1)
-
-
-    shilmandb_results: List[Dict] = []  # merged latency records for ShilmanDB
-    sqlite_ok = False
-    correctness_results: List[Tuple[str, List[str], bool, str]] = []
-    failures: List[str] = []
-
-    section_header("DATA CHECK")
-    valid_sfs: List[str] = []
-    missing_sfs: List[str] = []
-    for sf in scale_factors:
-        if check_tpch_data(args.data_dir, sf):
-            sf_dir = os.path.join(args.data_dir, f"sf{sf}")
-            print(f"  SF={sf}: data found ({sf_dir})")
-            valid_sfs.append(sf)
-        else:
-            print(f"  SF={sf}: data not found")
-            missing_sfs.append(sf)
-
-    # generate_tpch_data.sh always produces all SFs in one invocation
-    if missing_sfs:
-        print(f"  Missing SFs: {missing_sfs}. Running data generation ...")
-        if generate_tpch_data(args.data_dir):
-            for sf in missing_sfs:
-                if check_tpch_data(args.data_dir, sf):
-                    valid_sfs.append(sf)
-                else:
-                    msg = f"SF={sf}: still missing after generation, skipping"
-                    print(f"  ERROR: {msg}")
-                    failures.append(msg)
-        else:
-            for sf in missing_sfs:
-                msg = f"SF={sf}: data generation failed, skipping"
-                print(f"  ERROR: {msg}")
-                failures.append(msg)
-
-    if not valid_sfs:
-        print("\nError: no valid scale factors with data available.")
-        sys.exit(1)
-
-
-    if not args.skip_sqlite:
-        section_header(f"SQLITE BENCHMARKS (SFs: {valid_sfs}, {args.runs} runs)")
-        sq_ok, sq_err = run_sqlite_benchmarks(
-            args.data_dir, args.output_dir, args.runs, valid_sfs,
+    if args.pool_sweep:
+        sweep_records = run_pool_size_sweep(
+            binary=args.binary, data_dir=args.data_dir, output_dir=output_dir,
+            pool_sizes=POOL_SWEEP_SIZES, warmup_runs=args.warmup, timed_runs=args.runs,
         )
-        if sq_ok:
-            sqlite_ok = True
-            print(f"\n  SQLite benchmarks completed for all requested SFs.")
-        else:
-            msg = f"SQLite benchmarks failed: {sq_err}"
-            print(f"\n  WARNING: {msg}")
-            failures.append(msg)
-    else:
-        print("\n  Skipping SQLite benchmarks (--skip-sqlite).")
-        sqlite_lat_path = os.path.join(args.output_dir, "sqlite_latencies.csv")
-        if os.path.isfile(sqlite_lat_path):
-            sqlite_ok = True
-            print(f"  Using existing SQLite results from {sqlite_lat_path}")
+        all_records.update(sweep_records)
+        for (sf, cfg, _q) in sweep_records:
+            ps = int(cfg.removeprefix("baseline_pool"))
+            pool_sizes_by_config[(sf, cfg)] = ps
 
+    if args.v1_eviction:
+        v1_records = run_v1_eviction_sweep(
+            binary=args.binary, data_dir=args.data_dir, output_dir=output_dir,
+            scale_factors=sfs, warmup_runs=args.warmup, timed_runs=args.runs,
+        )
+        all_records.update(v1_records)
+        for (sf, cfg, _q) in v1_records:
+            pool_sizes_by_config[(sf, cfg)] = POOL_SIZES[sf]
 
-    for sf in valid_sfs:
-        section_header(f"SHILMANDB BENCHMARKS -- SF={sf}")
+    if need_sqlite:
+        sqlite_records = parse_sqlite_latencies(output_dir, sfs)
+        for key, qs in sqlite_records.items():
+            all_records[key] = qs
+            pool_sizes_by_config[(key[0], key[1])] = ""  # type: ignore[assignment]
 
-        configs_that_ran: List[str] = []
+    section("Writing outputs")
+    write_latencies_csv(output_dir / "latencies.csv", all_records)
+    write_hit_rates_csv(output_dir / "hit_rates.csv", all_records, pool_sizes_by_config)
 
-        for config_name in shilmandb_configs:
-            sub_header(
-                f"ShilmanDB [{config_name}] SF={sf}, "
-                f"pool={POOL_SIZES[sf]}, {args.runs} timed runs"
-            )
+    if not args.skip_correctness:
+        write_correctness_csv(
+            output_dir / "correctness.csv",
+            sfs=sfs,
+            configs=configs + (["+learned_v1"] if args.v1_eviction else []) + ([f"baseline_pool{ps}" for ps in POOL_SWEEP_SIZES] if args.pool_sweep else []),
+            output_dir=output_dir,
+        )
 
-            t0 = time.perf_counter()
-            success, error, per_query_lat, per_query_rows = benchmark_shilmandb_config(
-                binary=args.binary,
-                sf=sf,
-                config_name=config_name,
-                data_dir=args.data_dir,
-                output_dir=args.output_dir,
-                num_runs=args.runs,
-                purge=args.purge,
-            )
-            config_time = time.perf_counter() - t0
-
-            if success:
-                configs_that_ran.append(config_name)
-
-                # Compute medians and accumulate records
-                for query in QUERIES:
-                    latencies = per_query_lat.get(query, [])
-                    rows = per_query_rows.get(query, 0)
-                    if latencies:
-                        median = statistics.median(latencies)
-                        shilmandb_results.append({
-                            "sf": sf,
-                            "query": query,
-                            "config": config_name,
-                            "median_latency_ms": median,
-                            "rows": rows,
-                        })
-
-                print(
-                    f"    Completed {config_name} SF={sf} "
-                    f"({elapsed_str(config_time)})"
-                )
-            else:
-                msg = f"{config_name} SF={sf}: {error}"
-                print(f"    FAILED: {msg}")
-                failures.append(msg)
-
-        # ---- Correctness comparison for this SF ----
-        if not args.skip_correctness and configs_that_ran:
-            sub_header(f"Correctness comparison (SF={sf})")
-            cmp_ok, cmp_err = run_correctness_comparison(
-                sf, configs_that_ran, args.output_dir,
-            )
-            correctness_results.append((sf, configs_that_ran, cmp_ok, cmp_err or ""))
-            if not cmp_ok:
-                print(f"  WARNING: Correctness issues detected for SF={sf}")
-                # Do NOT abort -- keep benchmarking
-        elif args.skip_correctness:
-            print("\n  Skipping correctness comparison (--skip-correctness).")
-
-
-    section_header("MERGE RESULTS")
-
-    all_merged: List[Dict] = list(shilmandb_results)
-
-    # Add SQLite medians
-    if sqlite_ok:
-        sqlite_records = parse_sqlite_latencies(args.output_dir, valid_sfs)
-        all_merged.extend(sqlite_records)
-        print(f"  SQLite: {len(sqlite_records)} median records")
-    else:
-        print("  SQLite: no results available")
-
-    print(f"  ShilmanDB: {len(shilmandb_results)} median records")
-
-    if all_merged:
-        merged_path = os.path.join(args.output_dir, "latencies.csv")
-        write_merged_latencies(all_merged, merged_path)
-        print(f"  Merged latencies written to {merged_path}")
-    else:
-        print("  WARNING: No latency data to merge.")
-
-
-    overall_time = time.perf_counter() - overall_t0
-    section_header("SUMMARY")
-
-    # Latency summary table
-    if all_merged:
-        print(f"\n  {'SF':<8} {'Query':<6} {'Config':<30} {'Median (ms)':>12} {'Rows':>6}")
-        print(f"  {'-' * 66}")
-        for rec in sorted(all_merged, key=lambda r: (r["sf"], r["query"], r["config"])):
-            print(
-                f"  {rec['sf']:<8} {rec['query']:<6} {rec['config']:<30} "
-                f"{rec['median_latency_ms']:>12.2f} {rec['rows']:>6}"
-            )
-
-    # Correctness summary
-    if correctness_results:
-        print(f"\n  Correctness checks:")
-        for sf, configs, passed, err in correctness_results:
-            status = "PASS" if passed else "FAIL"
-            print(f"    SF={sf} [{', '.join(configs)}]: {status}")
-            if not passed and err:
-                print(f"      {err[:120]}")
-
-    # Failures
-    if failures:
-        print(f"\n  Failures ({len(failures)}):")
-        for msg in failures:
-            short = msg.split("\n")[0][:120]
-            print(f"    - {short}")
-    else:
-        print(f"\n  All benchmarks completed successfully.")
-
-    print(f"\n  Total elapsed: {elapsed_str(overall_time)}")
-    print(f"  Output directory: {args.output_dir}")
-    if all_merged:
-        print(f"  Merged CSV: {os.path.join(args.output_dir, 'latencies.csv')}")
-
-    # Exit with error if there were failures (but we ran everything we could)
-    if failures:
-        sys.exit(1)
+    section("Done")
+    print(f"  latencies  -> {output_dir / 'latencies.csv'}")
+    print(f"  hit_rates  -> {output_dir / 'hit_rates.csv'}")
+    if not args.skip_correctness:
+        print(f"  correctness -> {output_dir / 'correctness.csv'}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -156,6 +156,9 @@ struct Args {
     std::string trace_path;
     std::string results_dir;
     size_t pool_size{4096};
+    bool create_indexes{true};
+    int warmup_runs{1};
+    int timed_runs{5};
     ExecutionMode exec_mode{ExecutionMode::TUPLE};
 #ifdef SHILMANDB_HAS_LIBTORCH
     bool use_learned_join{false};
@@ -168,7 +171,9 @@ struct Args {
 
 static void PrintUsage(const char* prog) {
     std::cerr << "Usage: " << prog << " --sf <scale_factor> --db-file <path> --data-dir <path> [--no-verify]"
-              << " [--enable-tracing <path>] [--pool-size <N>] [--results-dir <path>]"
+              << " [--enable-tracing <path>] [--pool-size <N>] [--create-indexes <true|false>]"
+              << " [--warmup <N>] [--runs <N>]"
+              << " [--results-dir <path>]"
               << " [--execution-mode <tuple|vectorized>]"
 #ifdef SHILMANDB_HAS_LIBTORCH
               << " [--use-learned-join --join-model-path <path>]"
@@ -194,6 +199,28 @@ static Args ParseArgs(int argc, char* argv[]) {
             args.trace_path = argv[++i];
         } else if (arg == "--pool-size" && i + 1 < argc) {
             args.pool_size = std::stoul(argv[++i]);
+        } else if (arg == "--create-indexes" && i + 1 < argc) {
+            std::string val = argv[++i];
+            if (val == "true" || val == "1") {
+                args.create_indexes = true;
+            } else if (val == "false" || val == "0") {
+                args.create_indexes = false;
+            } else {
+                std::cerr << "Error: --create-indexes expects 'true' or 'false', got '" << val << "'\n";
+                std::exit(1);
+            }
+        } else if (arg == "--warmup" && i + 1 < argc) {
+            args.warmup_runs = std::stoi(argv[++i]);
+            if (args.warmup_runs < 0) {
+                std::cerr << "Error: --warmup must be >= 0\n";
+                std::exit(1);
+            }
+        } else if (arg == "--runs" && i + 1 < argc) {
+            args.timed_runs = std::stoi(argv[++i]);
+            if (args.timed_runs < 1) {
+                std::cerr << "Error: --runs must be >= 1\n";
+                std::exit(1);
+            }
         } else if (arg == "--results-dir" && i + 1 < argc) {
             args.results_dir = argv[++i];
         } else if (arg == "--execution-mode" && i + 1 < argc) {
@@ -203,8 +230,7 @@ static Args ParseArgs(int argc, char* argv[]) {
             } else if (mode_str == "tuple") {
                 args.exec_mode = ExecutionMode::TUPLE;
             } else {
-                std::cerr << "Error: unknown --execution-mode '" << mode_str
-                          << "' (expected 'tuple' or 'vectorized')\n";
+                std::cerr << "Error: unknown --execution-mode '" << mode_str << "' (expected 'tuple' or 'vectorized')\n";
                 std::exit(1);
             }
 #ifdef SHILMANDB_HAS_LIBTORCH
@@ -292,20 +318,24 @@ int main(int argc, char* argv[]) {
 
 
 
-    std::cout << "\nCreating indexes ...\n";
-    auto indexes = BuildIndexDescs();
-    for (const auto& idx : indexes) {
-        std::cout << "  " << idx.index_name << " on " << idx.table_name << "(" << idx.column_name << ") ... " << std::flush;
-        auto start = std::chrono::steady_clock::now();
-        auto* index_info = db.GetCatalog()->CreateIndex(idx.index_name, idx.table_name, idx.column_name);
-        auto elapsed = std::chrono::steady_clock::now() - start;
-        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
+    if (args.create_indexes) {
+        std::cout << "\nCreating indexes ...\n";
+        auto indexes = BuildIndexDescs();
+        for (const auto& idx : indexes) {
+            std::cout << "  " << idx.index_name << " on " << idx.table_name << "(" << idx.column_name << ") ... " << std::flush;
+            auto start = std::chrono::steady_clock::now();
+            auto* index_info = db.GetCatalog()->CreateIndex(idx.index_name, idx.table_name, idx.column_name);
+            auto elapsed = std::chrono::steady_clock::now() - start;
+            auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
 
-        if (index_info) {
-            std::cout << "done (" << ms << " ms)\n";
-        } else {
-            std::cout << "FAILED\n";
+            if (index_info) {
+                std::cout << "done (" << ms << " ms)\n";
+            } else {
+                std::cout << "FAILED\n";
+            }
         }
+    } else {
+        std::cout << "\nSkipping index creation (--create-indexes false)\n";
     }
 
 
@@ -482,86 +512,103 @@ int main(int argc, char* argv[]) {
             return str;
         };
 
-        // Latency records for latencies.csv
+        // Latency records for latencies.csv — one per (query, run)
         struct LatencyRecord {
             std::string tag;
+            int run;              // 0-indexed timed run number
             size_t rows;
             double latency_ms;
+            uint64_t hits;
+            uint64_t misses;
         };
         std::vector<LatencyRecord> latencies;
 
+        auto* bpm = db.GetBufferPoolManager();
+
+        // Warmup runs — timings discarded, CSVs not overwritten
+        if (args.warmup_runs > 0) {
+            std::cout << "\n--- Warmup (" << args.warmup_runs << " run" << (args.warmup_runs == 1 ? "" : "s") << ") ---\n";
+            for (int w = 0; w < args.warmup_runs; ++w) {
+                for (const auto& q : queries) {
+                    try {
+                        (void)db.ExecuteSQL(q.sql, args.exec_mode);
+                    } catch (const std::exception& e) {
+                        std::cerr << "  warmup " << q.tag << " failed: " << e.what() << "\n";
+                    }
+                }
+            }
+        }
+
+        std::cout << "\n--- Timed runs (" << args.timed_runs << ") ---\n";
         int passed = 0;
         for (const auto& q : queries) {
-            std::cout << "\n  " << q.name << " ... " << std::flush;
-            auto start = std::chrono::steady_clock::now();
-            try {
-                auto result = db.ExecuteSQL(q.sql, args.exec_mode);
-                auto elapsed = std::chrono::steady_clock::now() - start;
-                double ms = std::chrono::duration<double, std::milli>(elapsed).count();
+            std::cout << "\n  " << q.name << " ...\n";
+            size_t rows = 0;
+            for (int run = 0; run < args.timed_runs; ++run) {
+                bpm->ResetStats();
+                auto start = std::chrono::steady_clock::now();
+                try {
+                    auto result = db.ExecuteSQL(q.sql, args.exec_mode);
+                    auto elapsed = std::chrono::steady_clock::now() - start;
+                    double ms = std::chrono::duration<double, std::milli>(elapsed).count();
+                    uint64_t hits = bpm->GetHitCount();
+                    uint64_t misses = bpm->GetMissCount();
+                    rows = result.tuples.size();
 
-                std::cout << "OK — " << result.tuples.size() << " rows (" << static_cast<int64_t>(ms) << " ms)\n";
+                    std::cout << "    run " << run << ": "
+                              << static_cast<int64_t>(ms) << " ms, "
+                              << rows << " rows, "
+                              << hits << " hits, "
+                              << misses << " misses\n";
 
-                // Print first few rows for inspection
-                const auto& schema = result.schema;
-                std::cout << "    Columns: ";
-                for (uint32_t c = 0; c < schema.GetColumnCount(); ++c) {
-                    if (c > 0) std::cout << " | ";
-                    std::cout << schema.GetColumn(c).name;
-                }
-                std::cout << "\n";
-
-                size_t show = std::min(result.tuples.size(), static_cast<size_t>(5));
-                for (size_t r = 0; r < show; ++r) {
-                    std::cout << "    ";
-                    for (uint32_t c = 0; c < schema.GetColumnCount(); ++c) {
-                        if (c > 0) std::cout << " | ";
-                        std::cout << result.tuples[r].GetValue(schema, c).ToString();
-                    }
-                    std::cout << "\n";
-                }
-                if (result.tuples.size() > show) {
-                    std::cout << "    ... (" << result.tuples.size() - show << " more rows)\n";
-                }
-
-                // Export query results to CSV
-                if (export_csv) {
-                    auto csv_path = fs::path(args.results_dir) / (q.tag + ".csv");
-                    std::ofstream ofs(csv_path);
-                    if (ofs) {
-                        ofs << q.canonical_header << "\n";
-                        for (const auto& tuple : result.tuples) {
-                            for (uint32_t c = 0; c < schema.GetColumnCount(); ++c) {
-                                if (c > 0) ofs << ",";
-                                ofs << csv_value(tuple.GetValue(schema, c), schema, c);
+                    // Export query results CSV ONLY on run 0 (stable output)
+                    if (export_csv && run == 0) {
+                        const auto& schema = result.schema;
+                        auto csv_path = fs::path(args.results_dir) / (q.tag + ".csv");
+                        std::ofstream ofs(csv_path);
+                        if (ofs) {
+                            ofs << q.canonical_header << "\n";
+                            for (const auto& tuple : result.tuples) {
+                                for (uint32_t c = 0; c < schema.GetColumnCount(); ++c) {
+                                    if (c > 0) ofs << ",";
+                                    ofs << csv_value(tuple.GetValue(schema, c), schema, c);
+                                }
+                                ofs << "\n";
                             }
-                            ofs << "\n";
+                            std::cout << "    -> Exported to " << csv_path.string() << "\n";
+                        } else {
+                            std::cerr << "    Warning: could not open " << csv_path.string() << " for writing\n";
                         }
-                        std::cout << "    -> Exported to " << csv_path.string() << "\n";
-                    } else {
-                        std::cerr << "    Warning: could not open " << csv_path.string() << " for writing\n";
                     }
-                }
 
-                latencies.push_back({q.tag, result.tuples.size(), ms});
+                    latencies.push_back({q.tag, run, rows, ms, hits, misses});
+                } catch (const std::exception& e) {
+                    auto elapsed = std::chrono::steady_clock::now() - start;
+                    double ms = std::chrono::duration<double, std::milli>(elapsed).count();
+                    std::cerr << "    run " << run << ": FAILED (" << static_cast<int64_t>(ms) << " ms) — " << e.what() << "\n";
+                }
+            }
+            if (!latencies.empty() && latencies.back().tag == q.tag) {
                 ++passed;
-            } catch (const std::exception& e) {
-                auto elapsed = std::chrono::steady_clock::now() - start;
-                double ms = std::chrono::duration<double, std::milli>(elapsed).count();
-                std::cerr << "FAILED (" << static_cast<int64_t>(ms) << " ms) — " << e.what() << "\n";
             }
         }
 
         std::cout << "\n=== " << passed << "/" << queries.size() << " TPC-H queries passed ===\n";
 
-        // Write latencies.csv
+        // Write latencies.csv — one row per (query, run)
         if (export_csv && !latencies.empty()) {
             auto lat_path = fs::path(args.results_dir) / "latencies.csv";
             std::ofstream ofs(lat_path);
             if (ofs) {
-                ofs << "query,rows,latency_ms\n";
+                ofs << "query,run,rows,latency_ms,hits,misses\n";
                 ofs << std::fixed << std::setprecision(4);
                 for (const auto& rec : latencies) {
-                    ofs << rec.tag << "," << rec.rows << "," << rec.latency_ms << "\n";
+                    ofs << rec.tag << ","
+                        << rec.run << ","
+                        << rec.rows << ","
+                        << rec.latency_ms << ","
+                        << rec.hits << ","
+                        << rec.misses << "\n";
                 }
                 std::cout << "\nLatencies written to " << lat_path.string() << "\n";
             } else {
