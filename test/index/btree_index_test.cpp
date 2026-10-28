@@ -1,4 +1,6 @@
 #include <gtest/gtest.h>
+#include <string>
+#include <unistd.h>
 #include "index/btree_index.hpp"
 #include "storage/slotted_page.hpp"
 #include "buffer/buffer_pool_manager.hpp"
@@ -18,7 +20,8 @@ protected:
     std::string test_file_;
 
     void SetUp() override {
-        test_file_ = (std::filesystem::temp_directory_path() / "shilmandb_btree_index_test.db").string();
+        test_file_ = (std::filesystem::temp_directory_path() /
+                      ("shilmandb_btree_index_test_" + std::to_string(::getpid()) + ".db")).string();
         std::filesystem::remove(test_file_);
     }
 

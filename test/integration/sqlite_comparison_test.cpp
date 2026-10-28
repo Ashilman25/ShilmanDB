@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include <unistd.h>
 
 #include "engine/database.hpp"
 
@@ -163,7 +164,7 @@ protected:
 
     void SetUp() override {
         test_file_ = (std::filesystem::temp_directory_path() /
-                      "shilmandb_sqlite_cmp_test.db").string();
+                      ("shilmandb_sqlite_cmp_test_" + std::to_string(::getpid()) + ".db")).string();
         std::filesystem::remove(test_file_);
 
         auto data_dir = FindDataDir();

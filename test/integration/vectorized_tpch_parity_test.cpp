@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include <unistd.h>
 
 #include "engine/database.hpp"
 #include "executor/vectorized_parity_harness.hpp"
@@ -162,7 +163,7 @@ protected:
 
     static void SetUpTestSuite() {
         test_file_ = (std::filesystem::temp_directory_path() /
-                      "shilmandb_vec_tpch_parity_test.db").string();
+                      ("shilmandb_vec_tpch_parity_test_" + std::to_string(::getpid()) + ".db")).string();
         std::filesystem::remove(test_file_);
 
         auto data_dir = FindDataDir();

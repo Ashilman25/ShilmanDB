@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include <unistd.h>
 #include "executor/hash_join_executor.hpp"
 #include "executor/seq_scan_executor.hpp"
 #include "planner/plan_node.hpp"
@@ -36,7 +37,8 @@ protected:
     std::string test_file_;
 
     void SetUp() override {
-        test_file_ = (std::filesystem::temp_directory_path() / "shilmandb_hash_join_test.db").string();
+        test_file_ = (std::filesystem::temp_directory_path() /
+                      ("shilmandb_hash_join_test_" + std::to_string(::getpid()) + ".db")).string();
         std::filesystem::remove(test_file_);
     }
 

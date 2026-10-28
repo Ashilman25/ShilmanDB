@@ -1,4 +1,6 @@
 #include <gtest/gtest.h>
+#include <string>
+#include <unistd.h>
 #include "buffer/buffer_pool_manager.hpp"
 #include "buffer/lru_eviction_policy.hpp"
 #include <cstring>
@@ -13,7 +15,8 @@ protected:
     std::string test_file_;
 
     void SetUp() override {
-        test_file_ = (std::filesystem::temp_directory_path() / "shilmandb_bpm_test.db").string();
+        test_file_ = (std::filesystem::temp_directory_path() /
+                      ("shilmandb_bpm_test_" + std::to_string(::getpid()) + ".db")).string();
         std::filesystem::remove(test_file_);
     }
 
@@ -432,7 +435,8 @@ TEST_F(BufferPoolManagerTest, NewPageViaEvictionPath) {
 // Test 18: TracingWritesCorrectEntries
 // ---------------------------------------------------------------------------
 TEST_F(BufferPoolManagerTest, TracingWritesCorrectEntries) {
-    auto trace_path = (std::filesystem::temp_directory_path() / "shilmandb_trace_test.csv").string();
+    auto trace_path = (std::filesystem::temp_directory_path() /
+                       ("shilmandb_trace_test_" + std::to_string(::getpid()) + ".csv")).string();
     auto [dm, bpm] = MakeBPM(10);
 
     bpm->EnableTracing(trace_path);

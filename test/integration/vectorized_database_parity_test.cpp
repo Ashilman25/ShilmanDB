@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include <unistd.h>
 
 #include "catalog/catalog.hpp"
 #include "catalog/schema.hpp"
@@ -20,7 +21,7 @@ protected:
 
     void SetUp() override {
         test_file_ = (std::filesystem::temp_directory_path() /
-                      "shilmandb_vec_db_parity_test.db").string();
+                      ("shilmandb_vec_db_parity_test_" + std::to_string(::getpid()) + ".db")).string();
         std::filesystem::remove(test_file_);
         db_ = std::make_unique<Database>(test_file_);
 
