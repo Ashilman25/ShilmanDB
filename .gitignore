@@ -4,6 +4,7 @@ superpowers/
 docs/ToDo
 build/
 build-release/
+build-debug/
 third_party/libtorch/
 bench/tpch_data/
 bench/results/
