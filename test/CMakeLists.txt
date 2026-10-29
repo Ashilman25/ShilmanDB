@@ -39,7 +39,9 @@ shilmandb_add_test(like_test parser/like_test.cpp)
 
 # Planner tests
 shilmandb_add_test(join_order_optimizer_test planner/join_order_optimizer_test.cpp)
+shilmandb_add_test(join_graph_test planner/join_graph_test.cpp)
 shilmandb_add_test(planner_test planner/planner_test.cpp)
+shilmandb_add_test(forced_join_order_test planner/forced_join_order_test.cpp)
 shilmandb_add_test(index_selection_test planner/index_selection_test.cpp)
 shilmandb_add_test(nested_aggregate_test planner/nested_aggregate_test.cpp)
 
@@ -61,9 +63,14 @@ shilmandb_add_test(batch_to_tuple_adapter_test executor/batch_to_tuple_adapter_t
 shilmandb_add_test(vectorized_hybrid_pipeline_parity_test executor/vectorized_hybrid_pipeline_parity_test.cpp)
 shilmandb_add_test(case_expression_test executor/case_expression_test.cpp)
 shilmandb_add_test(like_expression_test executor/like_expression_test.cpp)
+shilmandb_add_test(profiling_executor_test executor/profiling_executor_test.cpp)
 
 # Integration tests
 shilmandb_add_test(end_to_end_test integration/end_to_end_test.cpp)
 shilmandb_add_test(sqlite_comparison_test integration/sqlite_comparison_test.cpp)
 shilmandb_add_test(vectorized_database_parity_test integration/vectorized_database_parity_test.cpp)
 shilmandb_add_test(vectorized_tpch_parity_test integration/vectorized_tpch_parity_test.cpp)
+shilmandb_add_test(query_profile_test integration/query_profile_test.cpp)
+shilmandb_add_test(join_predicate_placement_test integration/join_predicate_placement_test.cpp)
+shilmandb_add_test(join_order_parity_test integration/join_order_parity_test.cpp)
+target_include_directories(join_order_parity_test PRIVATE ${CMAKE_SOURCE_DIR}/bench)

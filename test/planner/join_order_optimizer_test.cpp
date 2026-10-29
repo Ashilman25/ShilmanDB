@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
+#include <algorithm>
 #include <cmath>
+#include <numeric>
 #include "planner/join_order_optimizer.hpp"
 
 namespace shilmandb {
@@ -431,6 +433,111 @@ TEST(JoinOrderOptimizerTest, FeatureVectorPairFeatures) {
         EXPECT_FLOAT_EQ(fv[offset], 0.0f) << "pair " << p << " is_joined";
         EXPECT_FLOAT_EQ(fv[offset + 1], 0.0f) << "pair " << p << " ratio";
     }
+}
+
+// ---------------------------------------------------------------------------
+// EstimateStepRows: intermediate size after each table joins in
+// ---------------------------------------------------------------------------
+
+// The 5-table chain from TPC-H Q5 at SF=0.01:
+// customer - orders - lineitem - supplier - nation
+struct Q5Example {
+    std::vector<TableRef> tables;
+    std::vector<JoinClause> joins;
+    std::vector<TableStats> stats;
+};
+
+auto MakeQ5Example() -> Q5Example {
+    Q5Example q;
+    q.tables = {
+        MakeTableRef("customer"), MakeTableRef("orders"), MakeTableRef("lineitem"),
+        MakeTableRef("supplier"), MakeTableRef("nation")
+    };
+    q.stats = {
+        MakeStats(1500,  {{"c_custkey", 1500}}),
+        MakeStats(15000, {{"o_custkey", 1000}, {"o_orderkey", 15000}}),
+        MakeStats(60175, {{"l_orderkey", 15000}, {"l_suppkey", 100}}),
+        MakeStats(100,   {{"s_suppkey", 100}, {"s_nationkey", 25}}),
+        MakeStats(25,    {{"n_nationkey", 25}})
+    };
+    q.joins.push_back(MakeJoinClause("orders",
+        MakeEquiJoinExpr("customer", "c_custkey", "orders", "o_custkey")));
+    q.joins.push_back(MakeJoinClause("lineitem",
+        MakeEquiJoinExpr("lineitem", "l_orderkey", "orders", "o_orderkey")));
+    q.joins.push_back(MakeJoinClause("supplier",
+        MakeEquiJoinExpr("lineitem", "l_suppkey", "supplier", "s_suppkey")));
+    q.joins.push_back(MakeJoinClause("nation",
+        MakeEquiJoinExpr("supplier", "s_nationkey", "nation", "n_nationkey")));
+    return q;
+}
+
+TEST(JoinOrderOptimizerTest, EstimateStepRowsQ5Example) {
+    const auto q = MakeQ5Example();
+
+    // customer first: 1500 -> 15000 orders -> 60175 lineitems, then supplier and nation keep it flat
+    {
+        const std::vector<int> order = {0, 1, 2, 3, 4};
+        const auto steps = JoinOrderOptimizer::EstimateStepRows(order, q.tables, q.joins, q.stats);
+        const std::vector<double> expected = {1500, 15000, 60175, 60175, 60175};
+
+        ASSERT_EQ(steps.size(), expected.size());
+        for (size_t k = 0; k < expected.size(); ++k) {
+            EXPECT_DOUBLE_EQ(steps[k], expected[k]) << "step " << k;
+        }
+        EXPECT_DOUBLE_EQ(JoinOrderOptimizer::EstimateCost(order, q.tables, q.joins, q.stats), 197025.0);
+    }
+
+    // nation first: 25 -> 100 suppliers -> 60175 lineitems, then orders and customer keep it flat
+    {
+        const std::vector<int> order = {4, 3, 2, 1, 0};
+        const auto steps = JoinOrderOptimizer::EstimateStepRows(order, q.tables, q.joins, q.stats);
+        const std::vector<double> expected = {25, 100, 60175, 60175, 60175};
+
+        ASSERT_EQ(steps.size(), expected.size());
+        for (size_t k = 0; k < expected.size(); ++k) {
+            EXPECT_DOUBLE_EQ(steps[k], expected[k]) << "step " << k;
+        }
+        EXPECT_DOUBLE_EQ(JoinOrderOptimizer::EstimateCost(order, q.tables, q.joins, q.stats), 180650.0);
+    }
+}
+
+TEST(JoinOrderOptimizerTest, EstimateStepRowsCrossProduct) {
+    std::vector<TableRef> tables = {MakeTableRef("A"), MakeTableRef("B")};
+    std::vector<TableStats> stats = {MakeStats(10), MakeStats(20)};
+    std::vector<JoinClause> joins;
+
+    const auto steps = JoinOrderOptimizer::EstimateStepRows({0, 1}, tables, joins, stats);
+
+    ASSERT_EQ(steps.size(), 2u);
+    EXPECT_DOUBLE_EQ(steps[0], 10.0);
+    EXPECT_DOUBLE_EQ(steps[1], 200.0);
+}
+
+TEST(JoinOrderOptimizerTest, EstimateStepRowsEmptyOrder) {
+    std::vector<TableRef> tables;
+    std::vector<JoinClause> joins;
+    std::vector<TableStats> stats;
+
+    const auto steps = JoinOrderOptimizer::EstimateStepRows({}, tables, joins, stats);
+    EXPECT_TRUE(steps.empty());
+}
+
+TEST(JoinOrderOptimizerTest, EstimateCostEqualsSumOfSteps) {
+    const auto q = MakeQ5Example();
+
+    // The cost must be exactly the steps added up in order, for every order
+    std::vector<int> perm = {0, 1, 2, 3, 4};
+    int checked = 0;
+    do {
+        const auto steps = JoinOrderOptimizer::EstimateStepRows(perm, q.tables, q.joins, q.stats);
+        const double cost = JoinOrderOptimizer::EstimateCost(perm, q.tables, q.joins, q.stats);
+
+        ASSERT_EQ(steps.size(), perm.size());
+        EXPECT_EQ(cost, std::accumulate(steps.begin(), steps.end(), 0.0));
+        ++checked;
+    } while (std::next_permutation(perm.begin(), perm.end()));
+
+    EXPECT_EQ(checked, 120);
 }
 
 }  // namespace shilmandb

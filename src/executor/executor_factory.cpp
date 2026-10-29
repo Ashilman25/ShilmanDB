@@ -13,6 +13,7 @@
 #include "executor/vectorized_projection_executor.hpp"
 #include "executor/vectorized_aggregate_executor.hpp"
 #include "executor/batch_to_tuple_adapter.hpp"
+#include "executor/profiling_executor.hpp"
 #include "common/exception.hpp"
 
 namespace shilmandb {
@@ -39,9 +40,9 @@ namespace {
     return child;
 }
 
-}  // namespace
-
-std::unique_ptr<Executor> ExecutorFactory::CreateExecutor(const PlanNode* plan, ExecutorContext* ctx, ExecutionMode mode) {
+// Builds the executor for one plan node. Children go back through
+// ExecutorFactory::CreateExecutor so they get profiled too.
+[[nodiscard]] std::unique_ptr<Executor> BuildExecutor(const PlanNode* plan, ExecutorContext* ctx, ExecutionMode mode) {
     switch (plan->type) {
         case PlanNodeType::SEQ_SCAN: {
             switch (mode) {
@@ -64,7 +65,7 @@ std::unique_ptr<Executor> ExecutorFactory::CreateExecutor(const PlanNode* plan, 
         }
 
         case PlanNodeType::FILTER: {
-            auto child = CreateExecutor(plan->children[0].get(), ctx, mode);
+            auto child = ExecutorFactory::CreateExecutor(plan->children[0].get(), ctx, mode);
             switch (mode) {
                 case ExecutionMode::VECTORIZED:
                     return std::make_unique<VectorizedFilterExecutor>(plan, ctx, std::move(child));
@@ -75,29 +76,29 @@ std::unique_ptr<Executor> ExecutorFactory::CreateExecutor(const PlanNode* plan, 
         }
 
         case PlanNodeType::HASH_JOIN: {
-            auto left  = CreateExecutor(plan->children[0].get(), ctx, mode);
-            auto right = CreateExecutor(plan->children[1].get(), ctx, mode);
+            auto left  = ExecutorFactory::CreateExecutor(plan->children[0].get(), ctx, mode);
+            auto right = ExecutorFactory::CreateExecutor(plan->children[1].get(), ctx, mode);
             left  = MaybeAdapt(std::move(left),  plan->children[0].get(), ctx, mode);
             right = MaybeAdapt(std::move(right), plan->children[1].get(), ctx, mode);
             return std::make_unique<HashJoinExecutor>(plan, ctx, std::move(left), std::move(right));
         }
 
         case PlanNodeType::NESTED_LOOP_JOIN: {
-            auto left  = CreateExecutor(plan->children[0].get(), ctx, mode);
-            auto right = CreateExecutor(plan->children[1].get(), ctx, mode);
+            auto left  = ExecutorFactory::CreateExecutor(plan->children[0].get(), ctx, mode);
+            auto right = ExecutorFactory::CreateExecutor(plan->children[1].get(), ctx, mode);
             left  = MaybeAdapt(std::move(left),  plan->children[0].get(), ctx, mode);
             right = MaybeAdapt(std::move(right), plan->children[1].get(), ctx, mode);
             return std::make_unique<NestedLoopJoinExecutor>(plan, ctx, std::move(left), std::move(right));
         }
 
         case PlanNodeType::SORT: {
-            auto child = CreateExecutor(plan->children[0].get(), ctx, mode);
+            auto child = ExecutorFactory::CreateExecutor(plan->children[0].get(), ctx, mode);
             child = MaybeAdapt(std::move(child), plan->children[0].get(), ctx, mode);
             return std::make_unique<SortExecutor>(plan, ctx, std::move(child));
         }
 
         case PlanNodeType::AGGREGATE: {
-            auto child = CreateExecutor(plan->children[0].get(), ctx, mode);
+            auto child = ExecutorFactory::CreateExecutor(plan->children[0].get(), ctx, mode);
             switch (mode) {
                 case ExecutionMode::VECTORIZED:
                     return std::make_unique<VectorizedAggregateExecutor>(plan, ctx, std::move(child));
@@ -108,7 +109,7 @@ std::unique_ptr<Executor> ExecutorFactory::CreateExecutor(const PlanNode* plan, 
         }
 
         case PlanNodeType::PROJECTION: {
-            auto child = CreateExecutor(plan->children[0].get(), ctx, mode);
+            auto child = ExecutorFactory::CreateExecutor(plan->children[0].get(), ctx, mode);
             switch (mode) {
                 case ExecutionMode::VECTORIZED:
                     return std::make_unique<VectorizedProjectionExecutor>(plan, ctx, std::move(child));
@@ -119,7 +120,7 @@ std::unique_ptr<Executor> ExecutorFactory::CreateExecutor(const PlanNode* plan, 
         }
 
         case PlanNodeType::LIMIT: {
-            auto child = CreateExecutor(plan->children[0].get(), ctx, mode);
+            auto child = ExecutorFactory::CreateExecutor(plan->children[0].get(), ctx, mode);
             child = MaybeAdapt(std::move(child), plan->children[0].get(), ctx, mode);
             return std::make_unique<LimitExecutor>(plan, ctx, std::move(child));
         }
@@ -127,6 +128,18 @@ std::unique_ptr<Executor> ExecutorFactory::CreateExecutor(const PlanNode* plan, 
         default:
             throw DatabaseException("Unknown plan node type");
     }
+}
+
+}  // namespace
+
+std::unique_ptr<Executor> ExecutorFactory::CreateExecutor(const PlanNode* plan, ExecutorContext* ctx, ExecutionMode mode) {
+    if (ctx->op_stats == nullptr) return BuildExecutor(plan, ctx, mode);
+
+    // The batch path isn't counted, so profiling is tuple-only.
+    if (mode == ExecutionMode::VECTORIZED) {
+        throw DatabaseException("analyze only supports tuple execution");
+    }
+    return std::make_unique<ProfilingExecutor>(plan, ctx, BuildExecutor(plan, ctx, mode));
 }
 
 }  // namespace shilmandb

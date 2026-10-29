@@ -94,11 +94,13 @@ auto LookupDistinct(const TableStats& stats, const std::string& col_name) -> uin
 }
 
 
-auto EstimateCostInternal(const std::vector<int>& order, const std::vector<JoinEdge>& edges, const std::vector<TableStats>& stats) -> double {
-    if (order.empty()) return 0.0;
+// Walks the join order and calls on_step with the estimated row count after each table joins in
+template <typename OnStep>
+void WalkSteps(const std::vector<int>& order, const std::vector<JoinEdge>& edges, const std::vector<TableStats>& stats, OnStep&& on_step) {
+    if (order.empty()) return;
 
     double intermediate = static_cast<double>(stats[order[0]].row_count);
-    double total_cost = intermediate;
+    on_step(intermediate);
 
     std::unordered_set<int> joined;
     joined.insert(order[0]);
@@ -133,10 +135,17 @@ auto EstimateCostInternal(const std::vector<int>& order, const std::vector<JoinE
 
         intermediate = has_join ? intermediate * new_rows * selectivity : intermediate * new_rows;
 
-        total_cost += intermediate;
+        on_step(intermediate);
         joined.insert(new_table);
     }
+}
 
+
+// Cost is the sum of every step's row count. Runs once per permutation, so it adds up in place
+// instead of building a vector.
+auto EstimateCostInternal(const std::vector<int>& order, const std::vector<JoinEdge>& edges, const std::vector<TableStats>& stats) -> double {
+    double total_cost = 0.0;
+    WalkSteps(order, edges, stats, [&total_cost](double rows) { total_cost += rows; });
     return total_cost;
 }
 
@@ -185,6 +194,15 @@ auto JoinOrderOptimizer::FindBestOrder(const std::vector<TableRef>& tables, cons
 auto JoinOrderOptimizer::EstimateCost(const std::vector<int>& order, const std::vector<TableRef>& tables, const std::vector<JoinClause>& joins, const std::vector<TableStats>& stats) -> double {
     auto edges = ExtractJoinEdges(tables, joins);
     return EstimateCostInternal(order, edges, stats);
+}
+
+auto JoinOrderOptimizer::EstimateStepRows(const std::vector<int>& order, const std::vector<TableRef>& tables, const std::vector<JoinClause>& joins, const std::vector<TableStats>& stats) -> std::vector<double> {
+    const auto edges = ExtractJoinEdges(tables, joins);
+
+    std::vector<double> steps;
+    steps.reserve(order.size());
+    WalkSteps(order, edges, stats, [&steps](double rows) { steps.push_back(rows); });
+    return steps;
 }
 
 auto JoinOrderOptimizer::BuildFeatureVector(const std::vector<TableRef>& tables, const std::vector<JoinClause>& joins, const std::vector<TableStats>& stats) -> std::vector<float> {
