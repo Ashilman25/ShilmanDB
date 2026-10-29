@@ -147,7 +147,7 @@ protected:
     std::unique_ptr<Database> db_;
 
     // Try several candidate paths for the SF=0.01 data directory.
-    // CTest runs from build/, so ../bench/... is the typical relative path.
+    // CTest runs from build/test/, so ../../bench/... is the typical relative path.
     static std::string FindDataDir() {
         std::vector<std::string> candidates = {
             "bench/tpch_data/sf0.01/",

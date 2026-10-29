@@ -35,16 +35,22 @@ Q3_ORDERS = {
     "b>c>a": ([1000, 10000, 10000], [1000, 2000, 800], 12.0),
     "c>b>a": ([10000, 10000, 10000], [2000, 2000, 800], 20.0),
 }
+# Its join estimate is a cross product: 100 x 1000 rows, against 1 real row.
 Q12_ORDERS = {
-    "x>y": ([100, 100000], [100, 90], 5.0),
-    "y>x": ([1000, 100000], [1000, 90], 4.0),
+    "x>y": ([100, 100000], [100, 1], 5.0),
+    "y>x": ([1000, 100000], [1000, 1], 4.0),
 }
 
 
+# Any query can use either table set: the order picks it. qerror swaps the join estimates for
+# the actual rows times qerror, so every joined set gets that q-error.
 def order_row(query: str, order: str, *, ms: float | None = None, classical: str = "",
-              learned: str = "", ok: int = 1) -> str:
-    table = Q3_ORDERS if query == "Q3" else Q12_ORDERS
+              learned: str = "", ok: int = 1, qerror: float | None = None,
+              min_ms: float | None = None, max_ms: float | None = None) -> str:
+    table = Q3_ORDERS if order in Q3_ORDERS else Q12_ORDERS
     est, act, default_ms = table[order]
+    if qerror is not None:
+        est = [est[0], *(a * qerror for a in act[1:])]
     ms = default_ms if ms is None else ms
     tables = order.split(">")
 
@@ -55,7 +61,7 @@ def order_row(query: str, order: str, *, ms: float | None = None, classical: str
         "0.01", query, order, " ".join(str(i) for i in range(len(tables))), "1",
         str(int(order == classical)), str(int(order == learned)), str(sum(est)), join(est), join(act),
         join(TABLE_ROWS[t] for t in tables), join(SCAN_ROWS[t] for t in tables),
-        str(ms), str(ms), str(ms), "5", str(ok),
+        str(ms), str(ms if min_ms is None else min_ms), str(ms if max_ms is None else max_ms), "5", str(ok),
     ])
 
 
@@ -93,6 +99,35 @@ def q3_summary(results_dir: Path):
     return summary[summary["query"] == "Q3"].iloc[0]
 
 
+def report_for(results_dir: Path, rows: list[str]) -> str:
+    write_orders(results_dir / "orders_sf0.01.csv", rows)
+    orders, operators, choices = mod.load_results(results_dir)
+    return mod.build_report(mod.summarize(orders, choices), orders, operators, choices)
+
+
+# The SF 0.01 row of the draft decision table: SF, within 10%, q-errors small, next move.
+def decision_cells(report: str) -> list[str]:
+    section = report.split("## Draft answers")[1]
+    line = next(line for line in section.splitlines() if line.startswith("| 0.01 |"))
+    return [cell.strip() for cell in line.strip().strip("|").split(" | ")]
+
+
+# Q3 and Q5 have their classical pick fastest and their join estimates close to the truth.
+# Q12 is the same, except its join estimate is a cross product (q-error 1e5).
+def decision_for(results_dir: Path, *, q3_orders=tuple(Q3_ORDERS), q3_classical: str = "b>a>c",
+                 q3_qerror: float = 1.5, q5_qerror: float = 1.5) -> list[str]:
+    rows = [order_row("Q3", o, classical=q3_classical, learned=q3_classical, qerror=q3_qerror) for o in q3_orders]
+    rows += [order_row("Q5", o, classical="y>x", learned="y>x", qerror=q5_qerror) for o in Q12_ORDERS]
+    rows += [order_row("Q12", o, classical="y>x", learned="y>x") for o in Q12_ORDERS]
+    return decision_cells(report_for(results_dir, rows))
+
+
+@pytest.fixture
+def three_query_sweep(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A full sweep here is Q3, Q5 and Q12 alone, so the other queries' absence decides nothing.
+    monkeypatch.setattr(mod, "FULL_ORDER_COUNTS", {"Q3": 4, "Q5": 2, "Q12": 2})
+
+
 def test_qerror_symmetric_and_clamped() -> None:
     assert mod.qerror(100, 10) == 10
     assert mod.qerror(10, 100) == 10
@@ -126,6 +161,15 @@ def test_join_qerror_dedupes_table_sets(tmp_path: Path) -> None:
     # {a,b}: est 1000 vs 400; {a,b,c}: est 10000 vs 800. Each set counts once.
     assert sorted(mod.join_qerrors(orders)) == pytest.approx([2.5, 12.5])
     assert sorted(mod.scan_qerrors(orders)) == pytest.approx([1.0, 2.0, 5.0])
+
+
+def test_qerrors_reject_lists_that_dont_line_up(tmp_path: Path) -> None:
+    write_orders(tmp_path / "orders_sf0.01.csv", [order_row("Q3", "a>b>c")])
+    orders, _, _ = mod.load_results(tmp_path)
+    with pytest.raises(ValueError):
+        mod.join_qerrors(orders.assign(actual_step_rows="50;400"))
+    with pytest.raises(ValueError):
+        mod.scan_qerrors(orders.assign(scan_rows="50;1000"))
 
 
 def test_duplicate_rows_newest_file_wins(tmp_path: Path) -> None:
@@ -174,9 +218,98 @@ def test_bad_classical_pick_gets_no_ratio(tmp_path: Path) -> None:
     report = (tmp_path / "report.md").read_text()
     q3_numbers = next(line for line in report.splitlines() if line.startswith("| Q3 | 3 |"))
     assert q3_numbers.count("wrong result") == 2
-    decision = next(line for line in report.splitlines() if line.startswith("| 0.01 |"))
-    assert "wrong result for Q3" in decision
-    assert "Yes" not in decision
+    near = decision_cells(report)[1]
+    assert near.startswith("Unknown: wrong result for Q3")
+
+    # Its operator times are still shown, with a note.
+    time_section = report.split("## Where the time goes")[1].split("## Draft answers")[0]
+    assert "`a>b>c` returned a wrong result" in time_section
+
+
+def test_chart_labels_skip_wrong_results(tmp_path: Path) -> None:
+    write_full_set(tmp_path, bad="a>b>c")  # Q3's classical and learned pick
+    orders, _, choices = mod.load_results(tmp_path)
+    summary = mod.summarize(orders, choices)
+    labels = {}
+    for query in ("Q3", "Q12"):
+        fig, ax = mod.plt.subplots()
+        mod._plot_query(ax, query, orders[orders["query"] == query], summary[summary["query"] == query])
+        labels[query] = list(ax.texts)
+        mod.plt.close(fig)
+
+    assert labels["Q3"] == []
+    assert [t.get_text() for t in labels["Q12"]] == ["1.25×"]
+    # A filled box behind the label, so the dashed 1.10× line can't run through it.
+    assert labels["Q12"][0].get_bbox_patch() is not None
+
+
+def test_decision_ignores_cross_product_queries(tmp_path: Path, three_query_sweep: None) -> None:
+    _, near, small, move = decision_for(tmp_path)
+    assert near == "Yes"
+    assert small == "Yes. Q12 left out: its join estimates are cross products."
+    assert move == "TPC-H is too easy for join ML. Move to skewed data (JCC-H) before building join V2."
+
+    _, near, small, move = decision_for(tmp_path, q5_qerror=5)
+    assert near == "Yes"
+    assert small == "No: Q5 5.0. Q12 left out: its join estimates are cross products."
+    assert move == "Join V2 has room on TPC-H as-is."
+
+
+def test_decision_unknown_when_every_query_is_a_cross_product(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(mod, "FULL_ORDER_COUNTS", {"Q12": 2, "Q14": 2})
+    rows = [order_row(q, o, classical="y>x", learned="y>x") for q in ("Q12", "Q14") for o in Q12_ORDERS]
+    _, near, small, move = decision_cells(report_for(tmp_path, rows))
+    assert near == "Yes"
+    assert small == "Unknown: no query left to judge. Q12, Q14 left out: their join estimates are cross products."
+    assert move == "Not enough data to call yet."
+
+
+def test_decision_unknown_when_a_query_is_partly_timed(tmp_path: Path, three_query_sweep: None) -> None:
+    # Q3 has 2 of its 4 orders, and its classical pick is the faster of the two.
+    _, near, small, move = decision_for(tmp_path, q3_orders=("b>a>c", "c>b>a"))
+    assert near == "Unknown: too few orders for Q3 (2 of 4 ok)"
+    assert small == "Unknown: too few orders for Q3 (2 of 4 ok). Q12 left out: its join estimates are cross products."
+    assert move == "Not enough data to call yet."
+
+    # Over the limit on the orders that were timed. That's a sure "No" for near-best: more orders can
+    # only lower the best. Not for q-errors: a median over some of the table sets can move either way.
+    _, near, small, move = decision_for(tmp_path, q3_orders=("b>a>c", "c>b>a"), q3_classical="c>b>a", q3_qerror=3)
+    assert near == "No: Q3 2.50×"
+    assert small == "Unknown: too few orders for Q3 (2 of 4 ok). Q12 left out: its join estimates are cross products."
+    assert move == "Join V2 has room on TPC-H as-is."
+
+    # A fully timed query over the limit is still a sure "No".
+    _, _, small, _ = decision_for(tmp_path, q3_orders=("b>a>c", "c>b>a"), q3_qerror=3, q5_qerror=5)
+    assert small == "No: Q5 5.0. Q12 left out: its join estimates are cross products."
+
+
+def test_noisy_orders_warned(tmp_path: Path) -> None:
+    write_orders(tmp_path / "orders_sf0.01.csv", [
+        order_row("Q3", "a>b>c", min_ms=9.0, max_ms=12.0),           # 1.33x apart: noisy
+        order_row("Q3", "b>a>c", min_ms=7.8, max_ms=8.58),           # 1.10x: fine
+        order_row("Q3", "c>b>a", min_ms=10.0, max_ms=30.0, ok=0),    # wrong result: has its own warning
+        order_row("Q12", "x>y", min_ms=4.0, max_ms=6.0),             # 1.50x: the noisiest
+    ])
+    assert mod.main(["--results-dir", str(tmp_path)]) == 0
+
+    report = (tmp_path / "report.md").read_text()
+    top = report[:report.index("# Join-order headroom")]
+    assert "> **Warning:** 2 timed order(s) had runs more than 20% apart" in top
+    assert "The machine may have been busy; rerun those queries (SF 0.01: Q3, Q12)." in top
+    noisy = [line for line in top.splitlines() if line.startswith("> - SF 0.01") and "ms to" in line]
+    assert noisy == [
+        "> - SF 0.01 Q12 `x>y`: 1.50× (4.0 ms to 6.0 ms)",
+        "> - SF 0.01 Q3 `a>b>c`: 1.33× (9.0 ms to 12.0 ms)",
+    ]
+
+    summary = pd.read_csv(tmp_path / "summary.csv").set_index("query")
+    assert summary.loc["Q3", "max_run_spread"] == pytest.approx(12.0 / 9.0, rel=1e-5)
+    assert summary.loc["Q12", "max_run_spread"] == pytest.approx(1.5, rel=1e-5)
+
+    # Every order within 5%: no noise warning.
+    write_orders(tmp_path / "orders_sf0.01.csv", [order_row("Q3", o, min_ms=10.0, max_ms=10.5) for o in Q3_ORDERS])
+    assert mod.main(["--results-dir", str(tmp_path)]) == 0
+    assert "may have been busy" not in (tmp_path / "report.md").read_text()
 
 
 def test_partial_query_is_summarized(tmp_path: Path) -> None:
@@ -198,5 +331,5 @@ def test_main_writes_outputs(tmp_path: Path) -> None:
         "classical_order", "classical_ms", "classical_over_best",
         "learned_order", "learned_ms", "learned_over_best", "worst_ms", "worst_over_best",
         "spearman_est_vs_ms", "median_join_qerror", "max_join_qerror",
-        "median_scan_qerror", "max_scan_qerror",
+        "median_scan_qerror", "max_scan_qerror", "max_run_spread",
     ]

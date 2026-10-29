@@ -25,6 +25,9 @@ FULL_ORDER_COUNTS = {"Q3": 4, "Q5": 16, "Q10": 8, "Q12": 2, "Q14": 2, "Q19": 2}
 NEAR_BEST = 1.10
 SMALL_QERROR = 2.0
 
+# An order whose slowest timed run is more than this × its fastest gets a noise warning.
+NOISY_SPREAD = 1.2
+
 KINDS = ("orders", "operators", "choices")
 COLUMNS = {
     "orders": [
@@ -45,7 +48,7 @@ SUMMARY_COLUMNS = [
     "classical_order", "classical_ms", "classical_over_best",
     "learned_order", "learned_ms", "learned_over_best", "worst_ms", "worst_over_best",
     "spearman_est_vs_ms", "median_join_qerror", "max_join_qerror",
-    "median_scan_qerror", "max_scan_qerror",
+    "median_scan_qerror", "max_scan_qerror", "max_run_spread",
 ]
 
 # Chart colors: three categorical slots for the planners' picks, a quiet gray for the rest
@@ -101,6 +104,11 @@ def _stat(values: list[float], fn) -> float:
     return float(fn(values)) if values else math.nan
 
 
+#Each order's slowest timed run ÷ its fastest
+def _run_spread(orders: pd.DataFrame) -> pd.Series:
+    return orders["max_ms"] / orders["min_ms"]
+
+
 #  Loading
 
 def _read_csv(path: Path) -> pd.DataFrame:
@@ -152,7 +160,7 @@ def join_qerrors(orders_q: pd.DataFrame) -> list[float]:
     per_set: dict[frozenset[str], float] = {}
     for row in orders_q[orders_q["connected"] == 1].itertuples():
         tables = row.order.split(">")
-        steps = zip(parse_list(row.est_step_rows), parse_list(row.actual_step_rows))
+        steps = zip(parse_list(row.est_step_rows), parse_list(row.actual_step_rows), strict=True)
         
         for size, (est, act) in enumerate(steps, start=1):
             if size >= 2:
@@ -164,7 +172,7 @@ def join_qerrors(orders_q: pd.DataFrame) -> list[float]:
 def scan_qerrors(orders_q: pd.DataFrame) -> list[float]:
     per_table: dict[str, float] = {}
     for row in orders_q.itertuples():
-        counts = zip(row.order.split(">"), parse_list(row.table_rows), parse_list(row.scan_rows))
+        counts = zip(row.order.split(">"), parse_list(row.table_rows), parse_list(row.scan_rows), strict=True)
         for table, full, scanned in counts:
             per_table.setdefault(table, qerror(full, scanned))
     return list(per_table.values())
@@ -222,8 +230,9 @@ def _summary_row(orders_q: pd.DataFrame, choices: pd.DataFrame) -> dict:
         "spearman_est_vs_ms": math.nan if rho is None else rho,
         "median_join_qerror": _stat(joins, np.median), 
         "max_join_qerror": _stat(joins, max),
-        "median_scan_qerror": _stat(scans, np.median), 
+        "median_scan_qerror": _stat(scans, np.median),
         "max_scan_qerror": _stat(scans, max),
+        "max_run_spread": _stat(_run_spread(orders_q[orders_q["result_ok"] == 1]).tolist(), max),
     }
 
 
@@ -297,6 +306,20 @@ def _warnings(orders: pd.DataFrame) -> str:
     if gaps:
         lines = ["> **Warning:** not every query was fully timed, so a best order may be missing:"]
         blocks.append("\n".join(lines + [f"> - {gap}" for gap in gaps]))
+
+    ok = orders[orders["result_ok"] == 1].assign(spread=_run_spread)
+    noisy = ok[ok["spread"] > NOISY_SPREAD].sort_values("spread", ascending=False)
+    if not noisy.empty:
+        queries = "; ".join(
+            f"SF {sf}: {', '.join(sorted(set(noisy.loc[noisy['sf'] == sf, 'query']), key=_query_number))}"
+            for sf in _sf_order(noisy["sf"])
+        )
+        lines = [f"> **Warning:** {len(noisy)} timed order(s) had runs more than {NOISY_SPREAD - 1:.0%} apart "
+                 f"(slowest ÷ fastest over {NOISY_SPREAD:.2f}×). The machine may have been busy; rerun those "
+                 f"queries ({queries}). The worst:"]
+        lines += [f"> - SF {r.sf} {r.query} `{r.order}`: {_times(r.spread)} ({_ms(r.min_ms)} to {_ms(r.max_ms)})"
+                  for r in noisy.head(5).itertuples()]
+        blocks.append("\n".join(lines))
     return "\n>\n".join(blocks)
 
 
@@ -352,12 +375,12 @@ def _sf_section(rows: pd.DataFrame, orders: pd.DataFrame, choices: pd.DataFrame)
             f"{_num(r['median_scan_qerror'])} / {_num(r['max_scan_qerror'])}"] for _, r in rows.iterrows()
         ],
     )
-    orders = _table(
+    picks = _table(
         ["Query", "Best order", "Classical order", "Learned order (source)"],
         ["---"] * 4,
         [[r["query"], _code(r["best_order"]), _code(r["classical_order"]), _learned_label(r, choices)] for _, r in rows.iterrows()],
     )
-    return f"## SF {rows['sf'].iloc[0]}\n\n{numbers}\n\n{orders}"
+    return f"## SF {rows['sf'].iloc[0]}\n\n{numbers}\n\n{picks}"
 
 
 def _q5_section(summary: pd.DataFrame, orders: pd.DataFrame, choices: pd.DataFrame) -> str:
@@ -372,7 +395,7 @@ def _q5_section(summary: pd.DataFrame, orders: pd.DataFrame, choices: pd.DataFra
             if not r[f"{chooser}_order"]:
                 continue
             
-            source = choice["source"] if choice is not None else "–"
+            source = choice["source"] if choice is not None else "-"
             model_order = choice["model_order"] if choice is not None else ""
             rows.append([r["sf"], chooser, _code(r[f"{chooser}_order"]), source, _code(model_order), _ms(r[f"{chooser}_ms"]), _pick_ratio(orders, r, chooser)])
             
@@ -397,40 +420,67 @@ def _operator_labels(ops: pd.DataFrame) -> list[str]:
     return labels
 
 
-def _hot_operators(query: str, summary: pd.DataFrame, operators: pd.DataFrame) -> str:
+def _hot_operators(query: str, summary: pd.DataFrame, orders: pd.DataFrame, operators: pd.DataFrame) -> str:
     candidates = summary[summary["query"] == query]
     for _, r in candidates.iloc[::-1].iterrows():  # largest SF first
         ops = operators[(operators["sf"] == r["sf"]) & (operators["query"] == query) & (operators["order"] == r["classical_order"])].sort_values("op_index")
         if ops.empty:
             continue
-        
+
         root_ms = float(ops["total_ms"].iloc[0])
         top = ops.assign(label=_operator_labels(ops)).nlargest(5, "self_ms")
         table = _table(
-            ["Operator", "Rows", "Self", "Share of root"], 
+            ["Operator", "Rows", "Self", "Share of root"],
             ["---", "---:", "---:", "---:"],
             [[t["label"], f"{int(t['rows']):,}", _ms(t["self_ms"]), f"{t['self_ms'] / root_ms:.0%}"] for _, t in top.iterrows()]
         )
-        return f"### {query} at SF {r['sf']}: {_code(r['classical_order'])} (root {_ms(root_ms)})\n\n{table}"
+        heading = f"### {query} at SF {r['sf']}: {_code(r['classical_order'])} (root {_ms(root_ms)})"
+        if _wrong_pick(orders, r, "classical"):
+            heading += f"\n\nNote: {_code(r['classical_order'])} returned a wrong result, so these times may not match a correct plan."
+        return f"{heading}\n\n{table}"
     return f"### {query}\n\nNo analyze rows for its classical order yet."
 
 
-def _time_section(summary: pd.DataFrame, operators: pd.DataFrame) -> str:
+def _time_section(summary: pd.DataFrame, orders: pd.DataFrame, operators: pd.DataFrame) -> str:
     intro = ("## Where the time goes\n\nThe top 5 operators by self time in the classical order, at the largest SF "
              "with analyze rows for it. Self times are approximate: the profiler's own clock reads land inside "
              "every parent operator's time.")
-    return "\n\n".join([intro, *(_hot_operators(q, summary, operators) for q in ("Q3", "Q5"))])
+    return "\n\n".join([intro, *(_hot_operators(q, summary, orders, operators) for q in ("Q3", "Q5"))])
 
 
-#'No' if any query is over the limit, 'Unknown' if any value or query is missing, else 'Yes'
-def _verdict(rows: pd.DataFrame, column: str, limit: float, fmt, wrong: Sequence[str] = ()) -> tuple[str, bool | None]:
-    over = rows[rows[column] > limit]
+#True when the formula's estimate for all of a query's tables is the plain product of their row counts:
+# it saw no join between them. Read from the classical order's row, or any row if that one wasn't
+# timed, since every order agrees on it
+def _cross_product_estimate(orders: pd.DataFrame, row: pd.Series) -> bool:
+    rows_q = orders[(orders["sf"] == row["sf"]) & (orders["query"] == row["query"])]
+    picked = rows_q[rows_q["order"] == row["classical_order"]]
+    first = (rows_q if picked.empty else picked).iloc[0]
+    est = parse_list(first["est_step_rows"])
+    return bool(est) and math.isclose(est[-1], math.prod(parse_list(first["table_rows"])), rel_tol=1e-9)
+
+
+#'No' if any query is over the limit. A partly timed query counts only when partial_is_sure: true for
+# near-best, where more orders can only lower the best, false for q-errors. Otherwise 'Unknown' if no
+# query is left to judge, or one has a wrong-result pick, no value, fewer ok orders than a full sweep,
+# or no rows. Else 'Yes'. expected is the queries that should have rows
+def _verdict(rows: pd.DataFrame, column: str, limit: float, fmt, expected: Sequence[str],
+             wrong: Sequence[str] = (), partial_is_sure: bool = True) -> tuple[str, bool | None]:
+    
+    partial = rows[rows["num_orders"] < rows["query"].map(lambda q: FULL_ORDER_COUNTS.get(q, 0))]
+    over = rows[(rows[column] > limit) & (partial_is_sure | ~rows.index.isin(partial.index))]
     if not over.empty:
         return "No: " + ", ".join(f"{r['query']} {fmt(r[column])}" for _, r in over.iterrows()), False
-    
+    if rows.empty and not expected:
+        return "Unknown: no query left to judge", None
+
     no_value = [q for q in rows.loc[rows[column].isna(), "query"] if q not in wrong]
-    no_rows = [q for q in FULL_ORDER_COUNTS if q not in set(rows["query"])]
-    gaps = [f"{what} {', '.join(qs)}" for what, qs in (("wrong result for", wrong), ("no value for", no_value), ("no rows for", no_rows)) if qs]
+    short = [f"{r['query']} ({r['num_orders']} of {FULL_ORDER_COUNTS[r['query']]} ok)" for _, r in partial.iterrows()]
+    no_rows = [q for q in expected if q not in set(rows["query"])]
+    gaps = [
+        f"{what} {', '.join(qs)}" for what, qs in (
+            ("wrong result for", wrong), ("no value for", no_value), ("too few orders for", short), ("no rows for", no_rows)
+        ) if qs
+    ]
     if gaps:
         return "Unknown: " + "; ".join(gaps), None
     return "Yes", True
@@ -441,9 +491,16 @@ def _decision_section(summary: pd.DataFrame, orders: pd.DataFrame) -> str:
     for sf in _sf_order(summary["sf"]):
         at_sf = summary[summary["sf"] == sf]
         wrong = [r["query"] for _, r in at_sf.iterrows() if _wrong_pick(orders, r, "classical")]
-        near_text, near = _verdict(at_sf, "classical_over_best", NEAR_BEST, _times, wrong)
-        small_text, small = _verdict(at_sf, "median_join_qerror", SMALL_QERROR, _num)
-        
+        near_text, near = _verdict(at_sf, "classical_over_best", NEAR_BEST, _times, list(FULL_ORDER_COUNTS), wrong)
+
+        # A cross-product estimate means the formula can't see the query's joins, so its q-error says
+        # nothing about the estimates. Those queries sit out the q-error answer.
+        blind = [r["query"] for _, r in at_sf.iterrows() if _cross_product_estimate(orders, r)]
+        judged = at_sf[~at_sf["query"].isin(blind)]
+        small_text, small = _verdict(judged, "median_join_qerror", SMALL_QERROR, _num, [q for q in FULL_ORDER_COUNTS if q not in blind], partial_is_sure=False)
+        if blind:
+            small_text += f". {', '.join(blind)} left out: {'its' if len(blind) == 1 else 'their'} join estimates are cross products."
+
         if near is False or small is False:
             move = "Join V2 has room on TPC-H as-is."
         elif near and small:
@@ -454,8 +511,9 @@ def _decision_section(summary: pd.DataFrame, orders: pd.DataFrame) -> str:
         
     intro = ("## Draft answers to the join rows of the decision rule (`docs/ToDo/03`)\n\n"
              "These are drafts for a person to check. \"Within 10%\" means every query's classical ÷ best "
-             f"is at most {NEAR_BEST:.2f}. \"Small q-errors\" means every query's median join q-error is at most "
-             f"{SMALL_QERROR:g}.")
+             f"is at most {NEAR_BEST:.2f}. \"Small q-errors\" means the median join q-error is at most "
+             f"{SMALL_QERROR:g} for every query whose join estimate isn't a cross product. A cross product means "
+             "the cost formula saw no join between the tables (they're joined in `WHERE`), so that query is left out.")
     table = _table(["SF", "Planner within 10% of best?", "Q-errors small?", "Draft next move"], ["---"] * 4, rows)
     return f"{intro}\n\n{table}"
 
@@ -468,7 +526,7 @@ def build_report(summary: pd.DataFrame, orders: pd.DataFrame, operators: pd.Data
         HOW_TO_READ,
         *(_sf_section(summary[summary["sf"] == sf], orders, choices) for sf in _sf_order(summary["sf"])),
         _q5_section(summary, orders, choices),
-        _time_section(summary, operators),
+        _time_section(summary, orders, operators),
         _decision_section(summary, orders),
     ]
     return "\n\n".join(s for s in sections if s) + "\n"
@@ -496,12 +554,13 @@ def _plot_query(ax, query: str, orders_q: pd.DataFrame, summary_q: pd.DataFrame)
     bars = orders_q.assign(ratio=orders_q["median_ms"] / info["best_ms"]).sort_values("ratio")
     roles = [_role(order, info) for order in bars["order"]]
     drawn = ax.bar(range(len(bars)), bars["ratio"], width=0.8, color=[COLORS[r] for r in roles], edgecolor=SURFACE, linewidth=1)
-    for patch, ok in zip(drawn, bars["result_ok"]):
+    # A wrong-result bar is hatched and gets no ratio. The label's filled box keeps the dashed line off its text.
+    for x, (patch, ratio, role, ok) in enumerate(zip(drawn, bars["ratio"], roles, bars["result_ok"])):
         if ok != 1:
             patch.set_hatch("///")
-    for x, (ratio, role) in enumerate(zip(bars["ratio"], roles)):
-        if role != "other":
-            ax.text(x, ratio, f"{ratio:.2f}×", ha="center", va="bottom", fontsize=8, color=INK)
+        elif role != "other":
+            ax.text(x, ratio, f"{ratio:.2f}×", ha="center", va="bottom", fontsize=8, color=INK,
+                    bbox={"facecolor": SURFACE, "edgecolor": "none", "pad": 1})
 
     ax.axhline(NEAR_BEST, color=MUTED, linestyle="--", linewidth=1)
     ax.set_title(f"{query} ({len(bars)} orders)", color=INK)

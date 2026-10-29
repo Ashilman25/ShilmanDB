@@ -126,7 +126,7 @@ void AddTableEdges(const std::unordered_set<int>& refs, std::vector<TableEdge>& 
 
 
 // A forced order must name every table exactly once, and each table after the first
-// must join to one already placed, so no step is a cross product.
+// must share a predicate with one already placed.
 void ValidateForcedOrder(const std::vector<int>& order, size_t num_tables, const std::vector<TableEdge>& edges) {
     const auto n = std::to_string(num_tables);
     if (order.size() != num_tables) {
@@ -572,41 +572,35 @@ auto Planner::Plan(SelectStatement stmt) -> std::unique_ptr<PlanNode> {
         std::unordered_set<int> joined_set;
         joined_set.insert(order[0]);
 
+        // A predicate belongs to the step that adds new_idx when it uses the new table, at
+        // least one placed table, and no table that isn't placed yet.
+        const auto belongs_to_step = [&](const Expression* pred, int new_idx) {
+            std::unordered_set<int> refs;
+            CollectTableIndices(pred, tables, table_infos, refs);
+
+            const bool refs_new = refs.find(new_idx) != refs.end();
+            const bool refs_joined = std::any_of(refs.begin(), refs.end(), [&](int r) {
+                return joined_set.find(r) != joined_set.end();
+            });
+            const bool refs_only_joined_or_new = std::all_of(refs.begin(), refs.end(), [&](int r) {
+                return r == new_idx || joined_set.find(r) != joined_set.end();
+            });
+            return refs_new && refs_joined && refs_only_joined_or_new;
+        };
+
         for (size_t k = 1; k < order.size(); ++k) {
             const int new_idx = order[k];
 
+            // Take every ON that belongs here: a table can be tied in by more than one.
             std::vector<std::unique_ptr<Expression>> join_preds;
             for (auto& join : stmt.joins) {
-                if (!join.on_condition) continue;
-
-                std::unordered_set<int> refs;
-                CollectTableIndices(join.on_condition.get(), tables, table_infos, refs);
-
-                bool refs_new = refs.find(new_idx) != refs.end();
-                bool refs_joined = std::any_of(refs.begin(), refs.end(), [&](int r) {
-                    return joined_set.find(r) != joined_set.end();
-                });
-
-                if (refs_new && refs_joined) {
+                if (join.on_condition && belongs_to_step(join.on_condition.get(), new_idx)) {
                     join_preds.push_back(std::move(join.on_condition));
-                    break;
                 }
             }
 
             for (auto it = residual_predicates.begin(); it != residual_predicates.end();) {
-                std::unordered_set<int> refs;
-                CollectTableIndices(it->get(), tables, table_infos, refs);
-
-                bool refs_new = refs.find(new_idx) != refs.end();
-                bool refs_joined = std::any_of(refs.begin(), refs.end(), [&](int r) {
-                    return joined_set.find(r) != joined_set.end();
-                });
-
-                bool refs_only_joined_or_new = std::all_of(refs.begin(), refs.end(), [&](int r) {
-                    return r == new_idx || joined_set.find(r) != joined_set.end();
-                });
-
-                if (refs_new && refs_joined && refs_only_joined_or_new) {
+                if (belongs_to_step(it->get(), new_idx)) {
                     join_preds.push_back(std::move(*it));
                     it = residual_predicates.erase(it);
                 } else {

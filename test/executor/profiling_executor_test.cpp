@@ -152,6 +152,10 @@ TEST_F(ProfilingExecutorTest, NoWrapWithoutStats) {
 
     EXPECT_EQ(dynamic_cast<ProfilingExecutor*>(root.get()), nullptr);
     EXPECT_EQ(DrainIds(*root).size(), 4u);
+
+    auto vec_root = ExecutorFactory::CreateExecutor(plan.get(), &ctx, ExecutionMode::VECTORIZED);
+    EXPECT_EQ(dynamic_cast<ProfilingExecutor*>(vec_root.get()), nullptr);
+    EXPECT_EQ(DrainIds(*vec_root).size(), 4u);
 }
 
 TEST_F(ProfilingExecutorTest, WrapsWithStats) {

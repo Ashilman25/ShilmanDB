@@ -118,6 +118,12 @@ TEST_F(QueryProfileTest, AnalyzeRowsReverse) {
 
     EXPECT_EQ(result.profile.scan_rows, (std::vector<uint64_t>{8, 6, 3}));
     EXPECT_EQ(result.profile.step_rows, (std::vector<uint64_t>{8, 8, 5}));
+
+    // a is a Filter over its scan, so the join's name has to look through the Filter.
+    const auto& ops = result.profile.operators;
+    const bool has_join_a = std::any_of(ops.begin(), ops.end(),
+                                        [](const OperatorProfile& op) { return op.name == "HashJoin +a"; });
+    EXPECT_TRUE(has_join_a);
 }
 
 TEST_F(QueryProfileTest, AnalyzeOperatorTree) {

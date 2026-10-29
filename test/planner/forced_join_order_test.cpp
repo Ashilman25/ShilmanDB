@@ -131,10 +131,16 @@ TEST_F(ForcedJoinOrderTest, ForcedNotPermutationThrows) {
     Catalog catalog(bundle.bpm.get());
     CreateTables(catalog);
 
-    for (const auto& order : {std::vector<int>{0, 0, 1}, std::vector<int>{0, 1, 3}}) {
+    // {1,0,1} is connected on the chain, so only the permutation check stops it.
+    for (const auto& order : {std::vector<int>{0, 0, 1}, std::vector<int>{0, 1, 3}, std::vector<int>{1, 0, 1}}) {
         Planner planner(&catalog);
         planner.SetForcedJoinOrder(order);
-        EXPECT_THROW((void)PlanSql(planner, kJoinSql), DatabaseException);
+        try {
+            (void)PlanSql(planner, kJoinSql);
+            ADD_FAILURE() << "order " << ::testing::PrintToString(order) << " did not throw";
+        } catch (const DatabaseException& e) {
+            EXPECT_NE(std::string(e.what()).find("exactly once"), std::string::npos) << e.what();
+        }
     }
 }
 

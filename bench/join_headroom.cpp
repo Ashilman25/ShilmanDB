@@ -61,6 +61,14 @@ template <typename T>
     return value;
 }
 
+// The same for a double. Uses strtod: from_chars for doubles is missing from some toolchains.
+[[nodiscard]] std::optional<double> ParseDouble(const std::string& s) {
+    char* end = nullptr;
+    const double value = std::strtod(s.c_str(), &end);
+    if (s.empty() || end != s.c_str() + s.size()) return std::nullopt;
+    return value;
+}
+
 // Items formatted by fmt and joined with sep.
 template <typename Range, typename Fmt>
 [[nodiscard]] std::string Join(const Range& items, std::string_view sep, Fmt fmt) {
@@ -107,21 +115,44 @@ template <typename... Fields>
 
 //  Arguments
 
+// The scale factors there's data for. Any spelling of one ("0.010", ".1", "1") becomes
+// its name here, which goes into the file names and the sf column so runs line up.
+struct ScaleFactor {
+    double value;
+    std::string_view name;
+    size_t pool_pages;  // same pool sizes as run_benchmarks.py
+};
+
+constexpr std::array<ScaleFactor, 3> kScaleFactors{{
+    {0.01, "0.01", 128},
+    {0.1, "0.1", 512},
+    {1.0, "1.0", 2048},
+}};
+
+[[nodiscard]] std::optional<ScaleFactor> FindScaleFactor(const std::string& text) {
+    const auto value = ParseDouble(text);
+    if (!value) return std::nullopt;
+
+    const auto it = std::find_if(kScaleFactors.begin(), kScaleFactors.end(), [&](const ScaleFactor& sf) { return sf.value == *value; });
+    if (it == kScaleFactors.end()) return std::nullopt;
+    return *it;
+}
+
 struct Args {
-    std::string sf;
+    std::string sf;  // the scale factor's name once parsed: "0.01", "0.1" or "1.0"
     std::string data_dir;
     std::string db_file;
     std::string out_dir{"bench/results/headroom/join"};
     std::vector<std::string> queries;
     int warmup{1};
     int runs{5};
-    size_t pool_size{0};  // 0 = pick from the scale factor
+    size_t pool_size{0};  // --pool-size, else the scale factor's pool once parsed
     std::optional<std::vector<int>> orders;
     std::string join_model_path;  // only settable in ML builds
 };
 
 void PrintUsage(std::ostream& out, const char* prog) {
-    out << "Usage: " << prog << " --sf <sf> --data-dir <dir> --db-file <path>\n"
+    out << "Usage: " << prog << " --sf <0.01|0.1|1.0> --data-dir <dir> --db-file <path>\n"
         << "         [--out-dir bench/results/headroom/join]\n"
         << "         [--queries Q3,Q5,Q10,Q12,Q14,Q19] [--warmup 1] [--runs 5] [--pool-size N]\n"
         << "         [--orders 4,3,2,1,0]          time just this order (needs exactly one --queries tag)\n"
@@ -220,11 +251,10 @@ template <typename T>
         Fail("--sf, --data-dir and --db-file are required");
     }
 
-    char* sf_end = nullptr;
-    const double sf = std::strtod(args.sf.c_str(), &sf_end);
-    if (sf_end != args.sf.c_str() + args.sf.size() || !(sf > 0.0)) {
-        Fail("--sf expects a positive number, got '" + args.sf + "'");
-    }
+    const auto scale = FindScaleFactor(args.sf);
+    if (!scale) Fail("--sf must be 0.01, 0.1 or 1.0, got '" + args.sf + "'");
+    args.sf = std::string(scale->name);
+    if (args.pool_size == 0) args.pool_size = scale->pool_pages;
 
     if (queries_arg) {
         args.queries = ParseQueries(*queries_arg);
@@ -245,6 +275,18 @@ template <typename T>
     }
 
     if (args.data_dir.back() != '/') args.data_dir += '/';
+
+    // A data dir named for a scale factor (".../sf0.1/") must match --sf.
+    std::string dir_path = args.data_dir;
+    while (dir_path.size() > 1 && dir_path.back() == '/') dir_path.pop_back();
+    const std::string dir_name = fs::path(dir_path).filename().string();
+    if (dir_name.rfind("sf", 0) == 0) {
+        const auto dir_sf = ParseDouble(dir_name.substr(2));
+        if (dir_sf && *dir_sf != scale->value) {
+            Fail("--data-dir " + args.data_dir + " is named for SF=" + dir_name.substr(2) + ", but --sf is " + args.sf);
+        }
+    }
+
     for (const auto& td : tpch::TableDescs()) {
         if (!fs::is_regular_file(args.data_dir + td.tbl_file)) {
             Fail("--data-dir: " + args.data_dir + td.tbl_file + " not found");
@@ -258,13 +300,6 @@ template <typename T>
     }
 
     return args;
-}
-
-[[nodiscard]] size_t DefaultPoolSize(const std::string& sf) {
-    if (sf == "0.01") return 128;
-    if (sf == "0.1") return 512;
-    if (sf == "1.0" || sf == "1") return 2048;
-    return 4096;
 }
 
 // A full run (every join query, no --orders) gets no suffix. Anything smaller is
@@ -547,7 +582,7 @@ void PrintSummary(const std::vector<QueryJob>& jobs) {
 
 int Run(const Args& args) {
     const auto run_start = Clock::now();
-    const size_t pool_size = args.pool_size ? args.pool_size : DefaultPoolSize(args.sf);
+    const size_t pool_size = args.pool_size;
 
     // Built before the load: with a model path this loads the model, so a bad path fails fast.
     std::unique_ptr<Database> db;
