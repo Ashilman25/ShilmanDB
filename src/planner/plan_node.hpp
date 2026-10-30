@@ -47,7 +47,7 @@ struct FilterPlanNode : PlanNode {
 
 struct HashJoinPlanNode : PlanNode {
     std::unique_ptr<Expression> join_predicate;
-    // Left child = build side, Right child = probe side
+    // The executor builds from whichever child turns out smaller, output is always left columns, then right
     HashJoinPlanNode(Schema schema, std::unique_ptr<Expression> pred) : PlanNode(PlanNodeType::HASH_JOIN, std::move(schema)), join_predicate(std::move(pred)) {}
 };
 
