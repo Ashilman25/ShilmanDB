@@ -1,6 +1,7 @@
 #include "planner/planner.hpp"
 #include "planner/join_order_optimizer.hpp"
 #include "planner/index_selector.hpp"
+#include "planner/expression_binder.hpp"
 #include "common/exception.hpp"
 #include "types/value.hpp"
 #include <algorithm>
@@ -785,6 +786,7 @@ auto Planner::Plan(SelectStatement stmt) -> std::unique_ptr<PlanNode> {
         current = std::move(limit_node);
     }
 
+    BindPlan(current.get());
     return current;
 }
 
