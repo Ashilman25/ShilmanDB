@@ -15,6 +15,9 @@ public:
     bool Next(Tuple* tuple) override;
     void Close() override;
 
+    // True when the hash table was built from the right child
+    [[nodiscard]] bool BuildsFromRight() const { return build_right_; }
+
 private:
     std::unique_ptr<Executor> left_child_;
     std::unique_ptr<Executor> right_child_;
@@ -25,9 +28,17 @@ private:
 
     const std::vector<Tuple>* current_bucket_{nullptr};
     size_t match_idx_{0};
-    Tuple current_right_;
+    Tuple current_probe_;
+
+    bool build_right_{false};
+    bool initialized_{false};
+
+    // Probe rows already pulled from the child while sizing up the two inputs
+    std::vector<Tuple> probe_buffer_;
+    size_t probe_cursor_{0};
 
     void ExtractKeyIndices();
+    [[nodiscard]] bool NextProbe(Tuple* out);
 };
 
 }  // namespace shilmandb

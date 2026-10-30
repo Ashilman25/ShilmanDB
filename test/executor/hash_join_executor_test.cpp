@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 #include <unistd.h>
 #include "executor/hash_join_executor.hpp"
+#include "executor/profiling_executor.hpp"
 #include "executor/seq_scan_executor.hpp"
 #include "planner/plan_node.hpp"
 #include "catalog/catalog.hpp"
@@ -9,6 +10,7 @@
 #include "storage/disk_manager.hpp"
 #include <filesystem>
 #include <memory>
+#include <algorithm>
 #include <set>
 #include <string>
 
@@ -27,6 +29,14 @@ static auto MakeEqPred(const std::string& left_col, const std::string& right_col
     e->op = BinaryOp::Op::EQ;
     e->left = MakeColRef(left_col);
     e->right = MakeColRef(right_col);
+    return e;
+}
+
+static auto MakeAndPred(std::unique_ptr<Expression> lhs, std::unique_ptr<Expression> rhs) {
+    auto e = std::make_unique<BinaryOp>();
+    e->op = BinaryOp::Op::AND;
+    e->left = std::move(lhs);
+    e->right = std::move(rhs);
     return e;
 }
 
@@ -57,6 +67,86 @@ protected:
         auto bpm = std::make_unique<BufferPoolManager>(
             pool_size, dm.get(), std::move(eviction));
         return {std::move(dm), std::move(bpm)};
+    }
+
+    using Rows = std::vector<std::vector<Value>>;
+
+    struct JoinRun {
+        Rows rows;
+        bool builds_right;
+    };
+
+    // Loads both tables, joins them with scan children and drains every output row.
+    JoinRun RunJoin(const Schema& left_schema, const Rows& left_rows,
+                    const Schema& right_schema, const Rows& right_rows,
+                    std::unique_ptr<Expression> pred) {
+        auto bundle = MakeBPM(test_file_);
+        Catalog catalog(bundle.bpm.get());
+        auto* left_info = catalog.CreateTable("left_t", left_schema);
+        auto* right_info = catalog.CreateTable("right_t", right_schema);
+        for (const auto& r : left_rows) (void)left_info->table->InsertTuple(Tuple(r, left_schema));
+        for (const auto& r : right_rows) (void)right_info->table->InsertTuple(Tuple(r, right_schema));
+
+        std::vector<Column> out_cols;
+        for (uint32_t i = 0; i < left_schema.GetColumnCount(); ++i) out_cols.push_back(left_schema.GetColumn(i));
+        for (uint32_t i = 0; i < right_schema.GetColumnCount(); ++i) out_cols.push_back(right_schema.GetColumn(i));
+        Schema output_schema(out_cols);
+
+        auto left_scan = std::make_unique<SeqScanPlanNode>(left_schema, "left_t");
+        auto right_scan = std::make_unique<SeqScanPlanNode>(right_schema, "right_t");
+        auto join_plan = std::make_unique<HashJoinPlanNode>(output_schema, std::move(pred));
+
+        ExecutorContext ctx{bundle.bpm.get(), &catalog};
+        HashJoinExecutor join_exec(join_plan.get(), &ctx,
+                                   std::make_unique<SeqScanExecutor>(left_scan.get(), &ctx),
+                                   std::make_unique<SeqScanExecutor>(right_scan.get(), &ctx));
+        join_exec.Init();
+        JoinRun run{{}, join_exec.BuildsFromRight()};
+        Tuple t;
+        while (join_exec.Next(&t)) {
+            std::vector<Value> row;
+            for (uint32_t i = 0; i < output_schema.GetColumnCount(); ++i) row.push_back(t.GetValue(output_schema, i));
+            run.rows.push_back(std::move(row));
+        }
+        join_exec.Close();
+        return run;
+    }
+
+    // Rows as sorted strings, so tests don't depend on output order.
+    static std::vector<std::string> Render(const Rows& rows) {
+        std::vector<std::string> out;
+        for (const auto& r : rows) {
+            std::string s;
+            for (const auto& v : r) s += v.ToString() + "|";
+            out.push_back(std::move(s));
+        }
+        std::sort(out.begin(), out.end());
+        return out;
+    }
+
+    static Schema LSchema() { return Schema({Column("lid", TypeId::INTEGER), Column("lval", TypeId::VARCHAR)}); }
+    static Schema RSchema() { return Schema({Column("rid", TypeId::INTEGER), Column("rval", TypeId::VARCHAR)}); }
+
+    static Rows LRows(std::initializer_list<int> keys) {
+        Rows rows;
+        for (int k : keys) rows.push_back({Value(k), Value("l" + std::to_string(k))});
+        return rows;
+    }
+    static Rows RRows(std::initializer_list<int> keys) {
+        Rows rows;
+        for (int k : keys) rows.push_back({Value(k), Value("r" + std::to_string(k))});
+        return rows;
+    }
+    static Rows Range(int lo, int hi, bool left) {
+        Rows rows;
+        for (int k = lo; k <= hi; ++k) {
+            rows.push_back({Value(k), Value((left ? "l" : "r") + std::to_string(k))});
+        }
+        return rows;
+    }
+
+    static std::string Expected(int k) {
+        return std::to_string(k) + "|l" + std::to_string(k) + "|" + std::to_string(k) + "|r" + std::to_string(k) + "|";
     }
 };
 
@@ -339,6 +429,178 @@ TEST_F(HashJoinExecutorTest, EmptyLeftTable) {
 
     Tuple result;
     EXPECT_FALSE(join_exec.Next(&result));
+    join_exec.Close();
+}
+
+// --- Build side follows the smaller input ---
+
+TEST_F(HashJoinExecutorTest, BuildsFromRightWhenRightIsSmaller) {
+    auto run = RunJoin(LSchema(), Range(1, 10, true), RSchema(), RRows({3, 7}), MakeEqPred("lid", "rid"));
+    EXPECT_TRUE(run.builds_right);
+    EXPECT_EQ(Render(run.rows), (std::vector<std::string>{Expected(3), Expected(7)}));
+}
+
+TEST_F(HashJoinExecutorTest, BuildsFromLeftWhenLeftIsSmaller) {
+    auto run = RunJoin(LSchema(), LRows({3, 7}), RSchema(), Range(1, 10, false), MakeEqPred("lid", "rid"));
+    EXPECT_FALSE(run.builds_right);
+    EXPECT_EQ(Render(run.rows), (std::vector<std::string>{Expected(3), Expected(7)}));
+}
+
+TEST_F(HashJoinExecutorTest, EqualSizesBuildFromLeft) {
+    auto run = RunJoin(LSchema(), Range(1, 3, true), RSchema(), Range(2, 4, false), MakeEqPred("lid", "rid"));
+    EXPECT_FALSE(run.builds_right);
+    EXPECT_EQ(Render(run.rows), (std::vector<std::string>{Expected(2), Expected(3)}));
+}
+
+TEST_F(HashJoinExecutorTest, DuplicateKeysOnRightWhenBuildingRight) {
+    // Same key, different second column, so every output pair is told apart.
+    Rows left = {{Value(1), Value("La")}, {Value(1), Value("Lb")}, {Value(2), Value("Lc")},
+                 {Value(2), Value("Ld")}, {Value(3), Value("Le")}, {Value(4), Value("Lf")}};
+    Rows right = {{Value(1), Value("Ra")}, {Value(1), Value("Rb")}, {Value(2), Value("Rc")}};
+
+    auto run = RunJoin(LSchema(), left, RSchema(), right, MakeEqPred("lid", "rid"));
+    EXPECT_TRUE(run.builds_right);
+    ASSERT_EQ(run.rows.size(), 6u);
+    EXPECT_EQ(Render(run.rows), (std::vector<std::string>{
+        "1|La|1|Ra|", "1|La|1|Rb|", "1|Lb|1|Ra|", "1|Lb|1|Rb|", "2|Lc|2|Rc|", "2|Ld|2|Rc|"}));
+}
+
+TEST_F(HashJoinExecutorTest, EmptyRightSideBuildsRight) {
+    auto bundle = MakeBPM(test_file_);
+    Catalog catalog(bundle.bpm.get());
+    auto ls = LSchema();
+    auto rs = RSchema();
+    auto* left_info = catalog.CreateTable("left_t", ls);
+    (void)catalog.CreateTable("right_t", rs);
+    for (const auto& r : Range(1, 3, true)) (void)left_info->table->InsertTuple(Tuple(r, ls));
+
+    Schema out({Column("lid", TypeId::INTEGER), Column("lval", TypeId::VARCHAR),
+                Column("rid", TypeId::INTEGER), Column("rval", TypeId::VARCHAR)});
+    auto left_scan = std::make_unique<SeqScanPlanNode>(ls, "left_t");
+    auto right_scan = std::make_unique<SeqScanPlanNode>(rs, "right_t");
+    auto join_plan = std::make_unique<HashJoinPlanNode>(out, MakeEqPred("lid", "rid"));
+    OperatorStatsMap stats;
+    ExecutorContext ctx{bundle.bpm.get(), &catalog, &stats};
+    HashJoinExecutor join_exec(join_plan.get(), &ctx,
+                               std::make_unique<ProfilingExecutor>(
+                                   left_scan.get(), &ctx, std::make_unique<SeqScanExecutor>(left_scan.get(), &ctx)),
+                               std::make_unique<SeqScanExecutor>(right_scan.get(), &ctx));
+    join_exec.Init();
+    EXPECT_TRUE(join_exec.BuildsFromRight());
+    Tuple t;
+    int count = 0;
+    while (join_exec.Next(&t)) ++count;
+    join_exec.Close();
+    EXPECT_EQ(count, 0);
+    // The probe side is still read to the end.
+    EXPECT_EQ(stats[left_scan.get()].rows, 3u);
+}
+
+TEST_F(HashJoinExecutorTest, EmptyLeftSideBuildsLeft) {
+    auto run = RunJoin(LSchema(), {}, RSchema(), Range(1, 3, false), MakeEqPred("lid", "rid"));
+    EXPECT_FALSE(run.builds_right);
+    EXPECT_TRUE(run.rows.empty());
+}
+
+TEST_F(HashJoinExecutorTest, ProbeBufferHandoffBuildingRight) {
+    auto run = RunJoin(LSchema(), Range(1, 100, true), RSchema(), RRows({2, 50, 99}), MakeEqPred("lid", "rid"));
+    EXPECT_TRUE(run.builds_right);
+    EXPECT_EQ(Render(run.rows), (std::vector<std::string>{Expected(2), Expected(50), Expected(99)}));
+}
+
+TEST_F(HashJoinExecutorTest, ProbeBufferHandoffBuildingLeft) {
+    auto run = RunJoin(LSchema(), LRows({2, 50, 99}), RSchema(), Range(1, 100, false), MakeEqPred("lid", "rid"));
+    EXPECT_FALSE(run.builds_right);
+    EXPECT_EQ(Render(run.rows), (std::vector<std::string>{Expected(2), Expected(50), Expected(99)}));
+}
+
+TEST_F(HashJoinExecutorTest, TwoEqualitiesBuildingRight) {
+    // The left side lists b before a, so the two key columns sit at different positions.
+    Schema ls({Column("b", TypeId::INTEGER), Column("a", TypeId::INTEGER)});
+    Schema rs({Column("c", TypeId::INTEGER), Column("d", TypeId::INTEGER)});
+    Rows left, right;
+    for (auto [b, a] : std::vector<std::pair<int, int>>{{1, 1}, {2, 1}, {1, 2}, {2, 2}, {3, 3}, {4, 4}}) {
+        left.push_back({Value(b), Value(a)});
+    }
+    for (auto [c, d] : std::vector<std::pair<int, int>>{{1, 2}, {2, 2}}) right.push_back({Value(c), Value(d)});
+
+    auto run = RunJoin(ls, left, rs, right, MakeAndPred(MakeEqPred("c", "a"), MakeEqPred("b", "d")));
+    EXPECT_TRUE(run.builds_right);
+    EXPECT_EQ(Render(run.rows), (std::vector<std::string>{"2|1|1|2|", "2|2|2|2|"}));
+}
+
+TEST_F(HashJoinExecutorTest, VarcharKeysBuildingRight) {
+    Schema ls({Column("lname", TypeId::VARCHAR), Column("lid", TypeId::INTEGER)});
+    Schema rs({Column("rid", TypeId::INTEGER), Column("rname", TypeId::VARCHAR)});
+    Rows left, right;
+    int id = 1;
+    for (const char* n : {"ann", "bob", "cat", "dan"}) left.push_back({Value(std::string(n)), Value(id++)});
+    right.push_back({Value(20), Value(std::string("bob"))});
+    right.push_back({Value(40), Value(std::string("dan"))});
+
+    auto run = RunJoin(ls, left, rs, right, MakeEqPred("lname", "rname"));
+    EXPECT_TRUE(run.builds_right);
+    EXPECT_EQ(Render(run.rows), (std::vector<std::string>{"bob|2|20|bob|", "dan|4|40|dan|"}));
+}
+
+// --- Lifecycle ---
+
+TEST_F(HashJoinExecutorTest, ReinitAfterCloseGivesSameRows) {
+    auto bundle = MakeBPM(test_file_);
+    Catalog catalog(bundle.bpm.get());
+    auto ls = LSchema();
+    auto rs = RSchema();
+    auto* left_info = catalog.CreateTable("left_t", ls);
+    auto* right_info = catalog.CreateTable("right_t", rs);
+    for (const auto& r : Range(1, 10, true)) (void)left_info->table->InsertTuple(Tuple(r, ls));
+    for (const auto& r : RRows({3, 7})) (void)right_info->table->InsertTuple(Tuple(r, rs));
+
+    Schema out({Column("lid", TypeId::INTEGER), Column("lval", TypeId::VARCHAR),
+                Column("rid", TypeId::INTEGER), Column("rval", TypeId::VARCHAR)});
+    auto left_scan = std::make_unique<SeqScanPlanNode>(ls, "left_t");
+    auto right_scan = std::make_unique<SeqScanPlanNode>(rs, "right_t");
+    auto join_plan = std::make_unique<HashJoinPlanNode>(out, MakeEqPred("lid", "rid"));
+    ExecutorContext ctx{bundle.bpm.get(), &catalog};
+    HashJoinExecutor join_exec(join_plan.get(), &ctx,
+                               std::make_unique<SeqScanExecutor>(left_scan.get(), &ctx),
+                               std::make_unique<SeqScanExecutor>(right_scan.get(), &ctx));
+
+    for (int round = 0; round < 2; ++round) {
+        join_exec.Init();
+        EXPECT_TRUE(join_exec.BuildsFromRight());
+        Rows rows;
+        Tuple t;
+        while (join_exec.Next(&t)) {
+            rows.push_back({t.GetValue(out, 0), t.GetValue(out, 1), t.GetValue(out, 2), t.GetValue(out, 3)});
+        }
+        join_exec.Close();
+        EXPECT_EQ(Render(rows), (std::vector<std::string>{Expected(3), Expected(7)}));
+    }
+}
+
+TEST_F(HashJoinExecutorTest, CloseMidStreamIsSafe) {
+    auto bundle = MakeBPM(test_file_);
+    Catalog catalog(bundle.bpm.get());
+    auto ls = LSchema();
+    auto rs = RSchema();
+    auto* left_info = catalog.CreateTable("left_t", ls);
+    auto* right_info = catalog.CreateTable("right_t", rs);
+    for (const auto& r : Range(1, 100, true)) (void)left_info->table->InsertTuple(Tuple(r, ls));
+    for (const auto& r : Range(1, 50, false)) (void)right_info->table->InsertTuple(Tuple(r, rs));
+
+    Schema out({Column("lid", TypeId::INTEGER), Column("lval", TypeId::VARCHAR),
+                Column("rid", TypeId::INTEGER), Column("rval", TypeId::VARCHAR)});
+    auto left_scan = std::make_unique<SeqScanPlanNode>(ls, "left_t");
+    auto right_scan = std::make_unique<SeqScanPlanNode>(rs, "right_t");
+    auto join_plan = std::make_unique<HashJoinPlanNode>(out, MakeEqPred("lid", "rid"));
+    ExecutorContext ctx{bundle.bpm.get(), &catalog};
+    HashJoinExecutor join_exec(join_plan.get(), &ctx,
+                               std::make_unique<SeqScanExecutor>(left_scan.get(), &ctx),
+                               std::make_unique<SeqScanExecutor>(right_scan.get(), &ctx));
+    join_exec.Init();
+    Tuple t;
+    EXPECT_TRUE(join_exec.Next(&t));
+    EXPECT_TRUE(join_exec.BuildsFromRight());
     join_exec.Close();
 }
 
