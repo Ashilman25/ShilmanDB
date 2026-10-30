@@ -2,15 +2,20 @@
 #include <unistd.h>
 
 #include "engine/database.hpp"
+#include "parser/parser.hpp"
 #include "planner/join_graph.hpp"
+#include "planner/plan_node.hpp"
+#include "planner/planner.hpp"
 #include "tpch_workload.hpp"
 
 #include <algorithm>
 #include <filesystem>
 #include <iterator>
 #include <memory>
+#include <optional>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace shilmandb {
@@ -25,6 +30,112 @@ std::string OrderString(const std::vector<int>& order) {
         out += std::to_string(order[i]);
     }
     return out + "]";
+}
+
+// How many column references and DATE-column-vs-literal comparisons CheckBound looked at.
+int g_refs_checked = 0;
+int g_date_comparisons_checked = 0;
+
+// Checks every column reference in an expression is bound to its place in `schema`, and
+// every DATE column compared with a literal has a DATE literal. Counts the problems it finds.
+void CheckBound(const Expression* expr, const Schema& schema, const std::string& where, int* problems) {
+    if (expr == nullptr) return;
+    switch (expr->type) {
+        case ExprType::COLUMN_REF: {
+            const auto* col = static_cast<const ColumnRef*>(expr);
+            ++g_refs_checked;
+            if (!col->bound_index.has_value()) {
+                ADD_FAILURE() << where << ": column " << col->column_name << " is not bound";
+                ++*problems;
+            } else if (schema.GetColumnIndex(col->column_name) != *col->bound_index) {
+                ADD_FAILURE() << where << ": column " << col->column_name << " is bound to " << *col->bound_index
+                              << ", the schema has it at " << schema.GetColumnIndex(col->column_name);
+                ++*problems;
+            }
+            break;
+        }
+        case ExprType::BINARY_OP: {
+            const auto* bin = static_cast<const BinaryOp*>(expr);
+            const bool is_comparison = bin->op == BinaryOp::Op::EQ || bin->op == BinaryOp::Op::NEQ ||
+                                       bin->op == BinaryOp::Op::LT || bin->op == BinaryOp::Op::GT ||
+                                       bin->op == BinaryOp::Op::LTE || bin->op == BinaryOp::Op::GTE;
+            if (is_comparison && bin->left && bin->right) {
+                for (const auto& [col_side, lit_side] : {std::pair{bin->left.get(), bin->right.get()},
+                                                         std::pair{bin->right.get(), bin->left.get()}}) {
+                    if (col_side->type != ExprType::COLUMN_REF || lit_side->type != ExprType::LITERAL) continue;
+                    const auto* col = static_cast<const ColumnRef*>(col_side);
+                    const auto* lit = static_cast<const Literal*>(lit_side);
+                    if (!col->bound_index.has_value()) continue;
+                    if (schema.GetColumn(*col->bound_index).type == TypeId::DATE) ++g_date_comparisons_checked;
+                    if (schema.GetColumn(*col->bound_index).type == TypeId::DATE && lit->value.type_ != TypeId::DATE) {
+                        ADD_FAILURE() << where << ": DATE column " << col->column_name << " is compared with a non-DATE literal";
+                        ++*problems;
+                    }
+                }
+            }
+            CheckBound(bin->left.get(), schema, where, problems);
+            CheckBound(bin->right.get(), schema, where, problems);
+            break;
+        }
+        case ExprType::UNARY_OP:
+            CheckBound(static_cast<const UnaryOp*>(expr)->operand.get(), schema, where, problems);
+            break;
+        case ExprType::AGGREGATE:
+            CheckBound(static_cast<const Aggregate*>(expr)->arg.get(), schema, where, problems);
+            break;
+        case ExprType::CASE: {
+            const auto* c = static_cast<const CaseExpression*>(expr);
+            for (const auto& [cond, result] : c->when_clauses) {
+                CheckBound(cond.get(), schema, where, problems);
+                CheckBound(result.get(), schema, where, problems);
+            }
+            CheckBound(c->else_clause.get(), schema, where, problems);
+            break;
+        }
+        case ExprType::LITERAL:
+        case ExprType::STAR:
+            break;
+    }
+}
+
+// Walks a plan and checks each node's expressions against the schema its executor reads rows with:
+// joins read the combined row (their own output schema), everything else reads its child's output.
+void CheckPlanBound(const PlanNode* node, const std::string& where, int* problems) {
+    switch (node->type) {
+        case PlanNodeType::FILTER:
+            CheckBound(static_cast<const FilterPlanNode*>(node)->predicate.get(),
+                       node->children[0]->output_schema, where + " Filter", problems);
+            break;
+        case PlanNodeType::HASH_JOIN:
+            CheckBound(static_cast<const HashJoinPlanNode*>(node)->join_predicate.get(),
+                       node->output_schema, where + " HashJoin", problems);
+            break;
+        case PlanNodeType::NESTED_LOOP_JOIN:
+            CheckBound(static_cast<const NestedLoopJoinPlanNode*>(node)->predicate.get(),
+                       node->output_schema, where + " NestedLoopJoin", problems);
+            break;
+        case PlanNodeType::AGGREGATE: {
+            const auto* agg = static_cast<const AggregatePlanNode*>(node);
+            for (const auto& e : agg->group_by_exprs)
+                CheckBound(e.get(), node->children[0]->output_schema, where + " Aggregate", problems);
+            for (const auto& e : agg->aggregate_exprs)
+                CheckBound(e.get(), node->children[0]->output_schema, where + " Aggregate", problems);
+            break;
+        }
+        case PlanNodeType::PROJECTION:
+            for (const auto& e : static_cast<const ProjectionPlanNode*>(node)->expressions)
+                CheckBound(e.get(), node->children[0]->output_schema, where + " Projection", problems);
+            break;
+        case PlanNodeType::SORT:
+            for (const auto& item : static_cast<const SortPlanNode*>(node)->order_by)
+                CheckBound(item.expr.get(), node->children[0]->output_schema, where + " Sort", problems);
+            break;
+        case PlanNodeType::SEQ_SCAN:
+        case PlanNodeType::INDEX_SCAN:
+        case PlanNodeType::LIMIT:
+            break;
+    }
+    for (const auto& child : node->children) CheckPlanBound(child.get(), where, problems);
 }
 
 }  // namespace
@@ -132,6 +243,44 @@ TEST_F(JoinOrderParityTest, DefaultOrdersUnchanged) {
         EXPECT_EQ(info.source, JoinOrderSource::CLASSICAL) << tag;
         EXPECT_EQ(info.order, order) << tag << ": got " << OrderString(info.order);
     }
+}
+
+// Every plan the planner builds for TPC-H, default and every forced connected order, has
+// each column reference bound to the right position and DATE comparisons holding DATE literals.
+TEST_F(JoinOrderParityTest, PlansAreFullyBound) {
+    int plans_checked = 0;
+    int problems = 0;
+    g_refs_checked = 0;
+    g_date_comparisons_checked = 0;
+
+    const auto check_plan = [&](const std::string& sql, const std::string& where,
+                                const std::optional<std::vector<int>>& order) {
+        Parser parser(sql);
+        auto stmt = parser.Parse();
+        Planner planner(db_->GetCatalog());
+        if (order) planner.SetForcedJoinOrder(*order);
+        const auto plan = planner.Plan(std::move(*stmt));
+        CheckPlanBound(plan.get(), where, &problems);
+        ++plans_checked;
+    };
+
+    for (const auto& query : tpch::Queries()) {
+        check_plan(query.sql, query.tag + " default", std::nullopt);
+    }
+
+    for (const std::string tag : {"Q3", "Q5", "Q10", "Q12", "Q14", "Q19"}) {
+        const auto query = tpch::FindQuery(tag);
+        ASSERT_TRUE(query.has_value()) << tag;
+        const auto info = db_->ExplainJoinOrder(query->sql);
+        for (const auto& order : ConnectedOrders(static_cast<int>(info.tables.size()), info.edges)) {
+            check_plan(query->sql, tag + " order " + OrderString(order), order);
+        }
+    }
+
+    EXPECT_EQ(problems, 0);
+    EXPECT_EQ(plans_checked, 42);
+    EXPECT_GT(g_refs_checked, 0);
+    EXPECT_GT(g_date_comparisons_checked, 0);
 }
 
 TEST_F(JoinOrderParityTest, Q5AnalyzeSanity) {

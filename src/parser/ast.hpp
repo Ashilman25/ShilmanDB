@@ -25,6 +25,7 @@ protected:
 struct ColumnRef : Expression {
     std::optional<std::string> table_name;
     std::string column_name;
+    std::optional<uint32_t> bound_index;  // position in the schema this ref is read from; empty if unbound
     ColumnRef() : Expression(ExprType::COLUMN_REF) {}
 
     [[nodiscard]] std::unique_ptr<Expression> Clone() const override {

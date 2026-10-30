@@ -3,6 +3,7 @@
 #include "types/tuple.hpp"
 #include "catalog/schema.hpp"
 #include "common/exception.hpp"
+#include <cassert>
 #include <string>
 
 namespace shilmandb {
@@ -41,8 +42,11 @@ inline Value EvaluateExpression(const Expression* expr, const Tuple& tuple, cons
     switch (expr->type) {
         case ExprType::COLUMN_REF: {
             const auto* col = static_cast<const ColumnRef*>(expr);
-            auto idx = schema.GetColumnIndex(col->column_name);
-            return tuple.GetValue(schema, idx);
+            if (col->bound_index) {
+                assert(schema.GetColumn(*col->bound_index).name == col->column_name && "column bound against a different schema");
+                return tuple.GetValue(schema, *col->bound_index);
+            }
+            return tuple.GetValue(schema, schema.GetColumnIndex(col->column_name));
         }
 
         case ExprType::LITERAL: {
