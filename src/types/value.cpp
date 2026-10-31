@@ -356,6 +356,16 @@ Value Value::CastTo(TypeId target) const {
     throw DatabaseException("Cannot cast " + ToString() + " to target type");
 }
 
+Value Value::WidenTo(TypeId target) const {
+    if (type_ == target || CommonType(target, type_) != target) return *this;
+
+    try {
+        return CastTo(target);
+    } catch (const std::exception&) {
+        return *this;
+    }
+}
+
 uint32_t Value::GetFixedLength() const {
     switch (type_) {
         case TypeId::INTEGER: 

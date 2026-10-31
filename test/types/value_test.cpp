@@ -265,4 +265,34 @@ TEST(ValueTest, GetFixedLength) {
     EXPECT_EQ(Value(std::string("")).GetFixedLength(), 0u);
 }
 
+// --- WidenTo ---
+
+TEST(ValueTest, WidenToConvertsDateStringToDate) {
+    Value v = Value(std::string("1994-01-01")).WidenTo(TypeId::DATE);
+    EXPECT_EQ(v.type_, TypeId::DATE);
+    EXPECT_TRUE(v == Value::FromString(TypeId::DATE, "1994-01-01"));
+}
+
+TEST(ValueTest, WidenToWidensNumbers) {
+    EXPECT_EQ(Value(int32_t{42}).WidenTo(TypeId::BIGINT).bigint_, 42);
+    EXPECT_DOUBLE_EQ(Value(int32_t{24}).WidenTo(TypeId::DECIMAL).decimal_, 24.0);
+}
+
+TEST(ValueTest, WidenToLeavesNarrowingAlone) {
+    Value d = Value(2.5).WidenTo(TypeId::INTEGER);
+    EXPECT_EQ(d.type_, TypeId::DECIMAL);
+    EXPECT_DOUBLE_EQ(d.decimal_, 2.5);
+
+    Value b = Value(int64_t{7}).WidenTo(TypeId::INTEGER);
+    EXPECT_EQ(b.type_, TypeId::BIGINT);
+    EXPECT_EQ(b.bigint_, 7);
+}
+
+TEST(ValueTest, WidenToLeavesBadDateAlone) {
+    Value v;
+    EXPECT_NO_THROW(v = Value(std::string("not-a-date")).WidenTo(TypeId::DATE));
+    EXPECT_EQ(v.type_, TypeId::VARCHAR);
+    EXPECT_EQ(v.varchar_, "not-a-date");
+}
+
 }  // namespace shilmandb
