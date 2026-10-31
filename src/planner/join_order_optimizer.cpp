@@ -156,7 +156,7 @@ auto EstimateCostInternal(const std::vector<int>& order, const std::vector<JoinE
 
 
 
-auto JoinOrderOptimizer::FindBestOrder(const std::vector<TableRef>& tables, const std::vector<JoinClause>& joins, const std::vector<TableStats>& stats) -> std::vector<int> {
+auto JoinOrderOptimizer::FindBestOrder(const std::vector<TableRef>& tables, const std::vector<JoinClause>& joins, const std::vector<TableStats>& stats, const std::vector<TableEdge>& table_edges) -> std::vector<int> {
     const auto n = static_cast<int>(tables.size());
 
     if (n <= 1) {
@@ -177,18 +177,27 @@ auto JoinOrderOptimizer::FindBestOrder(const std::vector<TableRef>& tables, cons
     std::vector<int> perm(n);
     std::iota(perm.begin(), perm.end(), 0);
 
-    double best_cost = std::numeric_limits<double>::max();
-    std::vector<int> best_order = perm;
+    // Try connected orders first; if none exists, try every order
+    for (const bool connected_only : {true, false}) {
+        if (connected_only && table_edges.empty()) continue;
 
-    do {
-        double cost = EstimateCostInternal(perm, edges, stats);
-        if (cost < best_cost) {
-            best_cost = cost;
-            best_order = perm;
-        }
-    } while (std::next_permutation(perm.begin(), perm.end()));
+        double best_cost = std::numeric_limits<double>::max();
+        std::vector<int> best_order;
 
-    return best_order;
+        do {
+            if (connected_only && !IsConnectedOrder(perm, table_edges)) continue;
+
+            double cost = EstimateCostInternal(perm, edges, stats);
+            if (cost < best_cost) {
+                best_cost = cost;
+                best_order = perm;
+            }
+        } while (std::next_permutation(perm.begin(), perm.end()));
+
+        if (!best_order.empty()) return best_order;
+    }
+
+    return perm;
 }
 
 auto JoinOrderOptimizer::EstimateCost(const std::vector<int>& order, const std::vector<TableRef>& tables, const std::vector<JoinClause>& joins, const std::vector<TableStats>& stats) -> double {

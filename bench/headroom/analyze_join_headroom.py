@@ -6,7 +6,7 @@ from __future__ import annotations
 import argparse
 import math
 import sys
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 import matplotlib
@@ -33,7 +33,7 @@ COLUMNS = {
     "orders": [
         "sf", "query", "order", "order_slots", "connected", "is_classical", "is_learned",
         "est_cost", "est_step_rows", "actual_step_rows", "table_rows", "scan_rows",
-        "median_ms", "min_ms", "max_ms", "runs", "result_ok"
+        "median_ms", "min_ms", "max_ms", "runs", "result_ok", "est_scan_rows"
     ],
     "operators": ["sf", "query", "order", "op_index", "depth", "operator", "rows", "total_ms", "self_ms"],
     "choices": ["sf", "query", "chooser", "order", "source", "model_order"],
@@ -168,13 +168,19 @@ def join_qerrors(orders_q: pd.DataFrame) -> list[float]:
                 
     return list(per_set.values())
 
-#One q-error per table: its full row count (what the formula uses) vs the rows its filters keep
+#The rows the cost formula used for each table, in join order: the filtered estimate, or the full
+# row count in older files that have no est_scan_rows column (or leave it empty)
+def formula_rows(fields: Mapping) -> list[float]:
+    return parse_list(fields.get("est_scan_rows")) or parse_list(fields["table_rows"])
+
+
+#One q-error per table: the rows the formula used vs the rows its filters keep
 def scan_qerrors(orders_q: pd.DataFrame) -> list[float]:
     per_table: dict[str, float] = {}
     for row in orders_q.itertuples():
-        counts = zip(row.order.split(">"), parse_list(row.table_rows), parse_list(row.scan_rows), strict=True)
-        for table, full, scanned in counts:
-            per_table.setdefault(table, qerror(full, scanned))
+        counts = zip(row.order.split(">"), formula_rows(row._asdict()), parse_list(row.scan_rows), strict=True)
+        for table, est, scanned in counts:
+            per_table.setdefault(table, qerror(est, scanned))
     return list(per_table.values())
 
 
@@ -339,7 +345,7 @@ HOW_TO_READ = """How to read the tables:
 - Best, worst, **Orders**, Spearman and the q-errors use only connected orders that returned the right answer.
 - A planner pick that isn't a connected order (it can't see `WHERE` joins) runs unforced. It counts only for the classical and learned ratios, so a ratio under 1.00× means it beat every connected order.
 - Spearman compares the cost formula's ranking of the orders with their measured ranking (1 means the same ranking). It's blank below 4 orders.
-- Join q-error is max(estimate ÷ actual, actual ÷ estimate) for the row count of each distinct set of joined tables. Scan q-error compares each table's full row count (what the cost formula uses) with the rows its filters keep.
+- Join q-error is max(estimate ÷ actual, actual ÷ estimate) for the row count of each distinct set of joined tables. Scan q-error compares each table's estimated rows after its filters (what the cost formula uses) with the rows its filters really keep. Older result files have no estimate and use the table's full row count.
 - Learned source: `learned` means the planner used the model's order; `learned_rejected` means it didn't and fell back to the classical order."""
 
 
@@ -448,7 +454,7 @@ def _time_section(summary: pd.DataFrame, orders: pd.DataFrame, operators: pd.Dat
     return "\n\n".join([intro, *(_hot_operators(q, summary, orders, operators) for q in ("Q3", "Q5"))])
 
 
-#True when the formula's estimate for all of a query's tables is the plain product of their row counts:
+#True when the formula's estimate for all of a query's tables is the plain product of the rows it used for them:
 # it saw no join between them. Read from the classical order's row, or any row if that one wasn't
 # timed, since every order agrees on it
 def _cross_product_estimate(orders: pd.DataFrame, row: pd.Series) -> bool:
@@ -456,7 +462,7 @@ def _cross_product_estimate(orders: pd.DataFrame, row: pd.Series) -> bool:
     picked = rows_q[rows_q["order"] == row["classical_order"]]
     first = (rows_q if picked.empty else picked).iloc[0]
     est = parse_list(first["est_step_rows"])
-    return bool(est) and math.isclose(est[-1], math.prod(parse_list(first["table_rows"])), rel_tol=1e-9)
+    return bool(est) and math.isclose(est[-1], math.prod(formula_rows(first)), rel_tol=1e-9)
 
 
 #'No' if any query is over the limit. A partly timed query counts only when partial_is_sure: true for

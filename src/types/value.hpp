@@ -46,6 +46,10 @@ public:
     bool IsNull() const;
 
     [[nodiscard]] Value CastTo(TypeId target) const;
+
+    // Like CastTo, but only when it widens (or a date string becomes a DATE).
+    // Anything else, or a cast that fails, returns the value unchanged.
+    [[nodiscard]] Value WidenTo(TypeId target) const;
 };
 
 [[nodiscard]] constexpr TypeId CommonType(TypeId a, TypeId b) {

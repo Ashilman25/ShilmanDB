@@ -44,6 +44,7 @@ shilmandb_add_test(planner_test planner/planner_test.cpp)
 shilmandb_add_test(forced_join_order_test planner/forced_join_order_test.cpp)
 shilmandb_add_test(expression_binder_test planner/expression_binder_test.cpp)
 shilmandb_add_test(index_selection_test planner/index_selection_test.cpp)
+shilmandb_add_test(selectivity_test planner/selectivity_test.cpp)
 shilmandb_add_test(nested_aggregate_test planner/nested_aggregate_test.cpp)
 
 # Executor tests
@@ -75,3 +76,5 @@ shilmandb_add_test(query_profile_test integration/query_profile_test.cpp)
 shilmandb_add_test(join_predicate_placement_test integration/join_predicate_placement_test.cpp)
 shilmandb_add_test(join_order_parity_test integration/join_order_parity_test.cpp)
 target_include_directories(join_order_parity_test PRIVATE ${CMAKE_SOURCE_DIR}/bench)
+shilmandb_add_test(tpch_estimates_test integration/tpch_estimates_test.cpp)
+target_include_directories(tpch_estimates_test PRIVATE ${CMAKE_SOURCE_DIR}/bench)

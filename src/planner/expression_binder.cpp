@@ -19,12 +19,7 @@ void ConvertLiteral(const Expression* column_side, Expression* literal_side, con
 
     const TypeId column_type = schema.GetColumns()[*col.bound_index].type;
     auto& value = static_cast<Literal*>(literal_side)->value;
-    if (value.type_ == column_type || CommonType(column_type, value.type_) != column_type) return;
-
-    try {
-        value = value.CastTo(column_type);
-    } catch (const std::exception&) {
-    }
+    value = value.WidenTo(column_type);
 }
 
 }  // namespace

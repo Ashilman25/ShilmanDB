@@ -498,6 +498,7 @@ void TimeCandidate(Database& db, const QueryJob& job, Candidate& c, const QueryR
     const auto table_rows = Join(c.order, ";", [&](int slot) {
         return std::to_string(db.GetCatalog()->GetTable(tables[slot])->stats.row_count);
     });
+    const auto est_scan_rows = Join(c.order, ";", [&](int slot) { return FormatEst(profile.join.est_scan_rows[slot]); });
     const auto [min_it, max_it] = std::minmax_element(times.begin(), times.end());
 
     out.orders.Write(CsvRow(
@@ -505,7 +506,7 @@ void TimeCandidate(Database& db, const QueryJob& job, Candidate& c, const QueryR
         int{c.is_classical}, int{c.is_learned}, FormatEst(profile.join.est_cost),
         Join(profile.join.est_step_rows, ";", FormatEst), Join(profile.step_rows, ";", kToString),
         table_rows, Join(profile.scan_rows, ";", kToString), FormatMs(*c.median_ms),
-        FormatMs(*min_it), FormatMs(*max_it), args.runs, int{c.result_ok}
+        FormatMs(*min_it), FormatMs(*max_it), args.runs, int{c.result_ok}, est_scan_rows
     ));
 }
 
@@ -623,7 +624,7 @@ int Run(const Args& args) {
     CsvFile orders(
         dir / ("orders_sf" + args.sf + suffix + ".csv"),
         "sf,query,order,order_slots,connected,is_classical,is_learned,est_cost,est_step_rows,"
-        "actual_step_rows,table_rows,scan_rows,median_ms,min_ms,max_ms,runs,result_ok"
+        "actual_step_rows,table_rows,scan_rows,median_ms,min_ms,max_ms,runs,result_ok,est_scan_rows"
     );
 
     CsvFile operators(dir / ("operators_sf" + args.sf + suffix + ".csv"), "sf,query,order,op_index,depth,operator,rows,total_ms,self_ms");

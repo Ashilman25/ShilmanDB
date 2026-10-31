@@ -305,6 +305,58 @@ TEST_F(CatalogTest, UpdateTableStatsDistinctCounts) {
     EXPECT_EQ(table_info->stats.distinct_counts.at("flag"), 2u);
 }
 
+TEST_F(CatalogTest, UpdateTableStatsMinMax) {
+    auto bundle = MakeBPM();
+    Catalog catalog(bundle.bpm.get());
+
+    Schema schema({
+        Column("i", TypeId::INTEGER),
+        Column("b", TypeId::BIGINT),
+        Column("d", TypeId::DECIMAL),
+        Column("dt", TypeId::DATE),
+        Column("s", TypeId::VARCHAR)
+    });
+
+    auto* table_info = catalog.CreateTable("t", schema);
+    ASSERT_NE(table_info, nullptr);
+
+    const int32_t ints[] = {5, -3, 9};
+    const int64_t bigs[] = {5000000000LL, -7, 42};
+    const double decs[] = {2.5, -1.25, 100.0};
+    const char* dates[] = {"1994-01-01", "1992-01-04", "1998-11-29"};
+    for (int k = 0; k < 3; ++k) {
+        Tuple tuple({Value(ints[k]), Value(bigs[k]), Value(decs[k]),
+                     Value::FromString(TypeId::DATE, dates[k]), Value(std::string("x"))},
+                    schema);
+        (void)table_info->table->InsertTuple(tuple);
+    }
+
+    catalog.UpdateTableStats("t");
+    const auto& mm = table_info->stats.min_max;
+
+    EXPECT_EQ(mm.at("i").min.integer_, -3);
+    EXPECT_EQ(mm.at("i").max.integer_, 9);
+    EXPECT_EQ(mm.at("b").min.bigint_, -7);
+    EXPECT_EQ(mm.at("b").max.bigint_, 5000000000LL);
+    EXPECT_DOUBLE_EQ(mm.at("d").min.decimal_, -1.25);
+    EXPECT_DOUBLE_EQ(mm.at("d").max.decimal_, 100.0);
+    EXPECT_EQ(mm.at("dt").min.date_, Value::FromString(TypeId::DATE, "1992-01-04").date_);
+    EXPECT_EQ(mm.at("dt").max.date_, Value::FromString(TypeId::DATE, "1998-11-29").date_);
+    EXPECT_TRUE(mm.find("s") == mm.end());
+}
+
+TEST_F(CatalogTest, UpdateTableStatsMinMaxEmptyTable) {
+    auto bundle = MakeBPM();
+    Catalog catalog(bundle.bpm.get());
+
+    Schema schema({Column("i", TypeId::INTEGER), Column("dt", TypeId::DATE)});
+    auto* table_info = catalog.CreateTable("t", schema);
+    ASSERT_NE(table_info, nullptr);
+
+    catalog.UpdateTableStats("t");
+    EXPECT_TRUE(table_info->stats.min_max.empty());
+}
+
 TEST_F(CatalogTest, UpdateTableStatsWithMixedTypes) {
     auto bundle = MakeBPM();
     Catalog catalog(bundle.bpm.get());

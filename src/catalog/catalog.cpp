@@ -1,5 +1,6 @@
 #include "catalog/catalog.hpp"
 #include "common/exception.hpp"
+#include <optional>
 #include <unordered_set>
 
 namespace shilmandb {
@@ -99,19 +100,36 @@ void Catalog::UpdateTableStats(const std::string& table_name) {
 
     uint64_t row_count = 0;
     std::vector<std::unordered_set<Value>> distinct_sets(col_count);
+    std::vector<std::optional<MinMax>> ranges(col_count);
 
     for (auto it = table_info->table->Begin(schema); it != table_info->table->End(); ++it) {
         auto tuple = *it;
         ++row_count;
 
         for (uint32_t i = 0; i < col_count; ++i) {
-            distinct_sets[i].insert(tuple.GetValue(schema, i));
+            auto value = tuple.GetValue(schema, i);
+
+            if (schema.GetColumn(i).type != TypeId::VARCHAR) {
+                if (!ranges[i]) {
+                    ranges[i] = MinMax{value, value};
+                } else if (value < ranges[i]->min) {
+                    ranges[i]->min = value;
+                } else if (ranges[i]->max < value) {
+                    ranges[i]->max = value;
+                }
+            }
+
+            distinct_sets[i].insert(std::move(value));
         }
     }
 
     table_info->stats.row_count = row_count;
     table_info->stats.distinct_counts.clear();
+    table_info->stats.min_max.clear();
     for (uint32_t i = 0; i < col_count; ++i) {
+        if (ranges[i]) {
+            table_info->stats.min_max[schema.GetColumn(i).name] = *ranges[i];
+        }
         table_info->stats.distinct_counts[schema.GetColumn(i).name] = static_cast<uint64_t>(distinct_sets[i].size());
     }
 }
