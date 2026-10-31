@@ -46,7 +46,8 @@ Q12_ORDERS = {
 # the actual rows times qerror, so every joined set gets that q-error.
 def order_row(query: str, order: str, *, ms: float | None = None, classical: str = "",
               learned: str = "", ok: int = 1, qerror: float | None = None,
-              min_ms: float | None = None, max_ms: float | None = None) -> str:
+              min_ms: float | None = None, max_ms: float | None = None,
+              est_scan_rows: str | None = None) -> str:
     table = Q3_ORDERS if order in Q3_ORDERS else Q12_ORDERS
     est, act, default_ms = table[order]
     if qerror is not None:
@@ -62,11 +63,14 @@ def order_row(query: str, order: str, *, ms: float | None = None, classical: str
         str(int(order == classical)), str(int(order == learned)), str(sum(est)), join(est), join(act),
         join(TABLE_ROWS[t] for t in tables), join(SCAN_ROWS[t] for t in tables),
         str(ms), str(ms if min_ms is None else min_ms), str(ms if max_ms is None else max_ms), "5", str(ok),
+        *([] if est_scan_rows is None else [est_scan_rows]),
     ])
 
 
 def write_orders(path: Path, rows: list[str]) -> Path:
-    path.write_text(ORDERS_HEADER + "\n" + "\n".join(rows) + "\n")
+    # Rows with one field more than the header carry the newest column, est_scan_rows.
+    header = ORDERS_HEADER + (",est_scan_rows" if any(r.count(",") == ORDERS_HEADER.count(",") + 1 for r in rows) else "")
+    path.write_text(header + "\n" + "\n".join(rows) + "\n")
     return path
 
 
@@ -161,6 +165,27 @@ def test_join_qerror_dedupes_table_sets(tmp_path: Path) -> None:
     # {a,b}: est 1000 vs 400; {a,b,c}: est 10000 vs 800. Each set counts once.
     assert sorted(mod.join_qerrors(orders)) == pytest.approx([2.5, 12.5])
     assert sorted(mod.scan_qerrors(orders)) == pytest.approx([1.0, 2.0, 5.0])
+
+
+def test_scan_qerror_uses_est_scan_rows(tmp_path: Path) -> None:
+    write_orders(tmp_path / "orders_sf0.01.csv", [order_row("Q12", "x>y", est_scan_rows="100;500")])
+    orders, _, _ = mod.load_results(tmp_path)
+    orders = orders.assign(table_rows="1000;500", scan_rows="100;500")
+    assert mod.scan_qerrors(orders) == pytest.approx([1.0, 1.0])
+    # An older file has no estimate: the full row count stands in for it.
+    for older in (orders.drop(columns="est_scan_rows"), orders.assign(est_scan_rows=float("nan"))):
+        assert sorted(mod.scan_qerrors(older)) == pytest.approx([1.0, 10.0])
+
+
+def test_cross_product_check_uses_est_scan_rows(tmp_path: Path) -> None:
+    write_orders(tmp_path / "orders_sf0.01.csv", [order_row("Q12", "x>y", classical="x>y", est_scan_rows="100;500")])
+    orders, _, _ = mod.load_results(tmp_path)
+    # The estimate ends at 100 x 500 = 50000, the product of the filtered rows, not of the 1000 x 500 full rows.
+    orders = orders.assign(est_step_rows="100;50000", table_rows="1000;500")
+    row = pd.Series({"sf": "0.01", "query": "Q12", "classical_order": "x>y"})
+    assert mod._cross_product_estimate(orders, row)
+    assert not mod._cross_product_estimate(orders.assign(est_step_rows="100;2000"), row)
+    assert mod._cross_product_estimate(orders.drop(columns="est_scan_rows").assign(est_step_rows="100;500000"), row)
 
 
 def test_qerrors_reject_lists_that_dont_line_up(tmp_path: Path) -> None:
