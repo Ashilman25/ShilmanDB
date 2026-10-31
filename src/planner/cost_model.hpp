@@ -6,6 +6,8 @@
 #include "types/types.hpp"
 #include <cstdint>
 #include <string>
+#include <string_view>
+#include <vector>
 
 namespace shilmandb {
 
@@ -22,7 +24,14 @@ struct CostModel {
 
     [[nodiscard]] static double EstimateTablePages(uint64_t row_count, const Schema& schema);
     [[nodiscard]] static int EstimateTreeHeight(uint64_t row_count, TypeId key_type);
-    [[nodiscard]] static double EstimateSelectivity(const Expression* predicate, const std::string& column_name, const TableStats& stats);
+
+    // Fraction of rows that pass every predicate in `conjuncts` (an AND list). Range comparisons
+    // on one column are merged into a single interval and priced from the column's min and max.
+    // With `only_column`, predicates on other columns count as 1.0 (how one index is priced).
+    [[nodiscard]] static double EstimateSelectivity(const std::vector<const Expression*>& conjuncts, const TableStats& stats, std::string_view only_column = {});
+
+    // Rows a table's own filters keep: row_count * selectivity, at least 1 (0 for an empty table).
+    [[nodiscard]] static double EstimateFilteredRows(const std::vector<const Expression*>& filters, const TableStats& stats);
 
     [[nodiscard]] static double SeqScanCost(uint64_t row_count, const Schema& schema);
     [[nodiscard]] static double IndexScanCost(uint64_t row_count, double selectivity, TypeId key_type);

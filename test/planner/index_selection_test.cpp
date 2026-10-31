@@ -33,6 +33,12 @@ static std::unique_ptr<Expression> MakeLit(int32_t v) {
     return e;
 }
 
+static std::unique_ptr<Expression> MakeStrLit(const std::string& v) {
+    auto e = std::make_unique<Literal>();
+    e->value = Value(v);
+    return e;
+}
+
 static std::unique_ptr<Expression> MakeBinOp(BinaryOp::Op op,
                                              std::unique_ptr<Expression> lhs,
                                              std::unique_ptr<Expression> rhs) {
@@ -71,7 +77,7 @@ TEST(CostModelTest, SelectivityEqualityUsesDistinctCount) {
     stats.distinct_counts["col"] = 100;
 
     auto pred = MakeBinOp(BinaryOp::Op::EQ, MakeColRef("col"), MakeLit(5));
-    const double sel = CostModel::EstimateSelectivity(pred.get(), "col", stats);
+    const double sel = CostModel::EstimateSelectivity({pred.get()}, stats, "col");
     EXPECT_NEAR(sel, 0.01, 1e-9);
 }
 
@@ -81,7 +87,7 @@ TEST(CostModelTest, SelectivityRangeConstant) {
     stats.distinct_counts["col"] = 1000000;  // should be ignored for range predicates
 
     auto pred = MakeBinOp(BinaryOp::Op::GT, MakeColRef("col"), MakeLit(5));
-    const double sel = CostModel::EstimateSelectivity(pred.get(), "col", stats);
+    const double sel = CostModel::EstimateSelectivity({pred.get()}, stats, "col");
     EXPECT_NEAR(sel, CostModel::kOpenRangeSelectivity, 1e-9);
 }
 
@@ -93,7 +99,7 @@ TEST(CostModelTest, SelectivityConjunctionClampsToFloor) {
     auto a    = MakeBinOp(BinaryOp::Op::EQ, MakeColRef("col"), MakeLit(1));
     auto b    = MakeBinOp(BinaryOp::Op::EQ, MakeColRef("col"), MakeLit(2));
     auto pred = MakeBinOp(BinaryOp::Op::AND, std::move(a), std::move(b));
-    const double sel = CostModel::EstimateSelectivity(pred.get(), "col", stats);
+    const double sel = CostModel::EstimateSelectivity({pred.get()}, stats, "col");
     EXPECT_NEAR(sel, CostModel::kMinSelectivity, 1e-9);
 }
 
@@ -447,6 +453,116 @@ TEST_F(IndexSelectorStrategyTest, LiteralOnLeftIsNormalized) {
     EXPECT_EQ(idx_scan->low_key.value(),  Value(static_cast<int32_t>(42)));
     EXPECT_EQ(idx_scan->high_key.value(), Value(static_cast<int32_t>(42)));
     EXPECT_TRUE(residual.empty());
+}
+
+// --- Date ranges and key types ---
+
+// Table t(id BIGINT, d DATE) with stats shaped like lineitem's ship date.
+static TableInfo* MakeDateTable(Catalog& catalog) {
+    auto* ti = catalog.CreateTable("t", Schema({
+        Column("id", TypeId::BIGINT),
+        Column("d",  TypeId::DATE)
+    }));
+    ti->stats.row_count = 6000000;
+    ti->stats.distinct_counts["d"] = 2522;
+    ti->stats.min_max["d"] = {Value::FromString(TypeId::DATE, "1992-01-04"),
+                              Value::FromString(TypeId::DATE, "1998-11-29")};
+    (void)catalog.CreateIndex("idx_t_d", "t", "d");
+    return ti;
+}
+
+TEST_F(IndexSelectorStrategyTest, YearRangeOnDateIndexUsesSeqScan) {
+    auto bundle = MakeBPM(test_file_);
+    Catalog catalog(bundle.bpm.get());
+    auto* ti = MakeDateTable(catalog);
+
+    std::vector<std::unique_ptr<Expression>> preds;
+    preds.push_back(MakeBinOp(BinaryOp::Op::GTE, MakeColRef("d"), MakeStrLit("1994-01-01")));
+    preds.push_back(MakeBinOp(BinaryOp::Op::LT,  MakeColRef("d"), MakeStrLit("1995-01-01")));
+
+    std::vector<std::unique_ptr<Expression>> residual;
+    auto scan = IndexSelector::SelectScanStrategy("t", ti->schema, preds, residual, &catalog);
+
+    ASSERT_NE(scan, nullptr);
+    EXPECT_EQ(scan->type, PlanNodeType::SEQ_SCAN);
+    EXPECT_EQ(residual.size(), 2u);
+}
+
+TEST_F(IndexSelectorStrategyTest, OneDayRangeUsesIndexScanWithDateKeys) {
+    auto bundle = MakeBPM(test_file_);
+    Catalog catalog(bundle.bpm.get());
+    auto* ti = MakeDateTable(catalog);
+
+    std::vector<std::unique_ptr<Expression>> preds;
+    preds.push_back(MakeBinOp(BinaryOp::Op::GTE, MakeColRef("d"), MakeStrLit("1995-06-17")));
+    preds.push_back(MakeBinOp(BinaryOp::Op::LT,  MakeColRef("d"), MakeStrLit("1995-06-18")));
+
+    std::vector<std::unique_ptr<Expression>> residual;
+    auto scan = IndexSelector::SelectScanStrategy("t", ti->schema, preds, residual, &catalog);
+
+    ASSERT_NE(scan, nullptr);
+    ASSERT_EQ(scan->type, PlanNodeType::INDEX_SCAN);
+    auto* idx_scan = dynamic_cast<IndexScanPlanNode*>(scan.get());
+    ASSERT_NE(idx_scan, nullptr);
+    ASSERT_TRUE(idx_scan->low_key.has_value());
+    ASSERT_TRUE(idx_scan->high_key.has_value());
+    EXPECT_EQ(idx_scan->low_key->type_,  TypeId::DATE);
+    EXPECT_EQ(idx_scan->high_key->type_, TypeId::DATE);
+    EXPECT_EQ(*idx_scan->low_key,  Value::FromString(TypeId::DATE, "1995-06-17"));
+    EXPECT_EQ(*idx_scan->high_key, Value::FromString(TypeId::DATE, "1995-06-18"));
+    // The scan is inclusive, so the strict < stays as a filter.
+    EXPECT_EQ(residual.size(), 1u);
+}
+
+TEST_F(IndexSelectorStrategyTest, OneDayBetweenUsesIndexScan) {
+    auto bundle = MakeBPM(test_file_);
+    Catalog catalog(bundle.bpm.get());
+    auto* ti = MakeDateTable(catalog);
+
+    std::vector<std::unique_ptr<Expression>> preds;
+    preds.push_back(MakeBinOp(BinaryOp::Op::GTE, MakeColRef("d"), MakeStrLit("1995-06-17")));
+    preds.push_back(MakeBinOp(BinaryOp::Op::LTE, MakeColRef("d"), MakeStrLit("1995-06-17")));
+
+    std::vector<std::unique_ptr<Expression>> residual;
+    auto scan = IndexSelector::SelectScanStrategy("t", ti->schema, preds, residual, &catalog);
+
+    ASSERT_NE(scan, nullptr);
+    ASSERT_EQ(scan->type, PlanNodeType::INDEX_SCAN);
+    auto* idx_scan = dynamic_cast<IndexScanPlanNode*>(scan.get());
+    ASSERT_NE(idx_scan, nullptr);
+    ASSERT_TRUE(idx_scan->low_key.has_value());
+    ASSERT_TRUE(idx_scan->high_key.has_value());
+    EXPECT_EQ(idx_scan->low_key->type_,  TypeId::DATE);
+    EXPECT_EQ(idx_scan->high_key->type_, TypeId::DATE);
+    EXPECT_EQ(*idx_scan->low_key,  Value::FromString(TypeId::DATE, "1995-06-17"));
+    EXPECT_EQ(*idx_scan->high_key, Value::FromString(TypeId::DATE, "1995-06-17"));
+    EXPECT_TRUE(residual.empty());
+}
+
+// An INTEGER literal against a BIGINT key becomes a BIGINT key.
+TEST_F(IndexSelectorStrategyTest, IntegerKeyWidenedToBigint) {
+    auto bundle = MakeBPM(test_file_);
+    Catalog catalog(bundle.bpm.get());
+
+    auto* ti = catalog.CreateTable("t", Schema({Column("id", TypeId::BIGINT)}));
+    ASSERT_NE(ti, nullptr);
+    ti->stats.row_count = 1000000;
+    ti->stats.distinct_counts["id"] = 1000000;
+    (void)catalog.CreateIndex("idx_t_id", "t", "id");
+
+    std::vector<std::unique_ptr<Expression>> preds;
+    preds.push_back(MakeBinOp(BinaryOp::Op::EQ, MakeColRef("id"), MakeLit(42)));
+
+    std::vector<std::unique_ptr<Expression>> residual;
+    auto scan = IndexSelector::SelectScanStrategy("t", ti->schema, preds, residual, &catalog);
+
+    ASSERT_NE(scan, nullptr);
+    ASSERT_EQ(scan->type, PlanNodeType::INDEX_SCAN);
+    auto* idx_scan = dynamic_cast<IndexScanPlanNode*>(scan.get());
+    ASSERT_NE(idx_scan, nullptr);
+    ASSERT_TRUE(idx_scan->low_key.has_value());
+    EXPECT_EQ(idx_scan->low_key->type_, TypeId::BIGINT);
+    EXPECT_EQ(idx_scan->low_key->bigint_, 42);
 }
 
 }  // namespace shilmandb

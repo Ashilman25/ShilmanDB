@@ -134,22 +134,21 @@ std::unique_ptr<PlanNode> IndexSelector::SelectScanStrategy(const std::string& t
             if (!m.referenced_column) continue;
             matched_preds.push_back(predicates[i].get());
 
+            // Convert bounds to the key's type once (a date string becomes a DATE).
             if (m.contributes_low) {
-                if (!low.has_value() || m.low_value > *low) low = m.low_value;
+                const Value bound = m.low_value.WidenTo(key_type);
+                if (!low.has_value() || bound > *low) low = bound;
             }
             if (m.contributes_high) {
-                if (!high.has_value() || m.high_value < *high) high = m.high_value;
+                const Value bound = m.high_value.WidenTo(key_type);
+                if (!high.has_value() || bound < *high) high = bound;
             }
             if (m.fully_consumed) consumed.push_back(i);
         }
 
         if (matched_preds.empty()) continue;
 
-        double sel = 1.0;
-        for (const auto* pred : matched_preds) {
-            sel *= CostModel::EstimateSelectivity(pred, idx_info->column_name, stats);
-        }
-        sel = std::max(CostModel::kMinSelectivity, std::min(1.0, sel));
+        const double sel = CostModel::EstimateSelectivity(matched_preds, stats, idx_info->column_name);
 
         const double idx_cost = CostModel::IndexScanCost(stats.row_count, sel, key_type);
         if (idx_cost < best.cost) {
