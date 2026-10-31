@@ -31,6 +31,7 @@ enum class JoinOrderSource { SINGLE_TABLE, CLASSICAL, LEARNED, LEARNED_REJECTED,
 // How the last Plan() call ordered its joins. Table slots are indexes into `tables`.
 struct JoinOrderInfo {
     std::vector<std::string> tables;    // table name per slot: FROM tables, then JOIN tables, as written
+    std::vector<double> est_scan_rows;  // rows each table's own WHERE filters are expected to keep, one per slot
     std::vector<TableEdge> edges;       // tables tied by an ON condition or a two-table WHERE predicate - each pair is (low, high), sorted, no duplicates
     std::vector<int> order;
     JoinOrderSource source{JoinOrderSource::SINGLE_TABLE};

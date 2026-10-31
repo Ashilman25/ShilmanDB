@@ -731,4 +731,94 @@ TEST_F(PlannerTest, FourTableImplicitJoinShape) {
     EXPECT_EQ(count_leaves(plan.get()), 4);
 }
 
+// ---------------------------------------------------------------------------
+// Filter-aware join row counts. Stats are set by hand on empty tables.
+// ---------------------------------------------------------------------------
+namespace {
+
+// t1(a, x): 1,000 rows, x in 0..999.  t2(b): 500 rows.
+void MakeFilterTables(Catalog& catalog) {
+    auto* t1 = catalog.CreateTable("t1", Schema({Column("a", TypeId::INTEGER), Column("x", TypeId::INTEGER)}));
+    auto* t2 = catalog.CreateTable("t2", Schema({Column("b", TypeId::INTEGER)}));
+    ASSERT_NE(t1, nullptr);
+    ASSERT_NE(t2, nullptr);
+    t1->stats.row_count = 1000;
+    t1->stats.distinct_counts["a"] = 500;
+    t1->stats.min_max["x"] = {Value(int32_t{0}), Value(int32_t{999})};
+    t2->stats.row_count = 500;
+    t2->stats.distinct_counts["b"] = 500;
+}
+
+auto PlanAndInfo(Catalog& catalog, const std::string& sql) -> JoinOrderInfo {
+    Parser parser(sql);
+    auto stmt = parser.Parse();
+    Planner planner(&catalog);
+    auto plan = planner.Plan(std::move(*stmt));
+    EXPECT_NE(plan, nullptr);
+    return planner.GetJoinOrderInfo();
+}
+
+}  // namespace
+
+TEST_F(PlannerTest, RecordsFilteredScanRows) {
+    auto bundle = MakeBPM(test_file_);
+    Catalog catalog(bundle.bpm.get());
+    MakeFilterTables(catalog);
+
+    const auto info = PlanAndInfo(catalog, "SELECT * FROM t1 JOIN t2 ON t1.a = t2.b WHERE t1.x < 100");
+
+    ASSERT_EQ(info.est_scan_rows.size(), 2u);
+    EXPECT_DOUBLE_EQ(info.est_scan_rows[0], 100.0);
+    EXPECT_DOUBLE_EQ(info.est_scan_rows[1], 500.0);
+    ASSERT_FALSE(info.est_step_rows.empty());
+    EXPECT_DOUBLE_EQ(info.est_step_rows[0], info.est_scan_rows[info.order[0]]);
+}
+
+TEST_F(PlannerTest, FilterChangesJoinOrder) {
+    auto bundle = MakeBPM(test_file_);
+    Catalog catalog(bundle.bpm.get());
+    MakeFilterTables(catalog);
+
+    const auto unfiltered = PlanAndInfo(catalog, "SELECT * FROM t1 JOIN t2 ON t1.a = t2.b");
+    EXPECT_EQ(unfiltered.order, (std::vector<int>{1, 0}));
+
+    const auto filtered = PlanAndInfo(catalog, "SELECT * FROM t1 JOIN t2 ON t1.a = t2.b WHERE t1.x < 100");
+    EXPECT_EQ(filtered.order, (std::vector<int>{0, 1}));
+}
+
+TEST_F(PlannerTest, SingleTableRecordsFilteredRows) {
+    auto bundle = MakeBPM(test_file_);
+    Catalog catalog(bundle.bpm.get());
+    MakeFilterTables(catalog);
+
+    const auto info = PlanAndInfo(catalog, "SELECT * FROM t1 WHERE x < 100");
+
+    EXPECT_EQ(info.est_scan_rows, (std::vector<double>{100.0}));
+    EXPECT_EQ(info.est_step_rows, (std::vector<double>{100.0}));
+    EXPECT_DOUBLE_EQ(info.est_cost, 100.0);
+}
+
+TEST_F(PlannerTest, ImplicitJoinOrderHasNoCrossProduct) {
+    auto bundle = MakeBPM(test_file_);
+    Catalog catalog(bundle.bpm.get());
+
+    auto* n = catalog.CreateTable("n", Schema({Column("n_nk", TypeId::INTEGER)}));
+    auto* c = catalog.CreateTable("c", Schema({Column("c_ck", TypeId::INTEGER), Column("c_nk", TypeId::INTEGER)}));
+    auto* o = catalog.CreateTable("o", Schema({Column("o_ck", TypeId::INTEGER), Column("o_d", TypeId::INTEGER)}));
+    ASSERT_NE(n, nullptr);
+    ASSERT_NE(c, nullptr);
+    ASSERT_NE(o, nullptr);
+    n->stats.row_count = 25;
+    c->stats.row_count = 1500;
+    o->stats.row_count = 15000;
+    o->stats.min_max["o_d"] = {Value(int32_t{0}), Value(int32_t{2405})};
+
+    // o filters down to about 574 rows, so by row counts alone o would come before c.
+    const auto info = PlanAndInfo(catalog,
+        "SELECT * FROM n, c, o WHERE n_nk = c_nk AND c_ck = o_ck AND o_d < 92");
+
+    EXPECT_TRUE(IsConnectedOrder(info.order, info.edges));
+    EXPECT_EQ(info.order, (std::vector<int>{0, 1, 2}));
+}
+
 }  // namespace shilmandb

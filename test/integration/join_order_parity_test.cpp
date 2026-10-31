@@ -221,6 +221,7 @@ TEST_F(JoinOrderParityTest, Q19AllOrders) { CheckAllOrders("Q19", 2); }
 
 // The classical planner's picks, as slots into info.tables. Pinned so a planner change
 // can't move them without anyone noticing: the answer would stay right, the time wouldn't.
+// The orders follow each table's filtered row count.
 TEST_F(JoinOrderParityTest, DefaultOrdersUnchanged) {
     struct Expected {
         std::string tag;
@@ -228,10 +229,10 @@ TEST_F(JoinOrderParityTest, DefaultOrdersUnchanged) {
     };
     const std::vector<Expected> expected = {
         {"Q3", {0, 1, 2}},        // customer, orders, lineitem
-        {"Q5", {4, 3, 2, 1, 0}},  // nation, supplier, lineitem, orders, customer
+        {"Q5", {0, 1, 2, 3, 4}},  // customer, orders, lineitem, supplier, nation
         {"Q10", {3, 0, 1, 2}},    // nation, customer, orders, lineitem
-        {"Q12", {0, 1}},          // orders, lineitem
-        {"Q14", {1, 0}},          // part, lineitem
+        {"Q12", {1, 0}},          // lineitem, orders
+        {"Q14", {0, 1}},          // lineitem, part
         {"Q19", {1, 0}},          // part, lineitem
     };
 

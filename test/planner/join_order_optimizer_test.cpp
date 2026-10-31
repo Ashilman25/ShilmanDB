@@ -540,4 +540,60 @@ TEST(JoinOrderOptimizerTest, EstimateCostEqualsSumOfSteps) {
     EXPECT_EQ(checked, 120);
 }
 
+// ---------------------------------------------------------------------------
+// FindBestOrder with edges: only connected orders compete
+// ---------------------------------------------------------------------------
+namespace {
+
+struct ChainQuery {
+    std::vector<TableRef> tables;
+    std::vector<TableStats> stats;
+    std::vector<JoinClause> joins;
+};
+
+// a (10 rows) - b (1,000 rows) - c (5 rows), joined a.k = b.k and b.j = c.j
+auto MakeChainQuery() -> ChainQuery {
+    ChainQuery q;
+    q.tables = {MakeTableRef("a"), MakeTableRef("b"), MakeTableRef("c")};
+    q.stats = {
+        MakeStats(10, {{"k", 10}}),
+        MakeStats(1000, {{"k", 10}, {"j", 5}}),
+        MakeStats(5, {{"j", 5}}),
+    };
+    q.joins.push_back(MakeJoinClause("b", MakeEquiJoinExpr("a", "k", "b", "k")));
+    q.joins.push_back(MakeJoinClause("c", MakeEquiJoinExpr("b", "j", "c", "j")));
+    return q;
+}
+
+}  // namespace
+
+TEST(JoinOrderOptimizerTest, FindBestOrderUnrestrictedPicksCrossProduct) {
+    const auto q = MakeChainQuery();
+
+    // c x a is a cross product, but the formula finds it cheapest
+    const auto order = JoinOrderOptimizer::FindBestOrder(q.tables, q.joins, q.stats);
+
+    EXPECT_EQ(order, (std::vector<int>{2, 0, 1}));
+    EXPECT_DOUBLE_EQ(JoinOrderOptimizer::EstimateCost(order, q.tables, q.joins, q.stats), 1055.0);
+}
+
+TEST(JoinOrderOptimizerTest, FindBestOrderWithEdgesSkipsCrossProduct) {
+    const auto q = MakeChainQuery();
+    const std::vector<TableEdge> edges = {{0, 1}, {1, 2}};
+
+    const auto order = JoinOrderOptimizer::FindBestOrder(q.tables, q.joins, q.stats, edges);
+
+    EXPECT_EQ(order, (std::vector<int>{2, 1, 0}));
+    EXPECT_DOUBLE_EQ(JoinOrderOptimizer::EstimateCost(order, q.tables, q.joins, q.stats), 2005.0);
+}
+
+TEST(JoinOrderOptimizerTest, FindBestOrderNoConnectedOrderFallsBack) {
+    const auto q = MakeChainQuery();
+    const std::vector<TableEdge> edges = {{0, 1}};  // table 2 is never tied in
+
+    const auto order = JoinOrderOptimizer::FindBestOrder(q.tables, q.joins, q.stats, edges);
+
+    EXPECT_EQ(order, (std::vector<int>{2, 0, 1}));
+}
+
 }  // namespace shilmandb

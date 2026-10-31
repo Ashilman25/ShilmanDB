@@ -1,10 +1,12 @@
 #include "planner/planner.hpp"
 #include "planner/join_order_optimizer.hpp"
 #include "planner/index_selector.hpp"
+#include "planner/cost_model.hpp"
 #include "planner/expression_binder.hpp"
 #include "common/exception.hpp"
 #include "types/value.hpp"
 #include <algorithm>
+#include <cmath>
 #include <numeric>
 #include <string>
 #include <unordered_set>
@@ -487,6 +489,16 @@ auto Planner::Plan(SelectStatement stmt) -> std::unique_ptr<PlanNode> {
         ValidateForcedOrder(*forced_order_, tables.size(), info.edges);
     }
 
+    // Rows each table keeps after its own filters. Worked out now, before the scans use up the predicates.
+    for (size_t i = 0; i < tables.size(); ++i) {
+        std::vector<const Expression*> filters;
+        filters.reserve(table_predicates[i].size());
+        for (const auto& pred : table_predicates[i]) {
+            filters.push_back(pred.get());
+        }
+        info.est_scan_rows.push_back(std::round(CostModel::EstimateFilteredRows(filters, table_infos[i]->stats)));
+    }
+
     std::vector<std::unique_ptr<PlanNode>> scans;
     scans.reserve(tables.size());
     for (size_t i = 0; i < tables.size(); ++i) {
@@ -512,17 +524,22 @@ auto Planner::Plan(SelectStatement stmt) -> std::unique_ptr<PlanNode> {
     if (tables.size() <= 1) {
         info.order = {0};
         info.source = forced_order_ ? JoinOrderSource::FORCED : JoinOrderSource::SINGLE_TABLE;
-        info.est_step_rows = {static_cast<double>(table_infos[0]->stats.row_count)};
+        info.est_step_rows = {info.est_scan_rows[0]};
         info.est_cost = info.est_step_rows[0];
 
         current = std::move(scans[0]);
         step_nodes_.push_back(current.get());
     } else {
-        std::vector<TableStats> stats;
-        stats.reserve(table_infos.size());
-
+        std::vector<TableStats> whole_table_stats;
+        whole_table_stats.reserve(table_infos.size());
         for (const auto* table_info : table_infos) {
-            stats.push_back(table_info->stats);
+            whole_table_stats.push_back(table_info->stats);
+        }
+
+        // The join formula sees each table's filtered row count; distinct counts stay as they are.
+        auto stats = whole_table_stats;
+        for (size_t i = 0; i < stats.size(); ++i) {
+            stats[i].row_count = static_cast<uint64_t>(info.est_scan_rows[i]);
         }
 
         std::vector<int> order;
@@ -535,15 +552,16 @@ auto Planner::Plan(SelectStatement stmt) -> std::unique_ptr<PlanNode> {
             // Every fallback below counts as rejected; only using the model's order changes that.
             info.source = JoinOrderSource::LEARNED_REJECTED;
             try {
-                auto features = JoinOrderOptimizer::BuildFeatureVector(tables, stmt.joins, stats);
+                // The model was trained on whole-table stats, so it gets those, not the filtered ones.
+                auto features = JoinOrderOptimizer::BuildFeatureVector(tables, stmt.joins, whole_table_stats);
                 auto learned_order = learned_optimizer_->PredictJoinOrder(features, static_cast<int>(tables.size()));
                 info.model_order = learned_order;
 
                 if (!IsConnectedOrder(learned_order, explicit_edges)) {
-                    order = JoinOrderOptimizer::FindBestOrder(tables, stmt.joins, stats);
+                    order = JoinOrderOptimizer::FindBestOrder(tables, stmt.joins, stats, info.edges);
                 } else {
                     double learned_cost = JoinOrderOptimizer::EstimateCost(learned_order, tables, stmt.joins, stats);
-                    auto exhaustive_order = JoinOrderOptimizer::FindBestOrder(tables, stmt.joins, stats);
+                    auto exhaustive_order = JoinOrderOptimizer::FindBestOrder(tables, stmt.joins, stats, info.edges);
                     double exhaustive_cost = JoinOrderOptimizer::EstimateCost(exhaustive_order, tables, stmt.joins, stats);
 
                     if (learned_cost <= 1.5 * exhaustive_cost) {
@@ -554,12 +572,12 @@ auto Planner::Plan(SelectStatement stmt) -> std::unique_ptr<PlanNode> {
                     }
                 }
             } catch (const std::exception&) {
-                order = JoinOrderOptimizer::FindBestOrder(tables, stmt.joins, stats);
+                order = JoinOrderOptimizer::FindBestOrder(tables, stmt.joins, stats, info.edges);
             }
 #endif
         } else {
             info.source = JoinOrderSource::CLASSICAL;
-            order = JoinOrderOptimizer::FindBestOrder(tables, stmt.joins, stats);
+            order = JoinOrderOptimizer::FindBestOrder(tables, stmt.joins, stats, info.edges);
         }
 
         // Record the estimates now: the loop below moves the ON conditions out of stmt.joins.
