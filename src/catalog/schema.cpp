@@ -19,6 +19,9 @@ void Schema::ComputeOffsets() {
 
     for (const auto& col : columns_) {
         offsets_.push_back(offset);
+        if (col.type == TypeId::VARCHAR) {
+            varchar_offsets_.push_back(offset);
+        }
         offset += col.fixed_length;
     }
     

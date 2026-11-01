@@ -146,18 +146,12 @@ inline Value EvaluateExpression(const Expression* expr, const Tuple& tuple, cons
 }
 
 inline auto CombineTuples(const Tuple& left, const Schema& left_schema, const Tuple& right, const Schema& right_schema, const Schema& output_schema) -> Tuple {
-    std::vector<Value> values;
-    values.reserve(output_schema.GetColumnCount());
+    assert(output_schema.GetColumnCount() == left_schema.GetColumnCount() + right_schema.GetColumnCount() && "join output schema must be the left columns then the right columns");
+    assert(output_schema.GetFixedLength() == left_schema.GetFixedLength() + right_schema.GetFixedLength() && "join output schema must be the left columns then the right columns");
+    (void)output_schema;
 
-    for (uint32_t i = 0; i < left_schema.GetColumnCount(); ++i) {
-        values.push_back(left.GetValue(left_schema, i));
-    }
-
-    for (uint32_t i = 0; i < right_schema.GetColumnCount(); ++i) {
-        values.push_back(right.GetValue(right_schema, i));
-    }
-    
-    return Tuple(std::move(values), output_schema);
+    // Copies the two rows' bytes; no column is decoded.
+    return Tuple::Concat(left, left_schema, right, right_schema);
 }
 
 }  // namespace shilmandb
