@@ -1,5 +1,6 @@
 #include "types/tuple.hpp"
 #include "common/exception.hpp"
+#include <algorithm>
 #include <cstring>
 #include <limits>
 
@@ -66,6 +67,44 @@ Tuple::Tuple(std::vector<Value> values, const Schema& schema) {
             }
         }
     }
+}
+
+Tuple Tuple::Concat(const Tuple& left, const Schema& left_schema,
+                    const Tuple& right, const Schema& right_schema) {
+    const uint32_t left_len = left.GetLength();
+    const uint32_t right_len = right.GetLength();
+    const uint32_t left_fixed = left_schema.GetFixedLength();
+    const uint32_t right_fixed = right_schema.GetFixedLength();
+    if (left_len < left_fixed || right_len < right_fixed) {
+        throw DatabaseException("Concat: row is shorter than its schema's fixed part");
+    }
+
+    // New layout: left fixed, right fixed, left strings, right strings.
+    Tuple out;
+    out.data_.resize(static_cast<size_t>(left_len) + right_len);
+    char* dst = out.data_.data();
+    const char* l = left.data_.data();
+    const char* r = right.data_.data();
+
+    dst = std::copy_n(l, left_fixed, dst);
+    dst = std::copy_n(r, right_fixed, dst);
+    dst = std::copy_n(l + left_fixed, left_len - left_fixed, dst);
+    std::copy_n(r + right_fixed, right_len - right_fixed, dst);
+
+    // Each string moved, so shift the offsets that point to them.
+    auto shift = [&](uint32_t slot, uint32_t by) {
+        uint32_t offset;
+        std::memcpy(&offset, out.data_.data() + slot, 4);
+        offset += by;
+        std::memcpy(out.data_.data() + slot, &offset, 4);
+    };
+    for (uint32_t slot : left_schema.GetVarcharOffsets()) {
+        shift(slot, right_fixed);
+    }
+    for (uint32_t slot : right_schema.GetVarcharOffsets()) {
+        shift(left_fixed + slot, left_len);
+    }
+    return out;
 }
 
 Value Tuple::GetValue(const Schema& schema, uint32_t col_idx) const {

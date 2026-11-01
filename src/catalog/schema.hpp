@@ -46,9 +46,13 @@ public:
     uint32_t GetFixedLength() const;
     const std::vector<Column>& GetColumns() const;
 
+    // Fixed-part offset of each VARCHAR column's slot, in column order.
+    const std::vector<uint32_t>& GetVarcharOffsets() const { return varchar_offsets_; }
+
 private:
     std::vector<Column> columns_;
     std::vector<uint32_t> offsets_;
+    std::vector<uint32_t> varchar_offsets_;
     uint32_t fixed_length_{0};
 
     void ComputeOffsets();
