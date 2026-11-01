@@ -1,8 +1,7 @@
 #pragma once
 #include "buffer/eviction_policy.hpp"
 #include <list>
-#include <unordered_map>
-#include <unordered_set>
+#include <vector>
 
 namespace shilmandb {
 
@@ -12,17 +11,24 @@ public:
 
     void RecordAccess(frame_id_t frame_id) override;
     void SetEvictable(frame_id_t frame_id, bool evictable) override;
-    
+
     [[nodiscard]] std::optional<frame_id_t> Evict() override;
     void Remove(frame_id_t frame_id) override;
 
     [[nodiscard]] size_t Size() const override;
 
 private:
-    size_t num_frames_;
+    struct FrameState {
+        std::list<frame_id_t>::iterator pos;  // its node in lru_list_, valid only while tracked
+        bool tracked{false};
+        bool evictable{false};
+    };
+
+    // Throws if the frame id is past the last frame
+    void CheckRange(frame_id_t frame_id) const;
+
     std::list<frame_id_t> lru_list_;  // front = LRU (evict first), back = MRU
-    std::unordered_map<frame_id_t, std::list<frame_id_t>::iterator> map_;
-    std::unordered_set<frame_id_t> non_evictable_;
+    std::vector<FrameState> frames_;  // one entry per frame, indexed by frame id
     size_t evictable_count_{0};
 };
 
