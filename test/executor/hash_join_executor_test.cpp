@@ -11,7 +11,9 @@
 #include <filesystem>
 #include <memory>
 #include <algorithm>
+#include <cstring>
 #include <set>
+#include <stdexcept>
 #include <string>
 
 namespace shilmandb {
@@ -74,6 +76,7 @@ protected:
     struct JoinRun {
         Rows rows;
         bool builds_right;
+        std::vector<Tuple> tuples;  // the raw output rows, in the same order as rows
     };
 
     // Loads both tables, joins them with scan children and drains every output row.
@@ -107,6 +110,7 @@ protected:
             std::vector<Value> row;
             for (uint32_t i = 0; i < output_schema.GetColumnCount(); ++i) row.push_back(t.GetValue(output_schema, i));
             run.rows.push_back(std::move(row));
+            run.tuples.push_back(t);
         }
         join_exec.Close();
         return run;
@@ -147,6 +151,61 @@ protected:
 
     static std::string Expected(int k) {
         return std::to_string(k) + "|l" + std::to_string(k) + "|" + std::to_string(k) + "|r" + std::to_string(k) + "|";
+    }
+
+    // Wider schemas than LSchema/RSchema: every column type, and strings in both rows.
+    static Schema WideLSchema() {
+        return Schema({Column("lid", TypeId::INTEGER), Column("lval", TypeId::VARCHAR),
+                       Column("ldate", TypeId::DATE), Column("lnote", TypeId::VARCHAR)});
+    }
+    static Schema WideRSchema() {
+        return Schema({Column("rid", TypeId::INTEGER), Column("rprice", TypeId::DECIMAL),
+                       Column("rval", TypeId::VARCHAR)});
+    }
+
+    // Strings get a different length for every key.
+    static Rows WideLRows(std::initializer_list<int> keys) {
+        Rows rows;
+        for (int k : keys) {
+            rows.push_back({Value(k), Value(std::string(static_cast<size_t>(k), 'a')),
+                            Value::MakeDate(19000 + k), Value("note-" + std::string(static_cast<size_t>(k) + 2, 'n'))});
+        }
+        return rows;
+    }
+    static Rows WideRRows(std::initializer_list<int> keys) {
+        Rows rows;
+        for (int k : keys) {
+            rows.push_back({Value(k), Value(k * 1.25), Value(std::string(static_cast<size_t>(k) * 3, 'r'))});
+        }
+        return rows;
+    }
+
+    // Each output row must be the exact bytes the constructor builds from the input rows
+    // that were joined (found by the key in column 0 of both sides).
+    static void ExpectBytesMatchConstructor(const JoinRun& run, const Schema& ls, const Rows& left_rows,
+                                            const Schema& rs, const Rows& right_rows) {
+        std::vector<Column> cols;
+        for (uint32_t i = 0; i < ls.GetColumnCount(); ++i) cols.push_back(ls.GetColumn(i));
+        for (uint32_t i = 0; i < rs.GetColumnCount(); ++i) cols.push_back(rs.GetColumn(i));
+        Schema output_schema(cols);
+
+        auto find_row = [](const Rows& rows, int key) -> const std::vector<Value>& {
+            auto it = std::find_if(rows.begin(), rows.end(), [key](const auto& r) { return r[0].integer_ == key; });
+            if (it == rows.end()) throw std::runtime_error("no input row with key " + std::to_string(key));
+            return *it;
+        };
+
+        ASSERT_EQ(run.tuples.size(), run.rows.size());
+        for (size_t i = 0; i < run.tuples.size(); ++i) {
+            int key = run.tuples[i].GetValue(output_schema, 0).integer_;
+            std::vector<Value> values = find_row(left_rows, key);
+            const auto& right_values = find_row(right_rows, key);
+            values.insert(values.end(), right_values.begin(), right_values.end());
+
+            Tuple expected(std::move(values), output_schema);
+            ASSERT_EQ(run.tuples[i].GetLength(), expected.GetLength()) << "row " << i;
+            EXPECT_EQ(0, std::memcmp(run.tuples[i].GetData(), expected.GetData(), expected.GetLength())) << "row " << i;
+        }
     }
 };
 
@@ -541,6 +600,30 @@ TEST_F(HashJoinExecutorTest, VarcharKeysBuildingRight) {
     auto run = RunJoin(ls, left, rs, right, MakeEqPred("lname", "rname"));
     EXPECT_TRUE(run.builds_right);
     EXPECT_EQ(Render(run.rows), (std::vector<std::string>{"bob|2|20|bob|", "dan|4|40|dan|"}));
+}
+
+// --- Output rows are the exact bytes the constructor builds ---
+
+TEST_F(HashJoinExecutorTest, OutputRowBytesMatchConstructorBuildingRight) {
+    auto ls = WideLSchema();
+    auto rs = WideRSchema();
+    auto left = WideLRows({1, 2, 3, 4, 5, 6});
+    auto right = WideRRows({2, 4, 6});
+    auto run = RunJoin(ls, left, rs, right, MakeEqPred("lid", "rid"));
+    EXPECT_TRUE(run.builds_right);
+    ASSERT_EQ(run.rows.size(), 3u);
+    ExpectBytesMatchConstructor(run, ls, left, rs, right);
+}
+
+TEST_F(HashJoinExecutorTest, OutputRowBytesMatchConstructorBuildingLeft) {
+    auto ls = WideLSchema();
+    auto rs = WideRSchema();
+    auto left = WideLRows({2, 4, 6});
+    auto right = WideRRows({1, 2, 3, 4, 5, 6});
+    auto run = RunJoin(ls, left, rs, right, MakeEqPred("lid", "rid"));
+    EXPECT_FALSE(run.builds_right);
+    ASSERT_EQ(run.rows.size(), 3u);
+    ExpectBytesMatchConstructor(run, ls, left, rs, right);
 }
 
 // --- Lifecycle ---
