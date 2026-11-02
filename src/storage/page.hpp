@@ -22,11 +22,16 @@ public:
     char* GetData() { return data_; }
     const char* GetData() const { return data_; }
 
-    void ResetMemory() {
-        std::memset(data_, 0, PAGE_SIZE);
+    // Forgets which page this is and its pin count and dirty flag. The bytes stay as they are.
+    void ClearMetadata() {
         page_id_ = INVALID_PAGE_ID;
         pin_count_ = 0;
         is_dirty_ = false;
+    }
+
+    void ResetMemory() {
+        std::memset(data_, 0, PAGE_SIZE);
+        ClearMetadata();
     }
 
 private:

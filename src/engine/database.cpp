@@ -226,4 +226,6 @@ Catalog* Database::GetCatalog() const { return catalog_.get(); }
 
 BufferPoolManager* Database::GetBufferPoolManager() const { return bpm_.get(); }
 
+DiskManager* Database::GetDiskManager() const { return disk_manager_.get(); }
+
 }  // namespace shilmandb
