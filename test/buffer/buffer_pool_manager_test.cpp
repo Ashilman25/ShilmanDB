@@ -513,6 +513,116 @@ TEST_F(BufferPoolManagerTest, TracingWritesCorrectEntries) {
 }
 
 // ---------------------------------------------------------------------------
+// Collapsed traces and the trace counter
+// ---------------------------------------------------------------------------
+namespace {
+
+std::string TraceTestPath() {
+    return (std::filesystem::temp_directory_path() /
+            ("shilmandb_trace_collapse_test_" + std::to_string(::getpid()) + ".csv")).string();
+}
+
+std::vector<std::string> ReadLines(const std::string& path) {
+    std::ifstream in(path);
+    std::vector<std::string> lines;
+    for (std::string line; std::getline(in, line);) {
+        lines.push_back(line);
+    }
+    return lines;
+}
+
+}  // namespace
+
+TEST_F(BufferPoolManagerTest, TracingCollapseDropsRepeats) {
+    const auto trace_path = TraceTestPath();
+    auto [dm, bpm] = MakeBPM(4);
+
+    page_id_t a, b;
+    ASSERT_NE(bpm->NewPage(&a), nullptr);
+    (void)bpm->UnpinPage(a, false);
+    ASSERT_NE(bpm->NewPage(&b), nullptr);
+    (void)bpm->UnpinPage(b, false);
+
+    bpm->EnableTracing(trace_path, true);
+    for (const page_id_t pid : {a, a, a, b, b, a}) {
+        ASSERT_NE(bpm->FetchPage(pid), nullptr);
+        (void)bpm->UnpinPage(pid, false);
+    }
+    bpm->DisableTracing();
+
+    const std::vector<std::string> expected = {
+        "timestamp,page_id",
+        "0," + std::to_string(a),
+        "3," + std::to_string(b),
+        "5," + std::to_string(a),
+    };
+    EXPECT_EQ(ReadLines(trace_path), expected);
+    EXPECT_EQ(bpm->GetTraceCount(), 6u);
+
+    std::filesystem::remove(trace_path);
+}
+
+TEST_F(BufferPoolManagerTest, TracingWithoutCollapseKeepsEveryFetch) {
+    const auto trace_path = TraceTestPath();
+    auto [dm, bpm] = MakeBPM(4);
+
+    page_id_t a, b;
+    ASSERT_NE(bpm->NewPage(&a), nullptr);
+    (void)bpm->UnpinPage(a, false);
+    ASSERT_NE(bpm->NewPage(&b), nullptr);
+    (void)bpm->UnpinPage(b, false);
+
+    bpm->EnableTracing(trace_path);
+    for (const page_id_t pid : {a, a, a, b, b, a}) {
+        ASSERT_NE(bpm->FetchPage(pid), nullptr);
+        (void)bpm->UnpinPage(pid, false);
+    }
+    bpm->DisableTracing();
+
+    const std::vector<std::string> expected = {
+        "timestamp,page_id",
+        "0," + std::to_string(a),
+        "1," + std::to_string(a),
+        "2," + std::to_string(a),
+        "3," + std::to_string(b),
+        "4," + std::to_string(b),
+        "5," + std::to_string(a),
+    };
+    EXPECT_EQ(ReadLines(trace_path), expected);
+    EXPECT_EQ(bpm->GetTraceCount(), 6u);
+
+    std::filesystem::remove(trace_path);
+}
+
+TEST_F(BufferPoolManagerTest, TraceCountStartsAtZero) {
+    const auto trace_path = TraceTestPath();
+    auto [dm, bpm] = MakeBPM(4);
+
+    page_id_t a;
+    ASSERT_NE(bpm->NewPage(&a), nullptr);
+    (void)bpm->UnpinPage(a, false);
+
+    // not tracing: fetches are not counted
+    for (int i = 0; i < 2; ++i) {
+        ASSERT_NE(bpm->FetchPage(a), nullptr);
+        (void)bpm->UnpinPage(a, false);
+    }
+    EXPECT_EQ(bpm->GetTraceCount(), 0u);
+
+    bpm->EnableTracing(trace_path);
+    ASSERT_NE(bpm->FetchPage(a), nullptr);
+    (void)bpm->UnpinPage(a, false);
+    EXPECT_EQ(bpm->GetTraceCount(), 1u);
+
+    // turning tracing on again starts over
+    bpm->EnableTracing(trace_path);
+    EXPECT_EQ(bpm->GetTraceCount(), 0u);
+
+    bpm->DisableTracing();
+    std::filesystem::remove(trace_path);
+}
+
+// ---------------------------------------------------------------------------
 // A failed read must not lose the frame
 // ---------------------------------------------------------------------------
 TEST_F(BufferPoolManagerTest, FailedReadKeepsFrame) {

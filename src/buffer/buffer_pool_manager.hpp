@@ -43,9 +43,13 @@ public:
     void SetPolicyTiming(bool on);
     [[nodiscard]] PolicyStats GetPolicyStats() const;  // all zero if timing was never on
 
-    // Access tracing for ML training data generation
-    void EnableTracing(const std::string& trace_path);
+    // Access tracing for ML training data generation. Each line is "timestamp,page_id",
+    // where timestamp is the fetch number since tracing was turned on. With collapse_repeats,
+    // a fetch of the same page as the fetch just before it is left out (the numbering still
+    // counts it).
+    void EnableTracing(const std::string& trace_path, bool collapse_repeats = false);
     void DisableTracing();
+    [[nodiscard]] uint64_t GetTraceCount() const { return access_counter_; }  // fetches since EnableTracing
 
     size_t GetPoolSize() const;
     const Page& GetPage(frame_id_t frame_id) const;
@@ -73,9 +77,12 @@ private:
     bool trace_enabled_{false};
     std::ofstream trace_file_;
     uint64_t access_counter_{0};
+    bool trace_collapse_{false};
+    page_id_t last_traced_page_{INVALID_PAGE_ID};
 
     bool FindVictimFrame(frame_id_t* frame_id);
     void RecordVisit(page_id_t page_id, frame_id_t frame_id, bool is_miss);
+    void TraceFetch(page_id_t page_id);
 };
 
 }  // namespace shilmandb
