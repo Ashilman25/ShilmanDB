@@ -4,6 +4,16 @@
 
 namespace shilmandb {
 
+namespace {
+
+// True when the leaf has no key above `key`, so more entries for `key` may start in the next leaf.
+bool MayContinueInNextLeaf(const char* leaf_data, const Value& key, TypeId key_type) {
+    const auto num_keys = BTreeLeafPage::GetNumKeys(leaf_data);
+    return num_keys == 0 || BTreeLeafPage::GetKey(leaf_data, num_keys - 1, key_type) <= key;
+}
+
+}  // namespace
+
 
 BTreeIndex::BTreeIndex(BufferPoolManager* bpm, TypeId key_type, page_id_t root_page_id) : bpm_(bpm), root_page_id_(root_page_id), key_type_(key_type) {}
 
@@ -39,8 +49,8 @@ page_id_t BTreeIndex::FindLeaf(const Value& key, std::vector<page_id_t>& path) {
 }
 
 
-//find leaf no path
-page_id_t BTreeIndex::FindLeaf(const Value& key) {
+// Descends left of any separator equal to the key, so copies of it spread over several leaves are not skipped.
+page_id_t BTreeIndex::FindLeftmostLeaf(const Value& key) {
     auto current_id = root_page_id_;
 
     while (true) {
@@ -52,7 +62,7 @@ page_id_t BTreeIndex::FindLeaf(const Value& key) {
             return current_id;
         }
 
-        auto child_id = BTreeInternalPage::Lookup(data, key, key_type_);
+        auto child_id = BTreeInternalPage::LookupLeftmost(data, key, key_type_);
         (void)bpm_->UnpinPage(current_id, false);
         current_id = child_id;
     }
@@ -121,11 +131,18 @@ void BTreeIndex::Delete(const Value& key, const RID& rid) {
         return;
     }
 
-    auto leaf_id = FindLeaf(key);
-    auto* page = bpm_->FetchPage(leaf_id);
-    auto* data = page->GetData();
-    auto deleted = BTreeLeafPage::Delete(data, key, rid, key_type_);
-    (void)bpm_->UnpinPage(leaf_id, deleted);
+    // The entry can be in any leaf that holds copies of the key, so walk them from the first.
+    auto leaf_id = FindLeftmostLeaf(key);
+    while (leaf_id != INVALID_PAGE_ID) {
+        auto* page = bpm_->FetchPage(leaf_id);
+        auto* data = page->GetData();
+
+        const auto deleted = BTreeLeafPage::Delete(data, key, rid, key_type_);
+        const auto next = (!deleted && MayContinueInNextLeaf(data, key, key_type_)) ? BTreeLeafPage::GetNextLeafPageId(data) : INVALID_PAGE_ID;
+
+        (void)bpm_->UnpinPage(leaf_id, deleted);
+        leaf_id = next;
+    }
 }
 
 
@@ -135,11 +152,19 @@ std::vector<RID> BTreeIndex::PointLookup(const Value& key) {
         return {};
     }
 
-    auto leaf_id = FindLeaf(key);
-    auto* page = bpm_->FetchPage(leaf_id);
-    auto* data = page->GetData();
-    auto result = BTreeLeafPage::Lookup(data, key, key_type_);
-    (void)bpm_->UnpinPage(leaf_id, false);
+    std::vector<RID> result;
+    auto leaf_id = FindLeftmostLeaf(key);
+    while (leaf_id != INVALID_PAGE_ID) {
+        auto* page = bpm_->FetchPage(leaf_id);
+        auto* data = page->GetData();
+
+        const auto rids = BTreeLeafPage::Lookup(data, key, key_type_);
+        result.insert(result.end(), rids.begin(), rids.end());
+        const auto next = MayContinueInNextLeaf(data, key, key_type_) ? BTreeLeafPage::GetNextLeafPageId(data) : INVALID_PAGE_ID;
+        
+        (void)bpm_->UnpinPage(leaf_id, false);
+        leaf_id = next;
+    }
     return result;
 }
 
@@ -332,7 +357,7 @@ BTreeIndex::Iterator BTreeIndex::Begin(const Value& low_key) {
         return End();
     }
 
-    auto leaf_id = FindLeaf(low_key);
+    auto leaf_id = FindLeftmostLeaf(low_key);
     auto* page = bpm_->FetchPage(leaf_id);
     auto* data = page->GetData();
     auto pos = BTreeLeafPage::LowerBound(data, low_key, key_type_);

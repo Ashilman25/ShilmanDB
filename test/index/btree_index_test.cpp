@@ -438,4 +438,103 @@ TEST_F(BTreeIndexTest, DeleteWithoutRebalance) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// One key with thousands of copies, spread over several leaves
+// ---------------------------------------------------------------------------
+namespace {
+
+constexpr int32_t kManyKey = 500;
+constexpr int32_t kManyCopies = 3000;
+
+// Keys 1..300, then kManyCopies of kManyKey, then 600..900. The copies start in a leaf that
+// also holds smaller keys and run on through the leaves after it.
+void FillWithManyCopies(BTreeIndex& index) {
+    // More copies than three leaves can hold, so they sit in at least four.
+    ASSERT_GT(kManyCopies, 3 * BTreeLeafPage::MaxKeys(TypeId::INTEGER));
+
+    for (int32_t i = 1; i <= 300; ++i) {
+        index.Insert(Value(i), RID(i, 0));
+    }
+    for (int32_t i = 0; i < kManyCopies; ++i) {
+        index.Insert(Value(kManyKey), RID(i, 1));
+    }
+    for (int32_t i = 600; i <= 900; ++i) {
+        index.Insert(Value(i), RID(i, 0));
+    }
+}
+
+// Counts the entries equal to kManyKey from `it` on. Sets `first_rid` to the first one seen.
+int32_t CountManyKey(BTreeIndex::Iterator it, RID* first_rid = nullptr) {
+    int32_t count = 0;
+    for (; !it.IsEnd(); ++it) {
+        auto [key, rid] = *it;
+        if (key.integer_ != kManyKey) break;
+        if (count == 0 && first_rid != nullptr) *first_rid = rid;
+        ++count;
+    }
+    return count;
+}
+
+}  // namespace
+
+TEST_F(BTreeIndexTest, DuplicatesAcrossLeavesRangeFromKey) {
+    auto bundle = MakeBPM();
+    BTreeIndex index(bundle.bpm.get(), TypeId::INTEGER);
+    ASSERT_NO_FATAL_FAILURE(FillWithManyCopies(index));
+
+    RID first(0, 0);
+    EXPECT_EQ(CountManyKey(index.Begin(Value(kManyKey)), &first), kManyCopies);
+    EXPECT_EQ(first, RID(0, 1));
+}
+
+TEST_F(BTreeIndexTest, DuplicatesAcrossLeavesRangeFromBelow) {
+    auto bundle = MakeBPM();
+    BTreeIndex index(bundle.bpm.get(), TypeId::INTEGER);
+    ASSERT_NO_FATAL_FAILURE(FillWithManyCopies(index));
+
+    auto it = index.Begin(Value(450));
+    ASSERT_FALSE(it.IsEnd());
+    EXPECT_EQ((*it).first.integer_, kManyKey);
+    EXPECT_EQ(CountManyKey(it), kManyCopies);
+}
+
+TEST_F(BTreeIndexTest, DuplicatesAcrossLeavesPointLookup) {
+    auto bundle = MakeBPM();
+    BTreeIndex index(bundle.bpm.get(), TypeId::INTEGER);
+    ASSERT_NO_FATAL_FAILURE(FillWithManyCopies(index));
+
+    const auto rids = index.PointLookup(Value(kManyKey));
+    ASSERT_EQ(rids.size(), static_cast<size_t>(kManyCopies));
+    for (int32_t i = 0; i < kManyCopies; ++i) {
+        EXPECT_NE(std::find(rids.begin(), rids.end(), RID(i, 1)), rids.end()) << "Missing RID(" << i << ", 1)";
+    }
+}
+
+TEST_F(BTreeIndexTest, DuplicatesAcrossLeavesDelete) {
+    auto bundle = MakeBPM();
+    BTreeIndex index(bundle.bpm.get(), TypeId::INTEGER);
+    ASSERT_NO_FATAL_FAILURE(FillWithManyCopies(index));
+
+    // One entry from the first leaf, one from a middle one, one from the last copy.
+    // The later two sit in leaves after the first, so Delete has to walk on to find them.
+    index.Delete(Value(kManyKey), RID(0, 1));
+    EXPECT_EQ(index.PointLookup(Value(kManyKey)).size(), static_cast<size_t>(kManyCopies - 1));
+
+    index.Delete(Value(kManyKey), RID(1500, 1));
+    EXPECT_EQ(index.PointLookup(Value(kManyKey)).size(), static_cast<size_t>(kManyCopies - 2));
+
+    index.Delete(Value(kManyKey), RID(kManyCopies - 1, 1));
+    EXPECT_EQ(index.PointLookup(Value(kManyKey)).size(), static_cast<size_t>(kManyCopies - 3));
+
+    // An entry that is not there changes nothing and ends the walk.
+    index.Delete(Value(kManyKey), RID(5000, 1));
+    const auto rids = index.PointLookup(Value(kManyKey));
+    EXPECT_EQ(rids.size(), static_cast<size_t>(kManyCopies - 3));
+
+    for (const RID& gone : {RID(0, 1), RID(1500, 1), RID(kManyCopies - 1, 1)}) {
+        EXPECT_EQ(std::find(rids.begin(), rids.end(), gone), rids.end()) << "RID(" << gone.page_id << ", 1) is still there";
+    }
+    EXPECT_NE(std::find(rids.begin(), rids.end(), RID(1, 1)), rids.end());
+}
+
 }  // namespace shilmandb

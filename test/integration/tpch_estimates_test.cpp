@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <iostream>
+#include <map>
 #include <memory>
 #include <string>
 #include <utility>
@@ -227,6 +228,47 @@ TEST_F(TpchEstimatesTest, ScanEstimatesWithinTwoXOfActual) {
                                      << " rows, actual " << actual;
         }
         std::cout << "[ q-error ] " << query.tag << " worst scan q-error " << worst << "\n";
+    }
+}
+
+// Each one-day range counts the same rows through the index as a plain scan does. A day's
+// rows often cross several index leaves, so a range has to start at the first of them.
+TEST_F(TpchEstimatesTest, EveryOneDayRangeMatchesScan) {
+    struct DateColumn {
+        std::string table;
+        std::string column;
+        std::string first_day;
+        std::string last_day;
+    };
+    const std::vector<DateColumn> columns = {
+        {"lineitem", "l_shipdate", "1992-01-02", "1998-12-01"},
+        {"orders", "o_orderdate", "1992-01-01", "1998-08-02"},
+    };
+
+    for (const auto& [table, column, first_day, last_day] : columns) {
+        // A scan with no WHERE never uses the index. Count the rows on each day.
+        const auto scan = db_->ExecuteSQL("SELECT " + column + " FROM " + table);
+        std::map<int32_t, int32_t> rows_per_day;
+        for (const auto& tuple : scan.tuples) ++rows_per_day[tuple.GetValue(scan.schema, 0).date_];
+
+        const int32_t first = Value::FromString(TypeId::DATE, first_day).date_;
+        const int32_t last = Value::FromString(TypeId::DATE, last_day).date_;
+        int32_t wrong_days = 0;
+        for (int32_t day = first; day <= last; ++day) {
+            const auto found = rows_per_day.find(day);
+            const int32_t expected = found == rows_per_day.end() ? 0 : found->second;
+
+            const std::string sql = "SELECT COUNT(*) FROM " + table + " WHERE " + column + " >= '" +
+                                    Value::MakeDate(day).ToString() + "' AND " + column + " < '" +
+                                    Value::MakeDate(day + 1).ToString() + "'";
+            const int32_t actual = CountStar(sql);
+            if (actual != expected) {
+                ++wrong_days;
+                ADD_FAILURE() << column << " on " << Value::MakeDate(day).ToString() << ": the index range counts "
+                              << actual << " rows, a scan counts " << expected;
+            }
+        }
+        EXPECT_EQ(wrong_days, 0) << column;
     }
 }
 
