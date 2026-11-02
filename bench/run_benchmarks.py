@@ -5,9 +5,16 @@ Benchmark runner
 Runs a matrix of (scale factor x configuration x query) benchmarks, then
 emits three unified CSVs under bench/results/:
 
-- latencies.csv: (sf, query, config, median_latency_ms, rows, hits, misses)
-- hit_rates.csv: (sf, config, pool_size, hit_rate, improvement_over_lru)
+- latencies.csv: (sf, query, config, median_latency_ms, rows, hits, misses,
+  visits, page_hit_rate, reads, read_ms, us_per_read, policy_ms, pool_size,
+  miss_penalty_us, direct_io)
+- hit_rates.csv: (sf, config, pool_size, pool_fraction, miss_penalty_us,
+  direct_io, hit_rate, raw_hit_rate, improvement_over_lru)
 - correctness.csv: (sf, query, config, status)
+
+A config label is the config name plus a suffix for each non-default option,
+for example baseline_pen100, baseline_direct, baseline_frac0.25. Columns an
+older load_tpch binary doesn't write are left empty.
 
 """
 
@@ -16,6 +23,7 @@ from __future__ import annotations
 import argparse
 import csv
 import os
+import re
 import shutil
 import statistics
 import subprocess
@@ -41,6 +49,14 @@ POOL_SIZES: Dict[str, int] = {
     "0.1": 512,
     "1.0": 2048,
 }
+
+# Pages in the tables alone (no indexes), measured by loading each scale factor.
+DB_PAGES: Dict[str, int] = {
+    "0.01": 1448,
+    "0.1": 14417,
+    "1.0": 144032,
+}
+MIN_POOL_PAGES: int = 16
 
 POOL_SWEEP_SIZES: List[int] = [128, 256, 512, 1024, 2048]
 POOL_SWEEP_SF: str = "0.1"
@@ -102,6 +118,71 @@ def eprint(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
 
 
+# Buffer pool size (in pages) that is the given fraction of the tables' size.
+def pool_for_fraction(sf: str, fraction: float) -> int:
+    if fraction <= 0:
+        raise ValueError(f"pool fraction must be positive, got {fraction}")
+    return max(MIN_POOL_PAGES, round(fraction * DB_PAGES[sf]))
+
+
+# Config name plus one suffix per non-default option: _frac, then _pen, then _direct.
+def config_label(base: str, miss_penalty_us: int = 0, direct_io: bool = False, fraction: Optional[float] = None) -> str:
+    label = base
+    if fraction is not None:
+        label += f"_frac{float(fraction)}"
+    if miss_penalty_us > 0:
+        label += f"_pen{miss_penalty_us}"
+    if direct_io:
+        label += "_direct"
+    return label
+
+
+_LABEL_SUFFIX_RE = re.compile(r"(?:_frac(?P<frac>[0-9.eE+-]+?))?(?:_pen(?P<pen>\d+))?(?P<direct>_direct)?$")
+
+
+@dataclass
+class LabelOptions:
+    base: str                       # the label without its suffix
+    fraction: Optional[float]
+    miss_penalty_us: int
+    direct_io: bool
+
+
+# Split a label made by config_label back into the config name and its options.
+def parse_label(label: str) -> LabelOptions:
+    m = _LABEL_SUFFIX_RE.search(label)
+    assert m is not None            # every part is optional, so this always matches
+    frac = m.group("frac")
+    return LabelOptions(
+        base=label[:m.start()],
+        fraction=float(frac) if frac else None,
+        miss_penalty_us=int(m.group("pen") or 0),
+        direct_io=m.group("direct") is not None,
+    )
+
+
+# The load_tpch flags for the realistic-I/O options (only the ones that are set).
+def option_flags(miss_penalty_us: int = 0, direct_io: bool = False, policy_timing: bool = False) -> List[str]:
+    flags: List[str] = []
+    if miss_penalty_us > 0:
+        flags += ["--miss-penalty-us", str(miss_penalty_us)]
+    if direct_io:
+        flags.append("--direct-io")
+    if policy_timing:
+        flags.append("--policy-timing")
+    return flags
+
+
+# Read a key,value CSV (run_info.csv). Empty dict when the file isn't there.
+def read_run_info(path: Path) -> Dict[str, str]:
+    if not path.exists():
+        return {}
+    with path.open(newline="") as f:
+        reader = csv.reader(f)
+        next(reader, None)          # header
+        return {row[0]: (row[1] if len(row) > 1 else "") for row in reader if row}
+
+
 # Per-query aggregated results
 
 @dataclass
@@ -113,6 +194,27 @@ class QueryStats:
     rows: Optional[int]
     median_hits: Optional[int]
     median_misses: Optional[int]
+
+    median_visits: Optional[int] = None
+    median_reads: Optional[int] = None
+    median_read_ms: Optional[float] = None
+    policy_ms: Optional[float] = None
+    pool_size: Optional[int] = None
+    miss_penalty_us: Optional[int] = None
+    direct_io: Optional[bool] = None
+
+    # 1 - misses / visits: how often a page visit found the page in the pool.
+    @property
+    def page_hit_rate(self) -> Optional[float]:
+        if not self.median_visits or self.median_misses is None:
+            return None
+        return 1.0 - self.median_misses / self.median_visits
+
+    @property
+    def us_per_read(self) -> Optional[float]:
+        if not self.median_reads or self.median_read_ms is None:
+            return None
+        return self.median_read_ms * 1000.0 / self.median_reads
 
 
 @dataclass
@@ -126,30 +228,32 @@ def _median_int(values: Sequence[int]) -> int:
     return int(round(statistics.median(values)))
 
 
-#Parse the per-run latencies.csv written by load_tpch
-# Schema: query,run,rows,latency_ms,hits,misses
+# Parse the per-run latencies.csv written by load_tpch
+# Schema: query,run,rows,latency_ms,hits,misses[,visits,reads,read_ms]
+# The last three are missing from older binaries; those fields stay None.
 # Returns: {query_tag: QueryStats}
 def parse_shilmandb_latencies(path: Path, sf: str, config: str) -> Dict[str, QueryStats]:
-    per_query_runs: Dict[str, List[Tuple[float, int, int, int]]] = {}
+    per_query_rows: Dict[str, List[Dict[str, str]]] = {}
     with path.open() as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            q = row["query"]
-            per_query_runs.setdefault(q, []).append((
-                float(row["latency_ms"]),
-                int(row["rows"]),
-                int(row["hits"]),
-                int(row["misses"]),
-            ))
+        for row in csv.DictReader(f):
+            per_query_rows.setdefault(row["query"], []).append(row)
+
+    # Values of an optional column, or None unless every run has one.
+    def column(runs: List[Dict[str, str]], name: str, cast) -> Optional[List]:
+        raw = [r.get(name) for r in runs]
+        if any(v is None or v == "" for v in raw):
+            return None
+        return [cast(v) for v in raw]
 
     result: Dict[str, QueryStats] = {}
-    for q, runs in per_query_runs.items():
-        if not runs:
-            continue
-        latencies = [r[0] for r in runs]
-        rows_vals = [r[1] for r in runs]
-        hits_vals = [r[2] for r in runs]
-        misses_vals = [r[3] for r in runs]
+    for q, runs in per_query_rows.items():
+        latencies = [float(r["latency_ms"]) for r in runs]
+        rows_vals = [int(r["rows"]) for r in runs]
+        hits_vals = [int(r["hits"]) for r in runs]
+        misses_vals = [int(r["misses"]) for r in runs]
+        visits = column(runs, "visits", int)
+        reads = column(runs, "reads", int)
+        read_ms = column(runs, "read_ms", float)
         result[q] = QueryStats(
             sf=sf,
             config=config,
@@ -158,15 +262,27 @@ def parse_shilmandb_latencies(path: Path, sf: str, config: str) -> Dict[str, Que
             rows=rows_vals[0],                     # stable across runs
             median_hits=_median_int(hits_vals),
             median_misses=_median_int(misses_vals),
+            median_visits=_median_int(visits) if visits else None,
+            median_reads=_median_int(reads) if reads else None,
+            median_read_ms=statistics.median(read_ms) if read_ms else None,
         )
     return result
+
+
+# Per-query policy time (ms) from policy_time.csv. Empty dict when it isn't there.
+def read_policy_ms(path: Path) -> Dict[str, float]:
+    if not path.exists():
+        return {}
+    with path.open(newline="") as f:
+        return {row["query"]: float(row["policy_ms"])for row in csv.DictReader(f) if row.get("policy_ms")}
 
 
 # ShilmanDB runner 
 #Build the load_tpch CLI for a given config.
 def build_command(binary: Path, sf: str, config_name: str, data_dir: Path, results_dir: Path,
-                  db_file: Path, pool_size: int, warmup_runs: int, timed_runs: int) -> List[str]:
-    
+                  db_file: Path, pool_size: int, warmup_runs: int, timed_runs: int,
+                  extra_flags: Sequence[str] = ()) -> List[str]:
+
     if config_name not in PRIMARY_CONFIGS:
         raise ValueError(f"unknown ShilmanDB config: {config_name}")
 
@@ -182,18 +298,32 @@ def build_command(binary: Path, sf: str, config_name: str, data_dir: Path, resul
         "--no-verify",
     ]
     cmd += PRIMARY_CONFIGS[config_name]
+    cmd += extra_flags
     return cmd
 
 
+# Warn (never fail) when the loaded database isn't the size DB_PAGES says it is.
+def warn_on_db_pages_mismatch(info: Dict[str, str], sf: str) -> None:
+    reported = info.get("db_pages")
+    if reported is None or sf not in DB_PAGES:
+        return
+    if not reported.isdigit() or int(reported) != DB_PAGES[sf]:
+        eprint(f"  ! warning: run_info.csv db_pages={reported} but DB_PAGES[{sf}]={DB_PAGES[sf]}; "
+               "pool fractions may be off")
+
+
 #spawn load_tpch for one (sf, config) combo
-#returns per query stats
+#returns per query stats; label names the results folder and the config column (default: config_name)
 def run_shilmandb_config(binary: Path, sf: str, config_name: str, data_dir: Path, output_dir: Path, pool_size: int, 
-                         warmup_runs: int, timed_runs: int, timeout_seconds: Optional[int] = None) -> Optional[Dict[str, QueryStats]]:
-    
-    results_parent = output_dir / "shilmandb_results" / config_name
+                         warmup_runs: int, timed_runs: int, timeout_seconds: Optional[int] = None,
+                         label: Optional[str] = None,
+                         extra_flags: Sequence[str] = ()) -> Optional[Dict[str, QueryStats]]:
+
+    label = label or config_name
+    results_parent = output_dir / "shilmandb_results" / label
     results_parent.mkdir(parents=True, exist_ok=True)
 
-    with tempfile.TemporaryDirectory(prefix=f"shilmandb_{config_name}_sf{sf}_") as tmp:
+    with tempfile.TemporaryDirectory(prefix=f"shilmandb_{label}_sf{sf}_") as tmp:
         tmp_path = Path(tmp)
         db_file = tmp_path / f"tpch_sf{sf}.db"
 
@@ -207,6 +337,7 @@ def run_shilmandb_config(binary: Path, sf: str, config_name: str, data_dir: Path
             pool_size=pool_size,
             warmup_runs=warmup_runs,
             timed_runs=timed_runs,
+            extra_flags=extra_flags,
         )
 
         print(f"  $ {' '.join(cmd)}", flush=True)
@@ -247,7 +378,24 @@ def run_shilmandb_config(binary: Path, sf: str, config_name: str, data_dir: Path
                 dst = results_parent / f"{query}_sf{sf}.csv"
                 shutil.copyfile(src, dst)
 
-        return parse_shilmandb_latencies(lat_csv, sf=sf, config=config_name)
+        # Keep the run settings and policy timing next to the query results.
+        for name in ("run_info", "policy_time"):
+            src = tmp_path / f"{name}.csv"
+            if src.exists():
+                shutil.copyfile(src, results_parent / f"{name}_sf{sf}.csv")
+
+        info = read_run_info(tmp_path / "run_info.csv")
+        warn_on_db_pages_mismatch(info, sf)
+        policy_ms = read_policy_ms(tmp_path / "policy_time.csv")
+
+        options = parse_label(label)
+        stats = parse_shilmandb_latencies(lat_csv, sf=sf, config=label)
+        for q, qs in stats.items():
+            qs.policy_ms = policy_ms.get(q)
+            qs.pool_size = pool_size
+            qs.miss_penalty_us = options.miss_penalty_us
+            qs.direct_io = options.direct_io
+        return stats
 
 
 # SQLite runner adapter
@@ -317,24 +465,24 @@ def run_pool_size_sweep(binary: Path, data_dir: Path, output_dir: Path,
     results: Dict[Tuple[str, str, str], QueryStats] = {}
     
     for ps in pool_sizes:
-        config_label = f"baseline_pool{ps}"
-        subsection(f"{config_label}")
-        PRIMARY_CONFIGS[config_label] = baseline_flags  # shares flags; pool_size differs via --pool-size
+        sweep_label = f"baseline_pool{ps}"
+        subsection(f"{sweep_label}")
+        PRIMARY_CONFIGS[sweep_label] = baseline_flags  # shares flags; pool_size differs via --pool-size
         try:
             stats = run_shilmandb_config(
-                binary=binary, sf=sf, config_name=config_label,
+                binary=binary, sf=sf, config_name=sweep_label,
                 data_dir=data_dir, output_dir=output_dir,
                 pool_size=ps, warmup_runs=warmup_runs, timed_runs=timed_runs,
             )
             
         finally:
-            del PRIMARY_CONFIGS[config_label]
+            del PRIMARY_CONFIGS[sweep_label]
             
         if stats is None:
             eprint(f"  pool-sweep {ps} failed — skipping")
             continue
         for query, qs in stats.items():
-            results[(sf, config_label, query)] = qs
+            results[(sf, sweep_label, query)] = qs
             
     return results
 
@@ -381,14 +529,24 @@ def _fmt_float(x: Optional[float]) -> str:
 def _fmt_int(x: Optional[int]) -> str:
     return "" if x is None else str(x)
 
-#write latencies.csv with schema: sf, query, config, median_latency_ms, rows, hits, misses
+def _fmt_flag(x: Optional[bool]) -> str:
+    return "" if x is None else ("true" if x else "false")
+
+
+LATENCIES_HEADER: List[str] = [
+    "sf", "query", "config", "median_latency_ms", "rows", "hits", "misses",
+    "visits", "page_hit_rate", "reads", "read_ms", "us_per_read", "policy_ms",
+    "pool_size", "miss_penalty_us", "direct_io",
+]
+
+#write latencies.csv with the LATENCIES_HEADER columns; fields a binary didn't write stay empty
 def write_latencies_csv(path: Path, records: Dict[Tuple[str, str, str], QueryStats]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     query_order = {q: i for i, q in enumerate(QUERIES)}
     keys = sorted(records.keys(), key=lambda k: (k[0], query_order.get(k[2], 999), k[1]))
     with path.open("w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["sf", "query", "config", "median_latency_ms", "rows", "hits", "misses"])
+        w.writerow(LATENCIES_HEADER)
         for key in keys:
             qs = records[key]
             w.writerow([
@@ -397,11 +555,23 @@ def write_latencies_csv(path: Path, records: Dict[Tuple[str, str, str], QuerySta
                 _fmt_int(qs.rows),
                 _fmt_int(qs.median_hits),
                 _fmt_int(qs.median_misses),
+                _fmt_int(qs.median_visits),
+                _fmt_float(qs.page_hit_rate),
+                _fmt_int(qs.median_reads),
+                _fmt_float(qs.median_read_ms),
+                _fmt_float(qs.us_per_read),
+                _fmt_float(qs.policy_ms),
+                _fmt_int(qs.pool_size),
+                _fmt_int(qs.miss_penalty_us),
+                _fmt_flag(qs.direct_io),
             ])
     print(f"  -> {path}")
 
 
-#Aggregate per-query hit/miss counts into per-(sf,config) hit_rate and improvement_over_lru
+#Aggregate per-query counts into per-(sf,config) hit rates.
+# hit_rate is page level: 1 - sum(misses) / sum(visits). raw_hit_rate is the old fetch-level
+# hits / (hits + misses). improvement_over_lru compares with the baseline row that has the same
+# option suffix (_frac, _pen, _direct); empty when that row is missing or has no page-level rate.
 def write_hit_rates_csv(path: Path, records: Dict[Tuple[str, str, str], QueryStats], pool_sizes_by_config: Dict[Tuple[str, str], int]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -409,47 +579,66 @@ def write_hit_rates_csv(path: Path, records: Dict[Tuple[str, str, str], QuerySta
     for (sf, config, _q), qs in records.items():
         by_sc.setdefault((sf, config), []).append(qs)
 
-    rates: Dict[Tuple[str, str], Optional[float]] = {}
+    page_rates: Dict[Tuple[str, str], Optional[float]] = {}
+    raw_rates: Dict[Tuple[str, str], Optional[float]] = {}
     for (sf, config), stats_list in by_sc.items():
-        is_sqlite = config.startswith("sqlite_")
-        if is_sqlite:
-            rates[(sf, config)] = None
+        if config.startswith("sqlite_"):
+            page_rates[(sf, config)] = raw_rates[(sf, config)] = None
             continue
-        
+
         total_hits = sum(s.median_hits for s in stats_list if s.median_hits is not None)
         total_misses = sum(s.median_misses for s in stats_list if s.median_misses is not None)
         total = total_hits + total_misses
-        rates[(sf, config)] = (total_hits / total) if total > 0 else 0.0
+        raw_rates[(sf, config)] = (total_hits / total) if total > 0 else 0.0
 
-    baseline_rates: Dict[str, Optional[float]] = {
-        sf: rates.get((sf, "baseline")) for sf in {k[0] for k in rates}
-    }
+        have_visits = all(s.median_visits is not None and s.median_misses is not None for s in stats_list)
+        total_visits = sum(s.median_visits for s in stats_list if s.median_visits is not None)
+        page_rates[(sf, config)] = (1.0 - total_misses / total_visits) if have_visits and total_visits > 0 else None
 
     def _config_rank(name: str) -> int:
-        if name == "baseline": return 0
-        if name.startswith("+"): return 1
-        if name.startswith("baseline_pool"): return 2
-        if name.startswith("sqlite_"): return 3
+        base = parse_label(name).base
+        if base == "baseline": return 0
+        if base.startswith("+"): return 1
+        if base.startswith("baseline_pool"): return 2
+        if base.startswith("sqlite_"): return 3
         return 4
 
-    keys = sorted(rates.keys(), key=lambda k: (k[0], _config_rank(k[1]), k[1]))
+    keys = sorted(raw_rates.keys(), key=lambda k: (k[0], _config_rank(k[1]), k[1]))
 
     with path.open("w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["sf", "config", "pool_size", "hit_rate", "improvement_over_lru"])
-        
+        w.writerow(["sf", "config", "pool_size", "pool_fraction", "miss_penalty_us",
+                    "direct_io", "hit_rate", "raw_hit_rate", "improvement_over_lru"])
+
         for (sf, config) in keys:
-            rate = rates[(sf, config)]
             ps = pool_sizes_by_config.get((sf, config), "")
-            if rate is None:
-                w.writerow([sf, config, ps, "", ""])
+            if config.startswith("sqlite_"):
+                w.writerow([sf, config, ps, "", "", "", "", "", ""])
                 continue
-            if config == "baseline":
+
+            options = parse_label(config)
+            if options.fraction is not None:
+                fraction = f"{options.fraction:.4f}"
+            elif ps != "" and sf in DB_PAGES:
+                fraction = f"{ps / DB_PAGES[sf]:.4f}"
+            else:
+                fraction = ""
+
+            rate = page_rates[(sf, config)]
+            baseline_label = "baseline" + config[len(options.base):]
+            base_rate = page_rates.get((sf, baseline_label))
+            if rate is None or base_rate is None or config == baseline_label:
                 improvement = ""
             else:
-                base = baseline_rates.get(sf)
-                improvement = "" if base is None else f"{rate - base:.4f}"
-            w.writerow([sf, config, ps, f"{rate:.4f}", improvement])
+                improvement = f"{rate - base_rate:.4f}"
+
+            w.writerow([
+                sf, config, ps, fraction, options.miss_penalty_us,
+                "true" if options.direct_io else "false",
+                "" if rate is None else f"{rate:.4f}",
+                f"{raw_rates[(sf, config)]:.4f}",
+                improvement,
+            ])
 
     print(f"  -> {path}")
 
@@ -517,7 +706,28 @@ def write_correctness_csv(path: Path, sfs: Sequence[str], configs: Sequence[str]
     print(f"  -> {path}")
 
 
-# ── CLI + main ────────────────────────────────────────────────────────
+# CLI + main 
+
+def _comma_list(text: str, cast, what: str) -> list:
+    try:
+        return [cast(v) for v in text.split(",") if v.strip()]
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{what}: bad value in {text!r}")
+
+
+def penalty_list(text: str) -> List[int]:
+    values = _comma_list(text, int, "--miss-penalty-us expects integers")
+    if not values or any(v < 0 for v in values):
+        raise argparse.ArgumentTypeError("--miss-penalty-us expects non-negative integers, e.g. 0,10,100")
+    return list(dict.fromkeys(values))
+
+
+def fraction_list(text: str) -> List[float]:
+    values = _comma_list(text, float, "--pool-fractions expects numbers")
+    if not values or any(not 0 < v <= 1 for v in values):
+        raise argparse.ArgumentTypeError("--pool-fractions expects numbers in (0, 1], e.g. 0.05,0.25,1.0")
+    return list(dict.fromkeys(values))
+
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Phase 20.1 benchmark runner")
@@ -530,6 +740,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--runs", type=int, default=5, help="Timed runs per query (default 5)")
     p.add_argument("--pool-sweep", action="store_true", help=f"Also run baseline pool-size sweep at SF={POOL_SWEEP_SF}")
     p.add_argument("--v1-eviction", action="store_true", help="Also run +learned with V1 eviction model per SF")
+    p.add_argument("--miss-penalty-us", type=penalty_list, default=[0], help="Comma list of simulated per-read delays in microseconds; every ShilmanDB config runs once per value (default 0)")
+    p.add_argument("--direct-io", action="store_true", help="Read pages around the OS file cache (adds _direct to labels)")
+    p.add_argument("--pool-fractions", type=fraction_list, default=[], help="Comma list of pool sizes as fractions of the tables' pages (0 to 1]; runs baseline once per fraction per SF")
+    p.add_argument("--policy-timing", action="store_true", help="Also time the eviction policy per query (fills policy_ms)")
     p.add_argument("--skip-sqlite", action="store_true", help="Skip the SQLite benchmark invocation (reuse existing output)")
     p.add_argument("--skip-correctness", action="store_true", help="Skip the correctness comparison step")
     p.add_argument("--timeout", type=int, default=None, help="Per-config subprocess timeout in seconds (default: none)")
@@ -565,6 +779,9 @@ def main() -> int:
     section(f"Phase 20.1 benchmark runner | SFs={sfs} | configs={configs}")
     print(f"  warmup={args.warmup}, runs={args.runs}, "
           f"pool_sweep={args.pool_sweep}, v1_eviction={args.v1_eviction}")
+    if args.miss_penalty_us != [0] or args.direct_io or args.pool_fractions or args.policy_timing:
+        print(f"  miss_penalty_us={args.miss_penalty_us}, direct_io={args.direct_io}, "
+              f"pool_fractions={args.pool_fractions}, policy_timing={args.policy_timing}")
 
     shilmandb_configs = [c for c in configs if c in PRIMARY_CONFIGS]
     need_sqlite = any(c.startswith("sqlite_") for c in configs)
@@ -579,21 +796,33 @@ def main() -> int:
     all_records: Dict[Tuple[str, str, str], QueryStats] = {}
     pool_sizes_by_config: Dict[Tuple[str, str], int] = {}
 
+    ran_labels: List[str] = []      # every ShilmanDB label that was run, for the correctness check
+
+    def run_labeled(sf: str, base: str, pool: int, penalty: int, fraction: Optional[float]) -> None:
+        label = config_label(base, penalty, args.direct_io, fraction)
+        section(f"ShilmanDB {label} @ SF={sf}")
+        stats = run_shilmandb_config(
+            binary=args.binary, sf=sf, config_name=base,
+            data_dir=args.data_dir, output_dir=output_dir,
+            pool_size=pool, warmup_runs=args.warmup, timed_runs=args.runs,
+            timeout_seconds=args.timeout, label=label,
+            extra_flags=option_flags(penalty, args.direct_io, args.policy_timing),
+        )
+        pool_sizes_by_config[(sf, label)] = pool
+        if label not in ran_labels:
+            ran_labels.append(label)
+        if stats is None:
+            return
+        for q, qs in stats.items():
+            all_records[(sf, label, q)] = qs
+
     for sf in sfs:
         for cfg in shilmandb_configs:
-            section(f"ShilmanDB {cfg} @ SF={sf}")
-            pool = POOL_SIZES[sf]
-            stats = run_shilmandb_config(
-                binary=args.binary, sf=sf, config_name=cfg,
-                data_dir=args.data_dir, output_dir=output_dir,
-                pool_size=pool, warmup_runs=args.warmup, timed_runs=args.runs,
-                timeout_seconds=args.timeout,
-            )
-            pool_sizes_by_config[(sf, cfg)] = pool
-            if stats is None:
-                continue
-            for q, qs in stats.items():
-                all_records[(sf, cfg, q)] = qs
+            for penalty in args.miss_penalty_us:
+                run_labeled(sf, cfg, POOL_SIZES[sf], penalty, None)
+        for fraction in args.pool_fractions:
+            for penalty in args.miss_penalty_us:
+                run_labeled(sf, "baseline", pool_for_fraction(sf, fraction), penalty, fraction)
 
     if args.pool_sweep:
         sweep_records = run_pool_size_sweep(
@@ -628,7 +857,9 @@ def main() -> int:
         write_correctness_csv(
             output_dir / "correctness.csv",
             sfs=sfs,
-            configs=configs + (["+learned_v1"] if args.v1_eviction else []) + ([f"baseline_pool{ps}" for ps in POOL_SWEEP_SIZES] if args.pool_sweep else []),
+            configs=ran_labels + [c for c in configs if c.startswith("sqlite_")]
+                    + (["+learned_v1"] if args.v1_eviction else [])
+                    + ([f"baseline_pool{ps}" for ps in POOL_SWEEP_SIZES] if args.pool_sweep else []),
             output_dir=output_dir,
         )
 
