@@ -3,7 +3,7 @@
 
 namespace shilmandb {
 
-BufferPoolManager::BufferPoolManager(size_t pool_size, DiskManager* disk_manager, std::unique_ptr<EvictionPolicy> eviction_policy) : pool_size_(pool_size), pages_(new Page[pool_size]), disk_manager_(disk_manager), eviction_policy_(std::move(eviction_policy)) {
+BufferPoolManager::BufferPoolManager(size_t pool_size, DiskManager* disk_manager, std::unique_ptr<EvictionPolicy> eviction_policy) : pool_size_(pool_size), pages_(new Page[pool_size]), disk_manager_(disk_manager), eviction_policy_(std::move(eviction_policy)), policy_(eviction_policy_.get()), last_seen_(pool_size, 0) {
     for (size_t i = 0; i < pool_size_; ++i) {
         free_list_.push_back(static_cast<frame_id_t>(i));
     }
@@ -24,9 +24,10 @@ Page* BufferPoolManager::FetchPage(page_id_t page_id) {
     if (auto it = page_table_.find(page_id); it != page_table_.end()) {
         auto frame_id = it->second;
         pages_[frame_id].Pin();
-        eviction_policy_->RecordAccess(frame_id, page_id);
-        eviction_policy_->SetEvictable(frame_id, false);
+        policy_->RecordAccess(frame_id, page_id);
+        policy_->SetEvictable(frame_id, false);
         ++hit_count_;
+        RecordVisit(page_id, frame_id, false);
         if (trace_enabled_) {
             trace_file_ << access_counter_++ << ',' << page_id << '\n';
         }
@@ -48,16 +49,23 @@ Page* BufferPoolManager::FetchPage(page_id_t page_id) {
         page_table_.erase(frame.GetPageId());
     }
 
-    // Load requested page
-    frame.ResetMemory();
-    disk_manager_->ReadPage(page_id, frame.GetData());
+    // Load requested page. The read overwrites the whole frame, so only the metadata needs clearing.
+    // If it fails, the frame goes back to the free list.
+    frame.ClearMetadata();
+    try {
+        disk_manager_->ReadPage(page_id, frame.GetData());
+    } catch (...) {
+        free_list_.push_back(frame_id);
+        throw;
+    }
     frame.SetPageId(page_id);
     frame.Pin();
 
     page_table_[page_id] = frame_id;
-    eviction_policy_->RecordAccess(frame_id, page_id);
-    eviction_policy_->SetEvictable(frame_id, false);
+    policy_->RecordAccess(frame_id, page_id);
+    policy_->SetEvictable(frame_id, false);
     ++miss_count_;
+    RecordVisit(page_id, frame_id, true);
     if (trace_enabled_) {
         trace_file_ << access_counter_++ << ',' << page_id << '\n';
     }
@@ -84,10 +92,11 @@ Page* BufferPoolManager::NewPage(page_id_t* page_id) {
     frame.ResetMemory();
     frame.SetPageId(new_page_id);
     frame.Pin();
+    last_seen_[frame_id] = 0;  // not fetched yet
 
     page_table_[new_page_id] = frame_id;
-    eviction_policy_->RecordAccess(frame_id, new_page_id);
-    eviction_policy_->SetEvictable(frame_id, false);
+    policy_->RecordAccess(frame_id, new_page_id);
+    policy_->SetEvictable(frame_id, false);
 
     *page_id = new_page_id;
     return &frame;
@@ -109,7 +118,7 @@ bool BufferPoolManager::UnpinPage(page_id_t page_id, bool is_dirty) {
         frame.MarkDirty();
     }
     if (frame.GetPinCount() == 0) {
-        eviction_policy_->SetEvictable(it->second, true);
+        policy_->SetEvictable(it->second, true);
     }
     return true;
 }
@@ -148,10 +157,22 @@ bool BufferPoolManager::DeletePage(page_id_t page_id) {
     }
 
     page_table_.erase(it);
-    eviction_policy_->Remove(frame_id);
+    policy_->Remove(frame_id);
     frame.ResetMemory();
     free_list_.push_back(frame_id);
     return true;
+}
+
+void BufferPoolManager::RecordVisit(page_id_t page_id, frame_id_t frame_id, bool is_miss) {
+    if (page_id != last_page_id_) {
+        ++page_changes_;
+        last_page_id_ = page_id;
+    }
+    const bool new_visit = is_miss || last_seen_[frame_id] <= epoch_start_ || page_changes_ - last_seen_[frame_id] > kVisitWindow;
+    if (new_visit) {
+        ++visit_count_;
+    }
+    last_seen_[frame_id] = page_changes_;
 }
 
 bool BufferPoolManager::FindVictimFrame(frame_id_t* frame_id) {
@@ -161,7 +182,7 @@ bool BufferPoolManager::FindVictimFrame(frame_id_t* frame_id) {
         return true;
     }
 
-    auto victim = eviction_policy_->Evict();
+    auto victim = policy_->Evict();
     if (victim.has_value()) {
         *frame_id = *victim;
         return true;
@@ -171,7 +192,31 @@ bool BufferPoolManager::FindVictimFrame(frame_id_t* frame_id) {
 
 uint64_t BufferPoolManager::GetHitCount()  const { return hit_count_; }
 uint64_t BufferPoolManager::GetMissCount() const { return miss_count_; }
-void BufferPoolManager::ResetStats() { hit_count_ = 0; miss_count_ = 0; }
+uint64_t BufferPoolManager::GetVisitCount() const { return visit_count_; }
+
+void BufferPoolManager::ResetStats() {
+    hit_count_ = 0;
+    miss_count_ = 0;
+    visit_count_ = 0;
+    epoch_start_ = page_changes_;
+    last_page_id_ = INVALID_PAGE_ID;  // the next fetch counts as a page change
+    if (timed_policy_) {
+        timed_policy_->ResetStats();
+    }
+}
+
+void BufferPoolManager::SetPolicyTiming(bool on) {
+    if (on && !timed_policy_) {
+        timed_policy_ = std::make_unique<TimedEvictionPolicy>(eviction_policy_.get());
+    }
+    // Off goes straight back to the real policy; the counts stay readable
+    policy_ = on ? static_cast<EvictionPolicy*>(timed_policy_.get()) : eviction_policy_.get();
+}
+
+PolicyStats BufferPoolManager::GetPolicyStats() const {
+    return timed_policy_ ? timed_policy_->GetStats() : PolicyStats{};
+}
+
 size_t BufferPoolManager::GetPoolSize() const { return pool_size_; }
 
 const Page& BufferPoolManager::GetPage(frame_id_t frame_id) const {

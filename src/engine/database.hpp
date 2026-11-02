@@ -75,6 +75,7 @@ public:
 
     [[nodiscard]] Catalog* GetCatalog() const;
     [[nodiscard]] BufferPoolManager* GetBufferPoolManager() const;
+    [[nodiscard]] DiskManager* GetDiskManager() const;
 
 private:
     // A planner with the join model (if wanted and loaded) and any forced order set.

@@ -196,4 +196,95 @@ TEST_F(DiskManagerTest, WriteBeyondEndLeavesZeroGap) {
     EXPECT_EQ(dm2.AllocatePage(), 6u);
 }
 
+TEST_F(DiskManagerTest, ReadStatsCountReadsAndTime) {
+    DiskManager dm(test_file_);
+    std::array<char, PAGE_SIZE> buf{};
+    dm.WritePage(dm.AllocatePage(), buf.data());
+
+    dm.ResetReadStats();
+    for (int i = 0; i < 3; ++i) {
+        dm.ReadPage(0, buf.data());
+    }
+
+    const auto stats = dm.GetReadStats();
+    EXPECT_EQ(stats.reads, 3u);
+    EXPECT_GT(stats.time, std::chrono::nanoseconds{0});
+}
+
+TEST_F(DiskManagerTest, ResetReadStatsClears) {
+    DiskManager dm(test_file_);
+    std::array<char, PAGE_SIZE> buf{};
+    dm.ReadPage(0, buf.data());
+    ASSERT_EQ(dm.GetReadStats().reads, 1u);
+
+    dm.ResetReadStats();
+
+    const auto stats = dm.GetReadStats();
+    EXPECT_EQ(stats.reads, 0u);
+    EXPECT_EQ(stats.time, std::chrono::nanoseconds{0});
+}
+
+TEST_F(DiskManagerTest, ReadInvalidPageThrows) {
+    DiskManager dm(test_file_);
+
+    std::array<char, PAGE_SIZE> buf{};
+    EXPECT_THROW(dm.ReadPage(INVALID_PAGE_ID, buf.data()), IOException);
+    EXPECT_EQ(dm.GetReadStats().reads, 0u);
+}
+
+TEST_F(DiskManagerTest, ReadPenaltyOffByDefault) {
+    DiskManager dm(test_file_);
+    EXPECT_EQ(dm.GetReadPenalty(), std::chrono::microseconds{0});
+}
+
+TEST_F(DiskManagerTest, ReadPenaltyWaits) {
+    using namespace std::chrono_literals;
+    DiskManager dm(test_file_);
+
+    std::array<char, PAGE_SIZE> pattern{};
+    std::memset(pattern.data(), 0x3C, PAGE_SIZE);
+    dm.WritePage(dm.AllocatePage(), pattern.data());
+
+    dm.SetReadPenalty(300us);
+    EXPECT_EQ(dm.GetReadPenalty(), 300us);
+    dm.ResetReadStats();
+
+    std::array<char, PAGE_SIZE> buf{};
+    const auto start = std::chrono::steady_clock::now();
+    dm.ReadPage(0, buf.data());
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+
+    EXPECT_GE(elapsed, 300us);
+    EXPECT_GE(dm.GetReadStats().time, 300us);
+    EXPECT_EQ(std::memcmp(buf.data(), pattern.data(), PAGE_SIZE), 0);
+}
+
+TEST_F(DiskManagerTest, DirectIORoundTrip) {
+    DiskManager dm(test_file_);
+    dm.SetDirectIO(true);
+
+    std::array<char, PAGE_SIZE> pattern{};
+    for (size_t i = 0; i < PAGE_SIZE; ++i) {
+        pattern[i] = static_cast<char>(i % 251);
+    }
+    const auto pid = dm.AllocatePage();
+    dm.WritePage(pid, pattern.data());
+
+    std::array<char, PAGE_SIZE> buf{};
+    dm.ReadPage(pid, buf.data());
+    EXPECT_EQ(std::memcmp(buf.data(), pattern.data(), PAGE_SIZE), 0);
+
+    EXPECT_NO_THROW(dm.SetDirectIO(false));
+}
+
+TEST_F(DiskManagerTest, NumPagesFollowsAllocation) {
+    DiskManager dm(test_file_);
+    EXPECT_EQ(dm.GetNumPages(), 0u);
+
+    for (int i = 0; i < 3; ++i) {
+        dm.AllocatePage();
+    }
+    EXPECT_EQ(dm.GetNumPages(), 3u);
+}
+
 }  // namespace shilmandb

@@ -1,6 +1,7 @@
 #include "storage/disk_manager.hpp"
 #include "common/exception.hpp"
 #include <cerrno>
+#include <chrono>
 #include <cstring>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -43,6 +44,11 @@ DiskManager::~DiskManager() {
 }
 
 void DiskManager::ReadPage(page_id_t page_id, char* page_data) {
+    if (page_id == INVALID_PAGE_ID) {
+        throw IOException("Cannot read INVALID_PAGE_ID");
+    }
+
+    const auto start = std::chrono::steady_clock::now();
     size_t bytes_read = 0;
     while (bytes_read < PAGE_SIZE) {
         auto n = ::pread(fd_, page_data + bytes_read, PAGE_SIZE - bytes_read, PageOffset(page_id) + static_cast<off_t>(bytes_read));
@@ -61,6 +67,27 @@ void DiskManager::ReadPage(page_id_t page_id, char* page_data) {
 
     // anything past the end of the file reads as zeros
     std::memset(page_data + bytes_read, 0, PAGE_SIZE - bytes_read);
+
+    // busy-wait so the read lasts at least the penalty
+    if (read_penalty_ > std::chrono::microseconds{0}) {
+        while (std::chrono::steady_clock::now() - start < read_penalty_) {
+        }
+    }
+
+    ++read_stats_.reads;
+    read_stats_.time += std::chrono::steady_clock::now() - start;
+}
+
+void DiskManager::SetDirectIO(bool on) {
+#ifdef __APPLE__
+    if (::fcntl(fd_, F_NOCACHE, on ? 1 : 0) == -1) {
+        const int err = errno;
+        throw IOException(std::string("Cannot change direct I/O: ") + std::strerror(err));
+    }
+#else
+    (void)on;
+    throw IOException("direct I/O is only supported on macOS");
+#endif
 }
 
 void DiskManager::WritePage(page_id_t page_id, const char* page_data) {
