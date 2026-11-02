@@ -352,3 +352,215 @@ def test_write_latencies_new_header(tmp_path: Path) -> None:
     old = dict(zip(LATENCIES_HEADER, next(r for r in rows[1:] if r[2] == "baseline")))
     for col in LATENCIES_HEADER[7:]:
         assert old[col] == ""
+
+
+# workload labels, flags and the run plan
+def test_config_label_workload() -> None:
+    assert mod.config_label("baseline", workload="stream", seed=1) == "baseline_stream_s1"
+    assert mod.config_label("baseline", 100, False, 0.25, "stream", 1) == "baseline_stream_s1_frac0.25_pen100"
+    assert mod.config_label("+index", 0, True, None, "lookup", 7) == "+index_lookup_s7_direct"
+    # single keeps today's labels, whatever the seed
+    assert mod.config_label("baseline", fraction=0.25) == "baseline_frac0.25"
+    assert mod.config_label("baseline", seed=5) == "baseline"
+
+
+def test_parse_label_workload_round_trip() -> None:
+    opts = mod.parse_label("+index_mixed_s7_frac0.5_pen10_direct")
+    assert (opts.base, opts.workload, opts.seed) == ("+index", "mixed", 7)
+    assert (opts.fraction, opts.miss_penalty_us, opts.direct_io) == (0.5, 10, True)
+
+    opts = mod.parse_label("baseline_pen100")
+    assert (opts.base, opts.workload, opts.seed) == ("baseline", "single", None)
+    assert opts.miss_penalty_us == 100
+
+    label = mod.config_label("baseline", 100, True, 0.25, "stream", 3)
+    opts = mod.parse_label(label)
+    assert (opts.base, opts.workload, opts.seed, opts.fraction) == ("baseline", "stream", 3, 0.25)
+
+
+def test_workload_flags_single_is_empty() -> None:
+    assert mod.workload_flags("single", 1, None) == []
+    assert mod.workload_flags("stream", 3, None) == ["--workload", "stream", "--seed", "3"]
+    assert mod.workload_flags("lookup", 1, 16) == [
+        "--workload", "lookup", "--seed", "1", "--stream-length", "16",
+    ]
+
+
+def test_can_run_and_fraction_config() -> None:
+    assert not mod.can_run("baseline", "lookup")
+    assert not mod.can_run("baseline", "mixed")
+    assert mod.can_run("baseline", "stream")
+    assert mod.can_run("baseline", "single")
+    assert mod.can_run("+index", "lookup")
+    assert mod.can_run("+vectorized", "mixed")
+    assert mod.fraction_config("single") == "baseline"
+    assert mod.fraction_config("stream") == "baseline"
+    assert mod.fraction_config("lookup") == "+index"
+    assert mod.fraction_config("mixed") == "+index"
+
+
+def test_planned_runs_single_matches_today() -> None:
+    runs = mod.planned_runs(["0.01"], ["baseline", "+index"], ["single"], [0, 100], [0.5])
+    assert runs == [
+        mod.RunSpec("0.01", "baseline", "single", 128, 0, None),
+        mod.RunSpec("0.01", "baseline", "single", 128, 100, None),
+        mod.RunSpec("0.01", "+index", "single", 128, 0, None),
+        mod.RunSpec("0.01", "+index", "single", 128, 100, None),
+        mod.RunSpec("0.01", "baseline", "single", 724, 0, 0.5),
+        mod.RunSpec("0.01", "baseline", "single", 724, 100, 0.5),
+    ]
+
+
+def test_planned_runs_skips_and_fraction_configs() -> None:
+    runs = mod.planned_runs(["0.01"], ["baseline", "+index"], ["stream", "lookup"], [0], [0.25])
+    assert runs == [
+        mod.RunSpec("0.01", "baseline", "stream", 128, 0, None),
+        mod.RunSpec("0.01", "+index", "stream", 128, 0, None),
+        mod.RunSpec("0.01", "baseline", "stream", 362, 0, 0.25),
+        mod.RunSpec("0.01", "+index", "lookup", 128, 0, None),
+        mod.RunSpec("0.01", "+index", "lookup", 362, 0, 0.25),
+    ]
+
+
+# stream CSVs
+STREAM_TOTALS_HEADER = "pass,warmup,items,latency_ms,hits,misses,visits,reads,read_ms,query_misses,lookup_misses\n"
+STREAM_HEADER = "pass,warmup,seq,kind,query,rows,latency_ms,hits,misses,visits,reads,read_ms,trace_start,trace_end\n"
+
+
+def test_parse_stream_totals_skips_warmup(tmp_path: Path) -> None:
+    path = tmp_path / "stream_totals.csv"
+    path.write_text(
+        STREAM_TOTALS_HEADER
+        + "0,1,16,99.0,1,999,999,999,9.0,999,0\n"
+        + "1,0,16,10.0,50,100,120,100,1.0,100,0\n"
+        + "2,0,16,30.0,50,100,120,100,3.0,100,0\n"
+        + "3,0,16,20.0,50,100,120,100,2.0,100,0\n"
+    )
+    totals = mod.parse_stream_totals(path)
+    assert totals["median_total_ms"] == 20.0
+    assert totals["misses"] == 100
+    assert totals["timed_passes"] == 3
+    assert totals["items"] == 16
+    assert totals["visits"] == 120
+    assert totals["reads"] == 100
+    assert totals["read_ms"] == 2.0
+    assert totals["query_misses"] == 100
+    assert totals["lookup_misses"] == 0
+
+
+def test_parse_stream_items_per_tag(tmp_path: Path) -> None:
+    path = tmp_path / "stream.csv"
+    path.write_text(
+        STREAM_HEADER
+        + "0,1,0,tpch,Q6,1,5.0,1,999,999,999,0.5,,\n"      # warmup: left out
+        + "1,0,0,tpch,Q6,1,4.0,1,10,12,10,0.4,,\n"
+        + "1,0,1,tpch,Q1,4,9.0,1,50,60,50,0.9,,\n"
+        + "1,0,2,tpch,Q6,1,6.0,1,30,32,30,0.6,,\n"
+        + "2,0,0,tpch,Q6,1,4.0,1,10,12,10,0.4,,\n"
+        + "2,0,1,tpch,Q1,4,9.0,1,50,60,50,0.9,,\n"
+        + "2,0,2,tpch,Q6,1,6.0,1,30,32,30,0.6,,\n"
+    )
+    items = mod.parse_stream_items(path)
+    assert list(items) == ["Q1", "Q6"]
+    assert items["Q6"]["items"] == 4
+    assert items["Q6"]["median_misses"] == 20
+    assert items["Q6"]["median_visits"] == 22
+    assert items["Q6"]["median_latency_ms"] == pytest.approx(5.0)
+    assert items["Q1"]["items"] == 2
+
+    rows = [
+        mod.WorkloadQueryRow("0.01", "baseline_stream_s1", "stream", tag, int(v["items"]),
+                             v["median_latency_ms"], v["median_misses"], v["median_visits"])
+        for tag, v in items.items()
+    ]
+    out = tmp_path / "workload_queries.csv"
+    mod.write_workload_queries_csv(out, rows)
+    lines = _read_dicts(out)
+    assert list(lines[0]) == ["sf", "config", "workload", "query", "items",
+                              "median_latency_ms", "median_misses", "median_visits"]
+    q6 = next(r for r in lines if r["query"] == "Q6")
+    assert (q6["items"], q6["median_latency_ms"], q6["median_misses"]) == ("4", "5.0000", "20")
+
+
+# workloads.csv
+WORKLOADS_HEADER = [
+    "sf", "config", "workload", "seed", "items", "timed_passes", "pool_size", "pool_fraction",
+    "miss_penalty_us", "direct_io", "median_total_ms", "misses", "visits", "page_hit_rate",
+    "reads", "read_ms", "us_per_read", "query_misses", "lookup_misses", "policy_ms", "correct",
+]
+
+
+def _workload_stats(config: str, pool_size: int, **overrides) -> "mod.WorkloadStats":
+    fields = dict(
+        sf="0.01", config=config, workload="stream", seed=1, items=16, timed_passes=3,
+        pool_size=pool_size, miss_penalty_us=0, direct_io=False, median_total_ms=12.5,
+        misses=40, visits=100, reads=40, read_ms=0.02, query_misses=40, lookup_misses=0,
+    )
+    fields.update(overrides)
+    return mod.WorkloadStats(**fields)
+
+
+def test_write_workloads_csv(tmp_path: Path) -> None:
+    records = [
+        _workload_stats("baseline_stream_s1", 724, correct="16/16"),
+        _workload_stats("baseline_stream_s1_frac0.25", 362, policy_ms=1.5),
+    ]
+    out = tmp_path / "workloads.csv"
+    mod.write_workloads_csv(out, records)
+    with out.open() as f:
+        assert next(csv.reader(f)) == WORKLOADS_HEADER
+
+    plain, frac = _read_dicts(out)
+    assert plain["page_hit_rate"] == "0.6000"
+    assert plain["pool_fraction"] == "0.5000"           # 724 / 1448, no fraction in the label
+    assert plain["us_per_read"] == "0.5000"
+    assert plain["median_total_ms"] == "12.5000"
+    assert plain["direct_io"] == "false"
+    assert plain["policy_ms"] == ""
+    assert plain["correct"] == "16/16"
+    assert frac["pool_fraction"] == "0.2500"            # the label's fraction
+    assert frac["policy_ms"] == "1.5000"
+    assert frac["correct"] == ""
+
+
+# a binary that can't run the workload
+def test_workload_run_with_failing_binary_returns_none(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    binary = tmp_path / "old_load_tpch"
+    binary.write_text("#!/bin/sh\necho 'usage: load_tpch [options]' >&2\nexit 1\n")
+    binary.chmod(0o755)
+    stats = mod.run_workload_config(
+        binary=binary, sf="0.01", config_name="baseline", data_dir=tmp_path,
+        output_dir=tmp_path / "out", pool_size=128, warmup_runs=1, timed_runs=2,
+        timeout_seconds=30, label="baseline_stream_s1",
+        extra_flags=mod.workload_flags("stream", 1, 16),
+    )
+    assert stats is None
+    assert "usage: load_tpch" in capsys.readouterr().err
+
+
+# a call that runs only workloads must not touch the single-query files or run SQLite
+def test_workload_only_call_leaves_single_files_alone(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                                                      capsys: pytest.CaptureFixture) -> None:
+    out = tmp_path / "out"
+    out.mkdir()
+    for name in ("latencies.csv", "hit_rates.csv", "correctness.csv"):
+        (out / name).write_text("marker\n")
+
+    sqlite_calls: list = []
+    monkeypatch.setattr(mod, "run_sqlite_benchmarks", lambda *a, **k: sqlite_calls.append(a) or True)
+    monkeypatch.setattr(mod, "run_workload_config",
+                        lambda **k: _workload_stats(k["label"], k["pool_size"]))
+    monkeypatch.setattr(mod, "workload_query_rows", lambda *a, **k: [])
+    monkeypatch.setattr(sys, "argv", [
+        "run_benchmarks.py", "--sf", "0.01", "--configs", "baseline,sqlite_disk",
+        "--workloads", "stream", "--skip-correctness", "--output-dir", str(out)])
+
+    assert mod.main() == 0
+
+    for name in ("latencies.csv", "hit_rates.csv", "correctness.csv"):
+        assert (out / name).read_text() == "marker\n"
+    assert sqlite_calls == []
+    assert len(_read_dicts(out / "workloads.csv")) == 1
+    text = capsys.readouterr().out
+    assert "SQLite configs only run with the single workload" in text
+    assert "latencies" not in text.split("Done")[-1]

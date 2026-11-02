@@ -1,19 +1,25 @@
 #include "engine/database.hpp"
 #include "executor/executor.hpp"
 #include "common/exception.hpp"
+#include "tpch_streams.hpp"
 #include "tpch_workload.hpp"
 
 #include <iostream>
 #include <fstream>
 #include <iomanip>
+#include <sstream>
 #include <string>
 #include <vector>
 #include <chrono>
 #include <filesystem>
 #include <algorithm>
+#include <cctype>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <optional>
 #include <stdexcept>
+#include <unordered_set>
 
 using namespace shilmandb;
 namespace fs = std::filesystem;
@@ -35,6 +41,10 @@ struct Args {
     int64_t miss_penalty_us{0};
     bool direct_io{false};
     bool policy_timing{false};
+    tpch::Workload workload{tpch::Workload::SINGLE};
+    uint64_t seed{1};
+    std::optional<size_t> stream_length;  // set to the scale factor's default when not given
+    bool trace_collapse{false};
 #ifdef SHILMANDB_HAS_LIBTORCH
     bool use_learned_join{false};
     std::string join_model_path;
@@ -46,11 +56,12 @@ struct Args {
 
 static void PrintUsage(const char* prog) {
     std::cerr << "Usage: " << prog << " --sf <scale_factor> --db-file <path> --data-dir <path> [--no-verify]"
-              << " [--enable-tracing <path>] [--pool-size <N>] [--create-indexes <true|false>]"
+              << " [--enable-tracing <path> [--trace-collapse]] [--pool-size <N>] [--create-indexes <true|false>]"
               << " [--warmup <N>] [--runs <N>]"
               << " [--results-dir <path>]"
               << " [--execution-mode <tuple|vectorized>]"
               << " [--miss-penalty-us <N>] [--direct-io] [--policy-timing]"
+              << " [--workload <single|stream|lookup|mixed>] [--stream-length <N>] [--seed <S>]"
 #ifdef SHILMANDB_HAS_LIBTORCH
               << " [--use-learned-join --join-model-path <path>]"
               << " [--use-learned-eviction --eviction-model-path <path>]"
@@ -59,8 +70,26 @@ static void PrintUsage(const char* prog) {
               << "\n";
 }
 
+[[noreturn]] static void ExitWithError(const std::string& message) {
+    std::cerr << "Error: " << message << "\n";
+    std::exit(1);
+}
+
+// A string made only of digits, as a number. Nothing for anything else, or a number too big.
+static std::optional<uint64_t> ParseUnsigned(const std::string& text) {
+    const bool digits = !text.empty() &&
+        std::all_of(text.begin(), text.end(), [](unsigned char ch) { return std::isdigit(ch) != 0; });
+    if (!digits) return std::nullopt;
+    try {
+        return std::stoull(text);
+    } catch (const std::out_of_range&) {
+        return std::nullopt;
+    }
+}
+
 static Args ParseArgs(int argc, char* argv[]) {
     Args args;
+    bool seed_given = false;
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--sf" && i + 1 < argc) {
@@ -126,6 +155,24 @@ static Args ParseArgs(int argc, char* argv[]) {
             args.direct_io = true;
         } else if (arg == "--policy-timing") {
             args.policy_timing = true;
+        } else if (arg == "--workload" && i + 1 < argc) {
+            const std::string val = argv[++i];
+            const auto workload = tpch::ParseWorkload(val);
+            if (!workload) ExitWithError("unknown --workload '" + val + "' (expected single, stream, lookup or mixed)");
+            args.workload = *workload;
+        } else if (arg == "--stream-length" && i + 1 < argc) {
+            const std::string val = argv[++i];
+            const auto length = ParseUnsigned(val);
+            if (!length || *length < 1) ExitWithError("--stream-length expects an integer >= 1, got '" + val + "'");
+            args.stream_length = static_cast<size_t>(*length);
+        } else if (arg == "--seed" && i + 1 < argc) {
+            const std::string val = argv[++i];
+            const auto seed = ParseUnsigned(val);
+            if (!seed) ExitWithError("--seed expects a non-negative integer, got '" + val + "'");
+            args.seed = *seed;
+            seed_given = true;
+        } else if (arg == "--trace-collapse") {
+            args.trace_collapse = true;
 #ifdef SHILMANDB_HAS_LIBTORCH
         } else if (arg == "--use-learned-join") {
             args.use_learned_join = true;
@@ -157,11 +204,419 @@ static Args ParseArgs(int argc, char* argv[]) {
         std::exit(1);
     }
 #endif
+    const bool single = args.workload == tpch::Workload::SINGLE;
+    const std::string workload_name = tpch::WorkloadName(args.workload);
+    if (single && args.stream_length) ExitWithError("--stream-length needs --workload stream, lookup or mixed");
+    if (single && seed_given) ExitWithError("--seed needs --workload stream, lookup or mixed");
+    if ((args.workload == tpch::Workload::LOOKUP || args.workload == tpch::Workload::MIXED) && !args.create_indexes) {
+        ExitWithError("--workload " + workload_name + " needs --create-indexes true");
+    }
+    if (args.trace_collapse && args.trace_path.empty()) ExitWithError("--trace-collapse needs --enable-tracing <path>");
+    if (!single && !args.stream_length) {
+        args.stream_length = tpch::DefaultStreamLength(args.workload, args.sf);
+        if (!args.stream_length) {
+            ExitWithError("--workload " + workload_name + " has no default length at --sf " + args.sf +
+                          "; pass --stream-length <N>");
+        }
+    }
     // Ensure data_dir ends with '/'
     if (args.data_dir.back() != '/') {
         args.data_dir += '/';
     }
     return args;
+}
+
+// Output helpers
+
+// A CSV field in quotes, with any quote inside it doubled.
+static std::string QuoteCsv(const std::string& text) {
+    std::string out;
+    out.reserve(text.size() + 2);
+    out += '"';
+    for (char ch : text) {
+        if (ch == '"') out += '"';
+        out += ch;
+    }
+    out += '"';
+    return out;
+}
+
+// A result value as a CSV field. VARCHARs are quoted when they hold a comma, a quote or a newline.
+static std::string CsvValue(const Value& v, const Schema& schema, uint32_t col) {
+    auto str = v.ToString();
+    const bool needs_quoting = schema.GetColumn(col).type == TypeId::VARCHAR && str.find_first_of(",\"\n") != std::string::npos;
+    return needs_quoting ? QuoteCsv(str) : str;
+}
+
+static double ToMs(std::chrono::nanoseconds t) {
+    return std::chrono::duration<double, std::milli>(t).count();
+}
+
+static const char* BoolText(bool b) { return b ? "true" : "false"; }
+
+// A number with a fixed count of decimals.
+static std::string Fixed(double value, int decimals) {
+    std::ostringstream out;
+    out << std::fixed << std::setprecision(decimals) << value;
+    return out.str();
+}
+
+// 81140 -> "81,140"
+static std::string WithCommas(uint64_t n) {
+    std::string text = std::to_string(n);
+    for (auto i = static_cast<std::ptrdiff_t>(text.size()) - 3; i > 0; i -= 3) {
+        text.insert(static_cast<size_t>(i), ",");
+    }
+    return text;
+}
+
+static void AddReads(ReadStats& total, const ReadStats& more) {
+    total.reads += more.reads;
+    total.time += more.time;
+}
+
+// Makes the results folder if it isn't there yet. Says why if it can't.
+[[nodiscard]] static bool MakeResultsDir(const std::string& dir) {
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    if (ec) {
+        std::cerr << "Error: could not create results directory '" << dir << "': " << ec.message() << "\n";
+        return false;
+    }
+    return true;
+}
+
+// Writes the header line, then whatever `write_rows` adds. Says so if the file won't open.
+template <typename WriteRows>
+[[nodiscard]] static bool WriteCsv(const fs::path& path, const std::string& header, WriteRows&& write_rows) {
+    std::ofstream ofs(path);
+    if (!ofs) {
+        std::cerr << "Error: could not open " << path.string() << " for writing\n";
+        return false;
+    }
+    ofs << header << "\n";
+    write_rows(ofs);
+    return true;
+}
+
+// One run with the policy timer on.
+struct PolicyRecord {
+    std::string tag;
+    size_t rows;
+    double latency_ms;
+    PolicyStats stats;
+};
+
+constexpr const char* kPolicyColumns = "query,rows,latency_ms,policy_calls,policy_ms,policy_raw_ms,record_ms,set_evictable_ms,evict_ms,remove_ms";
+
+// One policy_time.csv row, from the query column on.
+static void WritePolicyColumns(std::ostream& ofs, const PolicyRecord& rec) {
+    const auto& st = rec.stats;
+    auto net = [&](std::chrono::nanoseconds raw, uint64_t calls) {
+        return ToMs(std::max(std::chrono::nanoseconds{0}, raw - st.timer_cost * static_cast<std::chrono::nanoseconds::rep>(calls)));
+    };
+
+    ofs << rec.tag << ","
+        << rec.rows << ","
+        << rec.latency_ms << ","
+        << st.TotalCalls() << ","
+        << ToMs(st.NetTime()) << ","
+        << ToMs(st.RawTime()) << ","
+        << net(st.record_time, st.record_calls) << ","
+        << net(st.set_evictable_time, st.set_evictable_calls) << ","
+        << net(st.evict_time, st.evict_calls) << ","
+        << net(st.remove_time, st.remove_calls) << "\n";
+}
+
+// What every run_info.csv records about the database.
+struct RunInfo {
+    page_id_t db_pages;        // tables only, right after the load
+    page_id_t db_pages_total;  // after the indexes
+    std::string eviction;
+};
+
+// The keys every run_info.csv starts with. `reads` are the timed runs' page reads.
+static void WriteRunInfo(std::ostream& ofs, const Args& args, const RunInfo& info, const ReadStats& reads) {
+    ofs << "sf," << args.sf << "\n"
+        << "pool_size," << args.pool_size << "\n"
+        << "db_pages," << info.db_pages << "\n"
+        << "db_pages_total," << info.db_pages_total << "\n"
+        << "miss_penalty_us," << args.miss_penalty_us << "\n"
+        << "direct_io," << BoolText(args.direct_io) << "\n"
+        << "eviction," << info.eviction << "\n"
+        << "execution_mode," << (args.exec_mode == ExecutionMode::VECTORIZED ? "vectorized" : "tuple") << "\n"
+        << "policy_timing," << BoolText(args.policy_timing) << "\n"
+        << "us_per_read,";
+    if (reads.reads > 0) {
+        const double read_us = std::chrono::duration<double, std::micro>(reads.time).count();
+        ofs << Fixed(read_us / static_cast<double>(reads.reads), 3);
+    }
+    ofs << "\n";
+}
+
+//Workloads
+
+// One item of one pass: its result size, its time and what the pool did.
+struct ItemRecord {
+    int pass{0};
+    size_t seq{0};
+    size_t rows{0};
+    double latency_ms{0};
+    uint64_t hits{0};
+    uint64_t misses{0};
+    uint64_t visits{0};
+    ReadStats reads;
+    uint64_t trace_start{0};  // fetches traced before the item
+    uint64_t trace_end{0};    // and after it
+};
+
+// A pass's items added up.
+struct PassTotals {
+    size_t items{0};
+    double latency_ms{0};
+    uint64_t hits{0};
+    uint64_t misses{0};
+    uint64_t visits{0};
+    ReadStats reads;
+    uint64_t query_misses{0};
+    uint64_t lookup_misses{0};
+
+    void Add(const ItemRecord& r, tpch::StreamItem::Kind kind) {
+        ++items;
+        latency_ms += r.latency_ms;
+        hits += r.hits;
+        misses += r.misses;
+        visits += r.visits;
+        AddReads(reads, r.reads);
+        (kind == tpch::StreamItem::Kind::LOOKUP ? lookup_misses : query_misses) += r.misses;
+    }
+};
+
+struct ItemRun {
+    ItemRecord record;
+    QueryResult result;
+};
+
+static const char* KindName(tpch::StreamItem::Kind kind) {
+    return kind == tpch::StreamItem::Kind::LOOKUP ? "lookup" : "tpch";
+}
+
+// Runs one item with fresh counts, the way each timed run of a single query starts.
+static ItemRun RunItem(Database& db, const tpch::StreamItem& item, ExecutionMode mode) {
+    auto* bpm = db.GetBufferPoolManager();
+    auto* disk = db.GetDiskManager();
+    bpm->ResetStats();
+    disk->ResetReadStats();
+
+    ItemRun run;
+    auto& rec = run.record;
+    rec.trace_start = bpm->GetTraceCount();
+    const auto start = std::chrono::steady_clock::now();
+    auto result = db.ExecuteSQL(item.sql, mode);
+    rec.latency_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    rec.trace_end = bpm->GetTraceCount();
+
+    rec.rows = result.tuples.size();
+    rec.hits = bpm->GetHitCount();
+    rec.misses = bpm->GetMissCount();
+    rec.visits = bpm->GetVisitCount();
+    rec.reads = disk->GetReadStats();
+    run.result = std::move(result);
+    return run;
+}
+
+static void PrintPass(const std::string& label, const PassTotals& t) {
+    std::cout << "  " << label << ": " << t.items << " items, " << Fixed(t.latency_ms, 1) << " ms, "
+              << WithCommas(t.misses) << " misses, " << WithCommas(t.visits) << " visits\n";
+}
+
+// Runs the workload's warmup passes, its timed passes and, if asked, one pass with the policy
+// timer on. The CSVs are written only once everything ran. Returns the exit code.
+static int RunWorkload(Database& db, const Args& args, const RunInfo& info) {
+    using Kind = tpch::StreamItem::Kind;
+    const auto items = tpch::MakeWorkload(args.workload, args.seed, *args.stream_length);
+    const bool has_lookups = args.workload == tpch::Workload::LOOKUP || args.workload == tpch::Workload::MIXED;
+
+    std::cout << "\n=== Workload: " << tpch::WorkloadName(args.workload) << " (seed " << args.seed << ", " << items.size() << " items per pass) ===\n";
+
+    // A lookup that scans instead of reading through its index would measure the wrong thing
+    if (has_lookups) {
+        std::unordered_set<std::string> checked;
+        for (const auto& item : items) {
+            if (item.kind != Kind::LOOKUP || !checked.insert(item.sql).second) continue;
+            if (!tpch::PlanUsesIndex(db, item.sql, item.index_name)) {
+                std::cerr << "Error: lookup does not use " << item.index_name << ": " << item.sql << "\n";
+                return 1;
+            }
+        }
+        std::cout << "Plan check: " << checked.size() << " distinct lookups use their index\n";
+    }
+
+    const bool export_csv = !args.results_dir.empty();
+    if (export_csv && !MakeResultsDir(args.results_dir)) return 1;
+
+    auto* bpm = db.GetBufferPoolManager();
+    const bool tracing = !args.trace_path.empty();
+
+    // Gives nothing back if the item failed, after saying which one
+    auto run_item = [&](size_t seq) -> std::optional<ItemRun> {
+        try {
+            return RunItem(db, items[seq], args.exec_mode);
+        } catch (const std::exception& e) {
+            std::cerr << "Error: " << items[seq].tag << " seq " << seq << ": " << e.what() << "\n";
+            return std::nullopt;
+        }
+    };
+
+    // Every pass runs the same items in the same order
+    const int passes = args.warmup_runs + args.timed_runs;
+    std::vector<ItemRecord> records;
+    records.reserve(items.size() * static_cast<size_t>(passes));
+    std::vector<PassTotals> totals;
+    std::vector<QueryResult> first_timed_results;
+    ReadStats timed_reads;
+
+    std::cout << "\n--- Passes (" << args.warmup_runs << " warmup, " << args.timed_runs << " timed) ---\n";
+    for (int pass = 0; pass < passes; ++pass) {
+        const bool warmup = pass < args.warmup_runs;
+        PassTotals pass_totals;
+        for (size_t seq = 0; seq < items.size(); ++seq) {
+            auto run = run_item(seq);
+            if (!run) return 1;
+            run->record.pass = pass;
+            run->record.seq = seq;
+            pass_totals.Add(run->record, items[seq].kind);
+            records.push_back(run->record);
+            if (pass == args.warmup_runs) first_timed_results.push_back(std::move(run->result));
+        }
+        if (!warmup) AddReads(timed_reads, pass_totals.reads);
+        PrintPass("pass " + std::to_string(pass) + (warmup ? " (warmup)" : ""), pass_totals);
+        totals.push_back(pass_totals);
+    }
+
+    // The trace stops here, so stream.csv's trace columns cover all of it after the row counts
+    if (tracing) bpm->DisableTracing();
+
+    // One more pass with the policy timer on. The timed passes never include it.
+    std::vector<PolicyRecord> policy_records;
+    if (args.policy_timing) {
+        bpm->SetPolicyTiming(true);
+        double total_ms = 0;
+        uint64_t total_calls = 0;
+        for (size_t seq = 0; seq < items.size(); ++seq) {
+            auto run = run_item(seq);
+            if (!run) return 1;
+            policy_records.push_back({items[seq].tag, run->record.rows, run->record.latency_ms, bpm->GetPolicyStats()});
+            total_ms += run->record.latency_ms;
+            total_calls += policy_records.back().stats.TotalCalls();
+        }
+        bpm->SetPolicyTiming(false);
+        std::cout << "  policy pass: " << items.size() << " items, " << Fixed(total_ms, 1) << " ms, " << WithCommas(total_calls) << " policy calls\n";
+    }
+
+    if (!export_csv) return 0;
+    const fs::path dir(args.results_dir);
+
+    const bool stream_ok = WriteCsv(
+        dir / "stream.csv",
+        "pass,warmup,seq,kind,query,rows,latency_ms,hits,misses,visits,reads,read_ms,trace_start,trace_end",
+        [&](std::ostream& ofs) {
+            ofs << std::fixed << std::setprecision(4);
+            for (const auto& r : records) {
+                const auto& item = items[r.seq];
+                ofs << r.pass << ","
+                    << (r.pass < args.warmup_runs ? 1 : 0) << ","
+                    << r.seq << ","
+                    << KindName(item.kind) << ","
+                    << item.tag << ","
+                    << r.rows << ","
+                    << r.latency_ms << ","
+                    << r.hits << ","
+                    << r.misses << ","
+                    << r.visits << ","
+                    << r.reads.reads << ","
+                    << ToMs(r.reads.time) << ",";
+                // Left empty when nothing was traced
+                if (tracing) ofs << r.trace_start;
+                ofs << ",";
+                if (tracing) ofs << r.trace_end;
+                ofs << "\n";
+            }
+        });
+    if (!stream_ok) return 1;
+
+    const bool totals_ok = WriteCsv(
+        dir / "stream_totals.csv",
+        "pass,warmup,items,latency_ms,hits,misses,visits,reads,read_ms,query_misses,lookup_misses",
+        [&](std::ostream& ofs) {
+            ofs << std::fixed << std::setprecision(4);
+            for (size_t pass = 0; pass < totals.size(); ++pass) {
+                const auto& t = totals[pass];
+                ofs << pass << ","
+                    << (pass < static_cast<size_t>(args.warmup_runs) ? 1 : 0) << ","
+                    << t.items << ","
+                    << t.latency_ms << ","
+                    << t.hits << ","
+                    << t.misses << ","
+                    << t.visits << ","
+                    << t.reads.reads << ","
+                    << ToMs(t.reads.time) << ","
+                    << t.query_misses << ","
+                    << t.lookup_misses << "\n";
+            }
+        });
+    if (!totals_ok) return 1;
+
+    const bool queries_ok = WriteCsv(dir / "stream_queries.csv", "seq,kind,query,sql", [&](std::ostream& ofs) {
+        for (size_t seq = 0; seq < items.size(); ++seq) {
+            const auto& item = items[seq];
+            ofs << seq << "," << KindName(item.kind) << "," << item.tag << "," << QuoteCsv(item.sql) << "\n";
+        }
+    });
+    if (!queries_ok) return 1;
+
+    // Every result cell of the first timed pass, one per line, since items have different columns
+    const bool results_ok = WriteCsv(dir / "stream_results.csv", "seq,row,col,value", [&](std::ostream& ofs) {
+        for (size_t seq = 0; seq < first_timed_results.size(); ++seq) {
+            const auto& schema = first_timed_results[seq].schema;
+            const auto& tuples = first_timed_results[seq].tuples;
+            for (size_t row = 0; row < tuples.size(); ++row) {
+                for (uint32_t col = 0; col < schema.GetColumnCount(); ++col) {
+                    ofs << seq << "," << row << "," << col << "," << CsvValue(tuples[row].GetValue(schema, col), schema, col) << "\n";
+                }
+            }
+        }
+    });
+    if (!results_ok) return 1;
+
+    const bool info_ok = WriteCsv(dir / "run_info.csv", "key,value", [&](std::ostream& ofs) {
+        WriteRunInfo(ofs, args, info, timed_reads);
+        ofs << "workload," << tpch::WorkloadName(args.workload) << "\n"
+            << "seed," << args.seed << "\n"
+            << "stream_length," << *args.stream_length << "\n"
+            << "items," << items.size() << "\n"
+            << "warmup_passes," << args.warmup_runs << "\n"
+            << "timed_passes," << args.timed_runs << "\n";
+        if (args.workload == tpch::Workload::MIXED) ofs << "lookups_per_query," << tpch::kMixedLookupsPerQuery << "\n";
+        if (has_lookups) ofs << "zipf_s," << tpch::kLookupZipfS << "\n";
+        ofs << "trace_collapse," << BoolText(args.trace_collapse) << "\n";
+    });
+    if (!info_ok) return 1;
+
+    if (args.policy_timing) {
+        const bool policy_ok =
+            WriteCsv(dir / "policy_time.csv", std::string("seq,") + kPolicyColumns, [&](std::ostream& ofs) {
+                ofs << std::fixed << std::setprecision(4);
+                for (size_t seq = 0; seq < policy_records.size(); ++seq) {
+                    ofs << seq << ",";
+                    WritePolicyColumns(ofs, policy_records[seq]);
+                }
+            });
+        if (!policy_ok) return 1;
+    }
+
+    std::cout << "\nWorkload results written to " << dir.string() << "\n";
+    return 0;
 }
 
 // ── Main ─────────────────────────────────────────────────────────────
@@ -241,15 +696,16 @@ int main(int argc, char* argv[]) {
         db.GetDiskManager()->SetReadPenalty(std::chrono::microseconds{args.miss_penalty_us});
         std::cout << "Miss penalty: " << args.miss_penalty_us << " us per page read\n";
     }
+    const RunInfo run_info{db_pages, db_pages_total, eviction_name};
 
-
-    bool run_queries = args.verify || !args.trace_path.empty() || !args.results_dir.empty();
+    const bool single = args.workload == tpch::Workload::SINGLE;
+    bool run_queries = !single || args.verify || !args.trace_path.empty() || !args.results_dir.empty();
 
     if (!args.trace_path.empty()) {
         if (!args.verify) {
             std::cout << "\nTracing enabled — running verification queries for trace generation\n";
         }
-        db.GetBufferPoolManager()->EnableTracing(args.trace_path);
+        db.GetBufferPoolManager()->EnableTracing(args.trace_path, args.trace_collapse);
     }
 
     if (run_queries) {
@@ -268,7 +724,16 @@ int main(int argc, char* argv[]) {
                 std::cerr << "  " << name << ": verification failed — " << e.what() << "\n";
             }
         }
+    }
 
+    if (!single) {
+        try {
+            if (RunWorkload(db, args, run_info) != 0) return 1;
+        } catch (const std::exception& e) {
+            std::cerr << "Error: " << e.what() << "\n";
+            return 1;
+        }
+    } else if (run_queries) {
         // ── TPC-H target queries ─────────────────────────────────────
 
         std::cout << "\n=== TPC-H Query Verification ===\n";
@@ -277,35 +742,7 @@ int main(int argc, char* argv[]) {
 
         // Create results directory if requested
         const bool export_csv = !args.results_dir.empty();
-        if (export_csv) {
-            std::error_code ec;
-            fs::create_directories(args.results_dir, ec);
-            if (ec) {
-                std::cerr << "Error: could not create results directory '"
-                          << args.results_dir << "': " << ec.message() << "\n";
-                return 1;
-            }
-        }
-
-        // CSV value formatter: RFC 4180 quoting for VARCHAR fields
-        auto csv_value = [](const Value& v, const Schema& schema, uint32_t col) -> std::string {
-            auto str = v.ToString();
-            if (schema.GetColumn(col).type == TypeId::VARCHAR) {
-                bool needs_quoting = str.find(',')  != std::string::npos
-                                  || str.find('"')  != std::string::npos
-                                  || str.find('\n') != std::string::npos;
-                if (needs_quoting) {
-                    std::string escaped;
-                    escaped.reserve(str.size() + 2);
-                    for (char ch : str) {
-                        if (ch == '"') escaped += '"';
-                        escaped += ch;
-                    }
-                    return "\"" + escaped + "\"";
-                }
-            }
-            return str;
-        };
+        if (export_csv && !MakeResultsDir(args.results_dir)) return 1;
 
         // Latency records for latencies.csv — one per (query, run)
         struct LatencyRecord {
@@ -322,12 +759,6 @@ int main(int argc, char* argv[]) {
         std::vector<LatencyRecord> latencies;
 
         // One extra run per query with the policy timer on
-        struct PolicyRecord {
-            std::string tag;
-            size_t rows;
-            double latency_ms;
-            PolicyStats stats;
-        };
         std::vector<PolicyRecord> policy_records;
 
         auto* bpm = db.GetBufferPoolManager();
@@ -389,7 +820,7 @@ int main(int argc, char* argv[]) {
                             for (const auto& tuple : result.tuples) {
                                 for (uint32_t c = 0; c < schema.GetColumnCount(); ++c) {
                                     if (c > 0) ofs << ",";
-                                    ofs << csv_value(tuple.GetValue(schema, c), schema, c);
+                                    ofs << CsvValue(tuple.GetValue(schema, c), schema, c);
                                 }
                                 ofs << "\n";
                             }
@@ -461,23 +892,9 @@ int main(int argc, char* argv[]) {
             auto info_path = fs::path(args.results_dir) / "run_info.csv";
             std::ofstream ofs(info_path);
             if (ofs) {
-                auto flag = [](bool b) { return b ? "true" : "false"; };
-                ofs << "key,value\n"
-                    << "sf," << args.sf << "\n"
-                    << "pool_size," << args.pool_size << "\n"
-                    << "db_pages," << db_pages << "\n"
-                    << "db_pages_total," << db_pages_total << "\n"
-                    << "miss_penalty_us," << args.miss_penalty_us << "\n"
-                    << "direct_io," << flag(args.direct_io) << "\n"
-                    << "eviction," << eviction_name << "\n"
-                    << "execution_mode," << (args.exec_mode == ExecutionMode::VECTORIZED ? "vectorized" : "tuple") << "\n"
-                    << "policy_timing," << flag(args.policy_timing) << "\n"
-                    << "us_per_read,";
-                if (total_reads > 0) {
-                    const double read_us = std::chrono::duration<double, std::micro>(total_read_time).count();
-                    ofs << std::fixed << std::setprecision(3) << read_us / static_cast<double>(total_reads);
-                }
-                ofs << "\n";
+                ofs << "key,value\n";
+                WriteRunInfo(ofs, args, run_info, ReadStats{total_reads, total_read_time});
+                if (args.trace_collapse) ofs << "trace_collapse,true\n";
                 std::cout << "Run info written to " << info_path.string() << "\n";
             } else {
                 std::cerr << "Warning: could not open " << info_path.string() << " for writing\n";
@@ -488,29 +905,10 @@ int main(int argc, char* argv[]) {
             auto pol_path = fs::path(args.results_dir) / "policy_time.csv";
             std::ofstream ofs(pol_path);
             if (ofs) {
-                ofs << "query,rows,latency_ms,policy_calls,policy_ms,policy_raw_ms,record_ms,set_evictable_ms,evict_ms,remove_ms\n";
+                ofs << kPolicyColumns << "\n";
                 ofs << std::fixed << std::setprecision(4);
-                auto ms = [](std::chrono::nanoseconds t) {
-                    return std::chrono::duration<double, std::milli>(t).count();
-                };
-
                 for (const auto& rec : policy_records) {
-                    const auto& st = rec.stats;
-                    // Each method's time minus what reading the clock around its calls cost
-                    auto net = [&](std::chrono::nanoseconds raw, uint64_t calls) {
-                        return ms(std::max(std::chrono::nanoseconds{0}, raw - st.timer_cost * static_cast<std::chrono::nanoseconds::rep>(calls)));
-                    };
-
-                    ofs << rec.tag << ","
-                        << rec.rows << ","
-                        << rec.latency_ms << ","
-                        << st.TotalCalls() << ","
-                        << ms(st.NetTime()) << ","
-                        << ms(st.RawTime()) << ","
-                        << net(st.record_time, st.record_calls) << ","
-                        << net(st.set_evictable_time, st.set_evictable_calls) << ","
-                        << net(st.evict_time, st.evict_calls) << ","
-                        << net(st.remove_time, st.remove_calls) << "\n";
+                    WritePolicyColumns(ofs, rec);
                 }
                 std::cout << "Policy time written to " << pol_path.string() << "\n";
             } else {
