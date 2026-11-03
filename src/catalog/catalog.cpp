@@ -99,12 +99,20 @@ void Catalog::UpdateTableStats(const std::string& table_name) {
     auto col_count = schema.GetColumnCount();
 
     uint64_t row_count = 0;
+    uint64_t page_count = 0;
+    std::optional<page_id_t> last_page;
     std::vector<std::unordered_set<Value>> distinct_sets(col_count);
     std::vector<std::optional<MinMax>> ranges(col_count);
 
     for (auto it = table_info->table->Begin(schema); it != table_info->table->End(); ++it) {
         auto tuple = *it;
         ++row_count;
+
+        const page_id_t page = it.GetRID().page_id;
+        if (page != last_page) {
+            ++page_count;
+            last_page = page;
+        }
 
         for (uint32_t i = 0; i < col_count; ++i) {
             auto value = tuple.GetValue(schema, i);
@@ -124,6 +132,7 @@ void Catalog::UpdateTableStats(const std::string& table_name) {
     }
 
     table_info->stats.row_count = row_count;
+    table_info->stats.page_count = page_count;
     table_info->stats.distinct_counts.clear();
     table_info->stats.min_max.clear();
     for (uint32_t i = 0; i < col_count; ++i) {

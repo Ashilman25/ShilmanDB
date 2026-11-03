@@ -84,6 +84,7 @@ void DiskManager::SetDirectIO(bool on) {
         const int err = errno;
         throw IOException(std::string("Cannot change direct I/O: ") + std::strerror(err));
     }
+    direct_io_ = on;
 #else
     (void)on;
     throw IOException("direct I/O is only supported on macOS");

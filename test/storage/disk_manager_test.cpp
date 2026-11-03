@@ -277,6 +277,20 @@ TEST_F(DiskManagerTest, DirectIORoundTrip) {
     EXPECT_NO_THROW(dm.SetDirectIO(false));
 }
 
+TEST_F(DiskManagerTest, DirectIOFlagIsReported) {
+    DiskManager dm(test_file_);
+    EXPECT_FALSE(dm.GetDirectIO());
+#ifdef __APPLE__
+    dm.SetDirectIO(true);
+    EXPECT_TRUE(dm.GetDirectIO());
+    dm.SetDirectIO(false);
+    EXPECT_FALSE(dm.GetDirectIO());
+#else
+    EXPECT_THROW(dm.SetDirectIO(true), IOException);
+    EXPECT_FALSE(dm.GetDirectIO());
+#endif
+}
+
 TEST_F(DiskManagerTest, NumPagesFollowsAllocation) {
     DiskManager dm(test_file_);
     EXPECT_EQ(dm.GetNumPages(), 0u);

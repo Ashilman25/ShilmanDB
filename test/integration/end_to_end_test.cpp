@@ -279,4 +279,45 @@ TEST_F(EndToEndTest, CaseInSumGroupedByKey) {
     EXPECT_DOUBLE_EQ(urgent_rail.decimal_, 1.0);
 }
 
+// ---------------------------------------------------------------------------
+// Scan costs follow the storage
+// ---------------------------------------------------------------------------
+TEST(DatabaseScanCostsTest, FollowStorage) {
+    const auto file = (std::filesystem::temp_directory_path() /
+                       ("shilmandb_scan_costs_test_" + std::to_string(::getpid()) + ".db")).string();
+    std::filesystem::remove(file);
+    {
+        Database db(file, 16);
+        auto* dm = db.GetDiskManager();
+
+        auto costs = db.GetScanCosts();
+        EXPECT_DOUBLE_EQ(costs.seq_page_us, 0.6);
+        EXPECT_DOUBLE_EQ(costs.random_page_us, 0.6);
+        EXPECT_DOUBLE_EQ(costs.scan_row_us, 0.06);
+
+        dm->SetReadPenalty(std::chrono::microseconds{100});
+        EXPECT_DOUBLE_EQ(db.GetScanCosts().seq_page_us, 100.0);
+        EXPECT_DOUBLE_EQ(db.GetScanCosts().random_page_us, 100.0);
+
+        dm->SetReadPenalty(std::chrono::microseconds{0});
+#ifdef __APPLE__
+        dm->SetDirectIO(true);
+        EXPECT_DOUBLE_EQ(db.GetScanCosts().seq_page_us, 50.0);
+        dm->SetReadPenalty(std::chrono::microseconds{200});
+        EXPECT_DOUBLE_EQ(db.GetScanCosts().seq_page_us, 200.0);
+#else
+        // No direct I/O off macOS, so just set the penalty the later checks expect.
+        dm->SetReadPenalty(std::chrono::microseconds{200});
+#endif
+
+        db.SetScanCosts(ScanCosts::ForPageRead(7));
+        EXPECT_DOUBLE_EQ(db.GetScanCosts().seq_page_us, 7.0);
+        EXPECT_DOUBLE_EQ(db.GetScanCosts().random_page_us, 7.0);
+
+        db.SetScanCosts(std::nullopt);
+        EXPECT_DOUBLE_EQ(db.GetScanCosts().seq_page_us, 200.0);
+    }
+    std::filesystem::remove(file);
+}
+
 }  // namespace shilmandb

@@ -102,14 +102,14 @@ ConjunctMatch IndexSelector::MatchSingleConjunct(const Expression* expr, const s
     }
 }
 
-std::unique_ptr<PlanNode> IndexSelector::SelectScanStrategy(const std::string& table_name, const Schema& table_schema, std::vector<std::unique_ptr<Expression>>& predicates, std::vector<std::unique_ptr<Expression>>& residual_out, Catalog* catalog) {
+std::unique_ptr<PlanNode> IndexSelector::SelectScanStrategy(const std::string& table_name, const Schema& table_schema, std::vector<std::unique_ptr<Expression>>& predicates, std::vector<std::unique_ptr<Expression>>& residual_out, Catalog* catalog, const ScanCosts& costs) {
     auto* table_info = catalog->GetTable(table_name);
     if (!table_info) {
         throw DatabaseException("IndexSelector: table not found: " + table_name);
     }
 
     const auto& stats = table_info->stats;
-    const double seq_cost = CostModel::SeqScanCost(stats.row_count, table_schema);
+    const double seq_cost = CostModel::SeqScanCost(stats, table_schema, costs);
 
     struct BestCandidate {
         IndexInfo* index{nullptr};
@@ -150,7 +150,7 @@ std::unique_ptr<PlanNode> IndexSelector::SelectScanStrategy(const std::string& t
 
         const double sel = CostModel::EstimateSelectivity(matched_preds, stats, idx_info->column_name);
 
-        const double idx_cost = CostModel::IndexScanCost(stats.row_count, sel, key_type);
+        const double idx_cost = CostModel::IndexScanCost(stats.row_count, sel, key_type, costs);
         if (idx_cost < best.cost) {
             best.index = idx_info;
             best.low_key = low;

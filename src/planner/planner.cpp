@@ -503,7 +503,7 @@ auto Planner::Plan(SelectStatement stmt) -> std::unique_ptr<PlanNode> {
     scans.reserve(tables.size());
     for (size_t i = 0; i < tables.size(); ++i) {
         std::vector<std::unique_ptr<Expression>> residual;
-        auto scan = IndexSelector::SelectScanStrategy(tables[i].table_name, table_infos[i]->schema, table_predicates[i], residual, catalog_);
+        auto scan = IndexSelector::SelectScanStrategy(tables[i].table_name, table_infos[i]->schema, table_predicates[i], residual, catalog_, scan_costs_);
 
         if (!residual.empty()) {
             auto pred = CombinePredicates(residual);

@@ -61,6 +61,38 @@ TEST(CostModelTest, PageCountGrowsWithRows) {
     EXPECT_LE(p2, p3);
 }
 
+TEST(CostModelTest, ScanCostsForPageRead) {
+    const ScanCosts cached;
+    EXPECT_DOUBLE_EQ(cached.seq_page_us, 0.6);
+    EXPECT_DOUBLE_EQ(cached.random_page_us, 0.6);
+    EXPECT_DOUBLE_EQ(cached.scan_row_us, 0.06);
+    EXPECT_DOUBLE_EQ(cached.index_row_us, 0.07);
+
+    const ScanCosts slow = ScanCosts::ForPageRead(100);
+    EXPECT_DOUBLE_EQ(slow.seq_page_us, 100);
+    EXPECT_DOUBLE_EQ(slow.random_page_us, 100);
+    EXPECT_DOUBLE_EQ(slow.scan_row_us, 0.06);
+    EXPECT_DOUBLE_EQ(slow.index_row_us, 0.07);
+}
+
+TEST(CostModelTest, SeqScanCostUsesRealPageCount) {
+    const Schema schema({Column("id", TypeId::INTEGER), Column("val", TypeId::INTEGER)});
+    TableStats stats;
+    stats.row_count = 1000;
+
+    EXPECT_NEAR(CostModel::SeqScanCost(stats, schema),
+                CostModel::EstimateTablePages(1000, schema) * 0.6 + 1000 * 0.06, 1e-9);
+
+    stats.page_count = 50;
+    EXPECT_DOUBLE_EQ(CostModel::TablePages(stats, schema), 50.0);
+    EXPECT_NEAR(CostModel::SeqScanCost(stats, schema), 50 * 0.6 + 60, 1e-9);
+}
+
+TEST(CostModelTest, IndexScanCostChargesOneReadPerRow) {
+    const double cost = CostModel::IndexScanCost(1'000'000, 0.001, TypeId::INTEGER, ScanCosts::ForPageRead(100));
+    EXPECT_NEAR(cost, 3 * 100 + 1000 * (100 + 0.07), 1e-6);
+}
+
 TEST(CostModelTest, TreeHeightMonotonic) {
     EXPECT_EQ(CostModel::EstimateTreeHeight(1,       TypeId::INTEGER), 1);
     const int h100  = CostModel::EstimateTreeHeight(100,     TypeId::INTEGER);
@@ -260,8 +292,8 @@ TEST_F(IndexSelectorStrategyTest, HighSelectivityUsesSeqScan) {
 
 // Low selectivity (unique per key) should pick IndexScan with point lookup bounds.
 // rows=1M, distinct=10k, sel=1e-4, matching=100
-// seq_cost = 489 pages + 1M * 0.01 = 10489
-// idx_cost = 3 * 2.0 + 100 * 4.0 + 100 * 0.01 = 407
+// seq_cost is about 489 * 0.6 + 1M * 0.06 = 60,300 us
+// idx_cost is about 3 * 0.6 + 100 * 0.67 = 69 us
 TEST_F(IndexSelectorStrategyTest, LowSelectivityUsesIndexScan) {
     auto bundle = MakeBPM(test_file_);
     Catalog catalog(bundle.bpm.get());
@@ -388,16 +420,19 @@ TEST_F(IndexSelectorStrategyTest, MultipleIndexesBestChosen) {
     EXPECT_EQ(residual.size(), 1u);  // b=7 must still be applied via Filter
 }
 
-// Sweep distinct counts; the cost model's actual crossover (~0.26%) should
-// produce SeqScan for distinct=100 and IndexScan for distinct=1000/10000.
+// Sweep distinct counts. With cached costs the crossover on this one-column table is
+// about 9% (seq is about 489 * 0.6 + 1M * 0.06 = 60,300 us; an index row is about 0.67 us),
+// so distinct=5 and 8 (12.5%) scan and distinct=20 (5%) and up use the index.
 TEST_F(IndexSelectorStrategyTest, CostCrossoverPoint) {
     struct Case {
         uint64_t      distinct;
         PlanNodeType  expected;
     };
     const Case cases[] = {
-        {100,   PlanNodeType::SEQ_SCAN},
-        {1000,  PlanNodeType::INDEX_SCAN},
+        {5,     PlanNodeType::SEQ_SCAN},
+        {8,     PlanNodeType::SEQ_SCAN},
+        {20,    PlanNodeType::INDEX_SCAN},
+        {100,   PlanNodeType::INDEX_SCAN},
         {10000, PlanNodeType::INDEX_SCAN},
     };
 
@@ -469,6 +504,31 @@ static TableInfo* MakeDateTable(Catalog& catalog) {
                               Value::FromString(TypeId::DATE, "1998-11-29")};
     (void)catalog.CreateIndex("idx_t_d", "t", "d");
     return ti;
+}
+
+// The same 3.6% range flips from index to table scan when page reads get expensive.
+TEST_F(IndexSelectorStrategyTest, CrossoverMovesWithReadCost) {
+    auto bundle = MakeBPM(test_file_);
+    Catalog catalog(bundle.bpm.get());
+    auto* ti = catalog.CreateTable("t", Schema({Column("id", TypeId::BIGINT), Column("d", TypeId::DATE)}));
+    ASSERT_NE(ti, nullptr);
+    ti->stats.row_count = 60175;
+    ti->stats.page_count = 1121;
+    ti->stats.min_max["d"] = {Value::FromString(TypeId::DATE, "1992-01-02"),
+                              Value::FromString(TypeId::DATE, "1998-12-01")};
+    (void)catalog.CreateIndex("idx_t_d", "t", "d");
+
+    auto choose = [&](const ScanCosts& costs) {
+        std::vector<std::unique_ptr<Expression>> preds;
+        preds.push_back(MakeBinOp(BinaryOp::Op::GTE, MakeColRef("d"), MakeStrLit("1995-01-01")));
+        preds.push_back(MakeBinOp(BinaryOp::Op::LT,  MakeColRef("d"), MakeStrLit("1995-04-01")));
+        std::vector<std::unique_ptr<Expression>> residual;
+        auto scan = IndexSelector::SelectScanStrategy("t", ti->schema, preds, residual, &catalog, costs);
+        return scan->type;
+    };
+
+    EXPECT_EQ(choose(ScanCosts{}), PlanNodeType::INDEX_SCAN);
+    EXPECT_EQ(choose(ScanCosts::ForPageRead(100)), PlanNodeType::SEQ_SCAN);
 }
 
 TEST_F(IndexSelectorStrategyTest, YearRangeOnDateIndexUsesSeqScan) {

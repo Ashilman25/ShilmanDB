@@ -77,10 +77,16 @@ public:
     [[nodiscard]] BufferPoolManager* GetBufferPoolManager() const;
     [[nodiscard]] DiskManager* GetDiskManager() const;
 
+    // What the planner assumes a scan costs. Read from the disk manager on every call, so it
+    // follows the read penalty and direct I/O, unless an override is set.
+    [[nodiscard]] ScanCosts GetScanCosts() const;
+    void SetScanCosts(std::optional<ScanCosts> costs) { scan_costs_ = costs; }
+
 private:
     // A planner with the join model (if wanted and loaded) and any forced order set.
     [[nodiscard]] Planner MakePlanner(const QueryOptions& options) const;
 
+    std::optional<ScanCosts> scan_costs_;
     std::unique_ptr<DiskManager> disk_manager_;
     std::unique_ptr<BufferPoolManager> bpm_;
     std::unique_ptr<Catalog> catalog_;

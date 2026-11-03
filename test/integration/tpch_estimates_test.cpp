@@ -13,6 +13,8 @@
 #include <iostream>
 #include <map>
 #include <memory>
+#include <set>
+#include <tuple>
 #include <string>
 #include <utility>
 #include <vector>
@@ -107,16 +109,34 @@ protected:
     }
 };
 
-// With every index built, none of the 8 queries is cheaper through an index.
-TEST_F(TpchEstimatesTest, TpchQueriesScanEveryTable) {
-    for (const auto& query : tpch::Queries()) {
-        std::unique_ptr<PlanNode> plan;
-        Planner planner(db_->GetCatalog());
-        const auto leaves = LeafScans(query.sql, &plan, &planner);
-        EXPECT_FALSE(leaves.empty()) << query.tag;
-        for (const auto* leaf : leaves) {
-            EXPECT_EQ(leaf->type, PlanNodeType::SEQ_SCAN) << query.tag << ": a table is read through an index";
+// Which tables the 8 queries read through an index depends on what a page read costs:
+// with cached reads only Q10's orders range and Q14's lineitem range, with slow reads only Q14.
+TEST_F(TpchEstimatesTest, TpchScanChoices) {
+    using Choice = std::tuple<std::string, std::string, std::string>;
+    const std::vector<std::pair<ScanCosts, std::set<Choice>>> cases = {
+        {ScanCosts{}, {{"Q10", "orders", "idx_orders_orderdate"}, {"Q14", "lineitem", "idx_lineitem_shipdate"}}},
+        {ScanCosts::ForPageRead(50), {{"Q14", "lineitem", "idx_lineitem_shipdate"}}},
+        {ScanCosts::ForPageRead(100), {{"Q14", "lineitem", "idx_lineitem_shipdate"}}},
+    };
+
+    for (const auto& [costs, expected] : cases) {
+        std::set<Choice> chosen;
+        for (const auto& query : tpch::Queries()) {
+            std::unique_ptr<PlanNode> plan;
+            Planner planner(db_->GetCatalog());
+            planner.SetScanCosts(costs);
+            const auto leaves = LeafScans(query.sql, &plan, &planner);
+            EXPECT_FALSE(leaves.empty()) << query.tag;
+            for (const auto* leaf : leaves) {
+                if (leaf->type == PlanNodeType::INDEX_SCAN) {
+                    const auto* scan = static_cast<const IndexScanPlanNode*>(leaf);
+                    chosen.insert({query.tag, scan->table_name, scan->index_name});
+                } else {
+                    EXPECT_EQ(leaf->type, PlanNodeType::SEQ_SCAN) << query.tag;
+                }
+            }
         }
+        EXPECT_EQ(chosen, expected) << "page read " << costs.seq_page_us << " us";
     }
 }
 
@@ -138,27 +158,26 @@ TEST_F(TpchEstimatesTest, Q6YearIsAboutFifteenPercentAndScans) {
     const auto* leaf = OnlyScan(sql, &plan, &planner);
     ASSERT_NE(leaf, nullptr);
     EXPECT_EQ(leaf->type, PlanNodeType::SEQ_SCAN);
+
+    for (const double read_us : {50.0, 100.0}) {
+        std::unique_ptr<PlanNode> slow_plan;
+        Planner slow_planner(db_->GetCatalog());
+        slow_planner.SetScanCosts(ScanCosts::ForPageRead(read_us));
+        const auto* slow_leaf = OnlyScan(sql, &slow_plan, &slow_planner);
+        ASSERT_NE(slow_leaf, nullptr);
+        EXPECT_EQ(slow_leaf->type, PlanNodeType::SEQ_SCAN) << read_us << " us";
+    }
 }
 
 // A one-day range keeps a handful of rows, so the index wins. The three spellings
 // (half-open, BETWEEN, strict on both sides) must all pick it and count the same rows.
 TEST_F(TpchEstimatesTest, OneDayShipdateRangePicksIndex) {
-    // The true count: scan a month and count the rows on that day.
-    const std::string month_sql =
-        "SELECT l_shipdate FROM lineitem WHERE l_shipdate >= '1995-06-01' AND l_shipdate < '1995-07-01'";
-    {
-        // The reference count must come from a plain scan, not the index it is checking.
-        std::unique_ptr<PlanNode> month_plan;
-        Planner month_planner(db_->GetCatalog());
-        const auto* month_leaf = OnlyScan(month_sql, &month_plan, &month_planner);
-        ASSERT_NE(month_leaf, nullptr);
-        ASSERT_EQ(month_leaf->type, PlanNodeType::SEQ_SCAN);
-    }
-    const auto month = db_->ExecuteSQL(month_sql);
+    // The true count comes from a plain scan (no WHERE), not the index it is checking.
+    const auto all = db_->ExecuteSQL("SELECT l_shipdate FROM lineitem");
     const Value day = Value::FromString(TypeId::DATE, "1995-06-17");
     int32_t expected = 0;
-    for (const auto& tuple : month.tuples) {
-        if (tuple.GetValue(month.schema, 0) == day) ++expected;
+    for (const auto& tuple : all.tuples) {
+        if (tuple.GetValue(all.schema, 0) == day) ++expected;
     }
     ASSERT_GT(expected, 0);
 
