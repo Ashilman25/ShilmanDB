@@ -14,6 +14,9 @@ struct MinMax {
 struct TableStats {
     uint64_t row_count{0};
 
+    //heap pages the rows sit on (0 = unknown)
+    uint64_t page_count{0};
+
     //col name, distinct vals
     std::unordered_map<std::string, uint64_t> distinct_counts;
 

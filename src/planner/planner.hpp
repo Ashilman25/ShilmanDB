@@ -1,6 +1,7 @@
 #pragma once
 #include "catalog/catalog.hpp"
 #include "parser/ast.hpp"
+#include "planner/cost_model.hpp"
 #include "planner/join_graph.hpp"
 #include "planner/plan_node.hpp"
 #include <memory>
@@ -54,6 +55,9 @@ public:
     // doesn't list every table once or would need a cross product.
     void SetForcedJoinOrder(std::vector<int> order) { forced_order_ = std::move(order); }
 
+    // What scans cost when choosing between a table scan and an index (default: cached reads).
+    void SetScanCosts(const ScanCosts& costs) { scan_costs_ = costs; }
+
     [[nodiscard]] auto GetJoinOrderInfo() const -> const JoinOrderInfo& { return join_info_; }
 
     // Raw pointers into the last plan, so they're only valid while that plan lives.
@@ -64,6 +68,7 @@ public:
 
 private:
     Catalog* catalog_;
+    ScanCosts scan_costs_{};
 
 #ifdef SHILMANDB_HAS_LIBTORCH
     LearnedJoinOptimizer* learned_optimizer_{nullptr};

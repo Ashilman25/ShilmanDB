@@ -536,6 +536,7 @@ namespace detail {
     auto stmt = parser.Parse();
 
     Planner planner(db.GetCatalog());
+    planner.SetScanCosts(db.GetScanCosts());
     const auto plan = planner.Plan(std::move(*stmt));
     return detail::HasIndexScan(*plan, index_name);
 }

@@ -8,6 +8,7 @@
 #include "common/exception.hpp"
 #include <filesystem>
 #include <memory>
+#include <set>
 
 namespace shilmandb {
 
@@ -46,6 +47,30 @@ protected:
         });
     }
 };
+
+TEST_F(CatalogTest, UpdateTableStatsCountsPages) {
+    auto bundle = MakeBPM();
+    Catalog catalog(bundle.bpm.get());
+    const Schema schema({Column("id", TypeId::INTEGER), Column("pad", TypeId::VARCHAR)});
+    auto* info = catalog.CreateTable("t", schema);
+    ASSERT_NE(info, nullptr);
+
+    catalog.UpdateTableStats("t");
+    EXPECT_EQ(info->stats.page_count, 0u);
+
+    for (int32_t i = 0; i < 500; ++i) {
+        Tuple tuple({Value(i), Value(std::string(100, 'x'))}, schema);
+        ASSERT_NE(info->table->InsertTuple(tuple).page_id, INVALID_PAGE_ID);
+    }
+    catalog.UpdateTableStats("t");
+
+    std::set<page_id_t> pages;
+    for (auto it = info->table->Begin(schema); it != info->table->End(); ++it) {
+        pages.insert(it.GetRID().page_id);
+    }
+    EXPECT_GT(pages.size(), 2u);
+    EXPECT_EQ(info->stats.page_count, pages.size());
+}
 
 // ---------------------------------------------------------------------------
 // Table tests

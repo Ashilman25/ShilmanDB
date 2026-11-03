@@ -184,7 +184,17 @@ Planner Database::MakePlanner(const QueryOptions& options) const {
     if (options.forced_join_order) {
         planner.SetForcedJoinOrder(*options.forced_join_order);
     }
+    planner.SetScanCosts(GetScanCosts());
     return planner;
+}
+
+ScanCosts Database::GetScanCosts() const {
+    if (scan_costs_) {
+        return *scan_costs_;
+    }
+    const double penalty_us = std::chrono::duration<double, std::micro>(disk_manager_->GetReadPenalty()).count();
+    const double direct_us = disk_manager_->GetDirectIO() ? ScanCosts::kDirectPageReadUs : 0.0;
+    return ScanCosts::ForPageRead(std::max({ScanCosts::kCachedPageReadUs, direct_us, penalty_us}));
 }
 
 void Database::LoadTable(const std::string& table_name, const Schema& schema, const std::string& tbl_file_path, char delimiter) {

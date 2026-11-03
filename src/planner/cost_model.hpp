@@ -11,12 +11,24 @@
 
 namespace shilmandb {
 
-struct CostModel {
-    static constexpr double kSeqPageReadCost = 1.0;         // sequential page read
-    static constexpr double kRandomPageReadCost = 4.0;      // index scatter
-    static constexpr double kTupleProcessCost = 0.01;       // Per tuple CPU cost
-    static constexpr double kIndexTraversalCost = 2.0;      // Per Btree level descent
+// What a scan costs, in microseconds. The CPU parts were measured on this engine; the page
+// reads depend on where pages come from, so they follow the storage.
+struct ScanCosts {
+    static constexpr double kCachedPageReadUs = 0.6;   // from the OS file cache
+    static constexpr double kDirectPageReadUs = 50.0;  // macOS direct I/O, to the SSD
+    static constexpr double kScanRowUs = 0.06;         // CPU per row a sequential scan reads and filters
+    static constexpr double kIndexRowUs = 0.07;        // CPU per row an index scan returns
 
+    double seq_page_us{kCachedPageReadUs};
+    double random_page_us{kCachedPageReadUs};
+    double scan_row_us{kScanRowUs};
+    double index_row_us{kIndexRowUs};
+
+    // Both kinds of page read cost `us`; the CPU parts keep their measured values.
+    [[nodiscard]] static constexpr ScanCosts ForPageRead(double us) { return {us, us, kScanRowUs, kIndexRowUs}; }
+};
+
+struct CostModel {
     static constexpr double kMinSelectivity = 0.001;        
     static constexpr double kOpenRangeSelectivity = 0.33;   // heuristic for col > v / col < v
     static constexpr double kDefaultSelectivity = 0.1;      
@@ -33,8 +45,11 @@ struct CostModel {
     // Rows a table's own filters keep: row_count * selectivity, at least 1 (0 for an empty table).
     [[nodiscard]] static double EstimateFilteredRows(const std::vector<const Expression*>& filters, const TableStats& stats);
 
-    [[nodiscard]] static double SeqScanCost(uint64_t row_count, const Schema& schema);
-    [[nodiscard]] static double IndexScanCost(uint64_t row_count, double selectivity, TypeId key_type);
+    // The table's real page count when the stats have one, else an estimate from its row count.
+    [[nodiscard]] static double TablePages(const TableStats& stats, const Schema& schema);
+
+    [[nodiscard]] static double SeqScanCost(const TableStats& stats, const Schema& schema, const ScanCosts& costs = ScanCosts{});
+    [[nodiscard]] static double IndexScanCost(uint64_t row_count, double selectivity, TypeId key_type, const ScanCosts& costs = ScanCosts{});
 };
 
 }  // namespace shilmandb

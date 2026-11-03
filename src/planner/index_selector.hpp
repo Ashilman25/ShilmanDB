@@ -3,6 +3,7 @@
 #include "catalog/catalog.hpp"
 #include "catalog/schema.hpp"
 #include "parser/ast.hpp"
+#include "planner/cost_model.hpp"
 #include "planner/plan_node.hpp"
 #include "types/value.hpp"
 #include <memory>
@@ -26,7 +27,8 @@ public:
     [[nodiscard]] static std::unique_ptr<PlanNode> SelectScanStrategy(const std::string& table_name, const Schema& table_schema, 
                                                                         std::vector<std::unique_ptr<Expression>>& predicates, 
                                                                         std::vector<std::unique_ptr<Expression>>& residual_out, 
-                                                                        Catalog* catalog);
+                                                                        Catalog* catalog,
+                                                                        const ScanCosts& costs = ScanCosts{});
 
     [[nodiscard]] static ConjunctMatch MatchSingleConjunct(const Expression* expr, const std::string& indexed_column);
 };

@@ -386,17 +386,20 @@ def test_workload_flags_single_is_empty() -> None:
     ]
 
 
-def test_can_run_and_fraction_config() -> None:
-    assert not mod.can_run("baseline", "lookup")
-    assert not mod.can_run("baseline", "mixed")
-    assert mod.can_run("baseline", "stream")
-    assert mod.can_run("baseline", "single")
-    assert mod.can_run("+index", "lookup")
-    assert mod.can_run("+vectorized", "mixed")
+def test_fraction_config() -> None:
     assert mod.fraction_config("single") == "baseline"
     assert mod.fraction_config("stream") == "baseline"
     assert mod.fraction_config("lookup") == "+index"
     assert mod.fraction_config("mixed") == "+index"
+
+
+def test_planned_runs_lookup_runs_on_every_config() -> None:
+    runs = mod.planned_runs(["0.01"], ["baseline", "+index"], ["lookup", "mixed"], [0], [])
+    assert runs == [
+        mod.RunSpec("0.01", c, w, 128, 0, None)
+        for w in ("lookup", "mixed")
+        for c in ("baseline", "+index")
+    ]
 
 
 def test_planned_runs_single_matches_today() -> None:
@@ -411,12 +414,13 @@ def test_planned_runs_single_matches_today() -> None:
     ]
 
 
-def test_planned_runs_skips_and_fraction_configs() -> None:
+def test_planned_runs_every_config_and_fraction_configs() -> None:
     runs = mod.planned_runs(["0.01"], ["baseline", "+index"], ["stream", "lookup"], [0], [0.25])
     assert runs == [
         mod.RunSpec("0.01", "baseline", "stream", 128, 0, None),
         mod.RunSpec("0.01", "+index", "stream", 128, 0, None),
         mod.RunSpec("0.01", "baseline", "stream", 362, 0, 0.25),
+        mod.RunSpec("0.01", "baseline", "lookup", 128, 0, None),
         mod.RunSpec("0.01", "+index", "lookup", 128, 0, None),
         mod.RunSpec("0.01", "+index", "lookup", 362, 0, 0.25),
     ]

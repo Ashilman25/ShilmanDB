@@ -70,7 +70,7 @@ MIN_POOL_PAGES: int = 16
 
 # What load_tpch runs: "single" is one query at a time, the rest are streams of queries.
 WORKLOADS: List[str] = ["single", "stream", "lookup", "mixed"]
-INDEXED_WORKLOADS = {"lookup", "mixed"}     # these need a config that builds indexes
+INDEXED_WORKLOADS = {"lookup", "mixed"}     # fraction runs use a config with indexes for these
 
 # CSVs a workload run writes (policy_time only with --policy-timing).
 WORKLOAD_FILES: List[str] = ["stream", "stream_totals", "stream_queries", "stream_results", "run_info", "policy_time"]
@@ -210,13 +210,6 @@ def workload_flags(workload: str, seed: int, stream_length: Optional[int]) -> Li
     return flags
 
 
-# lookup and mixed read through indexes, so they only run on a config that builds them.
-def can_run(config: str, workload: str) -> bool:
-    flags = PRIMARY_CONFIGS.get(config, [])
-    has_indexes = "--create-indexes" in flags and flags[flags.index("--create-indexes") + 1] == "true"
-    return has_indexes or workload not in INDEXED_WORKLOADS
-
-
 # The config the pool-fraction runs use for a workload.
 def fraction_config(workload: str) -> str:
     return "+index" if workload in INDEXED_WORKLOADS else "baseline"
@@ -232,16 +225,15 @@ class RunSpec:
     fraction: Optional[float]       # pool fraction, when this run is part of a fraction sweep
 
 
-# Every ShilmanDB run to make, in order. Per scale factor and workload: each config that can run
-# it (once per penalty), then the pool-fraction runs (once per penalty).
+# Every ShilmanDB run to make, in order. Per scale factor and workload: each config
+# (once per penalty), then the pool-fraction runs (once per penalty).
 def planned_runs(sfs: Sequence[str], configs: Sequence[str], workloads: Sequence[str], penalties: Sequence[int], fractions: Sequence[float]) -> List[RunSpec]:
     runs: List[RunSpec] = []
     for sf in sfs:
         for workload in workloads:
             for config in configs:
-                if can_run(config, workload):
-                    runs += [RunSpec(sf, config, workload, POOL_SIZES[sf], penalty, None) for penalty in penalties]
-                    
+                runs += [RunSpec(sf, config, workload, POOL_SIZES[sf], penalty, None) for penalty in penalties]
+
             for fraction in fractions:
                 runs += [RunSpec(sf, fraction_config(workload), workload, pool_for_fraction(sf, fraction), penalty, fraction) for penalty in penalties]
     return runs
@@ -1135,7 +1127,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--direct-io", action="store_true", help="Read pages around the OS file cache (adds _direct to labels)")
     p.add_argument("--pool-fractions", type=fraction_list, default=[], help="Comma list of pool sizes as fractions of the tables' pages (0 to 1]; runs baseline once per fraction per SF (+index for the lookup and mixed workloads)")
     p.add_argument("--policy-timing", action="store_true", help="Also time the eviction policy per query (fills policy_ms)")
-    p.add_argument("--workloads", type=workload_list, default=["single"], help=f"Comma list of workloads from {','.join(WORKLOADS)}; single is one query at a time (default single). lookup and mixed need a config with indexes")
+    p.add_argument("--workloads", type=workload_list, default=["single"], help=f"Comma list of workloads from {','.join(WORKLOADS)}; single is one query at a time (default single). lookup and mixed run on every config; without indexes each lookup scans its table")
     p.add_argument("--seed", type=seed_value, default=1, help="Seed for the random queries of the non-single workloads (default 1)")
     p.add_argument("--stream-length", type=stream_length_value, default=None, help="Items per pass for every non-single workload (default: load_tpch's default for the scale factor)")
     p.add_argument("--skip-sqlite", action="store_true", help="Skip the SQLite benchmark invocation (reuse existing output)")
@@ -1181,10 +1173,6 @@ def main() -> int:
         print(f"  workloads={args.workloads}, seed={args.seed}, stream_length={args.stream_length}")
 
     shilmandb_configs = [c for c in configs if c in PRIMARY_CONFIGS]
-    for workload in args.workloads:
-        for cfg in shilmandb_configs:
-            if not can_run(cfg, workload):
-                print(f"  (skip: {workload} needs indexes, not run on {cfg})")
     # latencies.csv, hit_rates.csv and correctness.csv describe single-query runs only, so a call
     # that makes none (workloads only) must leave them alone.
     runs_single = "single" in args.workloads

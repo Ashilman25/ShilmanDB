@@ -231,16 +231,21 @@ double CostModel::EstimateFilteredRows(const std::vector<const Expression*>& fil
     return std::max(1.0, static_cast<double>(stats.row_count) * EstimateSelectivity(filters, stats));
 }
 
-double CostModel::SeqScanCost(uint64_t row_count, const Schema& schema) {
-    const double pages = EstimateTablePages(row_count, schema);
-    return pages * kSeqPageReadCost + static_cast<double>(row_count) * kTupleProcessCost;
+double CostModel::TablePages(const TableStats& stats, const Schema& schema) {
+    if (stats.page_count > 0) return static_cast<double>(stats.page_count);
+    return EstimateTablePages(stats.row_count, schema);
 }
 
-double CostModel::IndexScanCost(uint64_t row_count, double selectivity, TypeId key_type) {
+double CostModel::SeqScanCost(const TableStats& stats, const Schema& schema, const ScanCosts& costs) {
+    return TablePages(stats, schema) * costs.seq_page_us + static_cast<double>(stats.row_count) * costs.scan_row_us;
+}
+
+double CostModel::IndexScanCost(uint64_t row_count, double selectivity, TypeId key_type, const ScanCosts& costs) {
     const int height = EstimateTreeHeight(row_count, key_type);
     const double matching = std::max(1.0, static_cast<double>(row_count) * selectivity);
 
-    return static_cast<double>(height) * kIndexTraversalCost + matching * kRandomPageReadCost + matching * kTupleProcessCost;
+    // Descent, then one random page read plus the row's CPU for every match.
+    return static_cast<double>(height) * costs.random_page_us + matching * (costs.random_page_us + costs.index_row_us);
 }
 
 }  // namespace shilmandb

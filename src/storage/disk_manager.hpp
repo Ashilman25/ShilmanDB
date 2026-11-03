@@ -35,6 +35,7 @@ public:
 
     // Skips the OS file cache for this file - macOS only, throws if it cant
     void SetDirectIO(bool on);
+    [[nodiscard]] bool GetDirectIO() const { return direct_io_; }
 
     [[nodiscard]] page_id_t GetNumPages() const { return next_page_id_.load(); }
 
@@ -46,6 +47,7 @@ private:
     std::atomic<page_id_t> next_page_id_{0};
     ReadStats read_stats_{};
     std::chrono::microseconds read_penalty_{0};
+    bool direct_io_{false};
 };
 
 }  // namespace shilmandb

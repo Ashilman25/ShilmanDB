@@ -427,9 +427,54 @@ TEST_F(TpchStreamsDataTest, LookupPlansUseTheirIndex) {
     for (const auto& item : MakeLookups(1, 500)) index_of_sql.emplace(item.sql, item.index_name);
     ASSERT_GT(index_of_sql.size(), 100u);
 
-    for (const auto& [sql, index_name] : index_of_sql) {
-        EXPECT_TRUE(PlanUsesIndex(*db_, sql, index_name)) << sql;
+    for (const double page_us : {0.6, 50.0, 100.0}) {
+        db_->SetScanCosts(ScanCosts::ForPageRead(page_us));
+        for (const auto& [sql, index_name] : index_of_sql) {
+            EXPECT_TRUE(PlanUsesIndex(*db_, sql, index_name)) << page_us << " us: " << sql;
+        }
     }
+    db_->SetScanCosts(std::nullopt);
+}
+
+TEST_F(TpchStreamsDataTest, PlanUsesIndexFollowsDatabaseCosts) {
+    const std::string sql =
+        "SELECT COUNT(*) FROM lineitem WHERE l_shipdate >= '1995-01-01' AND l_shipdate < '1995-04-01'";
+    EXPECT_TRUE(PlanUsesIndex(*db_, sql, "idx_lineitem_shipdate"));
+
+    db_->GetDiskManager()->SetReadPenalty(std::chrono::microseconds{100});
+    EXPECT_FALSE(PlanUsesIndex(*db_, sql, "idx_lineitem_shipdate"));
+    db_->GetDiskManager()->SetReadPenalty(std::chrono::microseconds{0});
+    EXPECT_TRUE(PlanUsesIndex(*db_, sql, "idx_lineitem_shipdate"));
+
+    db_->SetScanCosts(ScanCosts::ForPageRead(100));
+    EXPECT_FALSE(PlanUsesIndex(*db_, sql, "idx_lineitem_shipdate"));
+    db_->SetScanCosts(std::nullopt);
+    EXPECT_TRUE(PlanUsesIndex(*db_, sql, "idx_lineitem_shipdate"));
+}
+
+TEST_F(TpchStreamsDataTest, ExecuteSqlFollowsDatabaseCosts) {
+    const std::string sql =
+        "SELECT COUNT(*) FROM lineitem WHERE l_shipdate >= '1995-01-01' AND l_shipdate < '1995-04-01'";
+    QueryOptions options;
+    options.analyze = true;
+
+    const auto has_op = [](const QueryResult& r, const std::string& prefix) {
+        return std::any_of(r.profile.operators.begin(), r.profile.operators.end(),
+                           [&](const auto& op) { return op.name.rfind(prefix, 0) == 0; });
+    };
+
+    const auto cheap = db_->ExecuteSQL(sql, options);
+    EXPECT_TRUE(has_op(cheap, "IndexScan lineitem"));
+
+    db_->SetScanCosts(ScanCosts::ForPageRead(100));
+    const auto slow = db_->ExecuteSQL(sql, options);
+    EXPECT_TRUE(has_op(slow, "SeqScan lineitem"));
+    EXPECT_FALSE(has_op(slow, "IndexScan"));
+    db_->SetScanCosts(std::nullopt);
+
+    ASSERT_EQ(cheap.tuples.size(), 1u);
+    ASSERT_EQ(slow.tuples.size(), 1u);
+    EXPECT_EQ(cheap.tuples[0].GetValue(cheap.schema, 0).integer_, slow.tuples[0].GetValue(slow.schema, 0).integer_);
 }
 
 TEST_F(TpchStreamsDataTest, PlanUsesIndexIsFalseForScans) {
