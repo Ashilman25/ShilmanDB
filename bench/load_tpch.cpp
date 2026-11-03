@@ -14,6 +14,7 @@
 #include <filesystem>
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -41,6 +42,7 @@ struct Args {
     int64_t miss_penalty_us{0};
     bool direct_io{false};
     bool policy_timing{false};
+    std::optional<double> planner_read_us;  // overrides the page read cost the planner prices scans with
     tpch::Workload workload{tpch::Workload::SINGLE};
     uint64_t seed{1};
     std::optional<size_t> stream_length;  // set to the scale factor's default when not given
@@ -60,7 +62,7 @@ static void PrintUsage(const char* prog) {
               << " [--warmup <N>] [--runs <N>]"
               << " [--results-dir <path>]"
               << " [--execution-mode <tuple|vectorized>]"
-              << " [--miss-penalty-us <N>] [--direct-io] [--policy-timing]"
+              << " [--miss-penalty-us <N>] [--direct-io] [--policy-timing] [--planner-read-us <X>]"
               << " [--workload <single|stream|lookup|mixed>] [--stream-length <N>] [--seed <S>]"
 #ifdef SHILMANDB_HAS_LIBTORCH
               << " [--use-learned-join --join-model-path <path>]"
@@ -155,6 +157,18 @@ static Args ParseArgs(int argc, char* argv[]) {
             args.direct_io = true;
         } else if (arg == "--policy-timing") {
             args.policy_timing = true;
+        } else if (arg == "--planner-read-us" && i + 1 < argc) {
+            const std::string val = argv[++i];
+            std::optional<double> parsed;
+            try {
+                size_t used = 0;
+                const double number = std::stod(val, &used);
+                if (used == val.size() && std::isfinite(number) && number > 0) parsed = number;
+            } catch (const std::exception&) {
+                // not a number; reported below
+            }
+            if (!parsed) ExitWithError("--planner-read-us expects a number > 0, got '" + val + "'");
+            args.planner_read_us = parsed;
         } else if (arg == "--workload" && i + 1 < argc) {
             const std::string val = argv[++i];
             const auto workload = tpch::ParseWorkload(val);
@@ -208,9 +222,6 @@ static Args ParseArgs(int argc, char* argv[]) {
     const std::string workload_name = tpch::WorkloadName(args.workload);
     if (single && args.stream_length) ExitWithError("--stream-length needs --workload stream, lookup or mixed");
     if (single && seed_given) ExitWithError("--seed needs --workload stream, lookup or mixed");
-    if ((args.workload == tpch::Workload::LOOKUP || args.workload == tpch::Workload::MIXED) && !args.create_indexes) {
-        ExitWithError("--workload " + workload_name + " needs --create-indexes true");
-    }
     if (args.trace_collapse && args.trace_path.empty()) ExitWithError("--trace-collapse needs --enable-tracing <path>");
     if (!single && !args.stream_length) {
         args.stream_length = tpch::DefaultStreamLength(args.workload, args.sf);
@@ -333,6 +344,7 @@ struct RunInfo {
     page_id_t db_pages;        // tables only, right after the load
     page_id_t db_pages_total;  // after the indexes
     std::string eviction;
+    double planner_read_us;  // the page read cost the planner priced scans with
 };
 
 // The keys every run_info.csv starts with. `reads` are the timed runs' page reads.
@@ -351,7 +363,8 @@ static void WriteRunInfo(std::ostream& ofs, const Args& args, const RunInfo& inf
         const double read_us = std::chrono::duration<double, std::micro>(reads.time).count();
         ofs << Fixed(read_us / static_cast<double>(reads.reads), 3);
     }
-    ofs << "\n";
+    ofs << "\n"
+        << "planner_read_us," << Fixed(info.planner_read_us, 2) << "\n";
 }
 
 //Workloads
@@ -440,7 +453,7 @@ static int RunWorkload(Database& db, const Args& args, const RunInfo& info) {
     std::cout << "\n=== Workload: " << tpch::WorkloadName(args.workload) << " (seed " << args.seed << ", " << items.size() << " items per pass) ===\n";
 
     // A lookup that scans instead of reading through its index would measure the wrong thing
-    if (has_lookups) {
+    if (has_lookups && args.create_indexes) {
         std::unordered_set<std::string> checked;
         for (const auto& item : items) {
             if (item.kind != Kind::LOOKUP || !checked.insert(item.sql).second) continue;
@@ -450,6 +463,8 @@ static int RunWorkload(Database& db, const Args& args, const RunInfo& info) {
             }
         }
         std::cout << "Plan check: " << checked.size() << " distinct lookups use their index\n";
+    } else if (has_lookups) {
+        std::cout << "Plan check: skipped, no indexes (every lookup scans its table)\n";
     }
 
     const bool export_csv = !args.results_dir.empty();
@@ -696,7 +711,14 @@ int main(int argc, char* argv[]) {
         db.GetDiskManager()->SetReadPenalty(std::chrono::microseconds{args.miss_penalty_us});
         std::cout << "Miss penalty: " << args.miss_penalty_us << " us per page read\n";
     }
-    const RunInfo run_info{db_pages, db_pages_total, eviction_name};
+
+    if (args.planner_read_us) db.SetScanCosts(ScanCosts::ForPageRead(*args.planner_read_us));
+    const double planner_read_us = db.GetScanCosts().random_page_us;
+    // Same rule GetScanCosts uses: the largest of the file cache, direct I/O and the penalty wins
+    const bool penalty_leads = static_cast<double>(args.miss_penalty_us) > ScanCosts::kCachedPageReadUs && (!args.direct_io || static_cast<double>(args.miss_penalty_us) >= ScanCosts::kDirectPageReadUs);
+    const char* planner_why = args.planner_read_us ? "set by --planner-read-us" : penalty_leads ? "follows the read penalty" : args.direct_io ? "follows direct I/O" : "file cache";
+    std::cout << "Planner page read cost: " << Fixed(planner_read_us, 2) << " us (" << planner_why << ")\n";
+    const RunInfo run_info{db_pages, db_pages_total, eviction_name, planner_read_us};
 
     const bool single = args.workload == tpch::Workload::SINGLE;
     bool run_queries = !single || args.verify || !args.trace_path.empty() || !args.results_dir.empty();
