@@ -45,8 +45,9 @@ private:
     TypeId key_type_;
 
     page_id_t FindLeaf(const Value& key, std::vector<page_id_t>& path);
-    page_id_t FindLeaf(const Value& key);
     page_id_t FindLeftmostLeaf();
+    // The first leaf that can hold `key`. It may hold only smaller keys, then the entries for `key` start in a later leaf.
+    page_id_t FindLeftmostLeaf(const Value& key);
 
     void SplitLeaf(page_id_t leaf_id, std::vector<page_id_t>& path);
     void InsertIntoParent(std::vector<page_id_t>& path, page_id_t left_child, const Value& key, page_id_t right_child);

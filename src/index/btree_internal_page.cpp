@@ -128,22 +128,34 @@ void BTreeInternalPage::SetChild(char* page_data, uint16_t child_idx, page_id_t 
 
 
 
-page_id_t BTreeInternalPage::Lookup(const char* page_data, const Value& key, TypeId key_type) {
+page_id_t BTreeInternalPage::FindChild(const char* page_data, const Value& key, TypeId key_type, bool go_right_on_equal) {
     auto num_keys = GetNumKeys(page_data);
     assert(num_keys > 0 && "Lookup on empty internal node is undefined");
 
     uint16_t lo = 0;
     uint16_t hi = num_keys;
 
+    // Count the separators the key has to pass: those below it, plus those equal to it when going right.
     while (lo < hi) {
         uint16_t mid = lo + (hi - lo) / 2;
-        if (GetKey(page_data, mid, key_type) <= key) {
+        const auto separator = GetKey(page_data, mid, key_type);
+        if (go_right_on_equal ? separator <= key : separator < key) {
             lo = mid + 1;
         } else {
             hi = mid;
         }
     }
     return GetChild(page_data, lo, key_type);
+}
+
+
+page_id_t BTreeInternalPage::Lookup(const char* page_data, const Value& key, TypeId key_type) {
+    return FindChild(page_data, key, key_type, true);
+}
+
+
+page_id_t BTreeInternalPage::LookupLeftmost(const char* page_data, const Value& key, TypeId key_type) {
+    return FindChild(page_data, key, key_type, false);
 }
 
 

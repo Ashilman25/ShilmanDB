@@ -28,9 +28,7 @@ Page* BufferPoolManager::FetchPage(page_id_t page_id) {
         policy_->SetEvictable(frame_id, false);
         ++hit_count_;
         RecordVisit(page_id, frame_id, false);
-        if (trace_enabled_) {
-            trace_file_ << access_counter_++ << ',' << page_id << '\n';
-        }
+        if (trace_enabled_) TraceFetch(page_id);
         return &pages_[frame_id];
     }
 
@@ -66,9 +64,7 @@ Page* BufferPoolManager::FetchPage(page_id_t page_id) {
     policy_->SetEvictable(frame_id, false);
     ++miss_count_;
     RecordVisit(page_id, frame_id, true);
-    if (trace_enabled_) {
-        trace_file_ << access_counter_++ << ',' << page_id << '\n';
-    }
+    if (trace_enabled_) TraceFetch(page_id);
     return &frame;
 }
 
@@ -224,7 +220,7 @@ const Page& BufferPoolManager::GetPage(frame_id_t frame_id) const {
     return pages_[frame_id];
 }
 
-void BufferPoolManager::EnableTracing(const std::string& trace_path) {
+void BufferPoolManager::EnableTracing(const std::string& trace_path, bool collapse_repeats) {
     DisableTracing();
     trace_file_.open(trace_path, std::ios::out | std::ios::trunc);
     if (!trace_file_.is_open()) {
@@ -232,7 +228,17 @@ void BufferPoolManager::EnableTracing(const std::string& trace_path) {
     }
     trace_file_ << "timestamp,page_id\n";
     access_counter_ = 0;
+    trace_collapse_ = collapse_repeats;
+    last_traced_page_ = INVALID_PAGE_ID;
     trace_enabled_ = true;
+}
+
+void BufferPoolManager::TraceFetch(page_id_t page_id) {
+    if (!trace_collapse_ || page_id != last_traced_page_) {
+        trace_file_ << access_counter_ << ',' << page_id << '\n';
+    }
+    last_traced_page_ = page_id;
+    ++access_counter_;
 }
 
 void BufferPoolManager::DisableTracing() {

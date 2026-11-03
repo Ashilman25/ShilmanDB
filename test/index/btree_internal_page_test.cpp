@@ -189,6 +189,32 @@ TEST_F(BTreeInternalPageTest, LookupBigintKeys) {
 }
 
 // ---------------------------------------------------------------------------
+// LookupLeftmost: goes left when a separator equals the key
+// ---------------------------------------------------------------------------
+TEST_F(BTreeInternalPageTest, LookupLeftmostGoesLeftOnEqual) {
+    // Node: [c0=10][10][c1=11][20][c2=12][20][c3=13][30][c4=14]
+    BTreeInternalPage::SetNumKeys(page_.data(), 4);
+    const std::array<int32_t, 4> separators = {10, 20, 20, 30};
+    for (uint16_t i = 0; i < 5; ++i) {
+        BTreeInternalPage::SetChild(page_.data(), i, 10 + i, TypeId::INTEGER);
+    }
+    for (uint16_t i = 0; i < 4; ++i) {
+        BTreeInternalPage::SetKey(page_.data(), i, Value(separators[i]), TypeId::INTEGER);
+    }
+
+    // Lookup goes right of every separator equal to the key; LookupLeftmost stops at the first one.
+    EXPECT_EQ(BTreeInternalPage::Lookup(page_.data(), Value(20), TypeId::INTEGER), 13u);
+    EXPECT_EQ(BTreeInternalPage::LookupLeftmost(page_.data(), Value(20), TypeId::INTEGER), 11u);
+
+    EXPECT_EQ(BTreeInternalPage::LookupLeftmost(page_.data(), Value(10), TypeId::INTEGER), 10u);
+    EXPECT_EQ(BTreeInternalPage::LookupLeftmost(page_.data(), Value(5), TypeId::INTEGER), 10u);
+    EXPECT_EQ(BTreeInternalPage::LookupLeftmost(page_.data(), Value(15), TypeId::INTEGER), 11u);
+    EXPECT_EQ(BTreeInternalPage::LookupLeftmost(page_.data(), Value(25), TypeId::INTEGER), 13u);
+    EXPECT_EQ(BTreeInternalPage::LookupLeftmost(page_.data(), Value(30), TypeId::INTEGER), 13u);
+    EXPECT_EQ(BTreeInternalPage::LookupLeftmost(page_.data(), Value(35), TypeId::INTEGER), 14u);
+}
+
+// ---------------------------------------------------------------------------
 // InsertAfter
 // ---------------------------------------------------------------------------
 TEST_F(BTreeInternalPageTest, InsertAfterBuildsNode) {

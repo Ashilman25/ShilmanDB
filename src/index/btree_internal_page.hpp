@@ -18,7 +18,11 @@ public:
     static page_id_t GetChild(const char* page_data, uint16_t child_idx, TypeId key_type);
     static void SetChild(char* page_data, uint16_t child_idx, page_id_t child_page_id, TypeId key_type);
 
+    // The child to descend into for an insert: goes right of a separator equal to the key.
     [[nodiscard]] static page_id_t Lookup(const char* page_data, const Value& key, TypeId key_type);
+    // The child to descend into for a read: goes left of a separator equal to the key, so the
+    // search starts at the first entry for the key even when copies of it sit in several leaves.
+    [[nodiscard]] static page_id_t LookupLeftmost(const char* page_data, const Value& key, TypeId key_type);
 
     static void InsertAfter(char* page_data, page_id_t left_child, const Value& key, page_id_t right_child, TypeId key_type);
 
@@ -26,6 +30,7 @@ public:
     [[nodiscard]] static bool NeedsSplit(const char* page_data, TypeId key_type);
 
 private:
+    [[nodiscard]] static page_id_t FindChild(const char* page_data, const Value& key, TypeId key_type, bool go_right_on_equal);
     static uint16_t KeySize(TypeId key_type);
     static size_t KeyOffset(uint16_t key_idx, TypeId key_type);
     static size_t ChildOffset(uint16_t child_idx, TypeId key_type);

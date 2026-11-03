@@ -79,3 +79,5 @@ shilmandb_add_test(join_order_parity_test integration/join_order_parity_test.cpp
 target_include_directories(join_order_parity_test PRIVATE ${CMAKE_SOURCE_DIR}/bench)
 shilmandb_add_test(tpch_estimates_test integration/tpch_estimates_test.cpp)
 target_include_directories(tpch_estimates_test PRIVATE ${CMAKE_SOURCE_DIR}/bench)
+shilmandb_add_test(tpch_streams_test integration/tpch_streams_test.cpp)
+target_include_directories(tpch_streams_test PRIVATE ${CMAKE_SOURCE_DIR}/bench)
