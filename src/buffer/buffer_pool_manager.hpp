@@ -31,6 +31,10 @@ public:
     [[nodiscard]] bool FlushPage(page_id_t page_id);
     void FlushAllPages();
 
+    // Writes out dirty pages and empties the pool, and the policy starts over: like a restart
+    // with an empty cache. Throws DatabaseException if a page is pinned.
+    void DropAllPages();
+
     // Stats for benchmarking
     uint64_t GetHitCount() const;
     uint64_t GetMissCount() const;
@@ -73,6 +77,13 @@ private:
     page_id_t last_page_id_{INVALID_PAGE_ID};
     std::vector<uint64_t> last_seen_;  // per frame: page_changes_ at its last fetch, 0 if none
 
+    // What a policy that counts visits is told. Kept apart from the visit stats above:
+    // ResetStats() never touches it.
+    bool uses_access_types_;
+    uint64_t policy_run_{0};                       // runs of fetches to one page so far
+    page_id_t policy_last_page_{INVALID_PAGE_ID};  // the page of the last fetch or NewPage
+    std::vector<uint64_t> frame_run_;              // per frame: policy_run_ at its last fetch or NewPage
+
     // Access tracing
     bool trace_enabled_{false};
     std::ofstream trace_file_;
@@ -80,7 +91,9 @@ private:
     bool trace_collapse_{false};
     page_id_t last_traced_page_{INVALID_PAGE_ID};
 
-    bool FindVictimFrame(frame_id_t* frame_id);
+    bool FindVictimFrame(page_id_t incoming_page, frame_id_t* frame_id);
+    void RecordPolicyAccess(frame_id_t frame_id, page_id_t page_id, bool is_miss);
+    [[nodiscard]] AccessType NextAccessType(page_id_t page_id, frame_id_t frame_id, bool is_miss);
     void RecordVisit(page_id_t page_id, frame_id_t frame_id, bool is_miss);
     void TraceFetch(page_id_t page_id);
 };

@@ -19,7 +19,12 @@ shilmandb_add_test(table_heap_test         storage/table_heap_test.cpp)
 
 # Buffer tests
 shilmandb_add_test(lru_eviction_policy_test buffer/lru_eviction_policy_test.cpp)
+shilmandb_add_test(clock_eviction_policy_test buffer/clock_eviction_policy_test.cpp)
+shilmandb_add_test(lru2_eviction_policy_test buffer/lru2_eviction_policy_test.cpp)
+shilmandb_add_test(arc_eviction_policy_test buffer/arc_eviction_policy_test.cpp)
+shilmandb_add_test(lirs_eviction_policy_test buffer/lirs_eviction_policy_test.cpp)
 shilmandb_add_test(timed_eviction_policy_test buffer/timed_eviction_policy_test.cpp)
+shilmandb_add_test(eviction_policy_factory_test buffer/eviction_policy_factory_test.cpp)
 shilmandb_add_test(buffer_pool_manager_test buffer/buffer_pool_manager_test.cpp)
 
 # Index tests
@@ -86,3 +91,10 @@ target_include_directories(eviction_sim_test PRIVATE ${CMAKE_SOURCE_DIR}/bench)
 if(APPLE)
     target_link_libraries(eviction_sim_test PRIVATE "-framework Accelerate")
 endif()
+shilmandb_add_test(engine_eviction_match_test integration/engine_eviction_match_test.cpp)
+target_include_directories(engine_eviction_match_test PRIVATE ${CMAKE_SOURCE_DIR}/bench)
+if(APPLE)
+    target_link_libraries(engine_eviction_match_test PRIVATE "-framework Accelerate")
+endif()
+shilmandb_add_test(eviction_policy_tpch_test integration/eviction_policy_tpch_test.cpp)
+target_include_directories(eviction_policy_tpch_test PRIVATE ${CMAKE_SOURCE_DIR}/bench)

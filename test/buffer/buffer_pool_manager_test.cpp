@@ -2,12 +2,18 @@
 #include <string>
 #include <unistd.h>
 #include "buffer/buffer_pool_manager.hpp"
+#include "buffer/eviction_policy_factory.hpp"
 #include "buffer/lru_eviction_policy.hpp"
 #include "common/exception.hpp"
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <initializer_list>
 #include <memory>
+#include <optional>
+#include <ostream>
+#include <set>
+#include <utility>
 #include <vector>
 
 namespace shilmandb {
@@ -39,6 +45,20 @@ protected:
             pool_size, dm.get(), std::move(eviction));
         return {std::move(dm), std::move(bpm)};
     }
+
+    // A fresh file and a BPM with the given policy from the factory
+    BPMBundle MakeBPM(size_t pool_size, EvictionPolicyKind kind) {
+        std::filesystem::remove(test_file_);
+        auto dm = std::make_unique<DiskManager>(test_file_);
+        auto bpm = std::make_unique<BufferPoolManager>(pool_size, dm.get(), MakeEvictionPolicy(kind, pool_size));
+        return {std::move(dm), std::move(bpm)};
+    }
+
+    // The policies the engine can run without a model
+    static constexpr EvictionPolicyKind kEngineKinds[] = {
+        EvictionPolicyKind::LRU, EvictionPolicyKind::CLOCK, EvictionPolicyKind::LRU2,
+        EvictionPolicyKind::ARC, EvictionPolicyKind::LIRS,
+    };
 };
 
 // ---------------------------------------------------------------------------
@@ -660,6 +680,104 @@ TEST_F(BufferPoolManagerTest, FailedReadAfterEvictionKeepsFrame) {
     EXPECT_NE(bpm->NewPage(&pid1), nullptr);
 }
 
+TEST_F(BufferPoolManagerTest, FailedReadKeepsFrameEveryPolicy) {
+    for (const auto kind : kEngineKinds) {
+        SCOPED_TRACE(std::string(EvictionPolicyKindName(kind)));
+        auto [dm, bpm] = MakeBPM(2, kind);
+
+        EXPECT_THROW((void)bpm->FetchPage(INVALID_PAGE_ID), IOException);
+        EXPECT_EQ(bpm->GetMissCount(), 0u);
+        EXPECT_EQ(bpm->GetHitCount(), 0u);
+
+        // both frames are still usable, at the same time
+        page_id_t pid0, pid1;
+        ASSERT_NE(bpm->NewPage(&pid0), nullptr);
+        ASSERT_NE(bpm->NewPage(&pid1), nullptr);
+        (void)bpm->UnpinPage(pid0, false);
+        (void)bpm->UnpinPage(pid1, false);
+    }
+}
+
+TEST_F(BufferPoolManagerTest, FailedReadAfterEvictionKeepsFrameEveryPolicy) {
+    for (const auto kind : kEngineKinds) {
+        SCOPED_TRACE(std::string(EvictionPolicyKindName(kind)));
+        auto [dm, bpm] = MakeBPM(2, kind);
+
+        page_id_t pids[2];
+        const char* texts[2] = {"page 0", "page 1"};
+        for (int i = 0; i < 2; ++i) {
+            auto* page = bpm->NewPage(&pids[i]);
+            ASSERT_NE(page, nullptr);
+            std::memcpy(page->GetData(), texts[i], 7);
+            (void)bpm->UnpinPage(pids[i], true);
+        }
+
+        // the pool is full, so a frame is taken from one page, then the read fails
+        EXPECT_THROW((void)bpm->FetchPage(INVALID_PAGE_ID), IOException);
+
+        // both pages come back intact and fit at once, so no frame was lost
+        auto* first = bpm->FetchPage(pids[0]);
+        auto* second = bpm->FetchPage(pids[1]);
+        ASSERT_NE(first, nullptr);
+        ASSERT_NE(second, nullptr);
+        EXPECT_EQ(std::memcmp(first->GetData(), texts[0], 7), 0);
+        EXPECT_EQ(std::memcmp(second->GetData(), texts[1], 7), 0);
+        EXPECT_EQ(bpm->GetMissCount(), 1u);  // the page that lost its frame
+        EXPECT_EQ(bpm->GetHitCount(), 1u);
+        (void)bpm->UnpinPage(pids[0], false);
+        (void)bpm->UnpinPage(pids[1], false);
+
+        page_id_t pid2;
+        ASSERT_NE(bpm->NewPage(&pid2), nullptr);
+        (void)bpm->UnpinPage(pid2, false);
+    }
+}
+
+TEST_F(BufferPoolManagerTest, EveryPolicyReturnsNullWhenAllPinned) {
+    for (const auto kind : kEngineKinds) {
+        for (page_id_t released = 0; released < 3; ++released) {
+            SCOPED_TRACE(std::string(EvictionPolicyKindName(kind)) + ", unpinning page " + std::to_string(released));
+            auto [dm, bpm] = MakeBPM(3, kind);
+
+            // pages 0-4 on disk, then an empty pool
+            for (page_id_t i = 0; i < 5; ++i) {
+                page_id_t pid;
+                ASSERT_NE(bpm->NewPage(&pid), nullptr);
+                ASSERT_EQ(pid, i);
+                (void)bpm->UnpinPage(pid, true);
+            }
+            bpm->DropAllPages();
+
+            // three pages held pinned fill the pool
+            for (page_id_t p = 0; p < 3; ++p) ASSERT_NE(bpm->FetchPage(p), nullptr);
+            EXPECT_EQ(bpm->FetchPage(4), nullptr);
+
+            // nothing was evicted: the three pages still hit
+            bpm->ResetStats();
+            for (page_id_t p = 0; p < 3; ++p) {
+                ASSERT_NE(bpm->FetchPage(p), nullptr);
+                (void)bpm->UnpinPage(p, false);
+            }
+            EXPECT_EQ(bpm->GetHitCount(), 3u);
+            EXPECT_EQ(bpm->GetMissCount(), 0u);
+
+            // unpinning one makes room, and that page is the one evicted
+            ASSERT_TRUE(bpm->UnpinPage(released, false));
+            ASSERT_NE(bpm->FetchPage(4), nullptr);
+            std::set<page_id_t> resident;
+            for (frame_id_t f = 0; f < 3; ++f) resident.insert(bpm->GetPage(f).GetPageId());
+            std::set<page_id_t> expected = {0, 1, 2, 4};
+            expected.erase(released);
+            EXPECT_EQ(resident, expected);
+
+            for (page_id_t p = 0; p < 3; ++p) {
+                if (p != released) (void)bpm->UnpinPage(p, false);
+            }
+            (void)bpm->UnpinPage(4, false);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Page visits
 // ---------------------------------------------------------------------------
@@ -867,6 +985,320 @@ TEST_F(BufferPoolManagerTest, PolicyTimingKeepsSameMisses) {
     EXPECT_EQ(plain.hits, timed.hits);
     EXPECT_EQ(plain.misses, timed.misses);
     EXPECT_EQ(plain.frame_pages, timed.frame_pages);
+}
+
+// ---------------------------------------------------------------------------
+// What the buffer pool tells the policy
+// ---------------------------------------------------------------------------
+
+// So a failed check prints the type's name
+void PrintTo(AccessType type, std::ostream* os) {
+    switch (type) {
+        case AccessType::NEW_USE: *os << "NEW_USE"; break;
+        case AccessType::TOUCH: *os << "TOUCH"; break;
+        case AccessType::REPEAT: *os << "REPEAT"; break;
+    }
+}
+
+namespace {
+
+struct TypedCall {
+    frame_id_t frame;
+    page_id_t page;
+    AccessType type;
+};
+
+// Decides like LRU and remembers every call the buffer pool makes
+class RecordingPolicy : public EvictionPolicy {
+public:
+    RecordingPolicy(size_t num_frames, bool uses_types) : lru_(num_frames), uses_types_(uses_types) {}
+
+    void RecordAccess(frame_id_t frame_id) override { lru_.RecordAccess(frame_id); }
+    void RecordAccess(frame_id_t frame_id, page_id_t page_id) override {
+        plain_calls.emplace_back(frame_id, page_id);
+        lru_.RecordAccess(frame_id);
+    }
+    void RecordAccess(frame_id_t frame_id, page_id_t page_id, AccessType type) override {
+        typed_calls.push_back({frame_id, page_id, type});
+        lru_.RecordAccess(frame_id);
+    }
+    void SetEvictable(frame_id_t frame_id, bool evictable) override { lru_.SetEvictable(frame_id, evictable); }
+    std::optional<frame_id_t> Evict() override {
+        ++plain_evicts;
+        return lru_.Evict();
+    }
+    std::optional<frame_id_t> Evict(page_id_t incoming_page) override {
+        evict_pages.push_back(incoming_page);
+        return lru_.Evict();
+    }
+    void Remove(frame_id_t frame_id) override { lru_.Remove(frame_id); }
+    size_t Size() const override { return lru_.Size(); }
+    bool UsesAccessTypes() const override { return uses_types_; }
+    void Reset() override {
+        ++reset_calls;
+        lru_.Reset();
+    }
+
+    std::vector<AccessType> Types() const {
+        std::vector<AccessType> types;
+        for (const auto& call : typed_calls) {
+            types.push_back(call.type);
+        }
+        return types;
+    }
+
+    std::vector<TypedCall> typed_calls;
+    std::vector<std::pair<frame_id_t, page_id_t>> plain_calls;
+    std::vector<page_id_t> evict_pages;
+    int plain_evicts{0};
+    int reset_calls{0};
+
+private:
+    LRUEvictionPolicy lru_;
+    bool uses_types_;
+};
+
+struct RecordingBundle {
+    std::unique_ptr<DiskManager> disk_manager;
+    std::unique_ptr<BufferPoolManager> bpm;
+    RecordingPolicy* policy;  // owned by bpm
+};
+
+RecordingBundle MakeRecordingBPM(const std::string& file, size_t pool_size, bool uses_types) {
+    auto dm = std::make_unique<DiskManager>(file);
+    auto policy = std::make_unique<RecordingPolicy>(pool_size, uses_types);
+    RecordingPolicy* raw = policy.get();
+    auto bpm = std::make_unique<BufferPoolManager>(pool_size, dm.get(), std::move(policy));
+    return {std::move(dm), std::move(bpm), raw};
+}
+
+// Fetches and unpins each page in turn
+void FetchAll(BufferPoolManager& bpm, std::initializer_list<page_id_t> pages) {
+    for (const page_id_t pid : pages) {
+        ASSERT_NE(bpm.FetchPage(pid), nullptr);
+        (void)bpm.UnpinPage(pid, false);
+    }
+}
+
+void FetchRange(BufferPoolManager& bpm, page_id_t first, page_id_t last) {
+    for (page_id_t pid = first; pid <= last; ++pid) {
+        ASSERT_NE(bpm.FetchPage(pid), nullptr);
+        (void)bpm.UnpinPage(pid, false);
+    }
+}
+
+}  // namespace
+
+TEST_F(BufferPoolManagerTest, AccessTypesForVisitPolicy) {
+    auto [dm, bpm, policy] = MakeRecordingBPM(test_file_, 8, true);
+
+    FetchAll(*bpm, {0, 0, 1, 0});
+
+    const std::vector<AccessType> expected = {AccessType::NEW_USE, AccessType::REPEAT, AccessType::NEW_USE, AccessType::TOUCH};
+    EXPECT_EQ(policy->Types(), expected);
+    EXPECT_TRUE(policy->plain_calls.empty());
+
+    // frames and pages come through too
+    ASSERT_EQ(policy->typed_calls.size(), 4u);
+    EXPECT_EQ(policy->typed_calls[2].page, 1u);
+    EXPECT_EQ(policy->typed_calls[3].page, 0u);
+    EXPECT_EQ(policy->typed_calls[3].frame, policy->typed_calls[0].frame);
+}
+
+TEST_F(BufferPoolManagerTest, ReturnAfter64RunsIsTouch) {
+    auto [dm, bpm, policy] = MakeRecordingBPM(test_file_, 80, true);
+
+    FetchAll(*bpm, {0});
+    FetchRange(*bpm, 1, 63);  // 63 other pages, so page 0 comes back 64 runs later
+    FetchAll(*bpm, {0});
+
+    EXPECT_EQ(bpm->GetMissCount(), 64u);
+    EXPECT_EQ(policy->Types().back(), AccessType::TOUCH);
+}
+
+TEST_F(BufferPoolManagerTest, ReturnAfter65RunsIsNewUse) {
+    auto [dm, bpm, policy] = MakeRecordingBPM(test_file_, 80, true);
+
+    FetchAll(*bpm, {0});
+    FetchRange(*bpm, 1, 64);
+    FetchAll(*bpm, {0});
+
+    EXPECT_EQ(bpm->GetMissCount(), 65u);  // page 0 is still resident: a hit, but a new use
+    EXPECT_EQ(policy->Types().back(), AccessType::NEW_USE);
+}
+
+TEST_F(BufferPoolManagerTest, ResetStatsDoesNotChangeAccessTypes) {
+    auto [dm, bpm, policy] = MakeRecordingBPM(test_file_, 80, true);
+
+    // ResetStats doesn't count as a page change
+    FetchAll(*bpm, {0});
+    bpm->ResetStats();
+    FetchAll(*bpm, {0});
+    EXPECT_EQ(policy->Types().back(), AccessType::REPEAT);
+
+    // and doesn't start a new visit
+    FetchAll(*bpm, {0});
+    FetchRange(*bpm, 1, 63);
+    bpm->ResetStats();
+    FetchAll(*bpm, {0});
+    EXPECT_EQ(policy->Types().back(), AccessType::TOUCH);
+}
+
+TEST_F(BufferPoolManagerTest, NewPageIsNewUseAndAPageChange) {
+    auto [dm, bpm, policy] = MakeRecordingBPM(test_file_, 8, true);
+
+    page_id_t a, p;
+    ASSERT_NE(bpm->NewPage(&a), nullptr);
+    (void)bpm->UnpinPage(a, false);
+    ASSERT_NE(bpm->NewPage(&p), nullptr);
+    (void)bpm->UnpinPage(p, false);
+    ASSERT_EQ(policy->typed_calls.size(), 2u);
+    EXPECT_EQ(policy->typed_calls[1].page, p);
+    EXPECT_EQ(policy->typed_calls[1].type, AccessType::NEW_USE);
+
+    // p was the last page, so fetching it is a repeat; a is a return within the window
+    FetchAll(*bpm, {p, a});
+    const std::vector<AccessType> expected = {AccessType::NEW_USE, AccessType::NEW_USE, AccessType::REPEAT, AccessType::TOUCH};
+    EXPECT_EQ(policy->Types(), expected);
+}
+
+TEST_F(BufferPoolManagerTest, PolicyWithoutTypesGetsOldCall) {
+    auto [dm, bpm, policy] = MakeRecordingBPM(test_file_, 8, false);
+
+    page_id_t a;
+    ASSERT_NE(bpm->NewPage(&a), nullptr);
+    (void)bpm->UnpinPage(a, false);
+    FetchAll(*bpm, {a, a, 5, a});
+
+    EXPECT_TRUE(policy->typed_calls.empty());
+    const std::vector<std::pair<frame_id_t, page_id_t>> expected = {{0, a}, {0, a}, {0, a}, {1, 5}, {0, a}};
+    EXPECT_EQ(policy->plain_calls, expected);
+}
+
+TEST_F(BufferPoolManagerTest, EvictGetsIncomingPage) {
+    auto [dm, bpm, policy] = MakeRecordingBPM(test_file_, 2, false);
+
+    FetchAll(*bpm, {1, 2});
+    EXPECT_TRUE(policy->evict_pages.empty());  // free frames first
+
+    FetchAll(*bpm, {5});
+    page_id_t fresh;
+    ASSERT_NE(bpm->NewPage(&fresh), nullptr);
+    (void)bpm->UnpinPage(fresh, false);
+
+    const std::vector<page_id_t> expected = {5, INVALID_PAGE_ID};
+    EXPECT_EQ(policy->evict_pages, expected);
+    EXPECT_EQ(policy->plain_evicts, 0);
+}
+
+TEST_F(BufferPoolManagerTest, DropAllPagesWritesAndEmpties) {
+    auto [dm, bpm, policy] = MakeRecordingBPM(test_file_, 3, true);
+
+    page_id_t a, b, c;
+    ASSERT_NE(bpm->NewPage(&a), nullptr);
+    (void)bpm->UnpinPage(a, false);
+    ASSERT_NE(bpm->NewPage(&b), nullptr);
+    (void)bpm->UnpinPage(b, false);
+    auto* page_c = bpm->NewPage(&c);
+    ASSERT_NE(page_c, nullptr);
+    std::memcpy(page_c->GetData(), "drop me", 8);
+    (void)bpm->UnpinPage(c, true);
+
+    // leave the free list out of order: frames 1 then 0, with c still in frame 2
+    ASSERT_TRUE(bpm->DeletePage(b));
+    ASSERT_TRUE(bpm->DeletePage(a));
+    FetchAll(*bpm, {c});
+    const uint64_t hits = bpm->GetHitCount();
+    const uint64_t misses = bpm->GetMissCount();
+
+    bpm->DropAllPages();
+
+    for (frame_id_t f = 0; f < 3; ++f) {
+        EXPECT_EQ(bpm->GetPage(f).GetPageId(), INVALID_PAGE_ID) << "frame " << f;
+    }
+    EXPECT_EQ(policy->reset_calls, 1);
+    EXPECT_EQ(bpm->GetHitCount(), hits);  // stats are left alone
+    EXPECT_EQ(bpm->GetMissCount(), misses);
+
+    // c was written out, so it reads back from disk
+    auto* again = bpm->FetchPage(c);
+    ASSERT_NE(again, nullptr);
+    EXPECT_EQ(bpm->GetMissCount(), misses + 1);
+    EXPECT_EQ(std::memcmp(again->GetData(), "drop me", 8), 0);
+    (void)bpm->UnpinPage(c, false);
+
+    // frames are handed out from 0 again, like a new pool
+    FetchAll(*bpm, {a, b});
+    EXPECT_EQ(bpm->GetPage(0).GetPageId(), c);
+    EXPECT_EQ(bpm->GetPage(1).GetPageId(), a);
+    EXPECT_EQ(bpm->GetPage(2).GetPageId(), b);
+}
+
+TEST_F(BufferPoolManagerTest, DropAllPagesThrowsOnPinnedPage) {
+    auto [dm, bpm, policy] = MakeRecordingBPM(test_file_, 4, true);
+
+    page_id_t a, b;
+    ASSERT_NE(bpm->NewPage(&a), nullptr);
+    (void)bpm->UnpinPage(a, true);
+    ASSERT_NE(bpm->NewPage(&b), nullptr);  // stays pinned
+
+    EXPECT_THROW(bpm->DropAllPages(), DatabaseException);
+
+    // nothing changed: both pages are resident, a is still dirty, the policy kept its state
+    EXPECT_EQ(policy->reset_calls, 0);
+    EXPECT_TRUE(bpm->GetPage(0).IsDirty());
+    EXPECT_EQ(bpm->GetPage(1).GetPinCount(), 1);
+    bpm->ResetStats();
+    FetchAll(*bpm, {a, b});
+    EXPECT_EQ(bpm->GetHitCount(), 2u);
+    EXPECT_EQ(bpm->GetMissCount(), 0u);
+    (void)bpm->UnpinPage(b, false);
+}
+
+TEST_F(BufferPoolManagerTest, DropAllPagesOnEmptyPool) {
+    auto [dm, bpm, policy] = MakeRecordingBPM(test_file_, 4, true);
+
+    EXPECT_NO_THROW(bpm->DropAllPages());
+    EXPECT_NO_THROW(bpm->DropAllPages());
+    EXPECT_EQ(policy->reset_calls, 2);
+
+    page_id_t a;
+    ASSERT_NE(bpm->NewPage(&a), nullptr);
+    EXPECT_EQ(bpm->GetPage(0).GetPageId(), a);
+    (void)bpm->UnpinPage(a, false);
+}
+
+TEST_F(BufferPoolManagerTest, PolicyTimingKeepsAccessTypes) {
+    auto run = [&](bool timing) {
+        std::filesystem::remove(test_file_);
+        auto [dm, bpm, policy] = MakeRecordingBPM(test_file_, 80, true);
+        bpm->SetPolicyTiming(timing);
+
+        page_id_t fresh;
+        EXPECT_NE(bpm->NewPage(&fresh), nullptr);
+        (void)bpm->UnpinPage(fresh, false);
+        FetchAll(*bpm, {0, 0, 1, 0});
+        FetchRange(*bpm, 2, 66);
+        FetchAll(*bpm, {1, 1});
+        bpm->DropAllPages();
+        FetchAll(*bpm, {1, 0});
+
+        std::vector<std::pair<frame_id_t, page_id_t>> where;
+        for (const auto& call : policy->typed_calls) {
+            where.emplace_back(call.frame, call.page);
+        }
+        if (timing) {
+            EXPECT_EQ(bpm->GetPolicyStats().record_calls, policy->typed_calls.size());
+        }
+        return std::make_pair(policy->Types(), where);
+    };
+
+    const auto plain = run(false);
+    const auto timed = run(true);
+
+    ASSERT_EQ(plain.first.size(), 74u);
+    EXPECT_EQ(plain.first, timed.first);
+    EXPECT_EQ(plain.second, timed.second);
 }
 
 }  // namespace shilmandb

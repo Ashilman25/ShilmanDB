@@ -1,9 +1,11 @@
 #include "buffer/buffer_pool_manager.hpp"
 #include "common/exception.hpp"
+#include <algorithm>
+#include <string>
 
 namespace shilmandb {
 
-BufferPoolManager::BufferPoolManager(size_t pool_size, DiskManager* disk_manager, std::unique_ptr<EvictionPolicy> eviction_policy) : pool_size_(pool_size), pages_(new Page[pool_size]), disk_manager_(disk_manager), eviction_policy_(std::move(eviction_policy)), policy_(eviction_policy_.get()), last_seen_(pool_size, 0) {
+BufferPoolManager::BufferPoolManager(size_t pool_size, DiskManager* disk_manager, std::unique_ptr<EvictionPolicy> eviction_policy) : pool_size_(pool_size), pages_(new Page[pool_size]), disk_manager_(disk_manager), eviction_policy_(std::move(eviction_policy)), policy_(eviction_policy_.get()), last_seen_(pool_size, 0), uses_access_types_(eviction_policy_->UsesAccessTypes()), frame_run_(pool_size, 0) {
     for (size_t i = 0; i < pool_size_; ++i) {
         free_list_.push_back(static_cast<frame_id_t>(i));
     }
@@ -24,7 +26,7 @@ Page* BufferPoolManager::FetchPage(page_id_t page_id) {
     if (auto it = page_table_.find(page_id); it != page_table_.end()) {
         auto frame_id = it->second;
         pages_[frame_id].Pin();
-        policy_->RecordAccess(frame_id, page_id);
+        RecordPolicyAccess(frame_id, page_id, false);
         policy_->SetEvictable(frame_id, false);
         ++hit_count_;
         RecordVisit(page_id, frame_id, false);
@@ -34,7 +36,7 @@ Page* BufferPoolManager::FetchPage(page_id_t page_id) {
 
     // Cache miss, find a frame
     frame_id_t frame_id;
-    if (!FindVictimFrame(&frame_id)) {
+    if (!FindVictimFrame(page_id, &frame_id)) {
         return nullptr;
     }
 
@@ -60,7 +62,7 @@ Page* BufferPoolManager::FetchPage(page_id_t page_id) {
     frame.Pin();
 
     page_table_[page_id] = frame_id;
-    policy_->RecordAccess(frame_id, page_id);
+    RecordPolicyAccess(frame_id, page_id, true);
     policy_->SetEvictable(frame_id, false);
     ++miss_count_;
     RecordVisit(page_id, frame_id, true);
@@ -70,7 +72,7 @@ Page* BufferPoolManager::FetchPage(page_id_t page_id) {
 
 Page* BufferPoolManager::NewPage(page_id_t* page_id) {
     frame_id_t frame_id;
-    if (!FindVictimFrame(&frame_id)) {
+    if (!FindVictimFrame(INVALID_PAGE_ID, &frame_id)) {
         return nullptr;
     }
 
@@ -91,7 +93,7 @@ Page* BufferPoolManager::NewPage(page_id_t* page_id) {
     last_seen_[frame_id] = 0;  // not fetched yet
 
     page_table_[new_page_id] = frame_id;
-    policy_->RecordAccess(frame_id, new_page_id);
+    RecordPolicyAccess(frame_id, new_page_id, true);  // a new page counts as a new use
     policy_->SetEvictable(frame_id, false);
 
     *page_id = new_page_id;
@@ -140,6 +142,31 @@ void BufferPoolManager::FlushAllPages() {
     }
 }
 
+void BufferPoolManager::DropAllPages() {
+    // Check first, so a pinned page leaves the pool exactly as it was
+    for (size_t i = 0; i < pool_size_; ++i) {
+        if (pages_[i].GetPinCount() > 0) {
+            throw DatabaseException("Cannot drop pages: page " + std::to_string(pages_[i].GetPageId()) + " is pinned");
+        }
+    }
+
+    FlushAllPages();
+    for (size_t i = 0; i < pool_size_; ++i) {
+        pages_[i].ClearMetadata();
+    }
+    page_table_.clear();
+
+    // Hand frames out in the same order as a new pool
+    free_list_.clear();
+    for (size_t i = 0; i < pool_size_; ++i) {
+        free_list_.push_back(static_cast<frame_id_t>(i));
+    }
+
+    policy_->Reset();
+    std::fill(last_seen_.begin(), last_seen_.end(), 0);
+    policy_last_page_ = INVALID_PAGE_ID;
+}
+
 bool BufferPoolManager::DeletePage(page_id_t page_id) {
     auto it = page_table_.find(page_id);
     if (it == page_table_.end()) {
@@ -159,6 +186,31 @@ bool BufferPoolManager::DeletePage(page_id_t page_id) {
     return true;
 }
 
+// Policies that count visits get the access type; the others get the plain call
+void BufferPoolManager::RecordPolicyAccess(frame_id_t frame_id, page_id_t page_id, bool is_miss) {
+    if (uses_access_types_) {
+        policy_->RecordAccess(frame_id, page_id, NextAccessType(page_id, frame_id, is_miss));
+    } else {
+        policy_->RecordAccess(frame_id, page_id);
+    }
+}
+
+// A run is a stretch of fetches to one page. A return to a resident page within
+// kVisitWindow runs of its frame's last fetch is the same visit.
+AccessType BufferPoolManager::NextAccessType(page_id_t page_id, frame_id_t frame_id, bool is_miss) {
+    const bool page_change = page_id != policy_last_page_;
+    if (page_change) {
+        ++policy_run_;
+        policy_last_page_ = page_id;
+    }
+    const uint64_t previous_run = frame_run_[frame_id];
+    frame_run_[frame_id] = policy_run_;
+
+    if (is_miss) return AccessType::NEW_USE;
+    if (!page_change) return AccessType::REPEAT;
+    return policy_run_ - previous_run <= kVisitWindow ? AccessType::TOUCH : AccessType::NEW_USE;
+}
+
 void BufferPoolManager::RecordVisit(page_id_t page_id, frame_id_t frame_id, bool is_miss) {
     if (page_id != last_page_id_) {
         ++page_changes_;
@@ -171,14 +223,14 @@ void BufferPoolManager::RecordVisit(page_id_t page_id, frame_id_t frame_id, bool
     last_seen_[frame_id] = page_changes_;
 }
 
-bool BufferPoolManager::FindVictimFrame(frame_id_t* frame_id) {
+bool BufferPoolManager::FindVictimFrame(page_id_t incoming_page, frame_id_t* frame_id) {
     if (!free_list_.empty()) {
         *frame_id = free_list_.front();
         free_list_.pop_front();
         return true;
     }
 
-    auto victim = policy_->Evict();
+    auto victim = policy_->Evict(incoming_page);
     if (victim.has_value()) {
         *frame_id = *victim;
         return true;

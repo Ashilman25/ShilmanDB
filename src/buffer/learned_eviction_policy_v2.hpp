@@ -24,6 +24,8 @@ public:
 
     [[nodiscard]] size_t Size() const override;
 
+    void Reset() override;
+
 private:
     static constexpr int kNumFeatures = 4;
 

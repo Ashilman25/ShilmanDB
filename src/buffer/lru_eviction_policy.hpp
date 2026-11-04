@@ -17,6 +17,8 @@ public:
 
     [[nodiscard]] size_t Size() const override;
 
+    void Reset() override;
+
 private:
     struct FrameState {
         std::list<frame_id_t>::iterator pos;  // its node in lru_list_, valid only while tracked

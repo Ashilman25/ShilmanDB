@@ -1,6 +1,7 @@
 #pragma once
 
 #include "buffer/buffer_pool_manager.hpp"
+#include "buffer/eviction_policy_factory.hpp"
 #include "storage/disk_manager.hpp"
 #include "catalog/catalog.hpp"
 #include "types/tuple.hpp"
@@ -50,10 +51,18 @@ struct QueryResult {
 
 class Database {
 public:
+    // LRU eviction, no learned join
     explicit Database(const std::string& db_file, size_t buffer_pool_size = DEFAULT_BUFFER_POOL_SIZE);
+
+    // The eviction policy to use (a learned one needs eviction_model_path). A non-empty
+    // join_model_path loads the learned join model, which needs an ML build; without one
+    // it throws DatabaseException.
+    Database(const std::string& db_file, size_t buffer_pool_size, EvictionPolicyKind eviction, const std::string& eviction_model_path = "", const std::string& join_model_path = "");
+
     ~Database();
 
 #ifdef SHILMANDB_HAS_LIBTORCH
+    // Learned eviction is V2 when eviction_version is "v2", else V1; LRU when off.
     Database(const std::string& db_file, size_t buffer_pool_size, bool use_learned_join, const std::string& join_model_path,
              bool use_learned_eviction, const std::string& eviction_model_path,
              const std::string& eviction_version = "v2");
