@@ -7,9 +7,9 @@ emits three unified CSVs under bench/results/:
 
 - latencies.csv: (sf, query, config, median_latency_ms, rows, hits, misses,
   visits, page_hit_rate, reads, read_ms, us_per_read, policy_ms, pool_size,
-  miss_penalty_us, direct_io)
+  miss_penalty_us, direct_io, eviction)
 - hit_rates.csv: (sf, config, pool_size, pool_fraction, miss_penalty_us,
-  direct_io, hit_rate, raw_hit_rate, improvement_over_lru)
+  direct_io, hit_rate, raw_hit_rate, improvement_over_lru, eviction)
 - correctness.csv: (sf, query, config, status)
 
 A config label is the config name plus a suffix for each non-default option,
@@ -143,11 +143,18 @@ def pool_for_fraction(sf: str, fraction: float) -> int:
     return max(MIN_POOL_PAGES, round(fraction * DB_PAGES[sf]))
 
 
-# Config name, then _<workload>_s<seed> for a workload, then _frac, _pen and _direct when set.
-def config_label(base: str, miss_penalty_us: int = 0, direct_io: bool = False, fraction: Optional[float] = None, workload: str = "single", seed: int = 1) -> str:
+# The eviction policies the runner can compare. The learned ones come with the +learned config.
+EVICTION_POLICIES: List[str] = ["lru", "clock", "lru2", "arc", "lirs"]
+
+
+# Config name, then _<workload>_s<seed> for a workload, then _<policy> unless it is lru,
+# then _frac, _pen and _direct when set.
+def config_label(base: str, miss_penalty_us: int = 0, direct_io: bool = False, fraction: Optional[float] = None, workload: str = "single", seed: int = 1, eviction: str = "lru") -> str:
     label = base
     if workload != "single":
         label += f"_{workload}_s{seed}"
+    if eviction != "lru":
+        label += f"_{eviction}"
     if fraction is not None:
         label += f"_frac{float(fraction)}"
     if miss_penalty_us > 0:
@@ -159,6 +166,7 @@ def config_label(base: str, miss_penalty_us: int = 0, direct_io: bool = False, f
 
 _LABEL_SUFFIX_RE = re.compile(
     rf"(?:_(?P<workload>{'|'.join(WORKLOADS[1:])})_s(?P<seed>\d+))?"
+    rf"(?:_(?P<eviction>{'|'.join(EVICTION_POLICIES[1:])}))?"
     r"(?:_frac(?P<frac>[0-9.eE+-]+?))?(?:_pen(?P<pen>\d+))?(?P<direct>_direct)?$"
 )
 
@@ -171,6 +179,7 @@ class LabelOptions:
     direct_io: bool
     workload: str = "single"
     seed: Optional[int] = None      # only a workload label has one
+    eviction: str = "lru"
 
 
 # Split a label made by config_label back into the config name and its options.
@@ -185,12 +194,15 @@ def parse_label(label: str) -> LabelOptions:
         direct_io=m.group("direct") is not None,
         workload=m.group("workload") or "single",
         seed=int(m.group("seed")) if m.group("seed") else None,
+        eviction=m.group("eviction") or "lru",
     )
 
 
 # The load_tpch flags for the realistic-I/O options (only the ones that are set).
-def option_flags(miss_penalty_us: int = 0, direct_io: bool = False, policy_timing: bool = False) -> List[str]:
+def option_flags(miss_penalty_us: int = 0, direct_io: bool = False, policy_timing: bool = False, eviction: str = "lru") -> List[str]:
     flags: List[str] = []
+    if eviction != "lru":
+        flags += ["--eviction-policy", eviction]
     if miss_penalty_us > 0:
         flags += ["--miss-penalty-us", str(miss_penalty_us)]
     if direct_io:
@@ -223,19 +235,23 @@ class RunSpec:
     pool: int                       # buffer pool pages
     penalty: int                    # miss penalty in microseconds
     fraction: Optional[float]       # pool fraction, when this run is part of a fraction sweep
+    eviction: str = "lru"
 
 
 # Every ShilmanDB run to make, in order. Per scale factor and workload: each config
-# (once per penalty), then the pool-fraction runs (once per penalty).
-def planned_runs(sfs: Sequence[str], configs: Sequence[str], workloads: Sequence[str], penalties: Sequence[int], fractions: Sequence[float]) -> List[RunSpec]:
+# (once per policy and penalty), then the pool-fraction runs (same). +learned is V2 eviction,
+# so it runs once per penalty, as an lru run, whatever the policy list says.
+def planned_runs(sfs: Sequence[str], configs: Sequence[str], workloads: Sequence[str], penalties: Sequence[int], fractions: Sequence[float], evictions: Sequence[str] = ("lru",)) -> List[RunSpec]:
     runs: List[RunSpec] = []
     for sf in sfs:
         for workload in workloads:
             for config in configs:
-                runs += [RunSpec(sf, config, workload, POOL_SIZES[sf], penalty, None) for penalty in penalties]
+                for eviction in (("lru",) if config == "+learned" else evictions):
+                    runs +=[RunSpec(sf, config, workload, POOL_SIZES[sf], penalty, None, eviction) for penalty in penalties]
 
             for fraction in fractions:
-                runs += [RunSpec(sf, fraction_config(workload), workload, pool_for_fraction(sf, fraction), penalty, fraction) for penalty in penalties]
+                for eviction in evictions:
+                    runs += [RunSpec(sf, fraction_config(workload), workload, pool_for_fraction(sf, fraction), penalty, fraction, eviction) for penalty in penalties]
     return runs
 
 
@@ -268,6 +284,7 @@ class QueryStats:
     pool_size: Optional[int] = None
     miss_penalty_us: Optional[int] = None
     direct_io: Optional[bool] = None
+    eviction: str = ""              # from run_info.csv; empty if the binary didn't write it
 
     # 1 - misses / visits: how often a page visit found the page in the pool.
     @property
@@ -365,6 +382,7 @@ class WorkloadStats:
     lookup_misses: Optional[int]
     policy_ms: Optional[float] = None
     correct: str = ""               # "passed/total" against SQLite, empty if not checked
+    eviction: str = ""              # from run_info.csv; empty if the binary didn't write it
 
     # 1 - misses / visits: how often a page visit found the page in the pool.
     @property
@@ -588,6 +606,7 @@ def run_shilmandb_config(binary: Path, sf: str, config_name: str, data_dir: Path
             qs.pool_size = pool_size
             qs.miss_penalty_us = options.miss_penalty_us
             qs.direct_io = options.direct_io
+            qs.eviction = info.get("eviction", "")
         return stats
 
 
@@ -614,7 +633,8 @@ def run_workload_config(binary: Path, sf: str, config_name: str, data_dir: Path,
             if src.exists():
                 shutil.copyfile(src, results_parent / f"{name}_sf{sf}.csv")
 
-        warn_on_db_pages_mismatch(read_run_info(tmp_path / "run_info.csv"), sf)
+        info = read_run_info(tmp_path / "run_info.csv")
+        warn_on_db_pages_mismatch(info, sf)
         try:
             totals = parse_stream_totals(tmp_path / "stream_totals.csv")
             policy_ms = read_policy_total_ms(tmp_path / "policy_time.csv")
@@ -632,6 +652,7 @@ def run_workload_config(binary: Path, sf: str, config_name: str, data_dir: Path,
             miss_penalty_us=options.miss_penalty_us,
             direct_io=options.direct_io,
             policy_ms=policy_ms,
+            eviction=info.get("eviction", ""),
             **totals,
         )
 
@@ -774,7 +795,7 @@ def _fmt_flag(x: Optional[bool]) -> str:
 LATENCIES_HEADER: List[str] = [
     "sf", "query", "config", "median_latency_ms", "rows", "hits", "misses",
     "visits", "page_hit_rate", "reads", "read_ms", "us_per_read", "policy_ms",
-    "pool_size", "miss_penalty_us", "direct_io",
+    "pool_size", "miss_penalty_us", "direct_io", "eviction",
 ]
 
 #write latencies.csv with the LATENCIES_HEADER columns; fields a binary didn't write stay empty
@@ -802,6 +823,7 @@ def write_latencies_csv(path: Path, records: Dict[Tuple[str, str, str], QuerySta
                 _fmt_int(qs.pool_size),
                 _fmt_int(qs.miss_penalty_us),
                 _fmt_flag(qs.direct_io),
+                qs.eviction,
             ])
     print(f"  -> {path}")
 
@@ -853,21 +875,21 @@ def write_hit_rates_csv(path: Path, records: Dict[Tuple[str, str, str], QuerySta
         return 4
 
     keys = sorted(raw_rates.keys(), key=lambda k: (k[0], _config_rank(k[1]), k[1]))
+    eviction_by_config = {(sf, config): stats_list[0].eviction for (sf, config), stats_list in by_sc.items()}
 
     with path.open("w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["sf", "config", "pool_size", "pool_fraction", "miss_penalty_us",
-                    "direct_io", "hit_rate", "raw_hit_rate", "improvement_over_lru"])
+        w.writerow(["sf", "config", "pool_size", "pool_fraction", "miss_penalty_us", "direct_io", "hit_rate", "raw_hit_rate", "improvement_over_lru", "eviction"])
 
         for (sf, config) in keys:
             ps = pool_sizes_by_config.get((sf, config), "")
             if config.startswith("sqlite_"):
-                w.writerow([sf, config, ps, "", "", "", "", "", ""])
+                w.writerow([sf, config, ps, "", "", "", "", "", "", ""])
                 continue
 
             options = parse_label(config)
             rate = page_rates[(sf, config)]
-            baseline_label = "baseline" + config[len(options.base):]
+            baseline_label = config_label("baseline", options.miss_penalty_us, options.direct_io, options.fraction, options.workload, options.seed or 1)
             base_rate = page_rates.get((sf, baseline_label))
             if rate is None or base_rate is None or config == baseline_label:
                 improvement = ""
@@ -880,6 +902,7 @@ def write_hit_rates_csv(path: Path, records: Dict[Tuple[str, str, str], QuerySta
                 "" if rate is None else f"{rate:.4f}",
                 f"{raw_rates[(sf, config)]:.4f}",
                 improvement,
+                eviction_by_config.get((sf, config), ""),
             ])
 
     print(f"  -> {path}")
@@ -888,7 +911,7 @@ def write_hit_rates_csv(path: Path, records: Dict[Tuple[str, str, str], QuerySta
 WORKLOADS_HEADER: List[str] = [
     "sf", "config", "workload", "seed", "items", "timed_passes", "pool_size", "pool_fraction",
     "miss_penalty_us", "direct_io", "median_total_ms", "misses", "visits", "page_hit_rate",
-    "reads", "read_ms", "us_per_read", "query_misses", "lookup_misses", "policy_ms", "correct",
+    "reads", "read_ms", "us_per_read", "query_misses", "lookup_misses", "policy_ms", "correct", "eviction",
 ]
 
 #write workloads.csv, one row per workload run, in the order given
@@ -906,7 +929,7 @@ def write_workloads_csv(path: Path, records: Sequence[WorkloadStats]) -> None:
                 _fmt_int(r.misses), _fmt_int(r.visits), _fmt_float(r.page_hit_rate),
                 _fmt_int(r.reads), _fmt_float(r.read_ms), _fmt_float(r.us_per_read),
                 _fmt_int(r.query_misses), _fmt_int(r.lookup_misses),
-                _fmt_float(r.policy_ms), r.correct,
+                _fmt_float(r.policy_ms), r.correct, r.eviction,
             ])
     print(f"  -> {path}")
 
@@ -1087,6 +1110,13 @@ def fraction_list(text: str) -> List[float]:
     return list(dict.fromkeys(values))
 
 
+def eviction_policy_list(text: str) -> List[str]:
+    values = _comma_list(text, str.strip, "--eviction-policies expects names")
+    if not values or any(v not in EVICTION_POLICIES for v in values):
+        raise argparse.ArgumentTypeError(f"--eviction-policies expects names from {','.join(EVICTION_POLICIES)}, e.g. lru,arc")
+    return list(dict.fromkeys(values))
+
+
 def workload_list(text: str) -> List[str]:
     values = _comma_list(text, str.strip, "--workloads expects names")
     if not values or any(v not in WORKLOADS for v in values):
@@ -1127,6 +1157,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--direct-io", action="store_true", help="Read pages around the OS file cache (adds _direct to labels)")
     p.add_argument("--pool-fractions", type=fraction_list, default=[], help="Comma list of pool sizes as fractions of the tables' pages (0 to 1]; runs baseline once per fraction per SF (+index for the lookup and mixed workloads)")
     p.add_argument("--policy-timing", action="store_true", help="Also time the eviction policy per query (fills policy_ms)")
+    p.add_argument("--eviction-policies", type=eviction_policy_list, default=["lru"], help=f"Comma list of eviction policies from {','.join(EVICTION_POLICIES)}; every ShilmanDB config runs once per policy (default lru). +learned is V2 eviction, so it runs once, not once per policy. single runs start from the pool the load left (warm); the other workloads start from an empty pool (cold)")
     p.add_argument("--workloads", type=workload_list, default=["single"], help=f"Comma list of workloads from {','.join(WORKLOADS)}; single is one query at a time (default single). lookup and mixed run on every config; without indexes each lookup scans its table")
     p.add_argument("--seed", type=seed_value, default=1, help="Seed for the random queries of the non-single workloads (default 1)")
     p.add_argument("--stream-length", type=stream_length_value, default=None, help="Items per pass for every non-single workload (default: load_tpch's default for the scale factor)")
@@ -1173,6 +1204,8 @@ def main() -> int:
         print(f"  workloads={args.workloads}, seed={args.seed}, stream_length={args.stream_length}")
 
     shilmandb_configs = [c for c in configs if c in PRIMARY_CONFIGS]
+    if "+learned" in shilmandb_configs and args.eviction_policies != ["lru"]:
+        print("  note: +learned is V2 eviction, so it runs once, not once per policy")
     # latencies.csv, hit_rates.csv and correctness.csv describe single-query runs only, so a call
     # that makes none (workloads only) must leave them alone.
     runs_single = "single" in args.workloads
@@ -1196,14 +1229,14 @@ def main() -> int:
     workload_records: List[WorkloadStats] = []
 
     def run_single(spec: RunSpec) -> None:
-        label = config_label(spec.base, spec.penalty, args.direct_io, spec.fraction)
+        label = config_label(spec.base, spec.penalty, args.direct_io, spec.fraction, eviction=spec.eviction)
         section(f"ShilmanDB {label} @ SF={spec.sf}")
         stats = run_shilmandb_config(
             binary=args.binary, sf=spec.sf, config_name=spec.base,
             data_dir=args.data_dir, output_dir=output_dir,
             pool_size=spec.pool, warmup_runs=args.warmup, timed_runs=args.runs,
             timeout_seconds=args.timeout, label=label,
-            extra_flags=option_flags(spec.penalty, args.direct_io, args.policy_timing),
+            extra_flags=option_flags(spec.penalty, args.direct_io, args.policy_timing, spec.eviction),
         )
         pool_sizes_by_config[(spec.sf, label)] = spec.pool
         if label not in ran_labels:
@@ -1214,21 +1247,21 @@ def main() -> int:
             all_records[(spec.sf, label, q)] = qs
 
     def run_workload(spec: RunSpec) -> None:
-        label = config_label(spec.base, spec.penalty, args.direct_io, spec.fraction, spec.workload, args.seed)
+        label = config_label(spec.base, spec.penalty, args.direct_io, spec.fraction, spec.workload, args.seed, spec.eviction)
         section(f"ShilmanDB {label} @ SF={spec.sf}")
         stats = run_workload_config(
             binary=args.binary, sf=spec.sf, config_name=spec.base,
             data_dir=args.data_dir, output_dir=output_dir,
             pool_size=spec.pool, warmup_runs=args.warmup, timed_runs=args.runs,
             timeout_seconds=args.timeout, label=label,
-            extra_flags=(workload_flags(spec.workload, args.seed, args.stream_length) + option_flags(spec.penalty, args.direct_io, args.policy_timing)),
+            extra_flags=(workload_flags(spec.workload, args.seed, args.stream_length) + option_flags(spec.penalty, args.direct_io, args.policy_timing, spec.eviction)),
         )
         if stats is None:
             eprint(f"  ! {label} @ SF={spec.sf} failed - skipping")
             return
         workload_records.append(stats)
 
-    for spec in planned_runs(sfs, shilmandb_configs, args.workloads, args.miss_penalty_us, args.pool_fractions):
+    for spec in planned_runs(sfs, shilmandb_configs, args.workloads, args.miss_penalty_us, args.pool_fractions, args.eviction_policies):
         (run_single if spec.workload == "single" else run_workload)(spec)
 
     if args.pool_sweep:
