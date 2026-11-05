@@ -1,5 +1,6 @@
 #include "buffer/lru_eviction_policy.hpp"
 #include "common/exception.hpp"
+#include <algorithm>
 
 namespace shilmandb {
 
@@ -75,6 +76,12 @@ void LRUEvictionPolicy::Remove(frame_id_t frame_id) {
 
 size_t LRUEvictionPolicy::Size() const {
     return evictable_count_;
+}
+
+void LRUEvictionPolicy::Reset() {
+    lru_list_.clear();
+    std::fill(frames_.begin(), frames_.end(), FrameState{});
+    evictable_count_ = 0;
 }
 
 }  // namespace shilmandb

@@ -282,4 +282,52 @@ TEST(LRUEvictionPolicyTest, OutOfRangeFrameThrows) {
     EXPECT_FALSE(lru.Evict().has_value());
 }
 
+// ---------------------------------------------------------------------------
+// Test 12: ResetForgetsEverything
+// ---------------------------------------------------------------------------
+TEST(LRUEvictionPolicyTest, ResetForgetsEverything) {
+    constexpr size_t kFrames = 8;
+    LRUEvictionPolicy lru(kFrames);
+
+    for (frame_id_t f = 0; f < kFrames; ++f) {
+        lru.RecordAccess(f);
+    }
+    lru.SetEvictable(2, false);
+    lru.RecordAccess(5);
+    ASSERT_EQ(*lru.Evict(), 0u);
+
+    lru.Reset();
+    EXPECT_EQ(lru.Size(), 0u);
+    EXPECT_FALSE(lru.Evict().has_value());
+
+    // from here it acts exactly like a new policy
+    LRUEvictionPolicy fresh(kFrames);
+    std::mt19937 rng(3);
+    for (int i = 0; i < 20000; ++i) {
+        frame_id_t frame = rng() % kFrames;
+        switch (rng() % 6) {
+            case 0: case 1:
+                lru.RecordAccess(frame);
+                fresh.RecordAccess(frame);
+                break;
+            case 2:
+                lru.SetEvictable(frame, true);
+                fresh.SetEvictable(frame, true);
+                break;
+            case 3:
+                lru.SetEvictable(frame, false);
+                fresh.SetEvictable(frame, false);
+                break;
+            case 4:
+                ASSERT_EQ(lru.Evict(), fresh.Evict()) << "op " << i;
+                break;
+            default:
+                lru.Remove(frame);
+                fresh.Remove(frame);
+                break;
+        }
+        ASSERT_EQ(lru.Size(), fresh.Size()) << "op " << i;
+    }
+}
+
 }  // namespace shilmandb

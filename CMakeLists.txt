@@ -24,7 +24,12 @@ file(GLOB_RECURSE CORE_SOURCES
     src/storage/*.cpp
     src/buffer/buffer_pool_manager.cpp
     src/buffer/lru_eviction_policy.cpp
+    src/buffer/clock_eviction_policy.cpp
+    src/buffer/lru2_eviction_policy.cpp
+    src/buffer/arc_eviction_policy.cpp
+    src/buffer/lirs_eviction_policy.cpp
     src/buffer/timed_eviction_policy.cpp
+    src/buffer/eviction_policy_factory.cpp
     src/index/*.cpp
     src/catalog/*.cpp
     src/types/*.cpp

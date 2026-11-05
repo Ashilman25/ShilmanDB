@@ -17,6 +17,9 @@ public:
     void RecordAccess(frame_id_t frame_id, page_id_t page_id) override {
         two_arg_record.emplace_back(frame_id, page_id);
     }
+    void RecordAccess(frame_id_t frame_id, page_id_t page_id, AccessType type) override {
+        typed_record.push_back({frame_id, page_id, type});
+    }
     void SetEvictable(frame_id_t frame_id, bool evictable) override {
         set_evictable.emplace_back(frame_id, evictable);
     }
@@ -24,14 +27,29 @@ public:
         ++evict_calls;
         return 5;
     }
+    std::optional<frame_id_t> Evict(page_id_t incoming_page) override {
+        evict_pages.push_back(incoming_page);
+        return 6;
+    }
     void Remove(frame_id_t frame_id) override { removed.push_back(frame_id); }
     size_t Size() const override { return 3; }
+    bool UsesAccessTypes() const override { return true; }
+    void Reset() override { ++reset_calls; }
+
+    struct TypedRecord {
+        frame_id_t frame;
+        page_id_t page;
+        AccessType type;
+    };
 
     std::vector<frame_id_t> one_arg_record;
     std::vector<std::pair<frame_id_t, page_id_t>> two_arg_record;
+    std::vector<TypedRecord> typed_record;
     std::vector<std::pair<frame_id_t, bool>> set_evictable;
     std::vector<frame_id_t> removed;
+    std::vector<page_id_t> evict_pages;
     int evict_calls{0};
+    int reset_calls{0};
 };
 
 }  // namespace
@@ -66,6 +84,37 @@ TEST(TimedEvictionPolicyTest, ForwardsEveryCall) {
     EXPECT_EQ(stats.evict_calls, 1u);
     EXPECT_EQ(stats.remove_calls, 1u);
     EXPECT_EQ(stats.TotalCalls(), 5u);
+}
+
+TEST(TimedEvictionPolicyTest, ForwardsNewCalls) {
+    FakePolicy fake;
+    TimedEvictionPolicy timed(&fake);
+
+    timed.RecordAccess(3, 77, AccessType::TOUCH);
+    auto victim = timed.Evict(7);
+    const bool uses_types = timed.UsesAccessTypes();
+    timed.Reset();
+
+    ASSERT_EQ(fake.typed_record.size(), 1u);
+    EXPECT_EQ(fake.typed_record[0].frame, 3u);
+    EXPECT_EQ(fake.typed_record[0].page, 77u);
+    EXPECT_EQ(fake.typed_record[0].type, AccessType::TOUCH);
+    EXPECT_TRUE(fake.two_arg_record.empty());  // not turned into the old call
+
+    EXPECT_EQ(fake.evict_pages, std::vector<page_id_t>{7});
+    EXPECT_EQ(fake.evict_calls, 0);
+    ASSERT_TRUE(victim.has_value());
+    EXPECT_EQ(*victim, 6u);
+
+    EXPECT_TRUE(uses_types);  // the default would say false
+    EXPECT_EQ(fake.reset_calls, 1);
+
+    // the typed call counts as a record call and Evict(page) as an evict call;
+    // Reset and UsesAccessTypes are not counted
+    const PolicyStats& stats = timed.GetStats();
+    EXPECT_EQ(stats.record_calls, 1u);
+    EXPECT_EQ(stats.evict_calls, 1u);
+    EXPECT_EQ(stats.TotalCalls(), 2u);
 }
 
 TEST(TimedEvictionPolicyTest, MatchesWrappedLRU) {

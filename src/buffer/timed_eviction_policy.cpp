@@ -62,6 +62,11 @@ void TimedEvictionPolicy::RecordAccess(frame_id_t frame_id, page_id_t page_id) {
     inner_->RecordAccess(frame_id, page_id);
 }
 
+void TimedEvictionPolicy::RecordAccess(frame_id_t frame_id, page_id_t page_id, AccessType type) {
+    CallTimer timer(stats_.record_calls, stats_.record_time);
+    inner_->RecordAccess(frame_id, page_id, type);
+}
+
 void TimedEvictionPolicy::SetEvictable(frame_id_t frame_id, bool evictable) {
     CallTimer timer(stats_.set_evictable_calls, stats_.set_evictable_time);
     inner_->SetEvictable(frame_id, evictable);
@@ -72,12 +77,21 @@ std::optional<frame_id_t> TimedEvictionPolicy::Evict() {
     return inner_->Evict();
 }
 
+std::optional<frame_id_t> TimedEvictionPolicy::Evict(page_id_t incoming_page) {
+    CallTimer timer(stats_.evict_calls, stats_.evict_time);
+    return inner_->Evict(incoming_page);
+}
+
 void TimedEvictionPolicy::Remove(frame_id_t frame_id) {
     CallTimer timer(stats_.remove_calls, stats_.remove_time);
     inner_->Remove(frame_id);
 }
 
 size_t TimedEvictionPolicy::Size() const { return inner_->Size(); }
+
+bool TimedEvictionPolicy::UsesAccessTypes() const { return inner_->UsesAccessTypes(); }
+
+void TimedEvictionPolicy::Reset() { inner_->Reset(); }
 
 const PolicyStats& TimedEvictionPolicy::GetStats() const { return stats_; }
 

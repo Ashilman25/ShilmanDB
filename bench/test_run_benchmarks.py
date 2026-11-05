@@ -19,11 +19,11 @@ spec.loader.exec_module(mod)
 LATENCIES_HEADER = [
     "sf", "query", "config", "median_latency_ms", "rows", "hits", "misses",
     "visits", "page_hit_rate", "reads", "read_ms", "us_per_read", "policy_ms",
-    "pool_size", "miss_penalty_us", "direct_io",
+    "pool_size", "miss_penalty_us", "direct_io", "eviction",
 ]
 HIT_RATES_HEADER = [
     "sf", "config", "pool_size", "pool_fraction", "miss_penalty_us", "direct_io",
-    "hit_rate", "raw_hit_rate", "improvement_over_lru",
+    "hit_rate", "raw_hit_rate", "improvement_over_lru", "eviction",
 ]
 
 
@@ -490,7 +490,7 @@ def test_parse_stream_items_per_tag(tmp_path: Path) -> None:
 WORKLOADS_HEADER = [
     "sf", "config", "workload", "seed", "items", "timed_passes", "pool_size", "pool_fraction",
     "miss_penalty_us", "direct_io", "median_total_ms", "misses", "visits", "page_hit_rate",
-    "reads", "read_ms", "us_per_read", "query_misses", "lookup_misses", "policy_ms", "correct",
+    "reads", "read_ms", "us_per_read", "query_misses", "lookup_misses", "policy_ms", "correct", "eviction",
 ]
 
 
@@ -568,3 +568,96 @@ def test_workload_only_call_leaves_single_files_alone(tmp_path: Path, monkeypatc
     text = capsys.readouterr().out
     assert "SQLite configs only run with the single workload" in text
     assert "latencies" not in text.split("Done")[-1]
+
+
+# eviction policies
+def test_config_label_eviction_suffix() -> None:
+    assert mod.config_label("+index", 100, False, None, "stream", 1, eviction="lirs") == "+index_stream_s1_lirs_pen100"
+    assert mod.config_label("baseline", eviction="lru") == "baseline"
+    assert mod.config_label("baseline", 0, False, 0.25, eviction="arc") == "baseline_arc_frac0.25"
+
+
+def test_parse_label_eviction() -> None:
+    o = mod.parse_label("+index_stream_s1_lirs_pen100")
+    assert (o.base, o.eviction, o.workload, o.seed, o.miss_penalty_us) == ("+index", "lirs", "stream", 1, 100)
+    assert mod.parse_label("baseline_frac0.25").eviction == "lru"
+    assert mod.parse_label("baseline_clock").base == "baseline"
+
+
+def test_planned_runs_skip_learned_for_other_policies() -> None:
+    runs = mod.planned_runs(["0.01"], ["baseline", "+learned"], ["single"], [0], [], evictions=["lru", "arc"])
+    assert [(r.base, r.eviction) for r in runs] == [("baseline", "lru"), ("baseline", "arc"), ("+learned", "lru")]
+
+
+def test_planned_runs_keep_learned_without_lru() -> None:
+    runs = mod.planned_runs(["0.01"], ["baseline", "+learned"], ["single"], [0, 100], [], evictions=["arc", "lirs"])
+    assert [(r.base, r.eviction, r.penalty) for r in runs] == [
+        ("baseline", "arc", 0), ("baseline", "arc", 100), ("baseline", "lirs", 0), ("baseline", "lirs", 100),
+        ("+learned", "lru", 0), ("+learned", "lru", 100)]
+
+
+def test_option_flags_eviction() -> None:
+    assert mod.option_flags(eviction="arc") == ["--eviction-policy", "arc"]
+    assert mod.option_flags(eviction="lru") == []
+    assert mod.option_flags() == []
+
+
+def test_eviction_policies_arg_rejects_unknown() -> None:
+    import argparse
+    assert mod.eviction_policy_list("lru,arc,lirs") == ["lru", "arc", "lirs"]
+    for bad in ("foo", "learned-v2", "lru,learned-v1"):
+        with pytest.raises(argparse.ArgumentTypeError):
+            mod.eviction_policy_list(bad)
+
+
+def test_improvement_over_lru_against_lru_baseline(tmp_path: Path) -> None:
+    records = {
+        ("0.01", "baseline", "Q1"): _stats("0.01", "baseline", "Q1", 100, 40, 100),
+        ("0.01", "baseline_lirs", "Q1"): _stats("0.01", "baseline_lirs", "Q1", 100, 30, 100),
+    }
+    out = tmp_path / "hit_rates.csv"
+    mod.write_hit_rates_csv(out, records, {("0.01", "baseline"): 128, ("0.01", "baseline_lirs"): 128})
+    by_cfg = {r["config"]: r for r in _read_dicts(out)}
+    assert by_cfg["baseline"]["improvement_over_lru"] == ""
+    assert by_cfg["baseline_lirs"]["improvement_over_lru"] == "0.1000"
+
+
+def test_eviction_column(tmp_path: Path) -> None:
+    lat = tmp_path / "lat.csv"
+    lat.write_text("query,run,rows,latency_ms,hits,misses\nQ1,0,4,1.0,10,5\n")
+    qs = mod.parse_shilmandb_latencies(lat, "0.01", "baseline_arc")["Q1"]
+    assert qs.eviction == ""
+    qs.eviction = "arc"
+    plain = _stats("0.01", "baseline", "Q1", 100, 40, 100)
+    out = tmp_path / "latencies.csv"
+    mod.write_latencies_csv(out, {("0.01", "baseline_arc", "Q1"): qs, ("0.01", "baseline", "Q1"): plain})
+    rows = {r["config"]: r for r in _read_dicts(out)}
+    assert list(rows["baseline_arc"])[-1] == "eviction"
+    assert rows["baseline_arc"]["eviction"] == "arc"
+    assert rows["baseline"]["eviction"] == ""
+
+    hr = tmp_path / "hit_rates.csv"
+    mod.write_hit_rates_csv(hr, {("0.01", "baseline_arc", "Q1"): qs}, {("0.01", "baseline_arc"): 128})
+    assert _read_dicts(hr)[0]["eviction"] == "arc"
+
+    wl = tmp_path / "workloads.csv"
+    mod.write_workloads_csv(wl, [_workload_stats("baseline_stream_s1_arc", 128, eviction="arc"),
+                                 _workload_stats("baseline_stream_s1", 128)])
+    got = _read_dicts(wl)
+    assert [r["eviction"] for r in got] == ["arc", ""]
+    assert list(got[0])[-1] == "eviction"
+
+
+def test_run_info_eviction_is_read(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    binary = tmp_path / "fake_load_tpch"
+    binary.write_text(
+        "#!/bin/sh\nwhile [ $# -gt 0 ]; do [ \"$1\" = --results-dir ] && d=\"$2\"; shift; done\n"
+        "mkdir -p \"$d\"\n"
+        "printf 'query,run,rows,latency_ms,hits,misses\\nQ1,0,4,1.0,10,5\\n' > \"$d/latencies.csv\"\n"
+        "printf 'key,value\\neviction,arc\\n' > \"$d/run_info.csv\"\n")
+    binary.chmod(0o755)
+    stats = mod.run_shilmandb_config(
+        binary=binary, sf="0.01", config_name="baseline", data_dir=tmp_path,
+        output_dir=tmp_path / "out", pool_size=128, warmup_runs=0, timed_runs=1,
+        timeout_seconds=30, label="baseline_arc", extra_flags=mod.option_flags(eviction="arc"))
+    assert stats is not None and stats["Q1"].eviction == "arc"

@@ -104,6 +104,16 @@ auto LearnedEvictionPolicyV2::Size() const -> size_t {
     return evictable_frames_.size();
 }
 
+// New containers rather than clear(), which keeps the bucket count and so would change the
+// order frames are scored in when scores tie
+void LearnedEvictionPolicyV2::Reset() {
+    global_clock_ = 0;
+    last_access_ts_ = std::unordered_map<frame_id_t, uint64_t>{};
+    second_last_access_ts_ = std::unordered_map<frame_id_t, uint64_t>{};
+    access_count_ = std::unordered_map<frame_id_t, uint32_t>{};
+    evictable_frames_ = std::unordered_set<frame_id_t>{};
+}
+
 }  // namespace shilmandb
 
 #endif  // SHILMANDB_HAS_LIBTORCH

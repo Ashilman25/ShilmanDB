@@ -13,8 +13,7 @@ LearnedEvictionPolicy::LearnedEvictionPolicy(const std::string& model_path) {
         model_ = torch::jit::load(model_path);
         model_.eval();
     } catch (const std::exception& e) {
-        throw DatabaseException(
-            "Failed to load eviction model from '" + model_path + "': " + e.what());
+        throw DatabaseException("Failed to load eviction model from '" + model_path + "': " + e.what());
     }
 }
 
@@ -116,6 +115,15 @@ void LearnedEvictionPolicy::Remove(frame_id_t frame_id) {
 
 auto LearnedEvictionPolicy::Size() const -> size_t {
     return evictable_frames_.size();
+}
+
+// New containers rather than clear(), which keeps the bucket count and so would change the
+// order frames are visited in when scores tie
+void LearnedEvictionPolicy::Reset() {
+    access_history_ = std::deque<int64_t>{};
+    frame_to_page_ = std::unordered_map<frame_id_t, page_id_t>{};
+    page_to_frame_ = std::unordered_map<page_id_t, frame_id_t>{};
+    evictable_frames_ = std::unordered_set<frame_id_t>{};
 }
 
 }  // namespace shilmandb

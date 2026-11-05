@@ -1,4 +1,5 @@
 #include "engine/database.hpp"
+#include "buffer/eviction_policy_factory.hpp"
 #include "executor/executor.hpp"
 #include "common/exception.hpp"
 #include "tpch_streams.hpp"
@@ -18,6 +19,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <unordered_set>
@@ -47,12 +49,12 @@ struct Args {
     uint64_t seed{1};
     std::optional<size_t> stream_length;  // set to the scale factor's default when not given
     bool trace_collapse{false};
+    EvictionPolicyKind eviction{EvictionPolicyKind::LRU};
+    std::string eviction_model_path;
+    bool keep_load_pool{false};  // a workload starts with the pool the load left, not an empty one
 #ifdef SHILMANDB_HAS_LIBTORCH
     bool use_learned_join{false};
     std::string join_model_path;
-    bool use_learned_eviction{false};
-    std::string eviction_model_path;
-    std::string eviction_version{"v2"};
 #endif
 };
 
@@ -63,11 +65,11 @@ static void PrintUsage(const char* prog) {
               << " [--results-dir <path>]"
               << " [--execution-mode <tuple|vectorized>]"
               << " [--miss-penalty-us <N>] [--direct-io] [--policy-timing] [--planner-read-us <X>]"
-              << " [--workload <single|stream|lookup|mixed>] [--stream-length <N>] [--seed <S>]"
+              << " [--workload <single|stream|lookup|mixed>] [--stream-length <N>] [--seed <S>] [--keep-load-pool]"
+              << " [--eviction-policy <lru|clock|lru2|arc|lirs|learned-v2|learned-v1>] [--eviction-model-path <path>]"
 #ifdef SHILMANDB_HAS_LIBTORCH
               << " [--use-learned-join --join-model-path <path>]"
-              << " [--use-learned-eviction --eviction-model-path <path>]"
-              << " [--eviction-model-version <v1|v2>]"
+              << " [--use-learned-eviction (same as --eviction-policy learned-v2)] [--eviction-model-version <v1|v2>]"
 #endif
               << "\n";
 }
@@ -75,6 +77,17 @@ static void PrintUsage(const char* prog) {
 [[noreturn]] static void ExitWithError(const std::string& message) {
     std::cerr << "Error: " << message << "\n";
     std::exit(1);
+}
+
+static bool IsLearned(EvictionPolicyKind kind) {
+    return kind == EvictionPolicyKind::LEARNED_V1 || kind == EvictionPolicyKind::LEARNED_V2;
+}
+
+// The name run_info.csv records. The learned ones keep their old names, v2 and v1.
+static std::string RunInfoEvictionName(EvictionPolicyKind kind) {
+    if (kind == EvictionPolicyKind::LEARNED_V2) return "v2";
+    if (kind == EvictionPolicyKind::LEARNED_V1) return "v1";
+    return std::string(EvictionPolicyKindName(kind));
 }
 
 // A string made only of digits, as a number. Nothing for anything else, or a number too big.
@@ -92,6 +105,11 @@ static std::optional<uint64_t> ParseUnsigned(const std::string& text) {
 static Args ParseArgs(int argc, char* argv[]) {
     Args args;
     bool seed_given = false;
+    std::string policy_name;  // what --eviction-policy said, empty if not given
+    bool use_learned_eviction = false;
+    std::string eviction_version{"v2"};
+    bool version_given = false;
+
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--sf" && i + 1 < argc) {
@@ -187,17 +205,27 @@ static Args ParseArgs(int argc, char* argv[]) {
             seed_given = true;
         } else if (arg == "--trace-collapse") {
             args.trace_collapse = true;
+        } else if (arg == "--keep-load-pool") {
+            args.keep_load_pool = true;
+        } else if (arg == "--eviction-policy" && i + 1 < argc) {
+            policy_name = argv[++i];
+            const auto kind = ParseEvictionPolicyKind(policy_name);
+            if (!kind) {
+                ExitWithError("unknown --eviction-policy '" + policy_name + "' (expected lru, clock, lru2, arc, lirs, learned-v2 or learned-v1)");
+            }
+            args.eviction = *kind;
+        } else if (arg == "--use-learned-eviction") {
+            use_learned_eviction = true;
+        } else if (arg == "--eviction-model-path" && i + 1 < argc) {
+            args.eviction_model_path = argv[++i];
+        } else if (arg == "--eviction-model-version" && i + 1 < argc) {
+            eviction_version = argv[++i];
+            version_given = true;
 #ifdef SHILMANDB_HAS_LIBTORCH
         } else if (arg == "--use-learned-join") {
             args.use_learned_join = true;
         } else if (arg == "--join-model-path" && i + 1 < argc) {
             args.join_model_path = argv[++i];
-        } else if (arg == "--use-learned-eviction") {
-            args.use_learned_eviction = true;
-        } else if (arg == "--eviction-model-path" && i + 1 < argc) {
-            args.eviction_model_path = argv[++i];
-        } else if (arg == "--eviction-model-version" && i + 1 < argc) {
-            args.eviction_version = argv[++i];
 #endif
         } else {
             PrintUsage(argv[0]);
@@ -213,15 +241,35 @@ static Args ParseArgs(int argc, char* argv[]) {
         std::cerr << "Error: --use-learned-join requires --join-model-path\n";
         std::exit(1);
     }
-    if (args.use_learned_eviction && args.eviction_model_path.empty()) {
-        std::cerr << "Error: --use-learned-eviction requires --eviction-model-path\n";
-        std::exit(1);
-    }
 #endif
+    if (use_learned_eviction && !policy_name.empty()) {
+        ExitWithError("--eviction-policy and --use-learned-eviction can't be used together "
+                      "(--use-learned-eviction means --eviction-policy learned-v2, or learned-v1 with --eviction-model-version v1)");
+    }
+    if (version_given && !policy_name.empty()) {
+        std::cerr << "Warning: --eviction-model-version is ignored with --eviction-policy (learned-v1 or learned-v2 names the version)\n";
+    }
+    // Only exactly "v2" means V2, as the database has always read it
+    if (use_learned_eviction) {
+        args.eviction = eviction_version == "v2" ? EvictionPolicyKind::LEARNED_V2 : EvictionPolicyKind::LEARNED_V1;
+    }
+    if (!args.eviction_model_path.empty() && !IsLearned(args.eviction)) {
+        std::cerr << "Warning: --eviction-model-path is ignored with eviction policy " << EvictionPolicyKindName(args.eviction)
+                  << " (only learned-v2 and learned-v1 use a model)\n";
+    }
+    if (IsLearned(args.eviction)) {
+        const std::string flag = use_learned_eviction ? "--use-learned-eviction" : "--eviction-policy " + policy_name;
+#ifdef SHILMANDB_HAS_LIBTORCH
+        if (args.eviction_model_path.empty()) ExitWithError(flag + " requires --eviction-model-path");
+#else
+        ExitWithError(flag + " needs a build with LibTorch (SHILMANDB_ENABLE_ML=ON)");
+#endif
+    }
     const bool single = args.workload == tpch::Workload::SINGLE;
     const std::string workload_name = tpch::WorkloadName(args.workload);
     if (single && args.stream_length) ExitWithError("--stream-length needs --workload stream, lookup or mixed");
     if (single && seed_given) ExitWithError("--seed needs --workload stream, lookup or mixed");
+    if (single && args.keep_load_pool) ExitWithError("--keep-load-pool needs --workload stream, lookup or mixed");
     if (args.trace_collapse && args.trace_path.empty()) ExitWithError("--trace-collapse needs --enable-tracing <path>");
     if (!single && !args.stream_length) {
         args.stream_length = tpch::DefaultStreamLength(args.workload, args.sf);
@@ -614,7 +662,8 @@ static int RunWorkload(Database& db, const Args& args, const RunInfo& info) {
             << "timed_passes," << args.timed_runs << "\n";
         if (args.workload == tpch::Workload::MIXED) ofs << "lookups_per_query," << tpch::kMixedLookupsPerQuery << "\n";
         if (has_lookups) ofs << "zipf_s," << tpch::kLookupZipfS << "\n";
-        ofs << "trace_collapse," << BoolText(args.trace_collapse) << "\n";
+        ofs << "trace_collapse," << BoolText(args.trace_collapse) << "\n"
+            << "cold_start," << BoolText(!args.keep_load_pool) << "\n";
     });
     if (!info_ok) return 1;
 
@@ -643,21 +692,28 @@ int main(int argc, char* argv[]) {
     std::cout << "Execution mode: "
               << (args.exec_mode == ExecutionMode::VECTORIZED ? "VECTORIZED" : "TUPLE")
               << "\n";
+    std::cout << "Eviction policy: " << EvictionPolicyKindName(args.eviction) << "\n";
+    const std::string eviction_name = RunInfoEvictionName(args.eviction);
 
+    std::string join_model_path;
 #ifdef SHILMANDB_HAS_LIBTORCH
-    Database db(args.db_file, args.pool_size,
-                args.use_learned_join, args.join_model_path,
-                args.use_learned_eviction, args.eviction_model_path,
-                args.eviction_version);
+    if (args.use_learned_join) join_model_path = args.join_model_path;
+#endif
+    std::unique_ptr<Database> db_owner;
+    try {
+        db_owner = std::make_unique<Database>(args.db_file, args.pool_size, args.eviction, args.eviction_model_path, join_model_path);
+    } catch (const std::exception& e) {
+        ExitWithError(std::string("could not open the database: ") + e.what());
+    }
+    Database& db = *db_owner;
+#ifdef SHILMANDB_HAS_LIBTORCH
     if (args.use_learned_join) {
         std::cout << "Learned join optimizer: ON (model: " << args.join_model_path << ")\n";
     }
-    if (args.use_learned_eviction) {
-        std::cout << "Learned eviction policy: ON (" << args.eviction_version << ", model: " << args.eviction_model_path << ")\n";
-    }
-#else
-    Database db(args.db_file, args.pool_size);
 #endif
+    if (IsLearned(args.eviction)) {
+        std::cout << "Learned eviction policy: ON (" << eviction_name << ", model: " << args.eviction_model_path << ")\n";
+    }
 
     if (args.direct_io) {
         try {
@@ -668,12 +724,6 @@ int main(int argc, char* argv[]) {
         }
         std::cout << "Direct I/O: ON\n";
     }
-
-    std::string eviction_name = "lru";
-#ifdef SHILMANDB_HAS_LIBTORCH
-    // Database runs V2 only for exactly "v2"; any other string gets V1
-    if (args.use_learned_eviction) eviction_name = (args.eviction_version == "v2") ? "v2" : "v1";
-#endif
 
     try {
         tpch::LoadTables(db, args.data_dir);
@@ -722,6 +772,18 @@ int main(int argc, char* argv[]) {
 
     const bool single = args.workload == tpch::Workload::SINGLE;
     bool run_queries = !single || args.verify || !args.trace_path.empty() || !args.results_dir.empty();
+
+    // A workload starts from an empty pool and a fresh policy, like a restart after the load.
+    // Done before tracing starts, so the trace and the pool start at the same point.
+    if (!single && !args.keep_load_pool) {
+        try {
+            db.GetBufferPoolManager()->DropAllPages();
+        } catch (const std::exception& e) {
+            std::cerr << "Error: could not empty the pool: " << e.what() << "\n";
+            return 1;
+        }
+        std::cout << "Pool emptied before the workload (cold start)\n";
+    }
 
     if (!args.trace_path.empty()) {
         if (!args.verify) {

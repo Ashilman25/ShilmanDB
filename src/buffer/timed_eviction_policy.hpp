@@ -43,13 +43,19 @@ public:
 
     void RecordAccess(frame_id_t frame_id) override;
     void RecordAccess(frame_id_t frame_id, page_id_t page_id) override;
+    void RecordAccess(frame_id_t frame_id, page_id_t page_id, AccessType type) override;
     void SetEvictable(frame_id_t frame_id, bool evictable) override;
 
     [[nodiscard]] std::optional<frame_id_t> Evict() override;
+    [[nodiscard]] std::optional<frame_id_t> Evict(page_id_t incoming_page) override;
     void Remove(frame_id_t frame_id) override;
 
-    // Not timed: it is a plain read
+    // Not timed: plain reads
     [[nodiscard]] size_t Size() const override;
+    [[nodiscard]] bool UsesAccessTypes() const override;
+
+    // Not timed: it only runs on a cold start, not per fetch
+    void Reset() override;
 
     [[nodiscard]] const PolicyStats& GetStats() const;
 

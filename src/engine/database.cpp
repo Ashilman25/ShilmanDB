@@ -1,21 +1,16 @@
 #include "engine/database.hpp"
 
-#include "buffer/lru_eviction_policy.hpp"
 #include "parser/parser.hpp"
 #include "planner/planner.hpp"
 #include "executor/executor_factory.hpp"
 #include "executor/executor_context.hpp"
 #include "common/exception.hpp"
 
-#ifdef SHILMANDB_HAS_LIBTORCH
-#include "buffer/learned_eviction_policy.hpp"
-#include "buffer/learned_eviction_policy_v2.hpp"
-#endif
-
 #include <algorithm>
 #include <chrono>
 #include <fstream>
 #include <sstream>
+#include <utility>
 
 namespace shilmandb {
 
@@ -79,6 +74,12 @@ void CollectOperators(const PlanNode* node, int depth, const OperatorStatsMap& o
     }
 }
 
+// What the older ML constructor's flags mean as a policy kind
+[[nodiscard]] EvictionPolicyKind EvictionKindFor(bool use_learned_eviction, const std::string& eviction_version) {
+    if (!use_learned_eviction) return EvictionPolicyKind::LRU;
+    return eviction_version == "v2" ? EvictionPolicyKind::LEARNED_V2 : EvictionPolicyKind::LEARNED_V1;
+}
+
 void FillAnalyzeProfile(const Planner& planner, const PlanNode* root, const OperatorStatsMap& op_stats, QueryProfile& profile) {
     for (const auto* step : planner.GetStepNodes()) {
         profile.step_rows.push_back(StatsFor(op_stats, step).rows);
@@ -94,35 +95,37 @@ void FillAnalyzeProfile(const Planner& planner, const PlanNode* root, const Oper
 
 }  // namespace
 
-Database::Database(const std::string& db_file, size_t buffer_pool_size) {
+Database::Database(const std::string& db_file, size_t buffer_pool_size) : Database(db_file, buffer_pool_size, EvictionPolicyKind::LRU) {}
+
+Database::Database(const std::string& db_file, size_t buffer_pool_size, EvictionPolicyKind eviction, const std::string& eviction_model_path, const std::string& join_model_path) {
+#ifndef SHILMANDB_HAS_LIBTORCH
+    // Checked first, so nothing is created
+    if (!join_model_path.empty()) {
+        throw DatabaseException("a learned join model needs a build with LibTorch (SHILMANDB_ENABLE_ML=ON)");
+    }
+#endif
+
+    // Built before the file is opened, so a policy that can't be built creates nothing either
+    auto policy = MakeEvictionPolicy(eviction, buffer_pool_size, eviction_model_path);
     disk_manager_ = std::make_unique<DiskManager>(db_file);
-    auto eviction = std::make_unique<LRUEvictionPolicy>(buffer_pool_size);
-    bpm_ = std::make_unique<BufferPoolManager>(buffer_pool_size, disk_manager_.get(), std::move(eviction));
+    bpm_ = std::make_unique<BufferPoolManager>(buffer_pool_size, disk_manager_.get(), std::move(policy));
     catalog_ = std::make_unique<Catalog>(bpm_.get());
+
+#ifdef SHILMANDB_HAS_LIBTORCH
+    if (!join_model_path.empty()) {
+        learned_join_optimizer_ = std::make_unique<LearnedJoinOptimizer>(join_model_path);
+    }
+#endif
 }
 
 Database::~Database() = default;
 
 #ifdef SHILMANDB_HAS_LIBTORCH
-Database::Database(const std::string& db_file, size_t buffer_pool_size, bool use_learned_join, const std::string& join_model_path, bool use_learned_eviction, const std::string& eviction_model_path, const std::string& eviction_version) {
-    disk_manager_ = std::make_unique<DiskManager>(db_file);
-
-    std::unique_ptr<EvictionPolicy> eviction;
-    if (use_learned_eviction) {
-        if (eviction_version == "v2") {
-            eviction = std::make_unique<LearnedEvictionPolicyV2>(eviction_model_path);
-        } else {
-            eviction = std::make_unique<LearnedEvictionPolicy>(eviction_model_path);
-        }
-    } else {
-        eviction = std::make_unique<LRUEvictionPolicy>(buffer_pool_size);
-    }
-    
-    bpm_ = std::make_unique<BufferPoolManager>(buffer_pool_size, disk_manager_.get(), std::move(eviction));
-    catalog_ = std::make_unique<Catalog>(bpm_.get());
-
-    if (use_learned_join) {
-        learned_join_optimizer_ = std::make_unique<LearnedJoinOptimizer>(join_model_path);
+Database::Database(const std::string& db_file, size_t buffer_pool_size, bool use_learned_join, const std::string& join_model_path, bool use_learned_eviction, const std::string& eviction_model_path, const std::string& eviction_version)
+    : Database(db_file, buffer_pool_size, EvictionKindFor(use_learned_eviction, eviction_version), eviction_model_path, use_learned_join ? join_model_path : std::string()) {
+    // Learned join with no model path has always been an error here
+    if (use_learned_join && join_model_path.empty()) {
+        throw DatabaseException("Failed to load join optimizer model: no model path given");
     }
 }
 #endif
