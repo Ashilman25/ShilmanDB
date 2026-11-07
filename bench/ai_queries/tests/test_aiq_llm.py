@@ -127,6 +127,8 @@ def test_nan_probs_raise(tmp_path):
 def test_extract_cleanup(tmp_path):
     assert llm.clean_extract(" iPhone 13.\nI love it") == "iPhone 13"
     assert llm.clean_extract("") == ""
+    assert llm.clean_extract("Answer: none") == "none"
+    assert llm.clean_extract("answer:iPhone 12 Pro.") == "iPhone 12 Pro"
     keys, inputs = keys_and_inputs(2)
     path = tmp_path / "E7.csv"
     llm.label(QUESTIONS["E7"], keys, inputs, FakeBackend(), path)

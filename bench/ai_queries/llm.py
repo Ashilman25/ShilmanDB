@@ -97,9 +97,12 @@ def build_prompt(q: Question, review: str) -> str:
     return _TEMPLATES[q.kind].format(review=review, wording=q.wording)
 
 
+#First line of a generated answer, without a trailing period or an echoed "Answer:" label
 def clean_extract(s: str) -> str:
     lines = s.strip().splitlines()
-    return lines[0].strip().rstrip(".").strip() if lines else ""
+    first = lines[0].strip() if lines else ""
+    first = re.sub(r"^answer\s*:\s*", "", first, flags=re.IGNORECASE)
+    return first.rstrip(".").strip()
 
 
 def slug(model: str) -> str:
