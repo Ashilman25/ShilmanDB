@@ -15,9 +15,9 @@ void VectorizedSeqScanExecutor::Init() {
     if (!table_info) {
         throw DatabaseException("VectorizedSeqScanExecutor: table not found: " + scan_plan->table_name);
     }
-    iter_.emplace(table_info->table->Begin(table_info->schema));
-    end_.emplace(table_info->table->End());
-    
+    table_ = table_info->table.get();
+    pos_ = RID{table_->GetFirstPageId(), 0};
+
     buffer_.Reset();
     buffer_cursor_ = 0;
     initialized_ = true;
@@ -26,10 +26,7 @@ void VectorizedSeqScanExecutor::Init() {
 bool VectorizedSeqScanExecutor::NextBatch(DataChunk* chunk) {
     assert(initialized_ && "NextBatch() called before Init()");
     chunk->Reset();
-    while (!chunk->IsFull() && *iter_ != *end_) {
-        chunk->AppendTuple(**iter_);
-        ++(*iter_);
-    }
+    table_->ReadRows(&pos_, chunk->capacity(), [&](const char* data, uint32_t length) { chunk->AppendRow(data, length); });
     return chunk->size() > 0;
 }
 
@@ -44,8 +41,7 @@ bool VectorizedSeqScanExecutor::Next(Tuple* tuple) {
 }
 
 void VectorizedSeqScanExecutor::Close() {
-    iter_.reset();
-    end_.reset();
+    table_ = nullptr;
     buffer_.Reset();
     buffer_cursor_ = 0;
     initialized_ = false;

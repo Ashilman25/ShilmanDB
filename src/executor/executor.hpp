@@ -26,7 +26,7 @@ public:
         Tuple tuple;
         while (!chunk->IsFull()) {
             if (!Next(&tuple)) break;
-            chunk->AppendTuple(tuple);
+            chunk->AppendRow(tuple.GetData(), tuple.GetLength());
         }
         return chunk->size() > 0;
     }

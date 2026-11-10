@@ -173,6 +173,7 @@ TEST_F(VectorizedFilterExecutorTest, SelectionVectorIsPhysicalIndex) {
     ASSERT_TRUE(chunk.HasSelectionVector());
     const auto& sel = chunk.GetSelectionVector();
     ASSERT_EQ(sel.size(), 10u);
+    chunk.EnsureDecoded({0, 1});
     for (size_t i = 0; i < sel.size(); ++i) {
         // sel[i] is a physical index whose `val` column satisfies val >= 100.
         EXPECT_EQ(chunk.GetValue(0, sel[i]).integer_, static_cast<int32_t>(10 + i));
@@ -206,6 +207,25 @@ TEST_F(VectorizedFilterExecutorTest, AllBatchesFilteredOutRetriesUntilEnd) {
     exec->Init();
 
     DataChunk chunk(env.schema);
+    EXPECT_FALSE(exec->NextBatch(&chunk));
+    exec->Close();
+}
+
+TEST_F(VectorizedFilterExecutorTest, MultiBatchRejectThenPass) {
+    // ids 2500..2999 pass and all sit in the third batch; earlier batches are rejected.
+    auto env = MakeEnv(3000, BinaryOp::Op::GTE, 25000);
+    auto exec = BuildPipeline(env);
+    exec->Init();
+
+    DataChunk chunk(env.schema);
+    ASSERT_TRUE(exec->NextBatch(&chunk));
+    ASSERT_TRUE(chunk.HasSelectionVector());
+    chunk.EnsureDecoded({0});
+    const auto& sel = chunk.GetSelectionVector();
+    ASSERT_EQ(sel.size(), 500u);
+    for (size_t i = 0; i < sel.size(); ++i) {
+        EXPECT_EQ(chunk.GetValue(0, sel[i]).integer_, static_cast<int32_t>(2500 + i));
+    }
     EXPECT_FALSE(exec->NextBatch(&chunk));
     exec->Close();
 }
@@ -330,6 +350,24 @@ TEST_F(VectorizedFilterExecutorTest, ParityChainedFilters) {
     // Surviving: val > 1000 AND val < 9000 → id in (100, 900) exclusive,
     // i.e., id in [101, 899] → 799 rows.
     EXPECT_EQ(runs.tuple_mode.size(), 799u);
+}
+
+TEST_F(VectorizedFilterExecutorTest, FilterDecodesNothing) {
+    auto env = MakeEnv(50, BinaryOp::Op::GTE, 250);  // val >= 250 keeps ids 25..49
+    auto exec = BuildPipeline(env);
+    exec->Init();
+    DataChunk chunk(env.schema);
+    ASSERT_TRUE(exec->NextBatch(&chunk));
+    for (size_t c = 0; c < 2; ++c) EXPECT_FALSE(chunk.IsDecoded(c)) << "column " << c;
+
+    ASSERT_EQ(chunk.size(), 25u);
+    chunk.EnsureDecoded({0, 1});
+    const auto& sel = chunk.GetSelectionVector();
+    for (size_t i = 0; i < sel.size(); ++i) {
+        EXPECT_EQ(chunk.GetValue(0, sel[i]).integer_, static_cast<int32_t>(25 + i));
+        EXPECT_EQ(chunk.GetValue(1, sel[i]).integer_, static_cast<int32_t>((25 + i) * 10));
+    }
+    exec->Close();
 }
 
 }  // namespace shilmandb

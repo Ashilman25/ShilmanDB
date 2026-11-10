@@ -1,8 +1,10 @@
 #pragma once
 #include "executor/aggregate_state.hpp"
 #include "executor/executor.hpp"
+#include "executor/expression_evaluator.hpp"
 #include "parser/ast.hpp"
 
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <vector>
@@ -19,13 +21,14 @@ public:
     void Close() override;
 
 private:
-    void UpdateAggregates(std::vector<AggregateState>& states, const Tuple& tuple, const Schema& child_schema);
-    Tuple BuildResultTuple(const std::vector<Value>& key, const std::vector<AggregateState>& states) const;
+    void UpdateAggregates(std::vector<AggregateState>& states, const ChunkRow& row);
+    std::vector<Value> BuildResultValues(const std::vector<Value>& key, const std::vector<AggregateState>& states) const;
 
     std::unique_ptr<Executor> child_;
     std::vector<const Expression*> group_by_exprs_;   // borrowed from AggregatePlanNode
     std::vector<const Expression*> aggregate_exprs_;  // borrowed from AggregatePlanNode
     std::vector<Aggregate::Func> aggregate_funcs_;    // copied (trivial enum)
+    std::vector<uint32_t> cols_;                      // child columns the expressions read
 
     std::map<std::vector<Value>, std::vector<AggregateState>> groups_;
     std::map<std::vector<Value>, std::vector<AggregateState>>::iterator emit_iter_;

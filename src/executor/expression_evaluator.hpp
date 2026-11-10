@@ -3,6 +3,7 @@
 #include "types/tuple.hpp"
 #include "catalog/schema.hpp"
 #include "common/exception.hpp"
+#include "executor/data_chunk.hpp"
 #include <cassert>
 #include <string>
 
@@ -38,15 +39,34 @@ inline bool MatchLike(const std::string& str, const std::string& pattern) {
     return pi == pattern.size();
 }
 
-inline Value EvaluateExpression(const Expression* expr, const Tuple& tuple, const Schema& schema) {
+// Reads a row's columns from a Tuple.
+struct TupleRow {
+    const Tuple& tuple;
+    const Schema& schema;
+    [[nodiscard]] Value Get(uint32_t idx) const { return tuple.GetValue(schema, idx); }
+    [[nodiscard]] const Schema& GetSchema() const { return schema; }
+};
+
+// Reads a cell from the decoded column, or straight from the row bytes if not decoded.
+struct ChunkRow {
+    const DataChunk& chunk;
+    size_t physical_row;
+    [[nodiscard]] Value Get(uint32_t idx) const {
+        return chunk.IsDecoded(idx) ? chunk.GetValue(idx, physical_row) : chunk.DecodeCell(idx, physical_row);
+    }
+    [[nodiscard]] const Schema& GetSchema() const { return chunk.GetSchema(); }
+};
+
+template <typename Row>
+Value EvaluateExpression(const Expression* expr, const Row& row) {
     switch (expr->type) {
         case ExprType::COLUMN_REF: {
             const auto* col = static_cast<const ColumnRef*>(expr);
             if (col->bound_index) {
-                assert(schema.GetColumn(*col->bound_index).name == col->column_name && "column bound against a different schema");
-                return tuple.GetValue(schema, *col->bound_index);
+                assert(row.GetSchema().GetColumn(*col->bound_index).name == col->column_name && "column bound against a different schema");
+                return row.Get(*col->bound_index);
             }
-            return tuple.GetValue(schema, schema.GetColumnIndex(col->column_name));
+            return row.Get(row.GetSchema().GetColumnIndex(col->column_name));
         }
 
         case ExprType::LITERAL: {
@@ -58,18 +78,18 @@ inline Value EvaluateExpression(const Expression* expr, const Tuple& tuple, cons
             const auto* bin = static_cast<const BinaryOp*>(expr);
 
             if (bin->op == BinaryOp::Op::AND) {
-                auto left = EvaluateExpression(bin->left.get(), tuple, schema);
+                auto left = EvaluateExpression(bin->left.get(), row);
                 if (!IsTruthy(left)) return MakeBool(false);
-                return MakeBool(IsTruthy(EvaluateExpression(bin->right.get(), tuple, schema)));
+                return MakeBool(IsTruthy(EvaluateExpression(bin->right.get(), row)));
             }
             if (bin->op == BinaryOp::Op::OR) {
-                auto left = EvaluateExpression(bin->left.get(), tuple, schema);
+                auto left = EvaluateExpression(bin->left.get(), row);
                 if (IsTruthy(left)) return MakeBool(true);
-                return MakeBool(IsTruthy(EvaluateExpression(bin->right.get(), tuple, schema)));
+                return MakeBool(IsTruthy(EvaluateExpression(bin->right.get(), row)));
             }
 
-            auto left = EvaluateExpression(bin->left.get(), tuple, schema);
-            auto right = EvaluateExpression(bin->right.get(), tuple, schema);
+            auto left = EvaluateExpression(bin->left.get(), row);
+            auto right = EvaluateExpression(bin->right.get(), row);
 
             switch (bin->op) {
                 case BinaryOp::Op::EQ:  
@@ -104,7 +124,7 @@ inline Value EvaluateExpression(const Expression* expr, const Tuple& tuple, cons
 
         case ExprType::UNARY_OP: {
             const auto* unary = static_cast<const UnaryOp*>(expr);
-            auto operand = EvaluateExpression(unary->operand.get(), tuple, schema);
+            auto operand = EvaluateExpression(unary->operand.get(), row);
 
             switch (unary->op) {
                 case UnaryOp::Op::NOT:
@@ -127,12 +147,12 @@ inline Value EvaluateExpression(const Expression* expr, const Tuple& tuple, cons
         case ExprType::CASE: {
             const auto* case_expr = static_cast<const CaseExpression*>(expr);
             for (const auto& [cond, result] : case_expr->when_clauses) {
-                if (IsTruthy(EvaluateExpression(cond.get(), tuple, schema))) {
-                    return EvaluateExpression(result.get(), tuple, schema);
+                if (IsTruthy(EvaluateExpression(cond.get(), row))) {
+                    return EvaluateExpression(result.get(), row);
                 }
             }
             if (case_expr->else_clause) {
-                return EvaluateExpression(case_expr->else_clause.get(), tuple, schema);
+                return EvaluateExpression(case_expr->else_clause.get(), row);
             }
             return Value(int32_t{0});  // zero-default (no NULL)
         }
@@ -143,6 +163,10 @@ inline Value EvaluateExpression(const Expression* expr, const Tuple& tuple, cons
     }
 
     throw DatabaseException("Unknown expression type");
+}
+
+inline Value EvaluateExpression(const Expression* expr, const Tuple& tuple, const Schema& schema) {
+    return EvaluateExpression(expr, TupleRow{tuple, schema});
 }
 
 inline auto CombineTuples(const Tuple& left, const Schema& left_schema, const Tuple& right, const Schema& right_schema, const Schema& output_schema) -> Tuple {

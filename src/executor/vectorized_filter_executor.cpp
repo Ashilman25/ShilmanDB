@@ -26,22 +26,19 @@ bool VectorizedFilterExecutor::NextBatch(DataChunk* chunk) {
         if (!child_->NextBatch(chunk)) return false;
 
         const size_t n = chunk->size();
-        const auto& schema = chunk->GetSchema();
         std::vector<uint32_t> selected;
         selected.reserve(n);
 
         if (chunk->HasSelectionVector()) {
             const auto& prev = chunk->GetSelectionVector();
             for (size_t i = 0; i < n; ++i) {
-                auto t = chunk->MaterializeTuple(i);
-                if (IsTruthy(EvaluateExpression(predicate_, t, schema))) {
+                if (IsTruthy(EvaluateExpression(predicate_, ChunkRow{*chunk, prev[i]}))) {
                     selected.push_back(prev[i]);
                 }
             }
         } else {
             for (size_t i = 0; i < n; ++i) {
-                auto t = chunk->MaterializeTuple(i);
-                if (IsTruthy(EvaluateExpression(predicate_, t, schema))) {
+                if (IsTruthy(EvaluateExpression(predicate_, ChunkRow{*chunk, i}))) {
                     selected.push_back(static_cast<uint32_t>(i));
                 }
             }
