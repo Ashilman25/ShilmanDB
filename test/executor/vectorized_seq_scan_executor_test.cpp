@@ -140,6 +140,7 @@ TEST_F(VectorizedSeqScanExecutorTest, NextBatchFillsOneChunk) {
     ASSERT_TRUE(exec.NextBatch(&chunk));
     EXPECT_EQ(chunk.size(), 500u);
     EXPECT_FALSE(chunk.HasSelectionVector());
+    chunk.EnsureDecoded({0});
     EXPECT_EQ(chunk.GetColumn(0)[0].integer_, 0);
     EXPECT_EQ(chunk.GetColumn(0)[499].integer_, 499);
 
@@ -171,15 +172,48 @@ TEST_F(VectorizedSeqScanExecutorTest, NextBatchMultipleChunks) {
     DataChunk chunk(env.schema);
     ASSERT_TRUE(exec.NextBatch(&chunk));
     EXPECT_EQ(chunk.size(), DataChunk::kDefaultBatchSize);
+    chunk.EnsureDecoded({0});
     EXPECT_EQ(chunk.GetColumn(0)[0].integer_, 0);
     EXPECT_EQ(chunk.GetColumn(0)[1023].integer_, 1023);
 
     ASSERT_TRUE(exec.NextBatch(&chunk));
     EXPECT_EQ(chunk.size(), 1500u - DataChunk::kDefaultBatchSize);  // 476
+    chunk.EnsureDecoded({0});
     EXPECT_EQ(chunk.GetColumn(0)[0].integer_, 1024);
     EXPECT_EQ(chunk.GetColumn(0)[475].integer_, 1499);
 
     EXPECT_FALSE(exec.NextBatch(&chunk));
+    exec.Close();
+}
+
+TEST_F(VectorizedSeqScanExecutorTest, NextBatchFetchesOncePerPage) {
+    auto env = MakeEnv(500);
+    auto* bpm = env.bundle.bpm.get();
+    auto* heap = env.catalog->GetTable("t")->table.get();
+
+    // Count heap pages by walking the chain once.
+    size_t page_count = 0;
+    for (page_id_t pid = heap->GetFirstPageId(); pid != INVALID_PAGE_ID;) {
+        auto* page = bpm->FetchPage(pid);
+        ASSERT_NE(page, nullptr);
+        auto next = SlottedPage::GetHeader(page->GetData())->next_page_id;
+        (void)bpm->UnpinPage(pid, false);
+        pid = next;
+        ++page_count;
+    }
+    ASSERT_GT(page_count, 1u);
+
+    VectorizedSeqScanExecutor exec(env.plan.get(), &env.ctx);
+    exec.Init();
+    DataChunk chunk(env.schema);
+    bpm->ResetStats();
+    size_t rows = 0;
+    while (exec.NextBatch(&chunk)) rows += chunk.size();
+    EXPECT_EQ(rows, 500u);
+    EXPECT_EQ(bpm->GetHitCount() + bpm->GetMissCount(), page_count);
+    for (size_t i = 0; i < bpm->GetPoolSize(); ++i) {
+        EXPECT_EQ(bpm->GetPage(static_cast<frame_id_t>(i)).GetPinCount(), 0);
+    }
     exec.Close();
 }
 

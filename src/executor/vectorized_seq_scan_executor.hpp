@@ -1,7 +1,6 @@
 #pragma once
 #include "executor/executor.hpp"
 #include "storage/table_heap.hpp"
-#include <optional>
 
 namespace shilmandb {
 
@@ -15,8 +14,8 @@ public:
     void Close() override;
 
 private:
-    std::optional<TableHeap::Iterator> iter_;
-    std::optional<TableHeap::Iterator> end_;
+    TableHeap* table_{nullptr};
+    RID pos_{INVALID_PAGE_ID, 0};
     bool initialized_{false};
 
     // Used only when a tuple-at-a-time parent drains via Next().

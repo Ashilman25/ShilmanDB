@@ -246,4 +246,32 @@ TEST_F(VectorizedProjectionAggregateParityTest, AggregateEmptyTableZeroDefault) 
     EXPECT_DOUBLE_EQ(runs.vectorized_mode.front().GetValue(out_schema, 1).decimal_, 0.0);
 }
 
+TEST_F(VectorizedProjectionAggregateParityTest, MinOverEmptyTableThroughProjection) {
+    // MIN over an empty DATE column emits integer 0; the projection above must
+    // still match tuple mode byte for byte.
+    auto bundle = MakeBPM(test_file_);
+    auto catalog = std::make_unique<Catalog>(bundle.bpm.get());
+    Schema schema({Column("d", TypeId::DATE)});
+    (void)catalog->CreateTable("t", schema);
+    ExecutorContext ctx{bundle.bpm.get(), catalog.get()};
+
+    auto scan_plan = std::make_unique<SeqScanPlanNode>(schema, "t");
+
+    Schema agg_schema({Column("min_d", TypeId::DATE)});
+    auto agg_plan = std::make_unique<AggregatePlanNode>(agg_schema);
+    agg_plan->aggregate_exprs.push_back(MakeColRef("d"));
+    agg_plan->aggregate_funcs = {Aggregate::Func::MIN};
+    agg_plan->children.push_back(std::move(scan_plan));
+
+    std::vector<std::unique_ptr<Expression>> exprs;
+    exprs.push_back(MakeColRef("min_d"));
+    auto proj_plan = std::make_unique<ProjectionPlanNode>(agg_schema, std::move(exprs));
+    proj_plan->children.push_back(std::move(agg_plan));
+
+    auto runs = test::RunBothModes(proj_plan.get(), &ctx);
+    test::ExpectRowsEqual(runs.tuple_mode, runs.vectorized_mode, runs.schema);
+    ASSERT_EQ(runs.tuple_mode.size(), 1u);
+    ASSERT_EQ(runs.vectorized_mode.size(), 1u);
+}
+
 }  // namespace shilmandb

@@ -5,6 +5,7 @@
 #include "types/tuple.hpp"
 #include "types/value.hpp"
 
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -246,6 +247,207 @@ TEST(DataChunkTest, DefaultNextBatchEmptyChildReturnsFalse) {
     EXPECT_FALSE(mock.NextBatch(&chunk));
     EXPECT_EQ(chunk.size(), 0u);
     mock.Close();
+}
+
+// --- Row store and lazy decode ---
+
+namespace {
+void AppendRaw(DataChunk& chunk, const Tuple& t) { chunk.AppendRow(t.GetData(), t.GetLength()); }
+}  // namespace
+
+TEST(DataChunkTest, AppendRowDecodesNothing) {
+    auto s = MakeTestSchema();
+    DataChunk chunk(s);
+    for (int i = 0; i < 3; ++i) AppendRaw(chunk, MakeRow(i, "n", i * 1.5, s));
+    EXPECT_EQ(chunk.size(), 3u);
+    EXPECT_TRUE(chunk.HasRowStore());
+    for (size_t c = 0; c < 3; ++c) EXPECT_FALSE(chunk.IsDecoded(c));
+}
+
+TEST(DataChunkTest, EnsureDecodedOnEmptyChunkThenAppendRow) {
+    auto s = MakeTestSchema();
+    DataChunk chunk(s);
+    chunk.EnsureDecoded({0});
+    AppendRaw(chunk, MakeRow(7, "n", 1.5, s));
+    EXPECT_FALSE(chunk.IsDecoded(0));
+    chunk.EnsureDecoded({0});
+    EXPECT_EQ(chunk.GetValue(0, 0).integer_, 7);
+}
+
+TEST(DataChunkTest, EnsureDecodedReadsColumns) {
+    auto s = MakeTestSchema();
+    DataChunk chunk(s);
+    for (int i = 0; i < 3; ++i) AppendRaw(chunk, MakeRow(i, "nm" + std::to_string(i), i * 1.5, s));
+    chunk.EnsureDecoded({0, 2});
+    for (size_t r = 0; r < 3; ++r) {
+        EXPECT_EQ(chunk.GetValue(0, r).integer_, static_cast<int32_t>(r));
+        EXPECT_DOUBLE_EQ(chunk.GetValue(2, r).decimal_, r * 1.5);
+    }
+    EXPECT_FALSE(chunk.IsDecoded(1));
+}
+
+TEST(DataChunkTest, EnsureDecodedOnlyActiveRows) {
+    auto s = MakeTestSchema();
+    DataChunk chunk(s);
+    for (int i = 0; i < 5; ++i) AppendRaw(chunk, MakeRow(i, "n", 0.0, s));
+    chunk.SetSelectionVector({1, 3});
+    chunk.EnsureDecoded({0});
+    EXPECT_EQ(chunk.GetValue(0, 1).integer_, 1);
+    EXPECT_EQ(chunk.GetValue(0, 3).integer_, 3);
+}
+
+TEST(DataChunkTest, EnsureDecodedTwiceIsNoOp) {
+    auto s = MakeTestSchema();
+    DataChunk chunk(s);
+    AppendRaw(chunk, MakeRow(5, "n", 0.0, s));
+    chunk.EnsureDecoded({0});
+    chunk.GetMutableColumn(0)[0] = Value(int32_t(99));
+    chunk.EnsureDecoded({0});
+    EXPECT_EQ(chunk.GetValue(0, 0).integer_, 99);
+}
+
+TEST(DataChunkTest, EnsureDecodedVarcharEdgeCases) {
+    auto s = MakeTestSchema();
+    DataChunk chunk(s);
+    const std::string big(300, 'x');
+    AppendRaw(chunk, MakeRow(1, "", 0.0, s));
+    AppendRaw(chunk, MakeRow(2, big, 0.0, s));
+    chunk.EnsureDecoded({1});
+    EXPECT_EQ(chunk.GetValue(1, 0).varchar_, "");
+    EXPECT_EQ(chunk.GetValue(1, 1).varchar_, big);
+}
+
+TEST(DataChunkTest, MaterializeTupleFromRowStoreIsByteIdentical) {
+    auto s = MakeTestSchema();
+    DataChunk chunk(s);
+    std::vector<Tuple> rows;
+    for (int i = 0; i < 3; ++i) rows.push_back(MakeRow(i, std::string(i * 7, 'q'), i * 2.0, s));
+    for (const auto& r : rows) AppendRaw(chunk, r);
+    chunk.SetSelectionVector({0, 2});
+    const size_t src[] = {0, 2};
+    for (size_t i = 0; i < 2; ++i) {
+        Tuple t = chunk.MaterializeTuple(i);
+        ASSERT_EQ(t.GetLength(), rows[src[i]].GetLength());
+        EXPECT_EQ(std::memcmp(t.GetData(), rows[src[i]].GetData(), t.GetLength()), 0);
+    }
+}
+
+TEST(DataChunkTest, AppendValuesDecodesAll) {
+    auto s = MakeTestSchema();
+    DataChunk chunk(s);
+    std::vector<Value> vals;
+    vals.emplace_back(int32_t(7));
+    vals.emplace_back(std::string("z"));
+    vals.emplace_back(1.5);
+    Tuple expected(vals, s);
+    chunk.AppendValues(std::move(vals));
+    for (size_t c = 0; c < 3; ++c) EXPECT_TRUE(chunk.IsDecoded(c));
+    EXPECT_FALSE(chunk.HasRowStore());
+    Tuple t = chunk.MaterializeTuple(0);
+    ASSERT_EQ(t.GetLength(), expected.GetLength());
+    EXPECT_EQ(std::memcmp(t.GetData(), expected.GetData(), t.GetLength()), 0);
+}
+
+TEST(DataChunkTest, EnsureDecodedOnValuesChunkIsNoOp) {
+    auto s = MakeTestSchema();
+    DataChunk chunk(s);
+    std::vector<Value> vals;
+    vals.emplace_back(int32_t(7));
+    vals.emplace_back(std::string("z"));
+    vals.emplace_back(1.5);
+    chunk.AppendValues(std::move(vals));
+    chunk.EnsureDecoded({0, 1, 2});
+    EXPECT_EQ(chunk.GetValue(0, 0).integer_, 7);
+    EXPECT_EQ(chunk.GetValue(1, 0).varchar_, "z");
+    EXPECT_DOUBLE_EQ(chunk.GetValue(2, 0).decimal_, 1.5);
+}
+
+TEST(DataChunkTest, AppendValuesMismatchedTypeRoundTrips) {
+    Schema s({Column("id", TypeId::INTEGER), Column("dt", TypeId::DATE)});
+    DataChunk chunk(s);
+    std::vector<Value> vals;
+    vals.emplace_back(int32_t(1));
+    vals.emplace_back(int32_t(0));
+    Tuple expected(vals, s);
+    chunk.AppendValues(std::move(vals));
+    const Value& got = chunk.GetValue(1, 0);
+    EXPECT_EQ(got.type_, TypeId::DATE);
+    EXPECT_TRUE(got == expected.GetValue(s, 1));
+}
+
+TEST(DataChunkTest, FlattenWithRowStore) {
+    auto s = MakeTestSchema();
+    DataChunk chunk(s);
+    std::vector<Tuple> rows;
+    for (int i = 0; i < 5; ++i) rows.push_back(MakeRow(i, std::string(i * 3, 'a'), 0.0, s));
+    for (const auto& r : rows) AppendRaw(chunk, r);
+    chunk.EnsureDecoded({0});
+    chunk.SetSelectionVector({1, 4});
+    chunk.Flatten();
+    EXPECT_EQ(chunk.size(), 2u);
+    EXPECT_EQ(chunk.GetValue(0, 0).integer_, 1);
+    EXPECT_EQ(chunk.GetValue(0, 1).integer_, 4);
+    Tuple t = chunk.MaterializeTuple(1);
+    ASSERT_EQ(t.GetLength(), rows[4].GetLength());
+    EXPECT_EQ(std::memcmp(t.GetData(), rows[4].GetData(), t.GetLength()), 0);
+}
+
+TEST(DataChunkTest, ResetClearsRowStoreAndFlags) {
+    auto s = MakeTestSchema();
+    DataChunk chunk(s);
+    AppendRaw(chunk, MakeRow(11, "a", 0.0, s));
+    chunk.EnsureDecoded({0});
+    chunk.Reset();
+    EXPECT_FALSE(chunk.HasRowStore());
+    EXPECT_FALSE(chunk.IsDecoded(0));
+    AppendRaw(chunk, MakeRow(22, "b", 0.0, s));
+    chunk.EnsureDecoded({0});
+    EXPECT_EQ(chunk.GetValue(0, 0).integer_, 22);
+}
+
+TEST(DataChunkTest, DefaultNextBatchStoresBytes) {
+    auto s = MakeTestSchema();
+    CountingMockExecutor exec(s, 5);
+    DataChunk chunk(s);
+    ASSERT_TRUE(exec.NextBatch(&chunk));
+    ASSERT_EQ(chunk.size(), 5u);
+    EXPECT_TRUE(chunk.HasRowStore());
+    EXPECT_FALSE(chunk.IsDecoded(0));
+
+    chunk.EnsureDecoded({0, 1, 2});
+    for (int32_t i = 0; i < 5; ++i) {
+        auto expected = MakeRow(i, "row", static_cast<double>(i), s);
+        EXPECT_EQ(chunk.GetValue(0, i).integer_, i);
+        EXPECT_EQ(chunk.GetValue(1, i).ToString(), "row");
+        EXPECT_DOUBLE_EQ(chunk.GetValue(2, i).decimal_, static_cast<double>(i));
+        Tuple t = chunk.MaterializeTuple(i);
+        ASSERT_EQ(t.GetLength(), expected.GetLength());
+        EXPECT_EQ(std::memcmp(t.GetData(), expected.GetData(), t.GetLength()), 0);
+    }
+}
+
+TEST(DataChunkTest, DecodeCellMatchesEnsureDecoded) {
+    auto s = MakeTestSchema();
+    DataChunk chunk(s);
+    for (const Tuple& t : {MakeRow(1, "abc", 1.5, s), MakeRow(2, "", -2.25, s),
+                           MakeRow(3, std::string(300, 'z'), 0.0, s)}) {
+        chunk.AppendRow(t.GetData(), t.GetLength());
+    }
+    std::vector<Value> direct;
+    for (size_t c = 0; c < 3; ++c)
+        for (size_t r = 0; r < 3; ++r) direct.push_back(chunk.DecodeCell(c, r));
+    EXPECT_FALSE(chunk.IsDecoded(0));
+
+    chunk.EnsureDecoded({0, 1, 2});
+    size_t i = 0;
+    for (size_t c = 0; c < 3; ++c) {
+        for (size_t r = 0; r < 3; ++r, ++i) {
+            const Value& want = chunk.GetValue(c, r);
+            EXPECT_EQ(direct[i].type_, want.type_);
+            EXPECT_TRUE(direct[i] == want);
+            EXPECT_EQ(direct[i].ToString(), want.ToString());
+        }
+    }
 }
 
 }  // namespace shilmandb

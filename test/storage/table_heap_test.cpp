@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include <cstring>
 #include <string>
 #include <unistd.h>
 #include "storage/table_heap.hpp"
@@ -185,6 +186,142 @@ TEST_F(TableHeapTest, NoPinnedPagesAfterScan) {
     for (size_t i = 0; i < bpm->GetPoolSize(); ++i) {
         EXPECT_EQ(bpm->GetPage(static_cast<frame_id_t>(i)).GetPinCount(), 0)
             << "Frame " << i << " still pinned after full scan";
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ReadRows: page-at-a-time reads
+// ---------------------------------------------------------------------------
+namespace {
+
+// Reads every row with the given batch size, collecting each row as a Tuple.
+size_t ReadAllRows(TableHeap& heap, RID* pos, size_t max_rows, const Schema& schema,
+                   std::vector<Tuple>* out) {
+    size_t total = 0;
+    while (true) {
+        size_t n = heap.ReadRows(pos, max_rows, [&](const char* data, uint32_t length) {
+            Tuple t;
+            t.DeserializeFrom(data, length, schema);
+            out->push_back(std::move(t));
+        });
+        if (n == 0) { break; }
+        total += n;
+    }
+    return total;
+}
+
+}  // namespace
+
+TEST_F(TableHeapTest, ReadRowsMatchesIterator) {
+    auto [dm, bpm] = MakeBPM(64);
+    auto schema = MakeSchema();
+    TableHeap heap(bpm.get());
+    for (int32_t i = 0; i < 1000; ++i) {
+        ASSERT_NE(heap.InsertTuple(MakeTuple(i, schema)).page_id, INVALID_PAGE_ID);
+    }
+
+    RID pos{heap.GetFirstPageId(), 0};
+    std::vector<Tuple> rows;
+    EXPECT_EQ(ReadAllRows(heap, &pos, 250, schema, &rows), 1000u);
+    EXPECT_EQ(pos.page_id, INVALID_PAGE_ID);
+
+    size_t i = 0;
+    for (auto it = heap.Begin(schema); it != heap.End(); ++it, ++i) {
+        Tuple expected = *it;
+        ASSERT_LT(i, rows.size());
+        ASSERT_EQ(rows[i].GetLength(), expected.GetLength()) << "row " << i;
+        EXPECT_EQ(std::memcmp(rows[i].GetData(), expected.GetData(), expected.GetLength()), 0)
+            << "row " << i;
+    }
+    EXPECT_EQ(i, rows.size());
+}
+
+TEST_F(TableHeapTest, ReadRowsStopsMidPage) {
+    auto [dm, bpm] = MakeBPM(64);
+    auto schema = MakeSchema();
+    TableHeap heap(bpm.get());
+    for (int32_t i = 0; i < 1000; ++i) {
+        ASSERT_NE(heap.InsertTuple(MakeTuple(i, schema)).page_id, INVALID_PAGE_ID);
+    }
+
+    RID pos{heap.GetFirstPageId(), 0};
+    std::vector<Tuple> rows;
+    auto collect = [&](const char* data, uint32_t length) {
+        Tuple t;
+        t.DeserializeFrom(data, length, schema);
+        rows.push_back(std::move(t));
+    };
+    EXPECT_EQ(heap.ReadRows(&pos, 7, collect), 7u);
+    EXPECT_EQ(pos.page_id, heap.GetFirstPageId());
+    EXPECT_EQ(pos.slot_id, 7);
+
+    rows.clear();
+    EXPECT_EQ(heap.ReadRows(&pos, 1, collect), 1u);
+    ASSERT_EQ(rows.size(), 1u);
+    EXPECT_EQ(rows[0].GetValue(schema, 0).integer_, 7);
+}
+
+TEST_F(TableHeapTest, ReadRowsSkipsDeleted) {
+    auto [dm, bpm] = MakeBPM(64);
+    auto schema = MakeSchema();
+    TableHeap heap(bpm.get());
+    std::vector<RID> rids;
+    for (int32_t i = 0; i < 100; ++i) {
+        rids.push_back(heap.InsertTuple(MakeTuple(i, schema)));
+    }
+    for (int32_t i = 0; i < 100; i += 2) {
+        ASSERT_TRUE(heap.DeleteTuple(rids[i]));
+    }
+
+    RID pos{heap.GetFirstPageId(), 0};
+    std::vector<Tuple> rows;
+    EXPECT_EQ(ReadAllRows(heap, &pos, 100000, schema, &rows), 50u);
+    ASSERT_EQ(rows.size(), 50u);
+    for (size_t i = 0; i < rows.size(); ++i) {
+        EXPECT_EQ(rows[i].GetValue(schema, 0).integer_, static_cast<int32_t>(2 * i + 1));
+    }
+}
+
+TEST_F(TableHeapTest, ReadRowsEmptyHeap) {
+    auto [dm, bpm] = MakeBPM(64);
+    TableHeap heap(bpm.get());
+
+    RID pos{heap.GetFirstPageId(), 0};
+    size_t calls = 0;
+    EXPECT_EQ(heap.ReadRows(&pos, 10, [&](const char*, uint32_t) { ++calls; }), 0u);
+    EXPECT_EQ(calls, 0u);
+    EXPECT_EQ(pos.page_id, INVALID_PAGE_ID);
+}
+
+TEST_F(TableHeapTest, ReadRowsOneFetchPerPage) {
+    auto [dm, bpm] = MakeBPM(64);
+    auto schema = MakeSchema();
+    TableHeap heap(bpm.get());
+    for (int32_t i = 0; i < 1000; ++i) {
+        ASSERT_NE(heap.InsertTuple(MakeTuple(i, schema)).page_id, INVALID_PAGE_ID);
+    }
+
+    // Count heap pages by walking the chain once.
+    size_t page_count = 0;
+    for (page_id_t pid = heap.GetFirstPageId(); pid != INVALID_PAGE_ID;) {
+        auto* page = bpm->FetchPage(pid);
+        ASSERT_NE(page, nullptr);
+        auto next = SlottedPage::GetHeader(page->GetData())->next_page_id;
+        (void)bpm->UnpinPage(pid, false);
+        pid = next;
+        ++page_count;
+    }
+    ASSERT_GT(page_count, 1u);
+
+    bpm->ResetStats();
+    RID pos{heap.GetFirstPageId(), 0};
+    size_t rows = heap.ReadRows(&pos, 100000, [](const char*, uint32_t) {});
+    EXPECT_EQ(rows, 1000u);
+    EXPECT_EQ(bpm->GetHitCount() + bpm->GetMissCount(), page_count);
+
+    for (size_t i = 0; i < bpm->GetPoolSize(); ++i) {
+        EXPECT_EQ(bpm->GetPage(static_cast<frame_id_t>(i)).GetPinCount(), 0)
+            << "Frame " << i << " still pinned after ReadRows";
     }
 }
 

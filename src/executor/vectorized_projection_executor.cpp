@@ -1,6 +1,7 @@
 #include "executor/vectorized_projection_executor.hpp"
 
 #include "executor/expression_evaluator.hpp"
+#include "planner/column_usage.hpp"
 #include "planner/plan_node.hpp"
 
 #include <cassert>
@@ -12,6 +13,7 @@ namespace shilmandb {
 VectorizedProjectionExecutor::VectorizedProjectionExecutor(const PlanNode* plan, ExecutorContext* ctx, std::unique_ptr<Executor> child)
     : Executor(plan, ctx),
       child_(std::move(child)),
+      cols_(ColumnsReadBy(*plan)),
       child_chunk_(child_->GetOutputSchema()),
       buffer_(plan->output_schema) {
         
@@ -38,20 +40,21 @@ bool VectorizedProjectionExecutor::NextBatch(DataChunk* chunk) {
         return false;
     }
 
-    chunk->Reset();  // clears any stale selection vector so AppendTuple is legal
+    chunk->Reset();  // clears any stale selection vector so AppendValues is legal
 
-    const auto& child_schema = child_chunk_.GetSchema();
-    const auto& out_schema = GetOutputSchema();
+    child_chunk_.EnsureDecoded(cols_);
     const size_t n_rows = child_chunk_.size();
+    const bool has_sel = child_chunk_.HasSelectionVector();
 
     for (size_t i = 0; i < n_rows; ++i) {
-        auto input_tuple = child_chunk_.MaterializeTuple(i);  // honors child's selection vector
+        const size_t physical = has_sel ? child_chunk_.GetSelectionVector()[i] : i;
+        const ChunkRow row{child_chunk_, physical};
         std::vector<Value> projected;
         projected.reserve(expressions_.size());
         for (const auto* expr : expressions_) {
-            projected.push_back(EvaluateExpression(expr, input_tuple, child_schema));
+            projected.push_back(EvaluateExpression(expr, row));
         }
-        chunk->AppendTuple(Tuple(std::move(projected), out_schema));
+        chunk->AppendValues(std::move(projected));
     }
     return chunk->size() > 0;
 }
