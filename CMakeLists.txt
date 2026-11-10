@@ -36,6 +36,7 @@ file(GLOB_RECURSE CORE_SOURCES
     src/parser/*.cpp
     src/planner/planner.cpp
     src/planner/expression_binder.cpp
+    src/planner/column_usage.cpp
     src/planner/join_order_optimizer.cpp
     src/planner/join_graph.cpp
     src/planner/cost_model.cpp
