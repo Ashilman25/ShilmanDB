@@ -14,7 +14,7 @@
 
 #include "buffer/buffer_pool_manager.hpp"
 #include "buffer/eviction_policy_factory.hpp"
-#include "eviction_sim.hpp"
+#include "eviction/sim/eviction_sim.hpp"
 #include "storage/disk_manager.hpp"
 
 // Drives a real BufferPoolManager and the trace simulator with the same fetches, and checks

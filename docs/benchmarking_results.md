@@ -122,20 +122,20 @@ The offline evaluation demonstrates the model's capability: +3.64% hit rate impr
 ### Prerequisites
 
 - Release build with ML enabled: `bash scripts/build.sh Release ON`
-- TPC-H data generated: `bash bench/generate_tpch_data.sh`
+- TPC-H data generated: `bash bench/tpch/generate_tpch_data.sh`
 - Python venv with matplotlib: `.venv/bin/pip install matplotlib`
 
 ### Commands
 
 ```bash
 # Full benchmark suite (all configs, SF=0.01, 5 runs)
-.venv/bin/python bench/run_benchmarks.py --sf 0.01 --runs 5
+.venv/bin/python bench/tpch/run_benchmarks.py --sf 0.01 --runs 5
 
 # Baseline only (faster, no ML needed)
-.venv/bin/python bench/run_benchmarks.py --config baseline --sf 0.01 --runs 5
+.venv/bin/python bench/tpch/run_benchmarks.py --config baseline --sf 0.01 --runs 5
 
 # Generate charts from results
-.venv/bin/python bench/plot_results.py
+.venv/bin/python bench/tpch/plot_results.py
 ```
 
 ### Output Files

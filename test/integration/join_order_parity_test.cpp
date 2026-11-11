@@ -6,7 +6,7 @@
 #include "planner/join_graph.hpp"
 #include "planner/plan_node.hpp"
 #include "planner/planner.hpp"
-#include "tpch_workload.hpp"
+#include "tpch/tpch_workload.hpp"
 
 #include <algorithm>
 #include <filesystem>
@@ -167,7 +167,7 @@ protected:
 
         const auto data_dir = FindDataDir();
         if (data_dir.empty()) {
-            GTEST_SKIP() << "TPC-H SF=0.01 data not found. Run bench/generate_tpch_data.sh first.";
+            GTEST_SKIP() << "TPC-H SF=0.01 data not found. Run bench/tpch/generate_tpch_data.sh first.";
         }
 
         // 32 MB, enough to hold all of SF=0.01.

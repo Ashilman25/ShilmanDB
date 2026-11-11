@@ -11,7 +11,7 @@
 #include "buffer/eviction_policy_factory.hpp"
 #include "common/exception.hpp"
 #include "engine/database.hpp"
-#include "tpch_workload.hpp"
+#include "tpch/tpch_workload.hpp"
 
 namespace shilmandb {
 namespace {
@@ -62,7 +62,7 @@ static void PrintTo(EvictionPolicyKind kind, std::ostream* os) { *os << Eviction
 TEST_P(EvictionPolicyTpchTest, EveryPolicyGivesLruAnswers) {
     const std::string data_dir = FindDataDir();
     if (data_dir.empty()) {
-        GTEST_SKIP() << "TPC-H SF=0.01 data not found. Run bench/generate_tpch_data.sh first.";
+        GTEST_SKIP() << "TPC-H SF=0.01 data not found. Run bench/tpch/generate_tpch_data.sh first.";
     }
 
     const auto queries = tpch::Queries();

@@ -18,7 +18,7 @@
 #include <utility>
 #include <vector>
 
-#include "eviction_learned.hpp"
+#include "eviction/sim/eviction_learned.hpp"
 
 namespace shilmandb::evsim {
 namespace {
