@@ -22,12 +22,18 @@ bench/
 │   ├── analyze_join_headroom.py
 │   ├── generate_join_training_data.cpp
 │   └── tests/
-└── eviction/          eviction experiments
-    ├── sim/           trace simulator (C++): eviction_sim, eviction_samples, eviction_switch
-    ├── headroom/      classical policies vs Belady on recorded traces
-    ├── engine/        the classical policies run inside the engine
-    ├── v3_check/      small learned policies on sampled candidates
-    ├── switch_check/  switching between policies as the workload changes
+├── eviction/          eviction experiments
+│   ├── sim/           trace simulator (C++): eviction_sim, eviction_samples, eviction_switch
+│   ├── headroom/      classical policies vs Belady on recorded traces
+│   ├── engine/        the classical policies run inside the engine
+│   ├── v3_check/      small learned policies on sampled candidates
+│   ├── switch_check/  switching between policies as the workload changes
+│   └── tests/
+└── vector_check/      vector search check: pgvector strategy grid and learned stopping (Python)
+    ├── vc_common.py             shared paths, text rules, distances, top-k, recall@10
+    ├── questions.csv            the 210 written questions used as queries
+    ├── prepare_vector_data.py   the 70K / 500K tables and the 10,000 query reviews
+    ├── embed_vector_check.py    embeds queries and the 500K slice (.venv-ai), drift check
     └── tests/
 ```
 
