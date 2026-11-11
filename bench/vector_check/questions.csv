@@ -1,0 +1,211 @@
+qid,group,text
+q001,written,Does this USB-C cable support fast charging for a Samsung phone?
+q002,written,How long is the cable compared to what the listing says?
+q003,written,Will this wall charger charge a phone and a tablet at the same time?
+q004,written,Does the braided cable hold up better than the cheap rubber ones?
+q005,written,Is the car charger loud or does it have a bright light?
+q006,written,Can this charger put out 20 watts for an iPhone?
+q007,written,Does the wireless charging pad work through a thick case?
+q008,written,cable frays near the connector
+q009,written,accessory not supported error with lightning cable
+q010,written,wireless charger stand phone placement
+q011,written,dual port wall charger speed
+q012,written,right angle cable for gaming
+q013,written,magnetic charging cable tips falling out
+q014,written,ten foot charging cable length
+q015,written,The plug is so loose it falls out of the phone port.
+q016,written,My phone charges slower with this than with the original charger.
+q017,written,Charger gets too hot to touch after an hour of use.
+q018,written,The cable only works if I hold it at a certain angle.
+q019,written,Wireless pad keeps starting and stopping charging all night.
+q020,written,"Data transfer does not work, the cable only charges."
+q021,written,Does this case protect the phone from a drop onto concrete?
+q022,written,Is the clear case going to turn yellow after a few months?
+q023,written,Does the wallet case hold more than three cards?
+q024,written,"How thick is this case, does it add a lot of bulk?"
+q025,written,Does the case have a raised lip to protect the camera?
+q026,written,Is the case slippery or does it have a good grip?
+q027,written,Can you use a MagSafe charger with this case on?
+q028,written,slim case with kickstand
+q029,written,rugged case with belt clip holster
+q030,written,silicone case attracts lint and dust
+q031,written,leather folio case card slots
+q032,written,glitter case leaking liquid
+q033,written,case with built in screen protector
+q034,written,shockproof case for a toddler
+q035,written,The volume buttons on this case are almost impossible to press.
+q036,written,The case started peeling and cracking at the corners.
+q037,written,Dirt gets trapped between the case and the back of the phone.
+q038,written,The magnetic flap on the wallet case will not stay closed.
+q039,written,Kickstand snapped off the first time I used it.
+q040,written,The case smells strongly of chemicals out of the box.
+q041,written,Is the tempered glass protector easy to install without bubbles?
+q042,written,Does the screen protector work with the fingerprint reader?
+q043,written,Does this protector come with an alignment frame?
+q044,written,Will the glass protector crack before the actual screen does?
+q045,written,Does the privacy screen protector make the display too dark?
+q046,written,Is the matte screen protector good for reducing glare outside?
+q047,written,How many protectors come in the pack?
+q048,written,screen protector edges lifting
+q049,written,bubbles under the screen protector
+q050,written,curved screen glass protector coverage
+q051,written,camera lens protector for the back
+q052,written,full adhesive versus edge adhesive glass
+q053,written,touch sensitivity with a glass protector
+q054,written,anti glare matte film rainbow effect
+q055,written,The protector is cut too small and leaves the edges exposed.
+q056,written,Dust got stuck under it no matter how carefully I installed it.
+q057,written,The glass shattered from a short drop off the couch.
+q058,written,Touches near the edge of the screen stopped registering after I put it on.
+q059,written,My case pushes the screen protector up at the sides.
+q060,written,The smooth coating wore off and now it smudges constantly.
+q061,written,How many full charges of an iPhone does this power bank give?
+q062,written,Can I bring this power bank on a plane?
+q063,written,Does the power bank charge two phones at once?
+q064,written,How long does the power bank take to recharge itself?
+q065,written,Can the power bank charge my phone while the power bank itself is plugged in?
+q066,written,Is the replacement phone battery easy to install yourself?
+q067,written,Does the power bank turn off by itself when charging earbuds?
+q068,written,power bank actual capacity versus advertised
+q069,written,slim power bank for travel
+q070,written,solar power bank charging speed
+q071,written,battery case for long days
+q072,written,power bank with built in cables
+q073,written,replacement battery for older Galaxy phone
+q074,written,magnetic battery pack that snaps on
+q075,written,The power bank lost half its charge sitting in a drawer for a week.
+q076,written,The battery indicator lights jump from full to empty with no warning.
+q077,written,It barely charged my phone to sixty percent before dying.
+q078,written,This power bank is way heavier than I expected for its size.
+q079,written,The replacement battery drains faster than the old one did.
+q080,written,My phone gets warm and charges slowly from this battery pack.
+q081,written,Does the car vent mount hold a heavy phone on bumpy roads?
+q082,written,Will the suction cup mount stick to a textured dashboard?
+q083,written,Does this bike mount keep the phone secure on rough trails?
+q084,written,Can the mount rotate between portrait and landscape?
+q085,written,Is the magnetic mount strong enough with a case on?
+q086,written,Does the vent mount block airflow or the radio controls?
+q087,written,Can I use the mount with one hand while driving?
+q088,written,windshield suction mount falls off in the heat
+q089,written,cup holder phone mount for trucks
+q090,written,desk stand for video calls
+q091,written,motorcycle handlebar phone mount vibration
+q092,written,metal plate stuck on phone back
+q093,written,flexible arm phone holder for bed
+q094,written,phone holder for the treadmill or gym
+q095,written,The mount sags down a little more every time I hit a bump.
+q096,written,The clip broke one of the air vent blades in my car.
+q097,written,The phone fell off the mount on the highway and cracked.
+q098,written,The adhesive pad left a sticky mark on my dashboard.
+q099,written,The arms do not open wide enough for my phone with a case.
+q100,written,The ball joint loosens and the phone keeps tilting sideways.
+q101,written,How long do these wireless earbuds last on a single charge?
+q102,written,Do the earbuds stay in during running and workouts?
+q103,written,Is the microphone clear enough for phone calls?
+q104,written,Does the noise cancelling actually block out airplane noise?
+q105,written,Is there a delay between the video and the sound?
+q106,written,Can the earbuds connect to two devices at the same time?
+q107,written,Are these headphones comfortable to wear for hours?
+q108,written,bass heavy sound on budget earbuds
+q109,written,uneven volume between left and right earbuds
+q110,written,Bluetooth range and connection drops
+q111,written,wired earbuds with USB-C plug
+q112,written,ear tip sizes and fit
+q113,written,charging case lid hinge quality
+q114,written,sweat proof earbuds for the gym
+q115,written,The right earbud does not sit right in the case and never charges.
+q116,written,Sound cuts out every few seconds when I walk around.
+q117,written,The touch controls pause my music every time I adjust them.
+q118,written,Callers say I sound like I am talking from a tunnel.
+q119,written,They hurt my ears after about thirty minutes.
+q120,written,The earbuds keep disconnecting from each other and only one plays.
+q121,written,Is this refurbished phone in good cosmetic condition?
+q122,written,Does the unlocked phone work with Verizon and T-Mobile?
+q123,written,How good is the camera in low light?
+q124,written,Does the phone come with a charger in the box?
+q125,written,Is the phone fast enough for games and lots of apps?
+q126,written,How is the screen brightness in direct sunlight?
+q127,written,Is this budget phone worth it for an older parent?
+q128,written,phone lag when switching apps
+q129,written,renewed phone battery health percentage
+q130,written,international version phone without US warranty
+q131,written,dual SIM phone for travel
+q132,written,phone storage size and memory card slot
+q133,written,flip phone for seniors with big buttons
+q134,written,Android updates on budget phones
+q135,written,The phone arrived carrier locked even though it said unlocked.
+q136,written,The screen has a burned in image from the last owner.
+q137,written,Face unlock barely works in dim rooms.
+q138,written,The phone came with someone else's account still signed in.
+q139,written,Calls keep dropping even with full bars.
+q140,written,The speaker crackles at anything above half volume.
+q141,written,Will this work with the iPhone 13 mini?
+q142,written,Does the Galaxy S22 case also fit the S22 Plus?
+q143,written,Is this charger compatible with older micro USB phones?
+q144,written,Does this car charger fit snugly in an older car's power socket?
+q145,written,Does the car mount work with large phones like the Pro Max?
+q146,written,Can I use these earbuds with an Android phone?
+q147,written,Is the listing clear about which phone sizes it supports?
+q148,written,wrong compatible models list in the listing
+q149,written,camera cutout misaligned on the case
+q150,written,adapter for headphone jack on new phones
+q151,written,fits with a thick case on
+q152,written,works with tablets and phones too
+q153,written,accessories that fit the Google Pixel
+q154,written,charging plug too short to reach through the case
+q155,written,The charging port cutout is too narrow for my cable.
+q156,written,The listing said universal but my phone is too wide for it.
+q157,written,The stylus does nothing at all on my phone's touch screen.
+q158,written,The speaker holes are covered so the sound is muffled.
+q159,written,My older phone does not support the fast charging this advertises.
+q160,written,The lens protector blocks part of the camera and the flash.
+q161,written,Was the item packaged well enough to arrive undamaged?
+q162,written,Did the seller honor the warranty when it broke?
+q163,written,How easy was it to return the item for a refund?
+q164,written,Did the package arrive with all the parts listed?
+q165,written,Did the seller respond quickly to emails or messages?
+q166,written,Did the item come with instructions in English?
+q167,written,Was the refund issued before or after sending the item back?
+q168,written,package marked delivered but missing
+q169,written,wrong color sent by seller
+q170,written,free replacement after contacting the seller
+q171,written,return shipping cost paid by buyer
+q172,written,seller offering gift card for five star review
+q173,written,tracking number never updated
+q174,written,damaged box crushed in transit
+q175,written,I only received one cable even though I paid for a three pack.
+q176,written,The seller stopped answering once the return window closed.
+q177,written,They refused a refund because I threw away the original box.
+q178,written,Customer support kept sending me the same scripted reply.
+q179,written,The item came in a plain bag with no box or manual.
+q180,written,I was charged twice for one order and nobody fixed it.
+q181,written,Are these Apple certified cables or uncertified copies?
+q182,written,How can I tell if these AirPods are knockoffs?
+q183,written,Does the serial number check out on the maker's website?
+q184,written,Is the packaging different from what you get in a store?
+q185,written,Was the charger lighter than the one that came with the phone?
+q186,written,Is the logo spelled and printed correctly on the box?
+q187,written,Were the earbuds sold as new actually used?
+q188,written,color slightly off compared to the real thing
+q189,written,knockoff charger with no certification marks
+q190,written,refurbished phone sold as new
+q191,written,wrong font on Samsung charger label
+q192,written,suspiciously low price for a name brand
+q193,written,pairing pop up missing on clone earbuds
+q194,written,"sold by a third party, not the brand store"
+q195,written,The box had a sticker covering the original serial number.
+q196,written,The earbuds show up under a random name when pairing.
+q197,written,The quality is nothing like the one I bought at the store.
+q198,written,The cable feels flimsy compared to the original that came with my phone.
+q199,written,My phone warned that the battery is not a genuine part.
+q200,written,The seal on the box looked like it had been opened and glued back.
+F1,ai53,Does the reviewer say the product stopped working or broke within a few weeks of getting it?
+C2,ai53,"What is this review mainly about: shipping or delivery; product quality or a defect; a wrong, fake or missing item; customer service or returns; price or value; other?"
+F3,ai53,Does the reviewer complain that the item arrived late or that shipping was slow?
+F4,ai53,"Does the reviewer say the item was counterfeit, fake, or not the genuine brand?"
+F5a,ai53,Does the review talk about battery life?
+F5b,ai53,Is the reviewer positive about the product overall?
+F6,ai53,Does the reviewer say the case does not fit their phone?
+E7,ai53,"Which phone model does the reviewer say they use? Answer with the model name only, or ""none""."
+F8,ai53,"Does the reviewer describe a safety hazard, such as overheating, melting, smoke, sparks, fire or a swelling battery?"
+F10,ai53,Does the reviewer praise the seller's or maker's customer service?
