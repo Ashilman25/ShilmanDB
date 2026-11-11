@@ -2,6 +2,7 @@
 #include "buffer/eviction_policy_factory.hpp"
 #include "executor/executor.hpp"
 #include "common/exception.hpp"
+#include "page_owners.hpp"
 #include "tpch_streams.hpp"
 #include "tpch_workload.hpp"
 
@@ -51,6 +52,7 @@ struct Args {
     bool trace_collapse{false};
     EvictionPolicyKind eviction{EvictionPolicyKind::LRU};
     std::string eviction_model_path;
+    std::string dump_page_owners;  // write the page-owner map to this path, then exit
     bool keep_load_pool{false};  // a workload starts with the pool the load left, not an empty one
 #ifdef SHILMANDB_HAS_LIBTORCH
     bool use_learned_join{false};
@@ -66,6 +68,7 @@ static void PrintUsage(const char* prog) {
               << " [--execution-mode <tuple|vectorized>]"
               << " [--miss-penalty-us <N>] [--direct-io] [--policy-timing] [--planner-read-us <X>]"
               << " [--workload <single|stream|lookup|mixed>] [--stream-length <N>] [--seed <S>] [--keep-load-pool]"
+              << " [--dump-page-owners <path>]"
               << " [--eviction-policy <lru|clock|lru2|arc|lirs|learned-v2|learned-v1>] [--eviction-model-path <path>]"
 #ifdef SHILMANDB_HAS_LIBTORCH
               << " [--use-learned-join --join-model-path <path>]"
@@ -118,6 +121,8 @@ static Args ParseArgs(int argc, char* argv[]) {
             args.db_file = argv[++i];
         } else if (arg == "--data-dir" && i + 1 < argc) {
             args.data_dir = argv[++i];
+        } else if (arg == "--dump-page-owners" && i + 1 < argc) {
+            args.dump_page_owners = argv[++i];
         } else if (arg == "--no-verify") {
             args.verify = false;
         } else if (arg == "--enable-tracing" && i + 1 < argc) {
@@ -755,6 +760,29 @@ int main(int argc, char* argv[]) {
         std::cout << "\nSkipping index creation (--create-indexes false)\n";
     }
     const page_id_t db_pages_total = db.GetDiskManager()->GetNumPages();
+
+    if (!args.dump_page_owners.empty()) {
+        std::vector<std::string> table_names, index_names;
+        for (const auto& td : tpch::TableDescs()) table_names.push_back(td.name);
+        if (args.create_indexes) {
+            for (const auto& idx : tpch::IndexDescs()) index_names.push_back(idx.index_name);
+        }
+
+        try {
+            const auto owners = tpch::CollectPageOwners(db, table_names, index_names);
+            tpch::WritePageOwners(owners, args.dump_page_owners);
+
+            size_t counts[4] = {0, 0, 0, 0};
+            for (const auto& o : owners) ++counts[static_cast<size_t>(o.kind)];
+            std::cout << "Page owners: " << owners.size() << " pages (table " << counts[0] << ", inner " << counts[1] << ", leaf " << counts[2] << ", other " << counts[3] << ") -> " << args.dump_page_owners << "\n";
+            
+        } catch (const std::exception& e) {
+            std::cerr << "\n" << e.what() << "\n";
+            return 1;
+        }
+
+        return 0;
+    }
 
     // The penalty starts after the load, so only the queries pay it
     if (args.miss_penalty_us > 0) {
