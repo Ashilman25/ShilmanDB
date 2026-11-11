@@ -1,0 +1,18 @@
+[
+  {
+    "Plan": {
+      "Node Type": "Index Only Scan",
+      "Parallel Aware": false,
+      "Async Capable": false,
+      "Scan Direction": "Forward",
+      "Index Name": "reviews_70k_review_date_idx",
+      "Relation Name": "reviews_70k",
+      "Alias": "reviews_70k",
+      "Startup Cost": 0.29,
+      "Total Cost": 26.53,
+      "Plan Rows": 712,
+      "Plan Width": 4,
+      "Index Cond": "((review_date >= '2016-02-06'::date) AND (review_date <= '2016-03-22'::date))"
+    }
+  }
+]

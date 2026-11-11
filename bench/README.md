@@ -36,7 +36,9 @@ bench/
     ├── embed_vector_check.py    embeds queries and the 500K slice (.venv-ai), drift check
     ├── vector_filters.py        the 15 filters per query (SQL and mask) and the part 1 queries
     ├── vector_truth.py          exact top-10 truth for every query × filter and unfiltered
-    └── tests/
+    ├── pg_vector_load.py        loads a table into the local Postgres, builds its B-trees and HNSW index
+    ├── pg_vector_grid.py        the 33 pgvector options, plan reading, and the timed strategy grid
+    └── tests/                   (fixtures/ holds EXPLAIN plans captured from the live server)
 ```
 
 `results/` and `tpch_data/` hold local data (gitignored) and stay at the top of `bench/`.
