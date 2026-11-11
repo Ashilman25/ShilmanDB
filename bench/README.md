@@ -34,6 +34,8 @@ bench/
     ├── questions.csv            the 210 written questions used as queries
     ├── prepare_vector_data.py   the 70K / 500K tables and the 10,000 query reviews
     ├── embed_vector_check.py    embeds queries and the 500K slice (.venv-ai), drift check
+    ├── vector_filters.py        the 15 filters per query (SQL and mask) and the part 1 queries
+    ├── vector_truth.py          exact top-10 truth for every query × filter and unfiltered
     └── tests/
 ```
 
