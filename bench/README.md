@@ -38,6 +38,9 @@ bench/
     ├── vector_truth.py          exact top-10 truth for every query × filter and unfiltered
     ├── pg_vector_load.py        loads a table into the local Postgres, builds its B-trees and HNSW index
     ├── pg_vector_grid.py        the 33 pgvector options, plan reading, and the timed strategy grid
+    ├── hnsw_search.py           numpy HNSW search over a saved graph, counting distance computations
+    ├── hnsw_graph.py            builds the HNSW graph with faiss and saves it (own process)
+    ├── stopping_check.py        REM, the logged plain search, the stopping model and its replay
     └── tests/                   (fixtures/ holds EXPLAIN plans captured from the live server)
 ```
 
