@@ -14,7 +14,7 @@ bash scripts/build.sh
 cd build && ctest --output-on-failure && cd ..
 
 # Generate TPC-H data (one-time)
-bash bench/generate_tpch_data.sh
+bash bench/tpch/generate_tpch_data.sh
 
 # Run a query (via the TPC-H benchmark loader)
 ./build/bench/load_tpch --sf 0.01 --db-file /tmp/tpch.db \
@@ -208,13 +208,13 @@ cd build && ctest --output-on-failure -R buffer
 
 ```bash
 # Generate TPC-H data (one-time setup)
-bash bench/generate_tpch_data.sh
+bash bench/tpch/generate_tpch_data.sh
 
 # Run full benchmark suite (ShilmanDB + SQLite, all configs)
-python bench/run_benchmarks.py --sf 0.01 --runs 5
+python bench/tpch/run_benchmarks.py --sf 0.01 --runs 5
 
 # Generate charts from results
-.venv/bin/python bench/plot_results.py
+.venv/bin/python bench/tpch/plot_results.py
 ```
 
 ## Project Structure
