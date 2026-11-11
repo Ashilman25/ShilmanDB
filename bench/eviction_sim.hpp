@@ -232,6 +232,11 @@ public:
     virtual bool Access(size_t run_index, const Run& run) = 0;
     [[nodiscard]] uint64_t Evictions() const { return evictions_; }
 
+    // The pages now in the pool, in no particular order.
+    [[nodiscard]] virtual std::vector<uint32_t> ResidentPages() const {
+        throw std::logic_error("policy cannot list its resident pages");
+    }
+
 protected:
     uint64_t evictions_{0};
 };
@@ -278,6 +283,12 @@ public:
         ++size_;
         PushBack(page);
         return true;
+    }
+
+    [[nodiscard]] std::vector<uint32_t> ResidentPages() const override {
+        std::vector<uint32_t> pages;
+        for (uint32_t p = head_; p != kNone; p = next_[p]) pages.push_back(p);
+        return pages;
     }
 
 private:
@@ -450,6 +461,10 @@ public:
         return true;
     }
 
+    [[nodiscard]] std::vector<uint32_t> ResidentPages() const override {
+        return std::vector<uint32_t>(page_in_.begin(), page_in_.begin() + static_cast<std::ptrdiff_t>(filled_));
+    }
+
 private:
     static constexpr uint32_t kEmpty = UINT32_MAX;
 
@@ -498,6 +513,12 @@ public:
         }
         order_.insert(KeyOf(page));
         return miss;
+    }
+
+    [[nodiscard]] std::vector<uint32_t> ResidentPages() const override {
+        std::vector<uint32_t> pages;
+        for (const auto& key : order_) pages.push_back(std::get<2>(key));
+        return pages;
     }
 
 private:
@@ -583,6 +604,14 @@ public:
 
     [[nodiscard]] ArcSizes Sizes() const { return {Size(kT1), Size(kT2), Size(kB1), Size(kB2), p_}; }
 
+    [[nodiscard]] std::vector<uint32_t> ResidentPages() const override {
+        std::vector<uint32_t> pages;
+        for (size_t p = 0; p < where_.size(); ++p) {
+            if (where_[p] == kT1 || where_[p] == kT2) pages.push_back(static_cast<uint32_t>(p));
+        }
+        return pages;
+    }
+
 private:
     enum List : uint8_t { kT1, kT2, kB1, kB2, kOut };
 
@@ -644,6 +673,14 @@ public:
             for (uint32_t k = 1; k < run.length && !lir_[x]; ++k) (void)Use(x);
         }
         return miss;
+    }
+
+    [[nodiscard]] std::vector<uint32_t> ResidentPages() const override {
+        std::vector<uint32_t> pages;
+        for (size_t p = 0; p < resident_.size(); ++p) {
+            if (resident_[p]) pages.push_back(static_cast<uint32_t>(p));
+        }
+        return pages;
     }
 
 private:
