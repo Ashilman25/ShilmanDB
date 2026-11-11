@@ -9,7 +9,7 @@
 
 namespace shilmandb {
 
-// ── TPC-H schema helpers (mirrors bench/load_tpch.cpp) ──────────────
+// ── TPC-H schema helpers (mirrors bench/tpch/load_tpch.cpp) ──────────────
 
 static Schema RegionSchema() {
     return Schema({
@@ -170,7 +170,7 @@ protected:
         auto data_dir = FindDataDir();
         if (data_dir.empty()) {
             GTEST_SKIP() << "TPC-H SF=0.01 data not found. "
-                            "Run bench/generate_tpch_data.sh first.";
+                            "Run bench/tpch/generate_tpch_data.sh first.";
         }
 
         // Large pool so eviction does not interfere with correctness.

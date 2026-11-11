@@ -8,7 +8,7 @@
 #include <vector>
 
 #include "engine/database.hpp"
-#include "page_owners.hpp"
+#include "tpch/page_owners.hpp"
 
 namespace shilmandb {
 

@@ -18,7 +18,7 @@
 
 #include "buffer/buffer_pool_manager.hpp"
 #include "buffer/lru_eviction_policy.hpp"
-#include "eviction_sim.hpp"
+#include "eviction/sim/eviction_sim.hpp"
 #include "storage/disk_manager.hpp"
 
 namespace shilmandb::evsim {

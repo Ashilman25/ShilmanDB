@@ -109,7 +109,7 @@ done
 if [ "$ALL_DATA_PRESENT" = true ]; then
     echo "TPC-H data already exists for all scale factors — skipping generation."
 else
-    bash bench/generate_tpch_data.sh
+    bash bench/tpch/generate_tpch_data.sh
 fi
 
 echo "Step 3 completed in $(elapsed_since "$STEP_START")"
@@ -254,7 +254,7 @@ step_header 10 "Run full benchmarks (ShilmanDB vs SQLite)"
 
 STEP_START=$(date +%s)
 
-$PYTHON bench/run_benchmarks.py --config all --sf all
+$PYTHON bench/tpch/run_benchmarks.py --config all --sf all
 
 echo ""
 echo "Step 10 completed in $(elapsed_since "$STEP_START")"
@@ -266,7 +266,7 @@ step_header 11 "Generate visualization charts"
 
 STEP_START=$(date +%s)
 
-$PYTHON bench/plot_results.py --results-dir "$RESULTS_DIR"
+$PYTHON bench/tpch/plot_results.py --results-dir "$RESULTS_DIR"
 
 echo ""
 echo "Step 11 completed in $(elapsed_since "$STEP_START")"

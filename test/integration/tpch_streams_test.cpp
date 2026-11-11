@@ -3,7 +3,7 @@
 
 #include "common/exception.hpp"
 #include "engine/database.hpp"
-#include "tpch_streams.hpp"
+#include "tpch/tpch_streams.hpp"
 #include "types/value.hpp"
 
 #include <algorithm>
@@ -401,7 +401,7 @@ protected:
 
         const auto data_dir = FindDataDir();
         if (data_dir.empty()) {
-            GTEST_SKIP() << "TPC-H SF=0.01 data not found. Run bench/generate_tpch_data.sh first.";
+            GTEST_SKIP() << "TPC-H SF=0.01 data not found. Run bench/tpch/generate_tpch_data.sh first.";
         }
 
         // 32 MB, enough to hold all of SF=0.01.

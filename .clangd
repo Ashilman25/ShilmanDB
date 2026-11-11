@@ -1,5 +1,5 @@
 If:
   PathMatch: bench/.*\.hpp
 CompileFlags:
-  Add: [-I../src]
+  Add: [-I../src, -I../bench]
   Remove: [-DSHILMANDB_HAS_LIBTORCH]
