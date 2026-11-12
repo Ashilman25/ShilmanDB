@@ -22,13 +22,28 @@ bench/
 │   ├── analyze_join_headroom.py
 │   ├── generate_join_training_data.cpp
 │   └── tests/
-└── eviction/          eviction experiments
-    ├── sim/           trace simulator (C++): eviction_sim, eviction_samples, eviction_switch
-    ├── headroom/      classical policies vs Belady on recorded traces
-    ├── engine/        the classical policies run inside the engine
-    ├── v3_check/      small learned policies on sampled candidates
-    ├── switch_check/  switching between policies as the workload changes
-    └── tests/
+├── eviction/          eviction experiments
+│   ├── sim/           trace simulator (C++): eviction_sim, eviction_samples, eviction_switch
+│   ├── headroom/      classical policies vs Belady on recorded traces
+│   ├── engine/        the classical policies run inside the engine
+│   ├── v3_check/      small learned policies on sampled candidates
+│   ├── switch_check/  switching between policies as the workload changes
+│   └── tests/
+└── vector_check/      vector search check: pgvector strategy grid and learned stopping (Python)
+    ├── vc_common.py             shared paths, text rules, distances, top-k, recall@10
+    ├── questions.csv            the 210 written questions used as queries
+    ├── prepare_vector_data.py   the 70K / 500K tables and the 10,000 query reviews
+    ├── embed_vector_check.py    embeds queries and the 500K slice (.venv-ai), drift check
+    ├── vector_filters.py        the 15 filters per query (SQL and mask) and the part 1 queries
+    ├── vector_truth.py          exact top-10 truth for every query × filter and unfiltered
+    ├── pg_vector_load.py        loads a table into the local Postgres, builds its B-trees and HNSW index
+    ├── pg_vector_grid.py        the 33 pgvector options, plan reading, and the timed strategy grid
+    ├── hnsw_search.py           numpy HNSW search over a saved graph, counting distance computations
+    ├── hnsw_graph.py            builds the HNSW graph with faiss and saves it (own process)
+    ├── stopping_check.py        REM, the logged plain search, the stopping model and its replay
+    ├── analyze_vector_check.py  applies the fixed bars (500K only) and writes report.md, cells.csv, charts
+    ├── run_vector_check.py      the driver: runs every step for one size, prints each command
+    └── tests/                   (fixtures/ holds EXPLAIN plans captured from the live server)
 ```
 
 `results/` and `tpch_data/` hold local data (gitignored) and stay at the top of `bench/`.
