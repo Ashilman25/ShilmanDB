@@ -91,7 +91,7 @@ def _missing(paths: Iterable[Path]) -> Path | None:
     return next((p for p in paths if not p.exists()), None)
 
 
-# Write via a temp file and a rename, so a stopped run leaves no half file.
+# Write via a temp file and rename, so a stopped run leaves no half file.
 def _write_atomic(path: Path, write: Callable) -> None:
     tmp = path.with_name(f"{path.name}.tmp{os.getpid()}")
     try:

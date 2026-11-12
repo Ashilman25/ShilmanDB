@@ -1,6 +1,7 @@
 """Tests for bench/vector_check/analyze_vector_check.py on hand-made grids and size folders."""
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import math
@@ -86,6 +87,8 @@ def test_constants_match_spec():
     assert mod.CHARGE_DIVISOR == 25 and mod.CHARGE_FACTORS == (0, 1, 4)
     assert mod.EPS == 1e-12
     assert len(mod.OPTIONS) == 33 and len(mod.FORCED) == 17 and len(mod.SETTINGS) == 16
+    assert mod.WARMUP == 50 and mod.RUNS == 3
+    assert mod.GATE_TEST_QUERIES == 1000 and mod.GATE_QUESTIONS == 210 and mod.GATE_TRAIN_QUERIES == 8000
 
 
 # My option copy must match the grid's names, kinds and intended scans.
@@ -336,8 +339,12 @@ def write_size(results: Path, size: str = "70k", n: int = 2, limits=None) -> Pat
     mem = [(q, f, o, "True") for q, _, _ in queries(size, n) for f in BAND_A for o in mod.ITERATIVE]
     pd.DataFrame(mem, columns=["qid", "filter", "option", "ids_equal"]).to_csv(out / "memcheck.csv", index=False)
     put_json(out / "pg_load.json", {"server_version": "17.11 (Homebrew)", "extversion": "0.8.7"})
+    sha = hashlib.sha256((out / "pg_load.json").read_bytes()).hexdigest()
+    run = {"n_per_group": n, "warmup": 50, "runs": 3, "load_sha256": sha, "kept": 0, "dropped": 0,
+           "measured": n * 30, "complete": True}
     put_json(out / "grid_info.json", {"size": size, "n_per_group": n, "cells": n * 30,
-                                      "server_version": "17.11 (Homebrew)", "extversion": "0.8.7"})
+                                      "server_version": "17.11 (Homebrew)", "extversion": "0.8.7",
+                                      "load_sha256": sha, "history": [run]})
     rem = [(s, f"{s[0]}{i:02d}", ef, 0.9 if ef == 10 else 1.0, ef * 10)
            for s, k in (("validation", 20), ("test", 5)) for i in range(k) for ef in (10, 100)]
     pd.DataFrame(rem, columns=["set", "qid", "ef", "recall", "ndis"]).to_csv(out / "rem.csv", index=False)
@@ -347,9 +354,10 @@ def write_size(results: Path, size: str = "70k", n: int = 2, limits=None) -> Pat
     put_json(out / "plain_E.json", {"E": 1000, "val_recall": {"500": 0.99, "1000": 0.997}, "limits": lim})
     targets = {str(t): {"dists_t": 500.0, "ipi": 250, "mpi": 50} for t in mod.TARGETS}
     put_json(out / "train_info.json",
-             {"E": 1000, "trees": 100, "learning_rate": 0.1, "limits": lim, "targets": targets})
+             {"E": 1000, "queries": 8000, "trees": 100, "learning_rate": 0.1, "limits": lim, "targets": targets})
     s = stop_frame()
     s = pd.concat([s.replace({"test": "validation"}).query("set == 'validation'"), s], ignore_index=True)
+    s["n_queries"] = s["set"].map({"validation": 1000, "test": 1000, "questions": 210})
     for f in (0, 4):
         s[f"work_{f}x"] = s["mean_ndis"] + 4 * f * s["mean_calls"]
     s.to_csv(out / "stopping.csv", index=False)
@@ -631,3 +639,218 @@ def test_clean_500k_with_warned_70k_gives_no_verdict(tmp_path, monkeypatch):
     assert not any(line.startswith("**WARNING** 500k") for line in lines)
     body = section(text, "## 500K (no verdict: see the warnings)")
     assert "**GO" not in body and "**NO-GO" not in body
+
+
+# Edit a JSON file in place with fn.
+def edit_json(path: Path, fn) -> None:
+    data = json.loads(path.read_text())
+    fn(data)
+    put_json(path, data)
+
+
+# One timed-out baseline row on a training cell: band B passes; the report counts it.
+def test_timeouts_behind_a_passing_band_get_a_line():
+    rows = []
+    for i in range(40):
+        q, half, stalled = f"q{i}", "train" if i < 20 else "test", i == 0
+        rows += [row(q, "date_1", "set_relaxed_ef40", 10000.0 if stalled else 1.0, 0.0 if stalled else 1.0, half),
+                 row(q, "date_1", "set_noindex", 1.0, 1.0, half), row(q, "date_1", "exact_bitmap", 1.0, 1.0, half)]
+        rows[-3]["timed_out"] = stalled
+        for j in range(5):
+            f = f"date_10_{j}"
+            rows += [row(q, f, "set_relaxed_ef40", 1.0, 1.0, half, 0.1), row(q, f, "set_noindex", 100.0, 1.0, half, 0.1),
+                     row(q, f, "exact_bitmap", 100.0, 1.0, half, 0.1)]
+            # A timed-out flag behind band C's picks, where room fails: it must not be counted.
+            rows[-3]["timed_out"] = i == 0 and j == 0
+        # Band D: the rule's pick misses recall on the test half, so both clauses fail there.
+        rows += [row(q, "rating_5", "set_relaxed_ef40", 1.0, 1.0, half, 0.6),
+                 row(q, "rating_5", "hnsw_off_ef40", 0.5, 1.0 if half == "train" else 0.0, half, 0.6)]
+        rows[-2]["timed_out"] = i == 20
+    result = mod.part1(pd.DataFrame(rows))
+    assert result["verdict"] == "GO" and result["band"] == "B" and result["baseline"] == "set_relaxed_ef40"
+    band_d = next(b for b in result["bands"] if b["band"] == "D")
+    assert not band_d["room_ok"] and not band_d["rule_ok"]
+    lines = [ln for ln in mod.part1_lines(result, dev=False) if ln.startswith("Timed-out rows")]
+    assert lines == ["Timed-out rows behind band B's totals: 1 (a timeout counts as 10,000 ms and recall 0)."]
+
+    clean = mod.part1_lines(mod.part1(band_b(GO_TRAIN, GO_TEST)), dev=False)
+    assert not any(ln.startswith("Timed-out rows") for ln in clean)
+
+
+# A crash while writing charts leaves no report.md, so the driver sees a crash, not warnings.
+def test_report_written_last(tmp_path, monkeypatch):
+    write_size(tmp_path)
+
+    # Stand-in chart writer that fails.
+    def broken(*args, **kwargs):
+        raise RuntimeError("chart failed")
+
+    monkeypatch.setattr(mod, "part1_chart", broken)
+    with pytest.raises(RuntimeError):
+        mod.main(["--results", str(tmp_path)])
+    assert not (tmp_path / "report.md").exists()
+
+
+GATE_HISTORY_CASES = {
+    "no_history": (lambda info: info.pop("history"), "no history of grid runs"),
+    "warmup": (lambda info: info["history"][0].update(warmup=0), "don't use warmup 50 and runs 3"),
+    "runs": (lambda info: info["history"][0].update(runs=1), "don't use warmup 50 and runs 3"),
+    "lowered": (lambda info: info["history"].append({**info["history"][0], "n_per_group": 1, "kept": 30,
+                                                     "dropped": 30, "measured": 0}),
+                "changes N from 2 to 1 after a finished grid"),
+    "raised": (lambda info: info["history"].append({**info["history"][0], "n_per_group": 3, "kept": 60,
+                                                    "dropped": 0, "measured": 60}),
+               "changes N from 2 to 3 after a finished grid"),
+}
+
+
+# Each history problem warns at 500K and not at 70K.
+@pytest.mark.parametrize("case", list(GATE_HISTORY_CASES))
+def test_history_warnings_at_gate_only(tmp_path, monkeypatch, case):
+    monkeypatch.setattr(mod, "MIN_GATE_QUERIES", 1)
+    mutate, words = GATE_HISTORY_CASES[case]
+    for size in ("70k", "500k"):
+        out = write_size(tmp_path, size)
+        edit_json(out / "grid_info.json", mutate)
+        found = mod.validate(out, size, None)
+        assert found == [] if size == "70k" else (len(found) == 1 and words in found[0]), found
+
+
+# The size section sums up the grid runs; without a history it says nothing.
+def test_history_summary_line(tmp_path):
+    out = write_size(tmp_path, limits={"train": 200, "validation": 100, "test": 100})
+    first = json.loads((out / "grid_info.json").read_text())["history"][0]
+    edit_json(out / "grid_info.json", lambda info: info.update(history=[
+        {**first, "n_per_group": 50, "measured": 420, "complete": False},
+        {**first, "n_per_group": 35, "kept": 380, "dropped": 40, "measured": 0}]))
+    assert mod.main(["--results", str(tmp_path)]) == 0
+    text = (tmp_path / "report.md").read_text()
+    assert ("Grid runs: N = 50, measured 420 cells; N = 35, kept 380, dropped 40, measured 0 cells, "
+            "complete.") in text.splitlines()
+
+    edit_json(out / "grid_info.json", lambda info: info.pop("history"))
+    assert mod.main(["--results", str(tmp_path)]) == 0
+    assert "Grid runs:" not in (tmp_path / "report.md").read_text()
+
+
+GATE_COUNT_CASES = {
+    "test": (lambda o: edit_csv(o / "stopping.csv", lambda df: df.assign(
+        n_queries=["500" if s == "test" else n for s, n in zip(df["set"], df["n_queries"])])),
+        "test rows have n_queries 500, want 1000"),
+    "questions": (lambda o: set_first(o / "stopping.csv", "n_queries", "200", set="questions"),
+                  "questions rows have n_queries 200, want 210"),
+    "train": (lambda o: set_json(o / "train_info.json", "queries", 7999), "queries 7999, want 8000"),
+}
+
+
+# Part 2 at the gate needs 1,000 test reviews, 210 questions and 8,000 training queries.
+@pytest.mark.parametrize("case", list(GATE_COUNT_CASES))
+def test_part2_counts_checked_at_gate(tmp_path, monkeypatch, case):
+    monkeypatch.setattr(mod, "MIN_GATE_QUERIES", 1)
+    out = write_size(tmp_path, "500k")
+    mutate, words = GATE_COUNT_CASES[case]
+    mutate(out)
+    found = mod.validate(out, "500k", None)
+    assert len(found) == 1 and words in found[0], found
+
+
+# A 70K run limited to a few queries doesn't warn about counts.
+def test_part2_counts_not_checked_at_70k(tmp_path):
+    out = write_size(tmp_path, limits={"train": 200, "validation": 100, "test": 100})
+    edit_csv(out / "stopping.csv", lambda df: df.assign(
+        n_queries=["210" if s == "questions" else "100" for s in df["set"]]))
+    set_json(out / "train_info.json", "queries", 200)
+    assert mod.validate(out, "70k", None) == []
+
+
+# 500K without a 70K run warns: the pgvector version can't be compared.
+def test_500k_without_70k_warns(tmp_path, monkeypatch):
+    monkeypatch.setattr(mod, "MIN_GATE_QUERIES", 1)
+    write_size(tmp_path, "500k")
+    assert mod.main(["--results", str(tmp_path)]) == 1
+    warning = "**WARNING** 500k: no 70K run, so the pgvector version can't be compared across sizes"
+    lines = (tmp_path / "report.md").read_text().splitlines()
+    assert [ln for ln in lines if ln.startswith("**WARNING**")] == [warning]
+
+    write_size(tmp_path, "70k")
+    assert mod.main(["--results", str(tmp_path)]) == 0
+    assert warning not in (tmp_path / "report.md").read_text()
+
+
+# A grid measured on another table load warns at any size.
+@pytest.mark.parametrize("change", ["reloaded", "no_hash"])
+def test_grid_must_match_table_load(tmp_path, change):
+    out = write_size(tmp_path)
+    if change == "reloaded":
+        set_json(out / "pg_load.json", "copy_s", 0.4)
+    else:
+        edit_json(out / "grid_info.json", lambda info: info.pop("load_sha256"))
+    found = mod.validate(out, "70k", None)
+    assert found == ["70k: grid_info.json load_sha256 doesn't match pg_load.json, so the grid was measured "
+                     "on another table load"]
+
+
+# --failed-step adds a warning and exits 1; a bad value exits 2.
+def test_failed_step_flag(tmp_path, capsys):
+    write_size(tmp_path)
+    assert mod.main(["--results", str(tmp_path), "--failed-step", "500k:grid"]) == 1
+    lines = (tmp_path / "report.md").read_text().splitlines()
+    assert ("**WARNING** 500k: the grid step failed, so the steps after it didn't run; their files are missing "
+            "or from an older run") in lines
+    assert "**Part 1: NO VERDICT**" in lines and "**Part 2: NO VERDICT**" in lines
+
+    assert mod.main(["--results", str(tmp_path), "--failed-step", "70k:replay"]) == 1
+    text = (tmp_path / "report.md").read_text()
+    assert "**WARNING** 70k: the replay step failed" in text and "not a verdict (see the warnings)" in text
+    for bad in ("1m:grid", "70k:", "grid", ":grid"):
+        with pytest.raises(SystemExit) as e:
+            mod.main(["--results", str(tmp_path), "--failed-step", bad])
+        assert e.value.code == 2
+
+
+# Part 2 limits print as words, or none.
+def test_part2_limits_print_plainly(tmp_path):
+    write_size(tmp_path, limits={"train": 200, "validation": 100, "test": 100})
+    mod.main(["--results", str(tmp_path)])
+    assert "Part 2 limits: train 200, validation 100, test 100." in (tmp_path / "report.md").read_text()
+    write_size(tmp_path)
+    mod.main(["--results", str(tmp_path)])
+    assert "Part 2 limits: none." in (tmp_path / "report.md").read_text()
+
+
+# The rule buckets cells by Postgres's estimate, not the true share.
+def test_rule_buckets_by_estimate():
+    low = {"hnsw_off_ef40": (1, 1.0), "hnsw_strict_ef40": (5, 1.0), "set_noindex": (10, 1.0)}
+    high = {"hnsw_off_ef40": (1, 0.5), "hnsw_strict_ef40": (2, 1.0), "set_noindex": (10, 1.0)}
+    g = grid(*[(q, "date_1", "train", 0.01, 0.0005, low) for q in ("q1", "q2")],
+             *[(q, "date_1", "train", 0.01, 0.01, high) for q in ("q3", "q4")],
+             ("q5", "date_1", "test", 0.01, 0.0005, low), ("q6", "date_1", "test", 0.01, 0.01, high))
+    assert mod.bucket_of(0.0005) == 0 and mod.bucket_of(0.01) == 3
+    result = mod.part1(g)
+    assert result["rule"][0] == "hnsw_off_ef40" and result["rule"][3] == "hnsw_strict_ef40"
+    assert band(result, "B")["rule_ms"] == 1 + 2
+
+
+# The work bar charges predictor calls, so 690 distances plus 5 calls fails it.
+def test_part2_work_bar_charges_calls():
+    # Learned's test row at the first target with these distances and calls.
+    def frame(calls: int) -> pd.DataFrame:
+        s = stop_frame()
+        hit = (s["set"] == "test") & (s["method"] == "learned") & (s["target"] == mod.TARGETS[0])
+        s.loc[hit, ["mean_ndis", "mean_calls", "work_1x"]] = [690, calls, 690 + 4 * calls]
+        return s
+
+    charged = mod.part2(frame(5))
+    assert charged["verdict"] == "NO-GO" and not charged["targets"][0]["work_ok"]
+    assert charged["targets"][0]["test"]["learned"]["work"][0] == 690
+    free = mod.part2(frame(0))
+    assert free["verdict"] == "GO" and free["targets"][0]["work_ok"]
+
+
+# A setting can be the ceiling's pick when it's the fastest at the bar.
+def test_ceiling_can_pick_a_setting():
+    g = grid(("q1", "date_1", "test", 0.01, 0.01, {
+        "exact_seq": (10, 1.0), "hnsw_off_ef40": (1, 0.9), "hnsw_off_ef400": (4, 1.0), "set_off_ef400": (2, 1.0)}))
+    g.loc[g["option"] == "set_off_ef400", "scan"] = "btree_index"
+    c = mod.ceiling_choice(g)
+    assert len(c) == 1 and c.iloc[0]["option"] == "set_off_ef400" and c.iloc[0]["time_ms"] == 2

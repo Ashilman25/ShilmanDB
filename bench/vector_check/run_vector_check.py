@@ -149,8 +149,13 @@ def build_commands(args) -> list[tuple[str, list[str] | None, str | None]]:
     return [(step, cmd, note) for step in args.steps for cmd, note in per_step[step]]
 
 
+# True when analyze exited 1 and wrote report.md: warnings, not a crash.
+def _warned(step: str, code: int, report: Path) -> bool:
+    return step == "analyze" and code == 1 and report.exists()
+
+
 # Run one command; returns 0, or the exit code to stop with after saying why.
-def _run(step: str, cmd: list[str]) -> int:
+def _run(step: str, cmd: list[str], report: Path) -> int:
     try:
         proc = subprocess.Popen(cmd)
     except OSError as e:
@@ -174,7 +179,10 @@ def _run(step: str, cmd: list[str]) -> int:
     if code < 0:
         print(f"== {step}: killed by signal {-code}, stopping", file=sys.stderr, flush=True)
         return 128 - code
-    if code:
+    
+    if _warned(step, code, report):
+        print("== analyze: report.md has warnings (NO VERDICT); see its first lines", file=sys.stderr, flush=True)
+    elif code:
         print(f"== {step}: failed with exit code {code}, stopping", file=sys.stderr, flush=True)
     return code
 
@@ -188,6 +196,20 @@ def resume_line(args, step: str) -> str:
     return f"to resume: rerun with --steps {rest} (and your other flags)"
 
 
+# After a step stops: analyzer warnings end quietly; any other failure still gets analyze.
+# Ctrl-C (130) skips analyze. Returns the exit code to stop with.
+def _stopped(args, commands, step: str, code: int, report: Path) -> int:
+    if _warned(step, code, report):
+        return 1
+    if step != "analyze" and code != 130 and "analyze" in args.steps:
+        cmd = [*next(c for s, c, _ in commands if s == "analyze"), "--failed-step", f"{args.size}:{step}"]
+        print(f"== analyze: start {time.strftime('%H:%M:%S')} (after the {step} step failed)", flush=True)
+        print(shlex.join(cmd), flush=True)
+        _run("analyze", cmd, report)
+    print(resume_line(args, step), file=sys.stderr, flush=True)
+    return code
+
+
 # Print and run each step's commands, stopping at the first failure. Returns the exit code.
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
@@ -199,17 +221,21 @@ def main(argv: list[str] | None = None) -> int:
             print(f"error: python not found: {', '.join(missing)}", file=sys.stderr)
             return 1
 
+    # An old report would outlive a failed step and look current.
+    report = vc.paths(args.results, args.ai).report
+    if "analyze" in args.steps and not args.dry_run:
+        report.unlink(missing_ok=True)
+
     for step in args.steps:
         started = time.monotonic()
         print(f"== {step}: start {time.strftime('%H:%M:%S')}", flush=True)
         for _, cmd, note in (row for row in commands if row[0] == step):
             print(note if cmd is None else shlex.join(cmd), flush=True)
             if cmd is not None and not args.dry_run:
-                code = _run(step, cmd)
+                code = _run(step, cmd, report)
                 if code:
-                    print(resume_line(args, step), file=sys.stderr, flush=True)
-                    return code
-                
+                    return _stopped(args, commands, step, code, report)
+
         print(f"== {step}: done in {time.monotonic() - started:.1f} s", flush=True)
     return 0
 

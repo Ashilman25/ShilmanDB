@@ -200,14 +200,14 @@ def test_unknown_step_rejected(tmp, capsys):
     assert _exit_code(["--size", "70k", "--steps", ",", *_folders(tmp), "--dry-run"]) == 2
 
 
-# A failing truth step stops the run with its exit code and a resume line.
+# A failing truth step: its exit code, a resume line, and only analyze after it.
 def test_stops_at_first_failure(tmp, monkeypatch, capsys):
     log = _fake_popen(monkeypatch, lambda cmd: [3 if cmd[1].endswith("vector_truth.py") else 0])
     py, ai_py = _fake_python(tmp, "py"), _fake_python(tmp, "aipy")
     code = mod.main(["--size", "70k", *_folders(tmp), "--python", str(py), "--ai-python", str(ai_py)])
     assert code == 3
     assert _scripts(log) == ["prepare_vector_data.py", "prepare_vector_data.py", "embed_vector_check.py",
-                             "vector_truth.py"]
+                             "vector_truth.py", "analyze_vector_check.py"]
     captured = capsys.readouterr()
     assert "truth" in captured.err and "exit code 3" in captured.err
     assert "to resume: rerun with --steps truth,load,grid,graph,rem,trajectories,train,replay,analyze " \
@@ -222,7 +222,7 @@ def test_resume_hint_lists_later_selected_steps(tmp, monkeypatch, capsys):
     argv = ["--size", "70k", "--steps", "analyze,grid,load,train", *_folders(tmp),
             "--python", str(py), "--ai-python", str(ai_py)]
     assert mod.main(argv) == 5
-    assert _scripts(log) == ["pg_vector_load.py", "pg_vector_grid.py"]
+    assert _scripts(log) == ["pg_vector_load.py", "pg_vector_grid.py", "analyze_vector_check.py"]
     err = capsys.readouterr().err.splitlines()
     assert "to resume: rerun with --steps grid,train,analyze (and your other flags)" in err
 
@@ -524,3 +524,88 @@ def test_killed_command_gives_shell_style_code(tmp, monkeypatch, capsys):
                      "--python", str(py), "--ai-python", str(ai_py)])
     assert code == 137
     assert "signal 9" in capsys.readouterr().err
+
+
+# A failing middle step: report.md goes first, analyze runs with --failed-step, then resume line.
+def test_failed_step_still_runs_analyze(tmp, monkeypatch, capsys):
+    report = tmp / "res" / "report.md"
+    report.parent.mkdir(parents=True)
+    report.write_text("old report\n")
+    seen = []
+
+    # Truth fails; analyze then writes a report and warns.
+    def outcomes(cmd):
+        seen.append(report.exists())
+        if cmd[1].endswith("analyze_vector_check.py"):
+            report.write_text("warned report\n")
+            return [1]
+        return [3 if cmd[1].endswith("vector_truth.py") else 0]
+
+    log = _fake_popen(monkeypatch, outcomes)
+    py, ai_py = _fake_python(tmp, "py"), _fake_python(tmp, "aipy")
+    code = mod.main(["--size", "70k", *_folders(tmp), "--python", str(py), "--ai-python", str(ai_py)])
+    assert code == 3 and seen and not any(seen) and report.read_text() == "warned report\n"
+    assert _scripts(log) == ["prepare_vector_data.py", "prepare_vector_data.py", "embed_vector_check.py",
+                             "vector_truth.py", "analyze_vector_check.py"]
+    assert _started(log)[-1][2:] == ["--results", str(tmp / "res"), "--failed-step", "70k:truth"]
+    captured = capsys.readouterr()
+    out, err = captured.out.splitlines(), captured.err.splitlines()
+    assert any(line.startswith("== analyze: start ") and line.endswith(" (after the truth step failed)") for line in out)
+    assert "== load: start" not in captured.out and "== analyze: done" not in captured.out
+    assert err[-1] == ("to resume: rerun with --steps truth,load,grid,graph,rem,trajectories,train,replay,analyze "
+                       "(and your other flags)")
+    assert "== analyze: report.md has warnings (NO VERDICT); see its first lines" in err
+
+
+# A crash of the analyze after a failed step keeps the failed step's exit code.
+def test_crash_of_analyze_after_failure_keeps_exit_code(tmp, monkeypatch, capsys):
+    _fake_popen(monkeypatch, lambda cmd: [3 if cmd[1].endswith("vector_truth.py") else 1 if cmd[1].endswith("analyze_vector_check.py") else 0])
+    py, ai_py = _fake_python(tmp, "py"), _fake_python(tmp, "aipy")
+    assert mod.main(["--size", "70k", *_folders(tmp), "--python", str(py), "--ai-python", str(ai_py)]) == 3
+    err = capsys.readouterr().err.splitlines()
+    assert "== analyze: failed with exit code 1, stopping" in err
+    assert err[-1] == ("to resume: rerun with --steps truth,load,grid,graph,rem,trajectories,train,replay,analyze "
+                       "(and your other flags)")
+
+
+# The analyzer's own exit 1 means warnings: one plain line, no resume line, exit 1.
+def test_analyze_warnings_are_not_a_failure(tmp, monkeypatch, capsys):
+    report = tmp / "res" / "report.md"
+    report.parent.mkdir(parents=True)
+    log = _fake_popen(monkeypatch, lambda cmd: (report.write_text("warned\n"), [1])[1])
+    py, ai_py = _fake_python(tmp, "py"), _fake_python(tmp, "aipy")
+    assert mod.main(["--steps", "analyze", *_folders(tmp), "--python", str(py), "--ai-python", str(ai_py)]) == 1
+    assert _scripts(log) == ["analyze_vector_check.py"] and "--failed-step" not in _started(log)[0]
+    err = capsys.readouterr().err.splitlines()
+    assert err == ["== analyze: report.md has warnings (NO VERDICT); see its first lines"]
+
+
+# An analyzer that exits 1 without writing report.md crashed: a failure with a resume line.
+def test_analyze_crash_is_a_failure(tmp, monkeypatch, capsys):
+    _fake_popen(monkeypatch, lambda cmd: [1])
+    py, ai_py = _fake_python(tmp, "py"), _fake_python(tmp, "aipy")
+    assert mod.main(["--steps", "analyze", *_folders(tmp), "--python", str(py), "--ai-python", str(ai_py)]) == 1
+    err = capsys.readouterr().err.splitlines()
+    assert err == ["== analyze: failed with exit code 1, stopping",
+                   "to resume: rerun with --steps analyze (and your other flags)"]
+
+
+# Any other analyzer exit code is a failure too, even when a report exists.
+def test_analyze_exit_2_is_a_failure(tmp, monkeypatch, capsys):
+    report = tmp / "res" / "report.md"
+    report.parent.mkdir(parents=True)
+    _fake_popen(monkeypatch, lambda cmd: (report.write_text("x\n"), [2])[1])
+    py, ai_py = _fake_python(tmp, "py"), _fake_python(tmp, "aipy")
+    assert mod.main(["--steps", "analyze", *_folders(tmp), "--python", str(py), "--ai-python", str(ai_py)]) == 2
+    err = capsys.readouterr().err.splitlines()
+    assert err == ["== analyze: failed with exit code 2, stopping",
+                   "to resume: rerun with --steps analyze (and your other flags)"]
+
+
+# A dry run deletes nothing, report.md included.
+def test_dry_run_keeps_report(tmp, monkeypatch, capsys):
+    report = tmp / "res" / "report.md"
+    report.parent.mkdir(parents=True)
+    report.write_text("old report\n")
+    code, _ = _dry(["--size", "70k", *_folders(tmp)], monkeypatch, capsys)
+    assert code == 0 and report.read_text() == "old report\n"

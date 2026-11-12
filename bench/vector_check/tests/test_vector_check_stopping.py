@@ -545,6 +545,9 @@ def test_tiny_end_to_end(tmp_path):
     assert set(info["targets"]) == {"0.9", "0.95", "0.99"}
     for t in info["targets"].values():
         assert t["ipi"] == max(8, round(t["dists_t"] / 2)) and t["mpi"] == max(8, round(t["dists_t"] / 10))
+    # dists_t: the mean distances training queries need to first reach each target.
+    for i, target in enumerate(mod.TARGETS):
+        assert info["targets"][str(target)]["dists_t"] == float(np.mean(train["reach"][:, i]))
     assert (size_dir / "model" / "darth.txt").exists()
 
     proc = run_child("replay", world, "--jobs", "2", *limit)
@@ -570,7 +573,96 @@ def test_tiny_end_to_end(tmp_path):
             assert int(r.param) in mod.EF_GRID
     plain_val = stop[(stop["set"] == "validation") & (stop["method"] == "plain")]
     assert (plain_val["mean_recall"].astype(float) == plain["val_recall"]["500"]).all()
+    # Plain's work is the logged plain search's own final distance count, per set.
+    for name in ("validation", "test", "questions"):
+        final = np.load(size_dir / "traj" / f"{name}.npz")["final_ndis"]
+        rows = stop[(stop["set"] == name) & (stop["method"] == "plain")]
+        assert rows["mean_ndis"].astype(float).tolist() == pytest.approx([float(np.mean(final))] * 3)
     per_query = pd.read_csv(size_dir / "stopping_queries.csv", dtype={"set": str, "qid": str})
     assert list(per_query.columns) == ["set", "qid", "target", "method", "recall", "ndis", "calls"]
     assert len(per_query) == (10 + 10 + 210) * 3 * 3
     assert time.monotonic() - started < 30
+
+
+# Predicted recall at each logged checkpoint of every hand-written trajectory.
+PREDS = (0.80, 0.902, 0.912, 0.925, 0.935, 0.96, 0.995, 1.0, 1.06)
+
+
+# Each scored set's selected qids: the first n of validation and test, then every question.
+def set_qids(world: dict, n_val: int, n_test: int) -> dict:
+    t = world["truth"]
+    return {name: t["qids"][t["sets"] == name][:n].tolist()
+            for name, n in (("validation", n_val), ("test", n_test), ("questions", None))}
+
+
+# A rem.csv whose recall per row comes from recall(set, ef, index in the set).
+def write_rem(world: dict, qids: dict, recall) -> pd.DataFrame:
+    rows = [(name, q, ef, recall(name, ef, i), ef * 10) for name, qs in qids.items()
+            for i, q in enumerate(qs) for ef in mod.EF_GRID]
+    frame = pd.DataFrame(rows, columns=["set", "qid", "ef", "recall", "ndis"])
+    frame.to_csv(world["size_dir"] / "rem.csv", index=False)
+    return frame
+
+
+# Validation recall reaches 0.9 only at the fourth checkpoint, test and questions at the second.
+def write_traj(world: dict, qids: dict) -> None:
+    ndis = [8 * (j + 1) for j in range(len(PREDS))]
+    late, early = [0.5, 0.5, 0.5] + [1.0] * 6, [0.5] + [1.0] * 8
+    (world["size_dir"] / "traj").mkdir(parents=True, exist_ok=True)
+    for name, qs in qids.items():
+        n = len(qs)
+        np.savez(world["size_dir"] / "traj" / f"{name}.npz", qids=np.array(qs, dtype=str),
+                 offsets=np.arange(n + 1, dtype=np.int64) * len(ndis), ndis=np.tile(ndis, n).astype(np.int32),
+                 features=np.zeros((n * len(ndis), len(hs.FEATURES)), dtype=np.float32),
+                 recall=np.tile(late if name == "validation" else early, n).astype(np.float32),
+                 final_ndis=np.full(n, ndis[-1] + 4, dtype=np.int64), final_recall=np.ones(n))
+
+
+# REM's ef and the margin come from the validation reviews, where test would pick others.
+def test_replay_choices_come_from_validation(tmp_path, monkeypatch):
+    world = write_world(tmp_path)
+    size_dir, qids = world["size_dir"], set_qids(world, 3, 3)
+    limits = {"train": 2, "validation": 3, "test": 3}
+    write_rem(world, qids, lambda name, ef, i: 1.0 if ef >= (100 if name == "validation" else 40) else 0.5)
+    write_traj(world, qids)
+    (size_dir / "plain_E.json").write_text(json.dumps({"E": 500, "val_recall": {}, "limits": limits}))
+    targets = {str(t): {"dists_t": 16.0, "ipi": 8, "mpi": 8} for t in mod.TARGETS}
+    (size_dir / "train_info.json").write_text(json.dumps({"E": 500, "limits": limits, "targets": targets}))
+    (size_dir / "model").mkdir()
+    (size_dir / "model" / "darth.txt").write_text("stand-in\n")
+    monkeypatch.setattr(mod, "predict_sets", lambda path, features, jobs: {
+        name: np.tile(PREDS, len(x) // len(PREDS)).astype(np.float64) for name, x in features.items()})
+    assert mod.main(["replay", *world_args(world), "--jobs", "1", "--limit", "2,3,3"]) == 0
+
+    rem = mod.read_rem(size_dir / "rem.csv", [q for qs in qids.values() for q in qs])
+    trajs = {name: mod.read_traj(size_dir / "traj" / f"{name}.npz", qs)[0] for name, qs in qids.items()}
+    preds = {name: np.tile(PREDS, len(qs)).astype(np.float64) for name, qs in qids.items()}
+    stop = pd.read_csv(size_dir / "stopping.csv", dtype=str, keep_default_na=False)
+    for t in mod.TARGETS:
+        rows = stop[stop["target"].astype(float) == t]
+        ef = mod.rem_choice(mod._val_means(rem, qids["validation"]), t)
+        assert ef == 100 != mod.rem_choice(mod._val_means(rem, qids["test"]), t)
+        assert {int(p) for p in rows.loc[rows["method"] == "rem", "param"]} == {ef}
+        margin = mod.margin_for(trajs["validation"], preds["validation"], t, 8, 8)[0]
+        assert {float(p) for p in rows.loc[rows["method"] == "learned", "param"]} == {margin}
+    on_test = mod.margin_for(trajs["test"], preds["test"], mod.TARGETS[0], 8, 8)[0]
+    assert mod.margin_for(trajs["validation"], preds["validation"], mod.TARGETS[0], 8, 8)[0] == 0.02 != on_test
+    assert "lightgbm" not in sys.modules
+
+
+# E comes from the validation reviews' recall, where test would pick a smaller one.
+def test_E_chosen_on_validation(tmp_path):
+    world = write_world(tmp_path)
+    qids = set_qids(world, 3, 3)
+    # One validation query finds 9 of 10 below ef 1000; test queries find all 10.
+    rem = write_rem(world, qids, lambda name, ef, i: 0.9 if name == "validation" and i == 0 and ef < 1000 else 1.0)
+    assert mod.main(["trajectories", *world_args(world), "--jobs", "1", "--limit", "5,3,3"]) == 1
+    plain = json.loads((world["size_dir"] / "plain_E.json").read_text())
+
+    # Mean recall per ef over one set's rows of the hand-written rem.csv.
+    def means(name: str) -> dict:
+        rows = rem[rem["set"] == name]
+        return {int(ef): mod.mean_recall(r["recall"]) for ef, r in rows.groupby("ef")}
+
+    assert plain["E"] == mod.choose_E(means("validation")) == 1000 and mod.choose_E(means("test")) == 500
+    assert plain["val_recall"] == {str(ef): v for ef, v in means("validation").items()}

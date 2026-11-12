@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import bisect
+import hashlib
 import importlib.util
 import json
 import sys
@@ -55,6 +56,11 @@ EXACT_OPTIONS = ("exact_seq", "exact_bitmap", "set_noindex")
 ITERATIVE_COUNT = 10
 MEMCHECK_CELLS = 20
 DETERMINISM_QUERIES = 20
+WARMUP = 50
+RUNS = 3
+GATE_TEST_QUERIES = 1000
+GATE_QUESTIONS = 210
+GATE_TRAIN_QUERIES = 8000
 TREES = 100
 LEARNING_RATE = 0.1
 CHARGE_DIVISOR = 25
@@ -192,9 +198,20 @@ def _total(cells: pd.DataFrame, label: str) -> tuple:
     return float(ms.sum()), float(cells[f"{label}_recall"].mean())
 
 
+# The timed-out rows behind these choices' totals, as (qid, filter, option).
+def _timed_out_picks(cells: pd.DataFrame, labels) -> set:
+    found = set()
+    for label in labels:
+        hit = cells[cells[f"{label}_timed_out"].eq(True)]
+        found |= set(zip(hit["qid"], hit["filter"], hit[f"{label}_option"]))
+    return found
+
+
 # Part 1 per band: out of box, baseline, per-band best, ceiling, the rule, both clauses.
 def part1(grid: pd.DataFrame) -> dict:
     g = with_bands(grid)
+    if "timed_out" not in g:
+        g = g.assign(timed_out=False)
     baseline = best_single_setting(g)
     filled = rule_rows(g)
     rule = fit_rule(filled[filled["half"] == "train"])
@@ -206,12 +223,14 @@ def part1(grid: pd.DataFrame) -> dict:
     }
     
     cells = g.drop_duplicates(["qid", "filter"])[[c for c in CELL_COLUMNS if c in g]].reset_index(drop=True)
+    flags = filled[["qid", "filter", "option", "timed_out"]].drop_duplicates(["qid", "filter", "option"])
     for label in CHOICES:
-        frame = picks[label][["qid", "filter", "option", "time_ms", "recall"]]
+        frame = picks[label][["qid", "filter", "option", "time_ms", "recall"]].merge(flags, on=["qid", "filter", "option"], how="left")
         names = {
             "option": f"{label}_option", 
             "time_ms": f"{label}_ms", 
-            "recall": f"{label}_recall"
+            "recall": f"{label}_recall",
+            "timed_out": f"{label}_timed_out"
         }
         cells = cells.merge(frame.rename(columns=names), on=["qid", "filter"], how="left")
 
@@ -245,6 +264,14 @@ def part1(grid: pd.DataFrame) -> dict:
         known = None not in (tb, tr, tc)
         row["rule_keep"] = (tb - tr) / (tb - tc) if known and tb != tc else None
         row["rule_ok"] = (known and at_least(row["rule_recall"], RECALL_BAR) and at_least(tb - tr, KEEP_SHARE * (tb - tc)))
+
+        # Room totals cover every cell, the rule clause's only the test half.
+        behind = set()
+        if row["room_ok"]:
+            behind |= _timed_out_picks(c, ("baseline", "ceiling"))
+        if row["rule_ok"]:
+            behind |= _timed_out_picks(t, ("baseline", "rule", "ceiling"))
+        row["timeouts_behind"] = len(behind)
         
         if passing is None and row["room_ok"] and row["rule_ok"]:
             passing = row
@@ -501,9 +528,39 @@ def _check_memcheck(mem: pd.DataFrame, band_a: set | None, warn) -> None:
             warn(f"memcheck.csv covers {len(per)} cells ({len(outside)} not band A cells of the set); want {want} band A cells")
 
 
+# A whole number, not a bool.
+def _whole(x) -> bool:
+    return isinstance(x, int) and not isinstance(x, bool)
+
+
+# grid_info.json's grid runs, or None. At the gate a missing history warns,
+# and so do another warm-up or run count and N changed after a finished grid.
+def _history(info: dict, gate: bool, warn) -> list[dict] | None:
+    runs = info.get("history")
+    if not (isinstance(runs, list) and runs and all(isinstance(r, dict) for r in runs)):
+        if gate:
+            warn("grid_info.json has no history of grid runs")
+        return None
+    
+    if not gate:
+        return runs
+
+    odd = [f"run {i}: warmup {r.get('warmup')!r}, runs {r.get('runs')!r}" for i, r in enumerate(runs, 1) if r.get("warmup") != WARMUP or r.get("runs") != RUNS]
+    _many(warn, odd, f"grid runs in grid_info.json's history don't use warmup {WARMUP} and runs {RUNS}")
+    changed = []
+    for i, done in enumerate(runs):
+        n = done.get("n_per_group")
+        if done.get("complete") is True and _whole(n):
+            changed += [(n, r["n_per_group"]) for r in runs[i + 1:] if _whole(r.get("n_per_group")) and r["n_per_group"] != n]
+            
+    if changed:
+        warn(f"grid_info.json's history changes N from {changed[0][0]} to {changed[0][1]} after a finished grid")
+    return runs
+
+
 # Read and check one size folder; every problem becomes a warning naming the size.
 def load_size(size_dir: Path, size: str, other_ext: str | None) -> dict:
-    d = {"size": size, "warnings": [], "grid": None, "dropped": 0, "timeouts": 0, "n": None, "stopping": None}
+    d = {"size": size, "warnings": [], "grid": None, "dropped": 0, "timeouts": 0, "n": None, "stopping": None, "history": None}
 
     # Add a warning that names this size.
     def warn(message: str) -> None:
@@ -527,7 +584,12 @@ def load_size(size_dir: Path, size: str, other_ext: str | None) -> dict:
             warn(f"grid_info.json size {info.get('size')!r} isn't {size!r}")
         if load is not None and info.get("extversion") != ext:
             warn(f"grid_info.json extversion {info.get('extversion')!r} differs from pg_load.json's {ext!r}")
-            
+
+        # The grid records sha256 of pg_load.json's bytes; a reload writes a new file.
+        if load is not None and info.get("load_sha256") != hashlib.sha256((size_dir / "pg_load.json").read_bytes()).hexdigest():
+            warn("grid_info.json load_sha256 doesn't match pg_load.json, so the grid was measured on another table load")
+
+        d["history"] = _history(info, gate, warn)
         d["n"] = info.get("n_per_group")
         cells = _cell_set(size_dir.parent, size, info, warn)
         
@@ -573,6 +635,8 @@ def load_size(size_dir: Path, size: str, other_ext: str | None) -> dict:
                 
     if train is not None and (train.get("trees") != TREES or train.get("learning_rate") != LEARNING_RATE):
         warn(f"train_info.json: trees {train.get('trees')!r} and learning_rate {train.get('learning_rate')!r} aren't 100 and 0.1")
+    if gate and train is not None and train.get("queries") != GATE_TRAIN_QUERIES:
+        warn(f"train_info.json: queries {train.get('queries')!r}, want {GATE_TRAIN_QUERIES} at the gate size")
     for name, data in (("plain_E.json", plain), ("train_info.json", train)):
         if gate and data is not None and data.get("limits"):
             warn(f"{name}: limits {data.get('limits')} cut the query sets at the gate size")
@@ -589,6 +653,10 @@ def load_size(size_dir: Path, size: str, other_ext: str | None) -> dict:
         mine = [work(n, c, 1) for n, c in zip(stop["mean_ndis"], stop["mean_calls"])]
         off = [" ".join(k) for k, w, x in zip(keys, stop["work_1x"], mine) if abs(w - x) > 1e-9 * max(1.0, abs(x))]
         _many(warn, off, "stopping.csv work_1x values differ from ndis + calls x 4")
+        for s, want in (("test", GATE_TEST_QUERIES), ("questions", GATE_QUESTIONS)):
+            wrong = stop.loc[(stop["set"] == s) & (stop["n_queries"] != want), "n_queries"]
+            if gate and len(wrong):
+                warn(f"stopping.csv: {s} rows have n_queries {wrong.iloc[0]:g}, want {want} at the gate size")
         d["stopping"] = stop
         
     sq = _csv(size_dir / "stopping_queries.csv", ("set", "qid", "method", *QUERY_NUMBERS), warn)
@@ -679,6 +747,10 @@ def part1_lines(p1: dict, dev: bool, warned: bool = False) -> list[str]:
             _f(b["rule_keep"], ".0%"), _yes(b["rule_ok"])
         ]
         lines.append("| " + " | ".join(map(str, cols)) + " |")
+    for b in p1["bands"]:
+        if b["timeouts_behind"]:
+            lines += ["", f"Timed-out rows behind band {b['band']}'s totals: {b['timeouts_behind']} (a timeout counts as {vc.TIMEOUT_MS:,.0f} ms and recall 0)."]
+            
     lines += ["", "The ceiling's most common pick by filter family:", "", "| family | cells | option | share |", "|---|---:|---|---:|"]
     for fam, rows in p1["cells"].groupby("family", sort=False):
         counts = rows["ceiling_option"].value_counts()
@@ -746,17 +818,31 @@ def part2_lines(p2: dict, d: dict, dev: bool, warned: bool = False) -> list[str]
     return lines + [""]
 
 
+# One grid run as text, like "N = 35, kept 380, measured 0 cells, complete".
+def _run_text(r: dict) -> str:
+    parts = [f"N = {r.get('n_per_group')}"]
+    if r.get("kept") or r.get("dropped"):
+        parts += [f"kept {r.get('kept')}", f"dropped {r.get('dropped')}"]
+        
+    parts.append(f"measured {r.get('measured')} cells")
+    return ", ".join(parts + (["complete"] if r.get("complete") is True else []))
+
+
 # One size's section: its facts, then part 1 and part 2.
 # warned marks a section whose readings can't be a verdict.
 def size_section(d: dict, warned: bool = False) -> list[str]:
     dev = d["size"] != GATE_SIZE
     note = " (development, not a verdict)" if dev else " (no verdict: see the warnings)" if warned else ""
+    limits = d["limits"]
+    shown = ", ".join(f"{k} {v}" for k, v in limits.items()) if isinstance(limits, dict) and limits else limits or "none"
     lines = [
         f"## {d['size'].upper()}{note}", "",
         f"N = {d['n']} queries per group, {d['n_cells']} cells, {d['dropped']} grid rows dropped "
         f"(outside the current cell set), {d['timeouts']} timed-out rows. Postgres {d['server_version']}, "
-        f"pgvector {d['extversion']}. Part 2 limits: {d['limits'] or 'none'}.", ""
+        f"pgvector {d['extversion']}. Part 2 limits: {shown}.", ""
     ]
+    if d.get("history"):
+        lines += [f"Grid runs: {'; '.join(_run_text(r) for r in d['history'])}.", ""]
     if d["part1"]:
         lines += part1_lines(d["part1"], dev, warned) + planner_lines(d["grid"])
     else:
@@ -773,8 +859,8 @@ def constants_lines() -> list[str]:
     names = (
         "BANDS", "RECALL_BAR", "ROOM_BAR", "KEEP_SHARE", "RULE_EDGES", "TARGETS", "WORK_BAR", "RECALL_TOL",
         "QUESTION_TOL", "E_RECALL", "E_CHOICES", "GATE_SIZE", "MIN_EXT", "MIN_GATE_QUERIES", "EXACT_OPTIONS",
-        "ITERATIVE_COUNT", "MEMCHECK_CELLS", "DETERMINISM_QUERIES", "TREES", "LEARNING_RATE", "CHARGE_DIVISOR",
-        "CHARGE_FACTORS", "EPS"
+        "ITERATIVE_COUNT", "MEMCHECK_CELLS", "DETERMINISM_QUERIES", "WARMUP", "RUNS", "GATE_TEST_QUERIES",
+        "GATE_QUESTIONS", "GATE_TRAIN_QUERIES", "TREES", "LEARNING_RATE", "CHARGE_DIVISOR", "CHARGE_FACTORS", "EPS"
     )
     rows = [f"| {n} | {globals()[n]} |" for n in names]
     return ["## Constants", "", "| constant | value |", "|---|---|"] + rows + [""]
@@ -843,6 +929,14 @@ def part2_chart(path: Path, p2: dict, rem: pd.DataFrame | None, size: str) -> No
     plt.close(fig)
 
 
+# argparse type for --failed-step: SIZE:STEP, with a known size and any step name.
+def _failed_step(text: str) -> tuple[str, str]:
+    size, _, step = text.partition(":")
+    if size not in vc.SIZES or not step:
+        raise argparse.ArgumentTypeError(f"wants SIZE:STEP with SIZE one of {', '.join(vc.SIZES)}, got {text!r}")
+    return size, step
+
+
 # Both headlines: NO VERDICT on any warning, PENDING 500K without 500K, else 500K's readings.
 def headlines(sizes: dict, warnings: list) -> tuple[str, str]:
     if warnings:
@@ -859,7 +953,9 @@ def headlines(sizes: dict, warnings: list) -> tuple[str, str]:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Apply the vector search check's bars and write report.md.")
     parser.add_argument("--results", type=Path, default=vc.RESULTS)
-    results = parser.parse_args(argv).results
+    parser.add_argument("--failed-step", type=_failed_step, default=None, metavar="SIZE:STEP", help="a step that failed before this run; gives NO VERDICT")
+    args = parser.parse_args(argv)
+    results = args.results
     dirs = {s: results / f"size{s}" for s in vc.SIZES}
     present = [s for s in vc.SIZES if is_present(dirs[s])]
     exts = {s: _extversion(dirs[s]) for s in present}
@@ -870,7 +966,15 @@ def main(argv: list[str] | None = None) -> int:
         d["part1"] = part1(d["grid"]) if d["grid"] is not None and len(d["grid"]) else None
         d["part2"] = part2(d["stopping"]) if d["stopping"] is not None else None
         sizes[s] = d
-    warnings = [w for d in sizes.values() for w in d["warnings"]]
+
+    if GATE_SIZE in sizes and "70k" not in present:
+        sizes[GATE_SIZE]["warnings"].append(f"{GATE_SIZE}: no 70K run, so the pgvector version can't be compared across sizes")
+    failed = []
+    if args.failed_step:
+        size, step = args.failed_step
+        message = f"{size}: the {step} step failed, so the steps after it didn't run; their files are missing or from an older run"
+        (sizes[size]["warnings"] if size in sizes else failed).append(message)
+    warnings = [w for d in sizes.values() for w in d["warnings"]] + failed
     h1, h2 = headlines(sizes, warnings)
 
     lines = ["# Vector-search check", ""] + [x for w in warnings for x in (f"**WARNING** {w}", "")]
@@ -883,8 +987,6 @@ def main(argv: list[str] | None = None) -> int:
         lines += size_section(d, bool(warnings) if s == GATE_SIZE else bool(d["warnings"]))
         
     results.mkdir(parents=True, exist_ok=True)
-    (results / "report.md").write_text("\n".join(lines + constants_lines()))
-
     cells = [d["part1"]["cells"].assign(size=s) for s, d in sizes.items() if d["part1"]]
     columns = ["size", *CELL_COLUMNS, *(f"{c}_{k}" for c in CHOICES for k in ("option", "ms", "recall"))]
     frame = pd.concat(cells, ignore_index=True) if cells else pd.DataFrame()
@@ -897,6 +999,9 @@ def main(argv: list[str] | None = None) -> int:
             part1_chart(results / f"part1_{s}.png", d["part1"], s)
         if d["part2"]:
             part2_chart(results / f"part2_{s}.png", d["part2"], d["rem"], s)
+
+    # The report goes last, so a crash above leaves none and can't pass for warnings.
+    (results / "report.md").write_text("\n".join(lines + constants_lines()))
     return 1 if warnings else 0
 
 
