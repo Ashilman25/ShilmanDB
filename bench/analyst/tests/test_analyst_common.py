@@ -1,0 +1,127 @@
+"""Unit tests for bench/analyst/an_common.py."""
+from __future__ import annotations
+
+import hashlib
+import importlib.util
+import os
+import sys
+from pathlib import Path
+
+import pytest
+
+HERE = Path(__file__).resolve().parent
+
+
+# Load a module by path under an an_ name, clear of other bench tests.
+def _load(module_name: str, file_name: str):
+    spec = importlib.util.spec_from_file_location(module_name, HERE.parent / file_name)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+mod = _load("an_common", "an_common.py")
+
+
+def test_paths_layout():
+    p = mod.paths(Path("R"))
+    assert p.dataset_dir("tpch") == Path("R/datasets/tpch")
+    assert p.run_file("test", "qwen36-35b") == Path("R/runs/test_qwen36-35b.jsonl")
+    assert (p.questions, p.freeze, p.cells) == (Path("R/questions.jsonl"), Path("R/freeze.json"), Path("R/cells.csv"))
+    with pytest.raises(ValueError):
+        mod.check_dataset("tpcds")
+
+
+def test_refuse_ai_root():
+    with pytest.raises(ValueError):
+        mod.refuse_ai_root(mod.AI_ROOT / "x.csv")
+    assert mod.refuse_ai_root(mod.RESULTS / "x") == mod.RESULTS / "x"
+
+
+def test_writers_refuse_ai_root(tmp_path, monkeypatch):
+    monkeypatch.setattr(mod, "AI_ROOT", tmp_path / "ai")
+    f = tmp_path / "ai" / f"x_{os.getpid()}.jsonl"
+    for write in (lambda: mod.append_jsonl(f, {}), lambda: mod.write_text_atomic(f, ""), lambda: mod.repair_jsonl(f)):
+        with pytest.raises(ValueError):
+            write()
+    assert not (tmp_path / "ai").exists()
+
+
+def test_jsonl_roundtrip_and_partial_last_line(tmp_path):
+    f = tmp_path / f"r_{os.getpid()}.jsonl"
+    assert mod.read_jsonl(f) == [] and mod.repair_jsonl(f) == 0
+    mod.append_jsonl(f, {"a": 1}); mod.append_jsonl(f, {"a": 2})
+    f.write_text(f.read_text() + '{"a": 3')          # interrupted write
+    assert [r["a"] for r in mod.read_jsonl(f)] == [1, 2]
+    assert mod.repair_jsonl(f) == len('{"a": 3') and f.read_text().endswith("\n")
+
+
+def test_read_jsonl_bad_middle_line_raises(tmp_path):
+    f = tmp_path / f"bad_{os.getpid()}.jsonl"
+    f.write_text('x\n{"a": 1}\n')
+    with pytest.raises(ValueError, match=r"\.jsonl:1: "):
+        mod.read_jsonl(f)
+
+
+def test_read_jsonl_skips_blank_lines(tmp_path):
+    f = tmp_path / f"blank_{os.getpid()}.jsonl"
+    f.write_text('{"a": 1}\n\n{"a": 2}\n\n')
+    assert mod.read_jsonl(f) == [{"a": 1}, {"a": 2}]
+
+
+def test_repair_jsonl_clean_file_unchanged(tmp_path):
+    f = tmp_path / f"clean_{os.getpid()}.jsonl"
+    f.write_text('{"a": 1}\n')
+    assert mod.repair_jsonl(f) == 0 and f.read_text() == '{"a": 1}\n'
+
+
+@pytest.mark.parametrize("tail", ['{"a": 2', '{"a": 2}'])   # partial line, complete line with no \n
+def test_append_after_unfinished_line_raises(tmp_path, tail):
+    f = tmp_path / f"glue_{os.getpid()}.jsonl"
+    f.write_text('{"a": 1}\n' + tail)
+    with pytest.raises(ValueError, match="repair_jsonl"):
+        mod.append_jsonl(f, {"a": 3})
+    assert f.read_text() == '{"a": 1}\n' + tail
+
+
+@pytest.mark.parametrize("tail, removed, kept", [('{"a": 2', 7, [1]), ('{"a": 2}', 0, [1, 2])])
+def test_repair_then_append_keeps_complete_records(tmp_path, tail, removed, kept):
+    f = tmp_path / f"fix_{os.getpid()}.jsonl"
+    f.write_text('{"a": 1}\n' + tail)
+    assert [r["a"] for r in mod.read_jsonl(f)] == kept
+    assert mod.repair_jsonl(f) == removed
+    mod.append_jsonl(f, {"a": 3})
+    assert [r["a"] for r in mod.read_jsonl(f)] == kept + [3]
+
+
+def test_repair_jsonl_without_any_newline(tmp_path):
+    f = tmp_path / f"lone_{os.getpid()}.jsonl"
+    f.write_text('{"a": 1')
+    assert mod.repair_jsonl(f) == 7 and f.read_text() == ""
+    mod.append_jsonl(f, {"a": 2})                         # an empty file takes appends
+    assert f.read_text() == '{"a": 2}\n'
+    f.write_text('{"a": 1}')
+    assert mod.repair_jsonl(f) == 0 and f.read_text() == '{"a": 1}\n'
+
+
+def test_sha1_file_matches_text(tmp_path):
+    f = tmp_path / f"s_{os.getpid()}.txt"
+    f.write_bytes("héllo\n".encode("utf-8"))
+    assert mod.sha1_file(f) == mod.sha1_text("héllo\n") == hashlib.sha1("héllo\n".encode("utf-8")).hexdigest()
+
+
+def test_write_text_atomic(tmp_path):
+    f = tmp_path / f"w_{os.getpid()}" / "out.md"
+    mod.write_text_atomic(f, "one")
+    mod.write_text_atomic(f, "two")
+    assert f.read_text() == "two" and os.listdir(f.parent) == ["out.md"]
+
+
+def test_load_sibling_registers_module():
+    other = mod.load_sibling("an_common_again", "an_common.py")
+    try:
+        assert sys.modules["an_common_again"] is other and other.SEED == 1
+    finally:
+        sys.modules.pop("an_common_again", None)
