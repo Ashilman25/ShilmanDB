@@ -29,6 +29,12 @@ bench/
 │   ├── v3_check/      small learned policies on sampled candidates
 │   ├── switch_check/  switching between policies as the workload changes
 │   └── tests/
+├── analyst/           AI-analyst check: local model writes SQL, the engine checks the answer (C++ bridge + Python)
+│   ├── an_common.py             shared paths, fixed values, crash-safe JSON-lines files
+│   ├── scoring.py               does a shown result match the answer key
+│   ├── analyst_bridge.cpp       loads a dataset once, answers SQL lines with rows and profile as JSON
+│   ├── bridge_client.py         talks to the bridge: 30 s timeout, restart on timeout or crash
+│   └── tests/                   (fake_bridge.py stands in for the bridge in client tests)
 └── vector_check/      vector search check: pgvector strategy grid and learned stopping (Python)
     ├── vc_common.py             shared paths, text rules, distances, top-k, recall@10
     ├── questions.csv            the 210 written questions used as queries
