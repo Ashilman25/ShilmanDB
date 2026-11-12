@@ -254,7 +254,7 @@ def _timed(conn, stmts: list[str]) -> float:
     return time.perf_counter() - start
 
 
-# Check settings and pgvector, drop the old JSON, then load, index, analyze and prewarm.
+# Check settings and pgvector, drop the old JSON, then load, index, vacuum, analyze and prewarm.
 # Returns what goes into pg_load.json, or None after printing why it stopped.
 def _load(conn, size: str, table: pd.DataFrame, vectors: np.ndarray, json_path: Path) -> dict | None:
     shown = show_settings(conn)
@@ -292,13 +292,14 @@ def _load(conn, size: str, table: pd.DataFrame, vectors: np.ndarray, json_path: 
     print(f"b-trees: {btree_s:.1f} s")
     hnsw_build_s = _timed(conn, [hnsw])
     print(f"hnsw: {hnsw_build_s:.1f} s")
-    analyze_s = _timed(conn, [f"ANALYZE {t}"])
-    print(f"analyze: {analyze_s:.1f} s")
+    # Vacuum now, so autovacuum doesn't change the heap while the grid is timing.
+    vacuum_analyze_s = _timed(conn, [f"VACUUM (ANALYZE) {t}"])
+    print(f"vacuum analyze: {vacuum_analyze_s:.1f} s")
     prewarm(conn, size)
 
     return {
         "server_version": ver["server_version"], "extversion": ver["extversion"], "settings": shown,
-        "rows": rows, "copy_s": copy_s, "btree_s": btree_s, "hnsw_build_s": hnsw_build_s, "analyze_s": analyze_s,
+        "rows": rows, "copy_s": copy_s, "btree_s": btree_s, "hnsw_build_s": hnsw_build_s, "vacuum_analyze_s": vacuum_analyze_s,
         **relation_sizes(conn, size),
     }
 

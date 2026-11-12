@@ -21,7 +21,7 @@ spec.loader.exec_module(mod)
 DIM = 384
 CASES = "Cases, Holsters & Sleeves"
 REGISTER = "<register_vector>"
-DDL_WORDS = ("SET ", "CREATE", "DROP", "COPY", "ANALYZE", "SELECT pg_prewarm")
+DDL_WORDS = ("SET ", "CREATE", "DROP", "COPY", "VACUUM", "ANALYZE", "SELECT pg_prewarm")
 
 
 # One query result: fetchone gives the row I was built with.
@@ -364,7 +364,7 @@ def test_load_disables_timeout_before_copy_and_index(tmp_path):
     code, _ = run_main(write_world(tmp_path), fake)
     assert code == 0
     log = fake.log
-    assert first(log, "SET statement_timeout = 0") < first(log, "COPY") < first(log, "CREATE INDEX") < first(log, "ANALYZE")
+    assert first(log, "SET statement_timeout = 0") < first(log, "COPY") < first(log, "CREATE INDEX") < first(log, "VACUUM")
 
 
 # The whole run in order; the vector type registers after it exists.
@@ -378,9 +378,10 @@ def test_main_runs_steps_in_order(tmp_path):
         first(log, "CREATE EXTENSION IF NOT EXISTS vector"), first(log, "DROP TABLE"), first(log, "CREATE TABLE"),
         log.index(REGISTER), first(log, "COPY"), first(log, "CREATE INDEX reviews_70k_review_date_idx"),
         first(log, "CREATE INDEX reviews_70k_verified_idx"), first(log, "CREATE INDEX reviews_70k_hnsw_idx"),
-        first(log, "ANALYZE reviews_70k"), first(log, "SELECT pg_prewarm"),
+        first(log, "VACUUM (ANALYZE) reviews_70k"), first(log, "SELECT pg_prewarm"),
     ]
     assert order == sorted(order)
+    assert not any(s.startswith("ANALYZE") for s in log)
     assert sum(s.startswith("SELECT pg_prewarm") for s in log) == 8
 
 
@@ -392,11 +393,11 @@ def test_main_writes_pg_load_json(tmp_path):
     assert code == 0
     out = json.loads((world["results"] / "size70k" / "pg_load.json").read_text())
     assert set(out) == {"server_version", "extversion", "settings", "rows", "copy_s", "btree_s",
-                        "hnsw_build_s", "analyze_s", "table_bytes", "hnsw_bytes", "btree_bytes"}
+                        "hnsw_build_s", "vacuum_analyze_s", "table_bytes", "hnsw_bytes", "btree_bytes"}
     assert out["extversion"] == "0.9.1" and out["server_version"] == "17.11 (Homebrew)"
     assert out["settings"] == mod.EXPECTED_SETTINGS and out["rows"] == 8
     assert (out["table_bytes"], out["hnsw_bytes"], out["btree_bytes"]) == (1000, 500, 300)
-    assert all(out[k] >= 0 for k in ("copy_s", "btree_s", "hnsw_build_s", "analyze_s"))
+    assert all(out[k] >= 0 for k in ("copy_s", "btree_s", "hnsw_build_s", "vacuum_analyze_s"))
     (c,) = fake.copies
     assert [r[5] for r in c.rows].count("") == 3
 

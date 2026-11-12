@@ -141,7 +141,9 @@ class FakeRunner:
         k = self.counts[name]
         self.counts[name] += 1
         self.log.append(("run", name, self.work_mem, sql, params["q"].tobytes()))
-        if s.get("timeout"):
+        # timeout: True for every run, or a list of run numbers (from 0) that time out.
+        timeout = s.get("timeout")
+        if timeout is True or k in (timeout or ()):
             raise mod.Timeout("canceled")
         times = s.get("ms", [self.ms])
         self.clock.t += times[k % len(times)] / 1000
@@ -427,12 +429,49 @@ def test_timeout_recorded():
     got = measure(runner)
     m = got["exact_seq"]
     assert m.timed_out is True and m.times_ms == [10000.0] * 3 and m.ids == [] and m.deterministic is False
-    assert runner.ran().count("exact_seq") == 1 and len(got) == 33
+    assert runner.ran().count("exact_seq") == 3 and len(got) == 33
     assert got["set_noindex"].reused_from == "exact_seq" and got["set_noindex"].timed_out is True
 
     row = mod.grid_row("70k", make_cell(), 50.0, N_ROWS, m, 0.0)
     assert row[COLUMNS.index("timed_out")] is True and row[COLUMNS.index("n_returned")] == 0
     assert row[COLUMNS.index("time_ms")] == 10000.0 and row[COLUMNS.index("ids")] == ""
+
+
+# One timed-out run of three counts as 10 s; ids come from run 1.
+def test_single_timed_out_run_takes_the_median():
+    runner = FakeRunner(script={"hnsw_off_ef100": {"timeout": [1], "ms": [3.0, 5.0, 2.0],
+                                                   "ids": [[1, 2], [7, 7], [1, 2]]}})
+    m = measure(runner)["hnsw_off_ef100"]
+    assert runner.ran().count("hnsw_off_ef100") == 3
+    assert m.timed_out is False and m.times_ms == pytest.approx([3.0, 10000.0, 2.0])
+    assert m.ids == [1, 2] and m.deterministic is True
+    row = mod.grid_row("70k", make_cell(), 50.0, N_ROWS, m, 1.0)
+    assert row[COLUMNS.index("time_ms")] == pytest.approx(3.0) and row[COLUMNS.index("timed_out")] is False
+    assert row[COLUMNS.index("t1"):COLUMNS.index("t3") + 1] == pytest.approx([3.0, 10000.0, 2.0])
+
+    # Runs 1 and 3 finish with different ids, so the row isn't deterministic.
+    runner = FakeRunner(script={"hnsw_off_ef100": {"timeout": [1], "ids": [[1, 2], [7, 7], [1, 3]]}})
+    m = measure(runner)["hnsw_off_ef100"]
+    assert m.timed_out is False and m.ids == [1, 2] and m.deterministic is False
+
+
+# Two timed-out runs of three make the median a timeout: no ids, recall 0.
+def test_two_timed_out_runs_time_out():
+    runner = FakeRunner(script={"hnsw_off_ef100": {"timeout": [0, 2], "ms": [4.0]}})
+    m = measure(runner)["hnsw_off_ef100"]
+    assert m.timed_out is True and m.ids == [] and m.deterministic is False
+    assert m.times_ms == pytest.approx([10000.0, 4.0, 10000.0])
+    assert mod.grid_row("70k", make_cell(), 50.0, N_ROWS, m, 0.0)[COLUMNS.index("time_ms")] == 10000.0
+
+
+# A setting reusing a twin with one timed-out run copies everything from it.
+def test_reused_setting_copies_a_partly_timed_out_twin():
+    runner = FakeRunner(script={"hnsw_relaxed_ef100": {"timeout": [2], "ms": [6.0, 8.0], "ids": [[4, 5]]}})
+    got = measure(runner)
+    twin, reused = got["hnsw_relaxed_ef100"], got["set_relaxed_ef100"]
+    assert twin.timed_out is False and twin.times_ms == pytest.approx([6.0, 8.0, 10000.0])
+    assert reused.reused_from == "hnsw_relaxed_ef100" and "set_relaxed_ef100" not in runner.ran()
+    assert (reused.ids, reused.times_ms, reused.timed_out, reused.deterministic) == ([4, 5], twin.times_ms, False, True)
 
 
 # Recall uses the truth's kth and n_pass; a timed-out row scores 0.
@@ -500,8 +539,7 @@ def test_seeded_cell_and_option_order(tmp_path):
 def test_warmup_and_memcheck_cells_are_seeded(tmp_path):
     world = write_world(tmp_path)
     runner = FakeRunner(ids=true_ids(world), stop_at_cell=1)
-    with pytest.raises(KeyboardInterrupt):
-        run_main(world, runner, "--warmup", "3")
+    assert run_main(world, runner, "--warmup", "3") == 130
     cells = base_cells(world, 2)
     picks = np.random.default_rng(vc.seed_for("70k", "warmup")).choice(len(cells), size=3, replace=False)
     ran = [world["key_of"][(e[3], e[4])] for e in runner.log if e[0] == "run"]
@@ -539,7 +577,7 @@ def test_none_filter_has_no_where(tmp_path):
     assert not any("nan" in s for s in sqls)
 
 
-# grid_info.json records the queries per group, cell count, warm-up, runs and versions.
+# grid_info.json records the queries per group, cell count, warm-up, runs, versions and history.
 def test_grid_info_records_n(tmp_path):
     world = write_world(tmp_path)
     conn = FakeConn()
@@ -548,9 +586,11 @@ def test_grid_info_records_n(tmp_path):
     shows = [i for i, sql in enumerate(conn.log) if sql.startswith("SHOW")]
     assert len(prewarms) == 8 and conn.log[prewarms[0]] == f"SELECT pg_prewarm('{T}')" and max(shows) < prewarms[0]
     info = json.loads((world["dir"] / "grid_info.json").read_text())
+    sha = hashlib.sha256(b'{"rows": 400}\n').hexdigest()
     assert info == {"size": "70k", "n_per_group": 2, "cells": 60, "warmup": 1, "runs": 3,
-                    "server_version": "17.11 (Homebrew)", "extversion": "0.8.7",
-                    "load_sha256": hashlib.sha256(b'{"rows": 400}\n').hexdigest()}
+                    "server_version": "17.11 (Homebrew)", "extversion": "0.8.7", "load_sha256": sha,
+                    "history": [{"n_per_group": 2, "warmup": 1, "runs": 3, "load_sha256": sha, "kept": 0,
+                                 "dropped": 0, "measured": 60, "complete": True}]}
 
 
 # Settings are checked before anything else touches the database; nothing measured or written.
@@ -604,8 +644,7 @@ def test_interrupted_run_resumes_to_same_rows(tmp_path):
     want = rows_without_times()
     (world["dir"] / "grid.csv").unlink()
 
-    with pytest.raises(KeyboardInterrupt):
-        run_main(world, FakeRunner(ids=true_ids(world), stop_at_cell=8))
+    assert run_main(world, FakeRunner(ids=true_ids(world), stop_at_cell=8)) == 130
     assert len({(r["qid"], r["filter"]) for r in read_grid(world)}) == 7
 
     assert run_main(world, FakeRunner(ids=true_ids(world))) == 0
@@ -632,8 +671,7 @@ def test_per_cell_order_same_on_resume(tmp_path):
 
     straight = FakeRunner(ids=true_ids(world))
     run_main(world, straight, "--redo")
-    with pytest.raises(KeyboardInterrupt):
-        run_main(world, FakeRunner(ids=true_ids(world), stop_at_cell=20), "--redo")
+    assert run_main(world, FakeRunner(ids=true_ids(world), stop_at_cell=20), "--redo") == 130
     resumed = FakeRunner(ids=true_ids(world))
     run_main(world, resumed)
     want, got = orders(straight), orders(resumed)
@@ -645,6 +683,11 @@ def test_per_cell_order_same_on_resume(tmp_path):
 def test_resume_rewrite_drops_stale_rows_and_fixes_half(tmp_path, capsys):
     world = write_world(tmp_path)
     assert run_main(world, FakeRunner(ids=true_ids(world)), "--queries", "3") == 0
+    # As if the run stopped before its memory check, so lowering N is still allowed.
+    info_path = world["dir"] / "grid_info.json"
+    info = json.loads(info_path.read_text())
+    info["history"][-1]["complete"] = False
+    info_path.write_text(json.dumps(info))
     rows = read_grid(world)
     three, two = part1(world, 3), part1(world, 2)
     dropped_qids = {q for q, _, _ in three} - {q for q, _, _ in two}
@@ -710,16 +753,14 @@ def test_resume_refuses_other_columns(tmp_path, capsys):
 def test_warmup_writes_nothing(tmp_path):
     world = write_world(tmp_path)
     runner = FakeRunner(ids=true_ids(world), stop_at_cell=1)
-    with pytest.raises(KeyboardInterrupt):
-        run_main(world, runner, "--warmup", "3")
+    assert run_main(world, runner, "--warmup", "3") == 130
     ran = runner.ran()
     assert 3 * 32 <= len(ran) <= 3 * 33 and len(set(e[4] for e in runner.log if e[0] == "run")) <= 3
     assert not any(e[0] == "explain" and not e[2].startswith("EXPLAIN") for e in runner.log)
     assert not (world["dir"] / "grid.csv").exists() and not (world["dir"] / "memcheck.csv").exists()
 
     other = FakeRunner(ids=true_ids(world), stop_at_cell=1)
-    with pytest.raises(KeyboardInterrupt):
-        run_main(world, other, "--warmup", "3")
+    assert run_main(world, other, "--warmup", "3") == 130
     assert other.log == runner.log
 
 
@@ -769,8 +810,7 @@ def test_memcheck_cells_are_seeded(tmp_path):
 # After N cells: elapsed per cell times cells left to measure, in minutes.
 def test_projection_message(tmp_path, capsys):
     world = write_world(tmp_path)
-    with pytest.raises(KeyboardInterrupt):
-        run_main(world, FakeRunner(ids=true_ids(world), stop_at_cell=11))
+    assert run_main(world, FakeRunner(ids=true_ids(world), stop_at_cell=11)) == 130
     capsys.readouterr()
     runner = FakeRunner(ids=true_ids(world), ms=1000.0, script={
         name: {"plan": btree_plan()} for name in ("set_off_ef100", "set_strict_ef40")})
@@ -897,6 +937,7 @@ def test_reload_starts_the_grid_over(tmp_path, capsys):
     assert (world["dir"] / "memcheck.csv").read_text().startswith("qid,filter,option,ids_equal")
     info = json.loads((world["dir"] / "grid_info.json").read_text())
     assert info["load_sha256"] == hashlib.sha256((world["dir"] / "pg_load.json").read_bytes()).hexdigest()
+    assert [(r["load_sha256"], r["measured"]) for r in info["history"]] == [(info["load_sha256"], 60)]
 
 
 # A run stopped right after starting over leaves no old grid or memory check behind.
@@ -904,8 +945,7 @@ def test_start_over_removes_old_files_first(tmp_path):
     world = write_world(tmp_path)
     run_main(world, FakeRunner(ids=true_ids(world)))
     (world["dir"] / "pg_load.json").write_text('{"rows": 400, "reloaded": true}\n')
-    with pytest.raises(KeyboardInterrupt):
-        run_main(world, FakeRunner(ids=true_ids(world), stop_at_cell=1))
+    assert run_main(world, FakeRunner(ids=true_ids(world), stop_at_cell=1)) == 130
     assert not (world["dir"] / "grid.csv").exists() and not (world["dir"] / "memcheck.csv").exists()
     info = json.loads((world["dir"] / "grid_info.json").read_text())
     assert info["load_sha256"] == hashlib.sha256((world["dir"] / "pg_load.json").read_bytes()).hexdigest()
@@ -974,3 +1014,97 @@ def test_pg_runner():
     assert ids == [5, 7] and all(type(i) is int for i in ids)
     with pytest.raises(mod.Timeout):
         mod.PgRunner(Conn(cancel=True)).run("SELECT id FROM t", params)
+
+
+# grid_info.json's run history, one entry per grid run.
+def history(world: dict) -> list[dict]:
+    return json.loads((world["dir"] / "grid_info.json").read_text())["history"]
+
+
+# A resume adds a history entry; --redo starts the history again.
+def test_history_appends_on_resume_and_resets_on_redo(tmp_path):
+    world = write_world(tmp_path)
+    sha = hashlib.sha256((world["dir"] / "pg_load.json").read_bytes()).hexdigest()
+    assert run_main(world, FakeRunner(ids=true_ids(world)), "--warmup", "1") == 0
+    first = {"n_per_group": 2, "warmup": 1, "runs": 3, "load_sha256": sha, "kept": 0, "dropped": 0,
+             "measured": 60, "complete": True}
+    assert history(world) == [first]
+
+    assert run_main(world, FakeRunner(ids=true_ids(world))) == 0
+    assert history(world) == [first, {**first, "warmup": 0, "kept": 60, "measured": 0}]
+    info = json.loads((world["dir"] / "grid_info.json").read_text())
+    assert (info["n_per_group"], info["warmup"], info["load_sha256"]) == (2, 0, sha)
+
+    assert run_main(world, FakeRunner(ids=true_ids(world)), "--redo") == 0
+    assert history(world) == [{**first, "warmup": 0}]
+
+
+# Lowering --queries after a finished grid exits 2 and touches nothing.
+def test_lowering_queries_after_finished_grid_refused(tmp_path, capsys):
+    world = write_world(tmp_path)
+    assert run_main(world, FakeRunner(ids=true_ids(world)), "--queries", "3") == 0
+    before = {n: (world["dir"] / n).read_bytes() for n in ("grid.csv", "grid_info.json", "memcheck.csv")}
+    conn, runner = FakeConn(), FakeRunner(ids=true_ids(world))
+    capsys.readouterr()
+    assert run_main(world, runner, "--queries", "2", conn=conn) == 2
+    assert ("error: the grid finished at N = 3 queries per group; changing --queries now would pick a new split "
+            "after the results exist (pass --redo to start over)") in capsys.readouterr().err.splitlines()
+    assert {n: (world["dir"] / n).read_bytes() for n in before} == before
+    assert conn.log == [] and runner.log == []
+
+    # The same N, or --redo, still runs.
+    assert run_main(world, FakeRunner(ids=true_ids(world)), "--queries", "3") == 0
+    assert run_main(world, FakeRunner(ids=true_ids(world)), "--queries", "2", "--redo") == 0
+
+
+# Raising --queries after a finished grid is refused too.
+def test_raising_queries_after_finished_grid_refused(tmp_path, capsys):
+    world = write_world(tmp_path)
+    assert run_main(world, FakeRunner(ids=true_ids(world)), "--queries", "2") == 0
+    capsys.readouterr()
+    assert run_main(world, FakeRunner(ids=true_ids(world)), "--queries", "3") == 2
+    assert ("error: the grid finished at N = 2 queries per group; changing --queries now would pick a new split "
+            "after the results exist (pass --redo to start over)") in capsys.readouterr().err.splitlines()
+
+
+# A finished run on another table load doesn't block a new N.
+def test_finished_run_on_another_load_does_not_refuse(tmp_path):
+    world = write_world(tmp_path)
+    assert run_main(world, FakeRunner(ids=true_ids(world)), "--queries", "3") == 0
+    info_path = world["dir"] / "grid_info.json"
+    info = json.loads(info_path.read_text())
+    info["history"][0]["load_sha256"] = "another load"
+    info_path.write_text(json.dumps(info))
+    assert run_main(world, FakeRunner(ids=true_ids(world)), "--queries", "2") == 0
+
+
+# Lowering --queries in a grid stopped part way runs, and the history shows both runs.
+def test_lowering_queries_in_unfinished_grid_proceeds(tmp_path):
+    world = write_world(tmp_path)
+    assert run_main(world, FakeRunner(ids=true_ids(world), stop_at_cell=5), "--queries", "3") == 130
+    assert [(r["n_per_group"], r["measured"], r["complete"]) for r in history(world)] == [(3, 4, False)]
+    assert run_main(world, FakeRunner(ids=true_ids(world)), "--queries", "2") == 0
+    runs = history(world)
+    assert [(r["n_per_group"], r["complete"]) for r in runs] == [(3, False), (2, True)]
+    assert runs[1]["kept"] + runs[1]["dropped"] == 4 and runs[1]["kept"] + runs[1]["measured"] == 60
+
+
+# A runner whose run raises KeyboardInterrupt on the second cell.
+class StopInRun(FakeRunner):
+    # Ctrl-C at the second cell's first run.
+    def run(self, sql: str, params) -> list[int]:
+        if self.cells == 2:
+            raise KeyboardInterrupt
+        return super().run(sql, params)
+
+
+# Ctrl-C in the grid exits 130 quietly; the first cell stays and the connection closes.
+def test_ctrl_c_exits_130_and_keeps_cells(tmp_path, capsys):
+    world = write_world(tmp_path)
+    conn = FakeConn()
+    assert run_main(world, StopInRun(ids=true_ids(world)), conn=conn) == 130
+    err = capsys.readouterr().err
+    assert "grid: stopped by Ctrl-C; finished cells are kept in grid.csv" in err.splitlines()
+    assert "Traceback" not in err and conn.closed
+    rows = read_grid(world)
+    assert len({(r["qid"], r["filter"]) for r in rows}) == 1 and len(rows) in (32, 33)

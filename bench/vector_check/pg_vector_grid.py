@@ -277,16 +277,22 @@ def reuse_match(setting: Option, plan: PlanShape, forced: dict[str, Measured]) -
     return name if twin is not None and twin.plan.nodes == plan.nodes else None
 
 
-# Run a query runs times: ids from run 1, ms around execute and fetch.
+# Run a query runs times, ms around execute and fetch; a timed-out run counts TIMEOUT_MS.
+# Timed out only when most runs are; else ids come from the first finished run.
 def _timed(runner, name: str, sql: str, params: dict, plan: PlanShape, timer: Callable, runs: int) -> Measured:
     results, times = [], []
-    try:
-        for _ in range(runs):
-            start = timer()
-            results.append(runner.run(sql, params))
-            times.append((timer() - start) * 1000.0)
-    except Timeout:
-        return Measured(name, [], [vc.TIMEOUT_MS] * runs, True, plan, None, False)
+    for _ in range(runs):
+        start = timer()
+        try:
+            ids = runner.run(sql, params)
+        except Timeout:
+            times.append(vc.TIMEOUT_MS)
+            continue
+        times.append((timer() - start) * 1000.0)
+        results.append(ids)
+
+    if 2 * (runs - len(results)) > runs:
+        return Measured(name, [], times, True, plan, None, False)
     return Measured(name, results[0], times, False, plan, None, all(r == results[0] for r in results))
 
 
@@ -527,10 +533,10 @@ def _same_inputs(row: list[str], cell: Cell, size: str, col: dict[str, int]) -> 
 
 
 # Keep only complete, unchanged rows of current cells in grid.csv, group and half from now.
-# Prints what it dropped and why, rewrites atomically, returns the cells already done.
-def resume(path: Path, cells: list[Cell], size: str) -> set[tuple[str, str]]:
+# Prints what it dropped and why, rewrites atomically, returns done cells and the dropped count.
+def resume(path: Path, cells: list[Cell], size: str) -> tuple[set[tuple[str, str]], int]:
     if not path.exists():
-        return set()
+        return set(), 0
     
     col = {name: i for i, name in enumerate(GRID_COLUMNS)}
     current = {(c.qid, c.filter): c for c in cells}
@@ -559,7 +565,23 @@ def resume(path: Path, cells: list[Cell], size: str) -> set[tuple[str, str]]:
             
     _write_atomic(path, _csv_text([GRID_COLUMNS, *kept]))
     print(f"resume: kept {len(done)} cells, dropped {len(found) - len(done)} cells ({len(rows) - len(kept):,} rows): {len(outside)} outside the current cell set, {len(incomplete)} incomplete, {len(changed)} changed inputs")
-    return done
+    return done, len(found) - len(done)
+
+
+# The grid runs grid_info.json records; none for a missing or older file.
+def _history(path: Path) -> list[dict]:
+    try:
+        info = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return []
+    runs = info.get("history") if isinstance(info, dict) else None
+    return [r for r in runs if isinstance(r, dict)] if isinstance(runs, list) else []
+
+
+# The N of a finished grid on this table load other than n, else None.
+def _finished_other(history: list[dict], n: int, load_sha256: str) -> int | None:
+    found = [r["n_per_group"] for r in history if r.get("complete") is True and r.get("load_sha256") == load_sha256 and isinstance(r.get("n_per_group"), int) and r["n_per_group"] != n]
+    return found[-1] if found else None
 
 
 # True when grid.csv has rows but grid_info.json doesn't vouch for this table load.
@@ -632,7 +654,8 @@ def memcheck(runner, table: str, cells: list[Cell], vectors: dict, grid_ids: dic
 
 
 # Check the server, warm up, resume, measure the cells left, then check memory.
-def _run(conn, runner, args, inputs: GridInputs, out: Path, timer: Callable, restart: bool) -> int:
+# history is the earlier runs to keep; this run's entry goes on the end.
+def _run(conn, runner, args, inputs: GridInputs, out: Path, timer: Callable, restart: bool, history: list[dict]) -> int:
     bad = pgl.check_server_settings(pgl.show_settings(conn))
     for line in bad:
         print(f"error: server setting {line}", file=sys.stderr)
@@ -655,38 +678,53 @@ def _run(conn, runner, args, inputs: GridInputs, out: Path, timer: Callable, res
         grid_path.unlink(missing_ok=True)
         memo_path.unlink(missing_ok=True)
         
+    entry = {
+        "n_per_group": inputs.n_per_group, "warmup": args.warmup, "runs": RUNS, "load_sha256": inputs.load_sha256,
+        "kept": 0, "dropped": 0, "measured": 0, "complete": False
+    }
     info = {
         "size": args.size, "n_per_group": inputs.n_per_group, "cells": len(inputs.cells),
-        "warmup": args.warmup, "runs": RUNS, **pgl.versions(conn), "load_sha256": inputs.load_sha256
+        "warmup": args.warmup, "runs": RUNS, **pgl.versions(conn), "load_sha256": inputs.load_sha256,
+        "history": [*history, entry]
     }
-    _write_atomic(info_path, json.dumps(info, indent=2) + "\n")
-    pgl.prewarm(conn, args.size)
 
-    start = timer()
-    warm_up(runner, table, inputs.cells, inputs.vectors, args.warmup, args.size)
-    print(f"warm-up: {min(args.warmup, len(inputs.cells))} cells in {timer() - start:.1f} s", flush=True)
+    # Write grid_info.json with this run's entry as it stands.
+    def write_info() -> None:
+        _write_atomic(info_path, json.dumps(info, indent=2) + "\n")
 
-    done = resume(grid_path, inputs.cells, args.size)
-    order = np.random.default_rng(vc.seed_for(args.size, "cells")).permutation(len(inputs.cells))
-    todo = [c for c in (inputs.cells[i] for i in order) if (c.qid, c.filter) not in done]
-    print(f"grid: {len(todo)} cells to measure, {len(done)} already done", flush=True)
+    write_info()
+    try:
+        pgl.prewarm(conn, args.size)
+        start = timer()
+        warm_up(runner, table, inputs.cells, inputs.vectors, args.warmup, args.size)
+        print(f"warm-up: {min(args.warmup, len(inputs.cells))} cells in {timer() - start:.1f} s", flush=True)
 
-    start = timer()
-    for k, cell in enumerate(todo, 1):
-        rng = np.random.default_rng(vc.seed_for(args.size, "order", cell.qid, cell.filter))
-        _append(grid_path, cell_rows(runner, args.size, table, cell, inputs.base, inputs.vec_row, inputs.vectors[cell.qid], inputs.table_rows, rng, timer))
-        elapsed = timer() - start
-        if k == args.projection_cells:
-            print(f"projected grid time: {elapsed / k * len(todo) / 60:.1f} min for {len(todo)} cells", flush=True)
-        elif k % 100 == 0:
-            print(f"cells: {k} of {len(todo)} in {elapsed / 60:.1f} min", flush=True)
-    if todo:
-        elapsed = timer() - start
-        print(f"grid: measured {len(todo)} cells in {elapsed:.1f} s ({elapsed / len(todo):.2f} s per cell)")
+        done, dropped = resume(grid_path, inputs.cells, args.size)
+        entry.update(kept=len(done), dropped=dropped)
+        order = np.random.default_rng(vc.seed_for(args.size, "cells")).permutation(len(inputs.cells))
+        todo = [c for c in (inputs.cells[i] for i in order) if (c.qid, c.filter) not in done]
+        print(f"grid: {len(todo)} cells to measure, {len(done)} already done", flush=True)
 
-    checks = memcheck(runner, table, inputs.cells, inputs.vectors, _grid_ids(grid_path), args.size)
-    _write_atomic(memo_path, _csv_text([MEMCHECK_COLUMNS, *checks]))
-    print(f"memcheck: {sum(c[3] for c in checks)} of {len(checks)} equal over {len(checks) // len(ITERATIVE)} cells")
+        start = timer()
+        for k, cell in enumerate(todo, 1):
+            rng = np.random.default_rng(vc.seed_for(args.size, "order", cell.qid, cell.filter))
+            _append(grid_path, cell_rows(runner, args.size, table, cell, inputs.base, inputs.vec_row, inputs.vectors[cell.qid], inputs.table_rows, rng, timer))
+            entry["measured"] = k
+            elapsed = timer() - start
+            if k == args.projection_cells:
+                print(f"projected grid time: {elapsed / k * len(todo) / 60:.1f} min for {len(todo)} cells", flush=True)
+            elif k % 100 == 0:
+                print(f"cells: {k} of {len(todo)} in {elapsed / 60:.1f} min", flush=True)
+        if todo:
+            elapsed = timer() - start
+            print(f"grid: measured {len(todo)} cells in {elapsed:.1f} s ({elapsed / len(todo):.2f} s per cell)")
+
+        checks = memcheck(runner, table, inputs.cells, inputs.vectors, _grid_ids(grid_path), args.size)
+        _write_atomic(memo_path, _csv_text([MEMCHECK_COLUMNS, *checks]))
+        entry["complete"] = True
+        print(f"memcheck: {sum(c[3] for c in checks)} of {len(checks)} equal over {len(checks) // len(ITERATIVE)} cells")
+    finally:
+        write_info()
     return 0
 
 
@@ -734,13 +772,23 @@ def main(argv: list[str] | None = None, connect: Callable = pgl.connect, make_ru
         print(f"error: {e}", file=sys.stderr)
         return 1
 
+    # N may change only before the grid finishes: a new N picks a new split.
+    old = _history(out / "grid_info.json")
+    finished = None if args.redo else _finished_other(old, inputs.n_per_group, inputs.load_sha256)
+    if finished is not None:
+        print(f"error: the grid finished at N = {finished} queries per group; changing --queries now would pick a new split after the results exist (pass --redo to start over)", file=sys.stderr)
+        return 2
+
     try:
         conn = connect()
     except psycopg.OperationalError as e:
         print(f"error: can't connect to Postgres on port {vc.PG_PORT}: {e}", file=sys.stderr)
         return 1
     try:
-        return _run(conn, make_runner(conn), args, inputs, out, timer, restart)
+        return _run(conn, make_runner(conn), args, inputs, out, timer, restart, [] if args.redo or restart else old)
+    except KeyboardInterrupt:
+        print("grid: stopped by Ctrl-C; finished cells are kept in grid.csv", file=sys.stderr)
+        return 130
     finally:
         conn.close()
 
