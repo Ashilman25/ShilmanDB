@@ -41,6 +41,8 @@ bench/
     ├── hnsw_search.py           numpy HNSW search over a saved graph, counting distance computations
     ├── hnsw_graph.py            builds the HNSW graph with faiss and saves it (own process)
     ├── stopping_check.py        REM, the logged plain search, the stopping model and its replay
+    ├── analyze_vector_check.py  applies the fixed bars (500K only) and writes report.md, cells.csv, charts
+    ├── run_vector_check.py      the driver: runs every step for one size, prints each command
     └── tests/                   (fixtures/ holds EXPLAIN plans captured from the live server)
 ```
 
