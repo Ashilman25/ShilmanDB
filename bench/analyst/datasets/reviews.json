@@ -1,0 +1,105 @@
+{
+ "dataset": "reviews",
+ "about": "Amazon customer reviews of products listed under Cell Phones & Accessories in the Amazon Reviews 2023 data (McAuley Lab), with details of every reviewed product. reviews has one row per review: the product, a star rating from 1 to 5, a title, the text, the day it was posted, its helpful votes, a verified-purchase flag and the reviewer's ID; reviews run from 2005-09-04 to 2023-09-03. products has one row per product: its title, store, main category, most specific category, price, and Amazon's own average rating and rating count. Every review's product is in products, and every product has between 50 and 300 reviews here. Amazon's figures (p_avg_rating, p_rating_count) cover all of a product's ratings on Amazon, not only the reviews in this data.",
+ "columns": {
+  "r_review_id": "Review number, unique per review.",
+  "r_asin": "Product the review is about (products.p_asin).",
+  "r_rating": "Star rating the reviewer gave, a whole number from 1 to 5.",
+  "r_title": "Review title as the reviewer wrote it; a title typed as 'N/A' or 'None' is kept as that text.",
+  "r_text": "Review text, cut to 4,000 bytes, with tabs, line breaks and '|' turned into spaces; a text typed as 'N/A' or 'None' is kept as that text.",
+  "r_date": "Day the review was posted, in UTC.",
+  "r_helpful_votes": "Number of helpful votes other shoppers gave the review, 0 or more.",
+  "r_verified": "1 if Amazon marked the review as a verified purchase, else 0.",
+  "r_user_id": "Reviewer's Amazon user ID.",
+  "r_year": "Year of r_date, e.g. 2021.",
+  "r_month": "Year and month of r_date as one number YYYYMM, e.g. 202103 for March 2021.",
+
+  "p_asin": "Product ID: Amazon's parent ASIN, which covers all variants (such as colors or sizes) of one product.",
+  "p_title": "Product title on Amazon.",
+  "p_store": "Store (seller or brand) name on Amazon.",
+  "p_main_category": "Amazon's top-level category for the product; it can differ from Cell Phones & Accessories.",
+  "p_category": "Most specific category: the last entry of the product's Amazon category path.",
+  "p_price": "Price in US dollars; 0 when the price is unknown.",
+  "p_has_price": "1 if the price is known, else 0.",
+  "p_avg_rating": "Amazon's average star rating for the product over all its ratings on Amazon, not just the reviews here.",
+  "p_rating_count": "Amazon's number of ratings for the product over all of Amazon, not just the reviews here."
+ },
+ "primary_keys": {
+  "reviews": ["r_review_id"],
+  "products": ["p_asin"]
+ },
+ "foreign_keys": [
+  {"table": "reviews", "columns": ["r_asin"], "ref_table": "products", "ref_columns": ["p_asin"]}
+ ],
+ "grains": {
+  "review": [["r_review_id"]],
+  "product": [["p_asin"], ["r_asin"], ["p_title"]],
+  "reviewer": [["r_user_id"]],
+  "user": [["r_user_id"]],
+  "customer": [["r_user_id"]],
+  "store": [["p_store"]],
+  "brand": [["p_store"]],
+  "main category": [["p_main_category"]],
+  "category": [["p_category"]],
+  "rating": [["r_rating"]],
+  "star rating": [["r_rating"]],
+  "star": [["r_rating"]],
+  "verified purchase": [["r_verified"]],
+  "verified status": [["r_verified"]],
+  "year": [["r_year"]],
+  "review year": [["r_year"]],
+  "month": [["r_month"]],
+  "review month": [["r_month"]],
+  "day": [["r_date"]],
+  "date": [["r_date"]],
+  "review date": [["r_date"]]
+ },
+ "entity_tables": {
+  "review": "reviews",
+  "rating": "reviews",
+  "product": "products"
+ },
+ "missing": [
+  "r_text is '' (empty) for the 5 reviews that have no text.",
+  "p_store is 'Unknown' for the 2 products with no store listed.",
+  "p_main_category is 'Unknown' for the 3 products with no main category.",
+  "p_category is 'Unknown' for the 45 products whose category path is empty.",
+  "p_price is 0 and p_has_price is 0 for the 282 products with no known price; 217 of the 499 products have a price."
+ ],
+ "glossary": [
+  {"term": "positive review",
+   "words": ["\\bpositive\\b", "\\bfavou?rable\\b"],
+   "readings": [
+    {"name": "4 or 5 stars", "default": true, "sql": "r_rating >= 4", "any": [], "all": ["r_rating"], "none": [], "pattern": "\\br_rating\\s*(?:>=\\s*(?<![\\w.])4(?:\\.0+)?(?![\\d.])|>\\s*(?<![\\w.])3(?:\\.0+)?(?![\\d.]))|(?:(?<![\\w.])4(?:\\.0+)?(?![\\d.])\\s*<=|(?<![\\w.])3(?:\\.0+)?(?![\\d.])\\s*<)\\s*r_rating\\b|\\br_rating\\s+in\\s*\\(\\s*(?:4\\s*,\\s*5|5\\s*,\\s*4)\\s*\\)|\\br_rating\\s+between\\s+4\\s+and\\s+5\\b|^(?=.*(?:\\br_rating\\s*=\\s*(?<![\\w.])4(?:\\.0+)?(?![\\d.])|(?<![\\w.])4(?:\\.0+)?(?![\\d.])\\s*=\\s*r_rating\\b))(?=.*(?:\\br_rating\\s*=\\s*(?<![\\w.])5(?:\\.0+)?(?![\\d.])|(?<![\\w.])5(?:\\.0+)?(?![\\d.])\\s*=\\s*r_rating\\b))"},
+    {"name": "5 stars only", "default": false, "sql": "r_rating = 5", "any": [], "all": ["r_rating"], "none": [], "pattern": "^(?!.*(?:\\br_rating\\s*=\\s*(?<![\\w.])4(?:\\.0+)?(?![\\d.])|(?<![\\w.])4(?:\\.0+)?(?![\\d.])\\s*=\\s*r_rating\\b)).*?(?:\\br_rating\\s*(?:=\\s*(?<![\\w.])5(?:\\.0+)?(?![\\d.])|>=\\s*(?<![\\w.])5(?:\\.0+)?(?![\\d.])|>\\s*(?<![\\w.])4(?:\\.0+)?(?![\\d.]))|(?:(?<![\\w.])5(?:\\.0+)?(?![\\d.])\\s*(?:=|<=)|(?<![\\w.])4(?:\\.0+)?(?![\\d.])\\s*<)\\s*r_rating\\b|\\br_rating\\s+in\\s*\\(\\s*5\\s*\\))"}
+   ]},
+  {"term": "negative review",
+   "words": ["\\bnegative\\b", "\\bunfavou?rable\\b"],
+   "readings": [
+    {"name": "1 or 2 stars", "default": true, "sql": "r_rating <= 2", "any": [], "all": ["r_rating"], "none": [], "pattern": "\\br_rating\\s*(?:<=\\s*(?<![\\w.])2(?:\\.0+)?(?![\\d.])|<\\s*(?<![\\w.])3(?:\\.0+)?(?![\\d.]))|(?:(?<![\\w.])2(?:\\.0+)?(?![\\d.])\\s*>=|(?<![\\w.])3(?:\\.0+)?(?![\\d.])\\s*>)\\s*r_rating\\b|\\br_rating\\s+in\\s*\\(\\s*(?:1\\s*,\\s*2|2\\s*,\\s*1)\\s*\\)|\\br_rating\\s+between\\s+1\\s+and\\s+2\\b|^(?=.*(?:\\br_rating\\s*=\\s*(?<![\\w.])1(?:\\.0+)?(?![\\d.])|(?<![\\w.])1(?:\\.0+)?(?![\\d.])\\s*=\\s*r_rating\\b))(?=.*(?:\\br_rating\\s*=\\s*(?<![\\w.])2(?:\\.0+)?(?![\\d.])|(?<![\\w.])2(?:\\.0+)?(?![\\d.])\\s*=\\s*r_rating\\b))"},
+    {"name": "1 star only", "default": false, "sql": "r_rating = 1", "any": [], "all": ["r_rating"], "none": [], "pattern": "^(?!.*(?:\\br_rating\\s*=\\s*(?<![\\w.])2(?:\\.0+)?(?![\\d.])|(?<![\\w.])2(?:\\.0+)?(?![\\d.])\\s*=\\s*r_rating\\b)).*?(?:\\br_rating\\s*(?:=\\s*(?<![\\w.])1(?:\\.0+)?(?![\\d.])|<=\\s*(?<![\\w.])1(?:\\.0+)?(?![\\d.])|<\\s*(?<![\\w.])2(?:\\.0+)?(?![\\d.]))|(?:(?<![\\w.])1(?:\\.0+)?(?![\\d.])\\s*(?:=|>=)|(?<![\\w.])2(?:\\.0+)?(?![\\d.])\\s*>)\\s*r_rating\\b|\\br_rating\\s+in\\s*\\(\\s*1\\s*\\))"}
+   ]},
+  {"term": "helpful",
+   "words": ["\\bhelpful(?:ness)?\\b"],
+   "readings": [
+    {"name": "at least one helpful vote", "default": true, "sql": "r_helpful_votes >= 1", "any": [], "all": ["r_helpful_votes"], "none": []}
+   ]},
+  {"term": "average price",
+   "words": ["\\b(?:average|mean|avg)\\s+(?:\\w+\\s+)?prices?\\b", "\\bprices?\\s+on\\s+average\\b"],
+   "readings": [
+    {"name": "known prices only", "default": true, "sql": "SELECT AVG(p_price) FROM products WHERE p_has_price = 1", "any": [], "all": ["p_price", "p_has_price"], "none": []}
+   ]},
+  {"term": "product rating",
+   "words": ["\\bproduct\\s+ratings?\\b", "\\b(?:average|mean|avg)\\s+(?:\\w+\\s+)?ratings?\\b", "\\b(?:best|worst|highest|lowest|top|bottom)[-\\s]rated\\b", "\\bratings?\\s+of\\s+(?:\\w+\\s+)?products?\\b"],
+   "readings": [
+    {"name": "average of r_rating", "default": true, "sql": "AVG(r_rating)", "any": [], "all": ["r_rating"], "none": ["p_avg_rating"]},
+    {"name": "Amazon's average", "default": false, "sql": "p_avg_rating", "any": [], "all": ["p_avg_rating"], "none": ["r_rating"]}
+   ]},
+  {"term": "review count",
+   "words": ["\\b(?:number|count)\\s+of\\s+(?:reviews|ratings)\\b", "\\bhow\\s+many\\s+(?:reviews|ratings)\\b", "\\b(?:review|rating)\\s+counts?\\b", "\\bmost[-\\s]reviewed\\b", "\\bmost\\s+(?:reviews|ratings)\\b"],
+   "readings": [
+    {"name": "reviews in this data", "default": true, "sql": "SELECT COUNT(*) FROM reviews", "any": [], "all": [], "none": ["p_rating_count"]},
+    {"name": "Amazon's count", "default": false, "sql": "p_rating_count", "any": [], "all": ["p_rating_count"], "none": []}
+   ]}
+ ]
+}
