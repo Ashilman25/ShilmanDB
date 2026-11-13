@@ -1,5 +1,5 @@
 // Loads a dataset into ShilmanDB once, then answers "<id>\t<sql>" lines on stdin
-// with one JSON line each on stdout: the rows, the column types and the query profile.
+// with one JSON line each on stdout: rows, column types and the query profile.
 
 #include "engine/database.hpp"
 #include "parser/parse_exception.hpp"
@@ -34,12 +34,12 @@ constexpr std::string_view kUsage = "usage: analyst_bridge --tables <tables.tsv>
 using Clock = std::chrono::steady_clock;
 
 // Milliseconds since start.
-double MsSince(Clock::time_point start) {
+[[nodiscard]] double MsSince(Clock::time_point start) {
     return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
 }
 
 // The type's name, as tables.tsv and the replies spell it.
-constexpr std::string_view TypeName(TypeId type) {
+[[nodiscard]] constexpr std::string_view TypeName(TypeId type) {
     switch (type) {
         case TypeId::INTEGER: return "INTEGER";
         case TypeId::BIGINT:  return "BIGINT";
@@ -51,7 +51,7 @@ constexpr std::string_view TypeName(TypeId type) {
     return "INVALID";
 }
 
-//  JSON, written by hand 
+// JSON, written by hand
 
 // Appends s as a JSON string. Control bytes become \u00XX; UTF-8 passes through.
 void AppendString(std::string& out, std::string_view s) {
@@ -166,7 +166,7 @@ void AppendProfile(std::string& out, const QueryProfile& profile) {
 }
 
 // The reply for a query that ran: columns, up to kRowCap rows, profile and time.
-std::string OkReply(std::string_view id, const QueryResult& result, double ms) {
+[[nodiscard]] std::string OkReply(std::string_view id, const QueryResult& result, double ms) {
     const auto& schema = result.schema;
     const size_t shown = std::min(result.tuples.size(), kRowCap);
 
@@ -205,7 +205,7 @@ std::string OkReply(std::string_view id, const QueryResult& result, double ms) {
 }
 
 // The reply for a request that failed: what kind of failure, and the engine's message.
-std::string ErrorReply(std::string_view id, std::string_view kind, std::string_view message, double ms) {
+[[nodiscard]] std::string ErrorReply(std::string_view id, std::string_view kind, std::string_view message, double ms) {
     std::string out = R"({"id":)";
     AppendString(out, id);
     out += R"(,"ok":false,"error":{"kind":)";
@@ -218,11 +218,11 @@ std::string ErrorReply(std::string_view id, std::string_view kind, std::string_v
     return out;
 }
 
-//  Requests 
+// Requests
 
 // Plans, then runs, one "<id>\t<sql>" line.
 // Planning first tells a bad query from a failed run.
-std::string HandleRequest(Database& db, std::string_view line) {
+[[nodiscard]] std::string HandleRequest(Database& db, std::string_view line) {
     const auto tab = line.find('\t');
     if (tab == std::string_view::npos) {
         return ErrorReply("", "request", "request line has no tab, expected <id><TAB><sql>", 0.0);
@@ -244,15 +244,14 @@ std::string HandleRequest(Database& db, std::string_view line) {
 
     QueryOptions options;
     options.analyze = true;
-    QueryResult result;
-    try {
-        result = db.ExecuteSQL(sql, options);
+    try {  // a throw while writing the reply is a run error too
+        const QueryResult result = db.ExecuteSQL(sql, options);
+        return OkReply(id, result, MsSince(start));
     } catch (const std::exception& e) {
         return ErrorReply(id, "run", e.what(), MsSince(start));
     } catch (...) {
         return ErrorReply(id, "run", "unknown error", MsSince(start));
     }
-    return OkReply(id, result, MsSince(start));
 }
 
 // Answers one request per stdin line until stdin closes, flushing every reply.
@@ -264,7 +263,7 @@ void ServeRequests(Database& db) {
     }
 }
 
-//  Arguments and tables.tsv 
+// Arguments and tables.tsv
 
 struct Args {
     fs::path tables;
@@ -316,7 +315,7 @@ struct TableSpec {
 }
 
 // Splits s at every sep, keeping empty pieces.
-std::vector<std::string_view> Split(std::string_view s, char sep) {
+[[nodiscard]] std::vector<std::string_view> Split(std::string_view s, char sep) {
     std::vector<std::string_view> parts;
     for (size_t start = 0;;) {
         const auto end = s.find(sep, start);
@@ -393,7 +392,7 @@ void LoadTables(Database& db, const std::vector<TableSpec>& tables) {
 }
 
 // The ready line, with each table's row count so a short load shows.
-std::string ReadyLine(Database& db, const std::vector<TableSpec>& tables, double load_ms) {
+[[nodiscard]] std::string ReadyLine(Database& db, const std::vector<TableSpec>& tables, double load_ms) {
     std::string out = R"({"ready":true,"tables":)";
     AppendNumber(out, tables.size());
     out += R"(,"load_ms":)";
@@ -419,7 +418,7 @@ struct RemoveOnExit {
 };
 
 // Prints why the bridge can't go on and returns its exit code.
-int Fail(std::string_view message) {
+[[nodiscard]] int Fail(std::string_view message) {
     std::cerr << "analyst_bridge: " << message << std::endl;
     return 1;
 }

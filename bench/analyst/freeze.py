@@ -37,6 +37,8 @@ FROZEN_CODE = [
     "prompts.py", "prompt_examples.json", "sql_facts.py", "checks.py", "scoring.py",
     "datasets/tpch.json", "datasets/reviews.json", "an_common.py", "describe_datasets.py", "model_mlx.py",
 ]
+# Files next to this script whose changes are shown, never a mismatch.
+WATCHED = ["analyze_analyst_check.py", "run_pipeline.py", "bridge_client.py", "analyst_bridge.cpp", "freeze.py"]
 
 
 # MODEL_CONFIGS from model_mlx.py, read with ast so mlx never has to be installed.
@@ -52,7 +54,7 @@ def read_model_configs(path: Path) -> dict:
             continue
         if any(isinstance(t, ast.Name) and t.id == "MODEL_CONFIGS" for t in targets):
             node = stmt.value
-            
+
     if node is None:
         raise ValueError(f"no top-level MODEL_CONFIGS in {path}")
 
@@ -78,14 +80,18 @@ def _model_record(config_id: str, model_configs: dict) -> dict:
     return json.loads(json.dumps({**model_configs[config_id], "id": config_id}))
 
 
-# sha1 of every frozen file, plus the model config. Raises if any file is missing.
+# sha1 of every frozen file, the model config, and each watched file found.
+# Raises if any frozen file is missing.
 def compute(results: Path, code_dir: Path, config_id: str, model_configs: dict) -> dict:
     model = _model_record(config_id, model_configs)
     named = _frozen_paths(results, code_dir)
     missing = [str(path) for _, path in named if not path.is_file()]
     if missing:
         raise FileNotFoundError(f"can't freeze; missing {', '.join(missing)}")
-    return {"files": {name: an.sha1_file(path) for name, path in named}, "model": model}
+
+    code = Path(code_dir)
+    watched = {name: an.sha1_file(code / name) for name in WATCHED if (code / name).is_file()}
+    return {"files": {name: an.sha1_file(path) for name, path in named}, "model": model, "watched": watched}
 
 
 # Every test-split answers file under the results folder.
@@ -99,7 +105,8 @@ def _test_runs(results: Path) -> list[Path]:
 def write(results: Path, code_dir: Path, config_id: str, model_configs: dict) -> Path:
     runs = _test_runs(results)
     if runs:
-        raise FileExistsError(f"won't freeze while a test run exists; move it away first: {', '.join(map(str, runs))}")
+        listed = ", ".join(map(str, runs))
+        raise FileExistsError(f"won't freeze: a test run exists, and a new freeze would no longer match it: {listed}")
 
     record = {"written_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
     record.update(compute(results, code_dir, config_id, model_configs))
@@ -122,14 +129,14 @@ def _load_freeze(results: Path) -> tuple[dict | None, str | None]:
     path = an.paths(results).freeze
     if not path.is_file():
         return None, "missing freeze.json"
-    
+
     try:
         frozen = json.loads(path.read_text(encoding="utf-8"))
     except ValueError as e:  # bad JSON or bad UTF-8
         return None, f"freeze.json doesn't parse: {e}"
     except OSError as e:
         return None, f"can't read freeze.json: {e}"
-    
+
     if not isinstance(frozen, dict):
         return None, "freeze.json isn't a JSON object"
     return frozen, None
@@ -145,6 +152,35 @@ def _model_id(frozen: dict) -> str | None:
 def frozen_model_id(results: Path) -> str | None:
     frozen, _ = _load_freeze(results)
     return None if frozen is None else _model_id(frozen)
+
+
+# sha1 of freeze.json's bytes, or None when it can't be read.
+def freeze_sha1(results: Path) -> str | None:
+    try:
+        return an.sha1_file(an.paths(results).freeze)
+    except OSError:
+        return None
+
+
+# A line per watched file changed or missing; [] when freeze.json is unusable.
+def watched_changes(results: Path, code_dir: Path) -> list[str]:
+    frozen, _ = _load_freeze(results)
+    if frozen is None:
+        return []  # verify already says why
+    watched = frozen.get("watched")
+    if not isinstance(watched, dict):
+        return ["freeze.json doesn't record the watched files"]
+
+    lines = []
+    for name in WATCHED:
+        path = Path(code_dir) / name
+        if name not in watched:
+            lines.append(f"{name} wasn't recorded in freeze.json")
+        elif not path.is_file():
+            lines.append(f"{name} is missing")
+        elif an.sha1_file(path) != watched[name]:
+            lines.append(f"{name} changed")
+    return lines
 
 
 # One line per difference between freeze.json and what's on disk now; [] when clean.
@@ -180,6 +216,7 @@ def verify(results: Path, code_dir: Path, model_configs: dict) -> list[str]:
 
 
 # Write freeze.json, or check it against today's files; 1 on any refusal or mismatch.
+# Watched files are printed as notes and never change the exit code.
 def main(argv: list[str] | None = None, code_dir: Path | None = None) -> int:
     ap = argparse.ArgumentParser(description="Freeze what the test run depends on, or check nothing changed since.")
     sub = ap.add_subparsers(dest="command", required=True)
@@ -207,14 +244,17 @@ def main(argv: list[str] | None = None, code_dir: Path | None = None) -> int:
         return 0
 
     freeze_path = an.paths(args.results).freeze
+    for line in watched_changes(args.results, code_dir):
+        print(f"note (watched, not frozen): {line}")
+        
     problems = verify(args.results, code_dir, configs)
     for problem in problems:
         print(problem, file=sys.stderr)
-        
+
     if problems:
         print(f"{len(problems)} {'difference' if len(problems) == 1 else 'differences'} from {freeze_path}", file=sys.stderr)
         return 1
-    
+
     print(f"everything matches {freeze_path}")
     return 0
 

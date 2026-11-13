@@ -12,9 +12,9 @@
       }
     },
     {
-      "question": "How many units of Brand#23 parts do our suppliers have in stock?",
+      "question": "How many people visited our website in 1996?",
       "reply": {
-        "cannot_answer": "The data has no stock levels: TPC-H's partsupp table, which holds supply costs and stock, isn't included."
+        "cannot_answer": "The data has no website or visitor records; it holds only the regions, nations, parts, suppliers, customers, orders and order lines of the sales records."
       }
     },
     {
@@ -47,13 +47,13 @@
       }
     },
     {
-      "question": "What was the average star rating of the reviews posted in each month of 2022?",
+      "question": "During 2019, how many unverified reviews appeared each month?",
       "reply": {
-        "sql": "SELECT r_month, AVG(r_rating) AS avg_rating FROM reviews WHERE r_year = 2022 GROUP BY r_month ORDER BY r_month",
-        "grain": "one row per month of 2022",
+        "sql": "SELECT r_month, COUNT(*) AS unverified_reviews FROM reviews WHERE r_year = 2019 AND r_verified = 0 GROUP BY r_month ORDER BY r_month",
+        "grain": "one row per month of 2019",
         "columns": [
           {"name": "r_month", "meaning": "year and month the reviews were posted, as YYYYMM", "entity": "month"},
-          {"name": "avg_rating", "meaning": "average r_rating of the reviews posted that month", "entity": "star rating"}
+          {"name": "unverified_reviews", "meaning": "number of reviews posted that month that Amazon didn't mark as a verified purchase (r_verified = 0)", "entity": "reviews"}
         ]
       }
     }

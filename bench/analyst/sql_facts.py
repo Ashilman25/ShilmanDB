@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from collections import Counter
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import NamedTuple
@@ -44,7 +45,9 @@ class SqlFacts:
     has_left_join: bool = False
     has_order_by: bool = False
     has_limit: bool = False
-    constant_conjuncts: list[str] = field(default_factory=list)
+    constant_conjuncts: list[str] = field(default_factory=list)   # WHERE terms with no column outside a CASE
+    case_only_conjuncts: list[str] = field(default_factory=list)  # those of them with columns inside a CASE
+    few_table_ons: list[tuple[str, list[str]]] = field(default_factory=list)  # (ON, its tables) under two tables
     text_arithmetic: bool = False
     int_divisions: list[str] = field(default_factory=list)
     select_columns: list[str | None] = field(default_factory=list)
@@ -137,7 +140,7 @@ def tokenize(sql: str) -> Iterator[Token]:
                 i = n if end < 0 else end
             else:
                 break
-            
+
         if i >= n:
             break
 
@@ -152,26 +155,26 @@ def tokenize(sql: str) -> Iterator[Token]:
                     i += 1
                 kind = "FLOAT"
             yield Token(kind, sql[start:i], start)
-            
+
         elif c == "'":
             text, i = _read_string(sql, i)
             yield Token("STRING", text, start)
-            
+
         elif c in _WORD_START:
             while i < n and sql[i] in _WORD:
                 i += 1
             word = sql[start:i]
             upper = word.upper()
             yield Token(upper, upper, start) if upper in KEYWORDS else Token("IDENT", word, start)
-            
+
         elif sql.startswith(("!=", "<>"), i):
             i += 2
             yield Token("<>", sql[start:i], start)
-            
+
         elif sql.startswith(("<=", ">="), i):
             i += 2
             yield Token(sql[start:i], sql[start:i], start)
-            
+
         else:
             i += 1
             yield Token(c if c in _SINGLE else "INVALID", c, start)
@@ -343,18 +346,18 @@ class Parser:
         negated = self.tok.kind == "NOT" and self.peek().kind in ("BETWEEN", "IN", "LIKE")
         if negated:
             self.advance()
-            
+
         if self.match("BETWEEN"):
             low = self.add_sub()
             self.expect("AND")
             node = Bin("AND", Bin(">=", left, low), Bin("<=", left, self.add_sub()))
-            
+
         elif self.match("IN"):
             return self.in_list(left, negated)
-        
+
         elif self.match("LIKE"):
             node = Bin("LIKE", left, self.add_sub())
-            
+
         else:
             while self.tok.kind in COMPARISONS:
                 op = self.tok.kind
@@ -363,7 +366,8 @@ class Parser:
             return left
         return Unary("NOT", node) if negated else node
 
-    # x IN (a, b) is (x = a) OR (x = b); NOT IN is (x <> a) AND (x <> b).
+    # x IN (a, b) is (x = a) OR (x = b);
+    # NOT IN is (x <> a) AND (x <> b).
     def in_list(self, lhs: Node, negated: bool) -> Node:
         self.expect("(")
         values = [self.add_sub()]
@@ -474,16 +478,28 @@ def _nodes(root: Node | None) -> list[Node]:
     return out
 
 
-# Top-level AND terms, split as the planner's SplitConjuncts does.
-def _conjuncts(root: Node) -> list[Node]:
+# The operands of a chain of one operator (AND or OR), left to right.
+def _chain(root: Node, op: str) -> list[Node]:
     out, stack = [], [root]
     while stack:
         node = stack.pop()
-        if isinstance(node, Bin) and node.op == "AND":
+        if isinstance(node, Bin) and node.op == op:
             stack += [node.right, node.left]
         else:
             out.append(node)
     return out
+
+
+# Top-level AND terms, split as the planner's SplitConjuncts does.
+def _conjuncts(root: Node) -> list[Node]:
+    return _chain(root, "AND")
+
+
+# Column = column pairs a conjunct implies: itself, or every pair all OR branches carry.
+def _implied_equalities(conjunct: Node) -> list[tuple[str, str]]:
+    branches = [[(c.left.name, c.right.name) for c in _conjuncts(b) if isinstance(c, Bin) and c.op == "=" and isinstance(c.left, Col) and isinstance(c.right, Col)] for b in _chain(conjunct, "OR")]
+    shared = set.intersection(*({tuple(sorted(p)) for p in pairs} for pairs in branches))
+    return [p for p in branches[0] if tuple(sorted(p)) in shared]
 
 
 # The engine's CommonType; None stands for INVALID or unknown.
@@ -519,7 +535,7 @@ def _type(node: Node, names: dict[str, str], types: dict[int, str | None]) -> st
                     return first
             merged = _common(resolved, types[id(node.otherwise)]) if node.otherwise else None
             return merged or resolved
-        
+
         case Bin(op=op) if op in ARITHMETIC:
             left = types[id(node.left)]
             return _common(left, types[id(node.right)]) or left
@@ -577,6 +593,18 @@ def _column_names(root: Node | None, skip: frozenset[str] = frozenset()) -> list
     return [n.name for n in _nodes(root) if isinstance(n, Col) and n.name not in skip]
 
 
+# Column names the planner sees when it places a predicate; it never looks inside CASE.
+def _placement_columns(root: Node) -> list[str]:
+    out, stack = [], [root]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, Col):
+            out.append(node.name)
+        elif not isinstance(node, Case):
+            stack += _children(node)
+    return out
+
+
 # Walk a parsed statement once per clause and gather every fact.
 def _facts(stmt: Select, manifest: dict) -> SqlFacts:
     types = {c["name"]: c["type"] for t in manifest["tables"] for c in t["columns"]}
@@ -612,14 +640,28 @@ def _facts(stmt: Select, manifest: dict) -> SqlFacts:
     f.group_by = list(dict.fromkeys(c for expr in stmt.group_by for c in _column_names(expr)))
 
     for expr in [j.on for j in stmt.joins] + ([stmt.where] if stmt.where else []):
-        f.equalities += [(c.left.name, c.right.name) for c in _conjuncts(expr) if isinstance(c, Bin) and c.op == "=" and isinstance(c.left, Col) and isinstance(c.right, Col)]
+        f.equalities += [p for c in _conjuncts(expr) for p in _implied_equalities(c)]
 
+    # The planner skips CASE, so a term with columns only inside one names no table.
     if stmt.where:
-        f.constant_conjuncts = [_render(c) for c in _conjuncts(stmt.where) if not _column_names(c)]
+        unplaced = [c for c in _conjuncts(stmt.where) if not _placement_columns(c)]
+        f.constant_conjuncts = [_render(c) for c in unplaced]
+        f.case_only_conjuncts = [_render(c) for c in unplaced if _column_names(c)]
 
     f.select_columns = [e.name if isinstance(e, Col) else None for e, _ in stmt.items]
     f.count_star_items = [i for i, (e, _) in enumerate(stmt.items) if any(_is_count_star(n) for n in _nodes(e))]
     f.column_table = {c: owner[c] for c in f.columns if c in owner}
+
+    # The planner places an ON only when it names two of the statement's tables.
+    # A repeated table's join is skipped: the planner places its ON by alias.
+    repeated = {t for t, n in Counter(f.tables).items() if n > 1}
+    for j in stmt.joins:
+        if j.table in repeated:
+            continue
+        
+        named = sorted({t for c in _placement_columns(j.on) if (t := f.column_table.get(c)) in f.tables})
+        if len(named) < 2:
+            f.few_table_ons.append((_render(j.on), named))
     return f
 
 

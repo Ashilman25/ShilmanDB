@@ -1,14 +1,31 @@
 from __future__ import annotations
 
+import os
 import time
 
 # A plain literal, so other scripts can read it with ast.literal_eval without mlx installed.
+# revision pins each model's files to one Hub snapshot, the one already in my cache.
 MODEL_CONFIGS = {
-    "gemma4-26b": {"path": "mlx-community/gemma-4-26b-a4b-it-4bit", "thinking": False, "max_tokens": 1024},
-    "qwen36-35b": {"path": "mlx-community/Qwen3.6-35B-A3B-4bit", "thinking": False, "max_tokens": 1024},
-    "qwen36-35b-think": {"path": "mlx-community/Qwen3.6-35B-A3B-4bit", "thinking": True, "max_tokens": 8192},
-    "qwen38-27b": {"path": "mlx-community/Qwen3.8-27B-4bit", "thinking": False, "max_tokens": 1024},
-    "qwen38-27b-think": {"path": "mlx-community/Qwen3.8-27B-4bit", "thinking": True, "max_tokens": 8192},
+    "gemma4-26b": {
+        "path": "mlx-community/gemma-4-26b-a4b-it-4bit", "revision": "0d77464eeb233a2da68ebf9d7dc4edaac7db956d",
+        "thinking": False, "max_tokens": 1024,
+    },
+    "qwen36-35b": {
+        "path": "mlx-community/Qwen3.6-35B-A3B-4bit", "revision": "38740b847e4cb78f352aba30aa41c76e08e6eb46",
+        "thinking": False, "max_tokens": 1024,
+    },
+    "qwen36-35b-think": {
+        "path": "mlx-community/Qwen3.6-35B-A3B-4bit", "revision": "38740b847e4cb78f352aba30aa41c76e08e6eb46",
+        "thinking": True, "max_tokens": 8192,
+    },
+    "qwen38-27b": {
+        "path": "mlx-community/Qwen3.8-27B-4bit", "revision": "10c35caafbb80f7dc6a7a432cdd11af10a6d4818",
+        "thinking": False, "max_tokens": 1024,
+    },
+    "qwen38-27b-think": {
+        "path": "mlx-community/Qwen3.8-27B-4bit", "revision": "10c35caafbb80f7dc6a7a432cdd11af10a6d4818",
+        "thinking": True, "max_tokens": 8192,
+    },
 }
 
 OPEN_THINKING_TAGS = ("<think>", "<thinking>", "<thought>")
@@ -45,11 +62,12 @@ class MlxModel:
     def __init__(self, config_id: str):
         if config_id not in MODEL_CONFIGS:
             raise ValueError(f"model config must be one of {', '.join(MODEL_CONFIGS)}, got {config_id!r}")
+        os.environ.setdefault("HF_HUB_OFFLINE", "1")  # the cached snapshot only, never a download
         from mlx_lm import load
 
         self.config_id = config_id
         self.config = dict(MODEL_CONFIGS[config_id])
-        self.model, self.tokenizer = load(self.config["path"])
+        self.model, self.tokenizer = load(self.config["path"], revision=self.config["revision"])
 
     # The model's text for one prompt, and the seconds the generation alone took.
     def generate(self, prompt: str) -> tuple[str, float]:

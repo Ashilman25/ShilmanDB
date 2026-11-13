@@ -50,6 +50,7 @@ RETRY = "Write a corrected reply in the same format."
 NOT_A_REPLY = "the reply wasn't one JSON object in the reply format"
 TOO_SLOW = f"the query took longer than {an.TIMEOUT_S:g} seconds"
 CRASHED = "the engine crashed on that query"
+TOO_MUCH_MEMORY = f"the query used more than {an.MAX_RSS_MB} MB of memory"
 
 _HEADING = re.compile(r"^#+(?=[ \t]|$)", re.MULTILINE)
 _THINK_BLOCK = re.compile(r"<think>.*?</think>", re.DOTALL)

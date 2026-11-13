@@ -42,7 +42,8 @@ def test_join_aggregates_and_equalities():
                   "JOIN lineitem ON l_orderkey = o_orderkey GROUP BY c_name ORDER BY t DESC LIMIT 5", M)
     assert f.ok and f.tables == ["customer", "orders", "lineitem"]
     assert f.aggregates == [Agg("SUM", {"o_totalprice"}, False)] and f.group_by == ["c_name"]
-    assert set(map(frozenset, f.equalities)) == {frozenset({"c_custkey", "o_custkey"}), frozenset({"l_orderkey", "o_orderkey"})}
+    assert (set(map(frozenset, f.equalities))
+            == {frozenset({"c_custkey", "o_custkey"}), frozenset({"l_orderkey", "o_orderkey"})})
     assert f.has_order_by and f.has_limit
 def test_implicit_join_equalities_from_where():
     f = mod.facts("SELECT c_name FROM customer c, orders o WHERE c.c_custkey = o.o_custkey AND o_totalprice > 10 "
@@ -51,7 +52,8 @@ def test_implicit_join_equalities_from_where():
     assert f.equalities == [("c_custkey", "o_custkey")]  # the OR term and the literal compare don't count
     assert not f.has_left_join and not f.has_order_by and not f.has_limit
 def test_left_join_and_constant_conjunct():
-    f = mod.facts("SELECT COUNT(*) FROM orders LEFT JOIN lineitem ON l_orderkey = o_orderkey WHERE 1 = 0 AND o_orderyear = 1995", M)
+    f = mod.facts("SELECT COUNT(*) FROM orders LEFT JOIN lineitem ON l_orderkey = o_orderkey "
+                  "WHERE 1 = 0 AND o_orderyear = 1995", M)
     assert f.has_left_join and f.constant_conjuncts == ["1 = 0"] and f.aggregates[0].star
 def test_int_division_detected_only_for_integers():
     assert mod.facts("SELECT COUNT(*) / 7 FROM orders", M).int_divisions
@@ -61,7 +63,8 @@ def test_text_arithmetic(): assert mod.facts("SELECT c_name + 1 FROM customer", 
 def test_self_join_tables_kept(): assert mod.facts("SELECT 1 FROM orders a, orders b", M).tables == ["orders", "orders"]
 def test_unparseable_is_not_an_exception(): assert not mod.facts("SELECT FROM WHERE", M).ok
 def test_select_columns_and_count_star_items():
-    f = mod.facts("SELECT o.o_orderyear AS y, COUNT(*) AS n, COUNT(*) * 1.0 / 7, o_custkey FROM orders o GROUP BY o_orderyear, o_custkey", M)
+    f = mod.facts("SELECT o.o_orderyear AS y, COUNT(*) AS n, COUNT(*) * 1.0 / 7, o_custkey FROM orders o "
+                  "GROUP BY o_orderyear, o_custkey", M)
     assert f.select_columns == ["o_orderyear", None, None, "o_custkey"] and f.count_star_items == [1, 2]
 
 
@@ -119,7 +122,8 @@ def test_columns_drop_qualifiers_and_map_to_tables():
 
 
 def test_order_by_alias_is_not_a_column():
-    f = mod.facts("SELECT o_custkey, SUM(o_totalprice) AS total FROM orders GROUP BY o_custkey ORDER BY total, o_orderyear", M)
+    f = mod.facts("SELECT o_custkey, SUM(o_totalprice) AS total FROM orders GROUP BY o_custkey "
+                  "ORDER BY total, o_orderyear", M)
     assert f.columns == {"o_custkey", "o_totalprice", "o_orderyear"}
     g = mod.facts("SELECT o_custkey AS total FROM orders WHERE total > 1", M)  # an alias only counts in ORDER BY
     assert "total" in g.columns
@@ -154,7 +158,22 @@ def test_group_by_columns_from_expressions():
 def test_equalities_split_on_and_and_follow_in():
     f = mod.facts("SELECT 1 FROM orders JOIN lineitem ON l_orderkey = o_orderkey AND l_quantity > 1 "
                   "JOIN customer ON c_custkey = o_custkey OR c_custkey = 1 WHERE o_custkey IN (c_custkey)", M)
-    assert f.equalities == [("l_orderkey", "o_orderkey"), ("o_custkey", "c_custkey")]  # IN (x) is x = ..., as in the engine
+    assert f.equalities == [("l_orderkey", "o_orderkey"),
+                            ("o_custkey", "c_custkey")]  # IN (x) is x = ..., as in the engine
+
+
+def test_equalities_carried_by_every_or_branch():
+    # Either side order matches; the pair is written as the first branch has it.
+    f = mod.facts("SELECT 1 FROM orders, lineitem WHERE (l_orderkey = o_orderkey AND l_quantity > 1) "
+                  "OR (o.o_orderkey = l.l_orderkey AND o_orderyear = 1995) OR l_orderkey = o_orderkey", M)
+    assert f.equalities == [("l_orderkey", "o_orderkey")]
+    f = mod.facts("SELECT 1 FROM orders JOIN lineitem ON (l_orderkey = o_orderkey AND l_quantity > 1) "
+                  "OR (l_orderkey = o_orderkey AND l_quantity < 0) WHERE o_custkey IN (o_orderkey, o_orderkey)", M)
+    assert f.equalities == [("l_orderkey", "o_orderkey"), ("o_custkey", "o_orderkey")]
+    for where in ["(l_orderkey = o_orderkey AND l_quantity > 1) OR l_quantity < 0",
+                  "(l_orderkey = o_orderkey OR l_quantity > 1) AND o_orderyear = 1995",
+                  "l_orderkey = o_orderkey OR o_orderkey = 1 OR l_orderkey = o_orderkey"]:
+        assert mod.facts(f"SELECT 1 FROM orders, lineitem WHERE {where}", M).equalities == [], where
 
 
 def test_constant_conjuncts_as_the_engine_splits_them():
@@ -162,6 +181,15 @@ def test_constant_conjuncts_as_the_engine_splits_them():
                   "AND (1 = 1 OR o_orderyear = 2) AND DATE '1995-01-01' < DATE '1996-01-01'", M)
     assert f.constant_conjuncts == ["1 <> 2", "1 <> 3", "'a''b' = 'a''b'", "DATE '1995-01-01' < DATE '1996-01-01'"]
     assert mod.facts("SELECT 1 FROM orders WHERE 2 BETWEEN o_orderyear AND 1", M).constant_conjuncts == ["2 <= 1"]
+
+
+def test_constant_conjuncts_count_columns_outside_case():
+    case = "CASE WHEN o_orderyear > 2 THEN 1 ELSE 0 END = 1"
+    f = mod.facts(f"SELECT 1 FROM orders WHERE o_orderyear > 1 AND {case} "
+                  "AND o_orderyear + CASE WHEN o_orderyear > 3 THEN 1 ELSE 0 END > 2 "
+                  f"AND ({case} OR o_orderyear = 2) AND CASE WHEN 1 = 0 THEN 1 END = 1", M)
+    assert f.constant_conjuncts == [case, "CASE WHEN 1 = 0 THEN 1 END = 1"]   # the planner doesn't look inside CASE
+    assert f.case_only_conjuncts == [case]                                   # columns, but only inside a CASE
 
 
 @pytest.mark.parametrize("expr, flagged", [
@@ -172,7 +200,8 @@ def test_constant_conjuncts_as_the_engine_splits_them():
     ("AVG(o_orderyear) / 2", False),
     ("CASE WHEN o_orderyear > 1 THEN 1 ELSE 0 END / 2", True),
     ("CASE WHEN o_orderyear > 1 THEN 1 ELSE 0.5 END / 2", False),
-    ("CASE WHEN o_orderyear > 1 THEN 1 WHEN o_orderyear > 2 THEN c_name ELSE 2.5 END / 2", True),  # planner keeps the first type
+    # planner keeps the first type
+    ("CASE WHEN o_orderyear > 1 THEN 1 WHEN o_orderyear > 2 THEN c_name ELSE 2.5 END / 2", True),
     ("-o_orderyear / 2", True),
     ("(o_orderyear + 1) / 2", True),
     ("(o_orderyear + 1.5) / 2", False),
@@ -182,7 +211,8 @@ def test_constant_conjuncts_as_the_engine_splits_them():
     ("nope / 2", False),                                               # unknown column: no type
 ])
 def test_int_division_types(expr, flagged):
-    assert bool(mod.facts(f"SELECT {expr} FROM orders JOIN customer ON c_custkey = o_custkey", M).int_divisions) == flagged
+    assert bool(mod.facts(f"SELECT {expr} FROM orders "
+                          f"JOIN customer ON c_custkey = o_custkey", M).int_divisions) == flagged
 
 
 def test_int_division_text_and_alias_types():
@@ -199,7 +229,8 @@ def test_int_division_text_and_alias_types():
     ("o_orderdate", False),
 ])
 def test_text_arithmetic_sides(expr, flagged):
-    f = mod.facts(f"SELECT {expr} FROM orders JOIN customer ON c_custkey = o_custkey WHERE o_orderdate > DATE '1995-01-01'", M)
+    f = mod.facts(f"SELECT {expr} FROM orders JOIN customer ON c_custkey = o_custkey "
+                  f"WHERE o_orderdate > DATE '1995-01-01'", M)
     assert f.text_arithmetic == flagged
 
 
@@ -210,6 +241,38 @@ def test_select_columns_and_count_star_edge_cases():
     f = mod.facts("SELECT CASE WHEN COUNT(*) > 1 THEN 1 ELSE 0 END, COUNT(o_orderkey) FROM orders "
                   "HAVING COUNT(*) > 0 ORDER BY COUNT(*)", M)
     assert f.count_star_items == [0]   # HAVING and ORDER BY aren't select items
+
+
+@pytest.mark.parametrize("on, expected", [
+    ("l_quantity > 1", [("l_quantity > 1", ["lineitem"])]),                   # only the new table
+    ("o_orderyear = 1995", [("o_orderyear = 1995", ["orders"])]),             # only the placed table
+    ("1 = 1", [("1 = 1", [])]),                                               # no column at all
+    ("l_orderkey = c_custkey", [("l_orderkey = c_custkey", ["lineitem"])]),   # customer isn't in the statement
+    ("CASE WHEN l_orderkey = o_orderkey THEN 1 ELSE 0 END = 1",               # the planner doesn't look inside CASE
+     [("CASE WHEN l_orderkey = o_orderkey THEN 1 ELSE 0 END = 1", [])]),
+    ("l_orderkey = o_orderkey AND l_quantity > 1", []),                       # the whole ON names two tables
+    ("l_orderkey = o_orderkey", []),
+    ("l_orderkey < o_orderkey", []),
+    ("l.l_orderkey = o.o_orderkey", []),
+])
+def test_few_table_ons(on, expected):
+    assert mod.facts(f"SELECT 1 FROM orders o JOIN lineitem l ON {on}", M).few_table_ons == expected
+
+
+def test_few_table_ons_per_join_in_order():
+    f = mod.facts("SELECT 1 FROM orders JOIN customer ON c_name = 'x' JOIN lineitem ON 2 > 1", M)
+    assert f.few_table_ons == [("c_name = 'x'", ["customer"]), ("2 > 1", [])]
+    f = mod.facts("SELECT 1 FROM orders JOIN lineitem ON l_orderkey = o_orderkey JOIN customer ON c_name = 'x'", M)
+    assert f.few_table_ons == [("c_name = 'x'", ["customer"])]   # the good ON isn't listed
+    assert mod.facts("SELECT 1 FROM orders, customer WHERE o_custkey = c_custkey", M).few_table_ons == []
+
+
+def test_few_table_ons_skip_a_join_whose_table_repeats():
+    # The planner places this ON by alias, so a.x = b.y names two tables.
+    assert mod.facts("SELECT 1 FROM orders a JOIN orders b ON a.o_orderkey = b.o_custkey", M).few_table_ons == []
+    f = mod.facts("SELECT 1 FROM orders JOIN customer ON c_name = 'x' JOIN lineitem ON l_orderkey = o_orderkey "
+                  "JOIN customer ON 2 > 1", M)
+    assert f.few_table_ons == []   # customer repeats, so both its joins are skipped
 
 
 def test_comments_strings_and_join_kinds():

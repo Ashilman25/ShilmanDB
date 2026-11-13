@@ -82,7 +82,8 @@ def test_one_line_keeps_spaces_inside_strings():
 
 
 def test_one_line_drops_comments():
-    assert mod.one_line("SELECT COUNT(*) FROM big -- every row\nWHERE n < 10") == "SELECT COUNT(*) FROM big WHERE n < 10"
+    assert (mod.one_line("SELECT COUNT(*) FROM big -- every row\nWHERE n < 10")
+            == "SELECT COUNT(*) FROM big WHERE n < 10")
     assert (mod.one_line("SELECT a FROM t -- the customer's rows\nWHERE b = 'x  y'")
             == "SELECT a FROM t WHERE b = 'x  y'")                    # a quote in a comment doesn't count
     assert mod.one_line("SELECT 'a--b' FROM t") == "SELECT 'a--b' FROM t"   # -- in a string is text
@@ -119,6 +120,59 @@ def test_crash_restarts_and_continues(tmp_path):
         assert b.restarts == 1 and b.query("SELECT 3")["ok"]
 
 
+def test_memory_over_the_cap_restarts_and_continues(tmp_path):
+    with mod.Bridge(_dummy_tsv(tmp_path), command=FAKE, max_rss_mb=100) as b:
+        old = b._proc
+        r = b.query("HOG")
+        assert r["error"] == {"kind": "memory", "message": "over 100 MB"}
+        assert r["ok"] is False and r["id"] == "1" and r["ms"] >= 500
+        assert old.poll() is not None and b._proc is not old   # the killed bridge is reaped
+        assert b.restarts == 1 and b.query("SELECT 6")["rows"] == [["SELECT 6"]]
+
+
+# Count the client's memory reads, still reading the real RSS.
+def _count_rss_reads(monkeypatch) -> list[int]:
+    reads, real = [], mod._rss_mb
+    monkeypatch.setattr(mod, "_rss_mb", lambda pid: reads.append(pid) or real(pid))
+    return reads
+
+
+def test_fast_query_never_reads_memory(tmp_path, monkeypatch):
+    reads = _count_rss_reads(monkeypatch)
+    with mod.Bridge(_dummy_tsv(tmp_path), command=FAKE, max_rss_mb=1) as b:
+        assert b.query("SELECT 7")["ok"] and b.restarts == 0
+    assert reads == []
+
+
+def test_slow_query_under_the_cap_reads_memory_every_half_second(tmp_path, monkeypatch):
+    reads = _count_rss_reads(monkeypatch)
+    with mod.Bridge(_dummy_tsv(tmp_path), command=FAKE) as b:
+        assert b.query("HOG")["rows"] == [["HOG"]] and b.restarts == 0
+        assert set(reads) == {b._proc.pid}
+    assert 2 <= len(reads) <= 5   # a 2 s query, read from 0.5 s on
+
+
+def test_ps_that_cant_run_skips_the_memory_read(tmp_path, monkeypatch):
+    calls = []
+
+    def no_ps(*args, **kwargs):
+        calls.append(args)
+        raise OSError(12, "Cannot allocate memory")
+
+    with mod.Bridge(_dummy_tsv(tmp_path), command=FAKE, max_rss_mb=100) as b:
+        monkeypatch.setattr(mod.subprocess, "run", no_ps)
+        r = b.query("HOG")                    # over the cap, but no reading says so
+        assert r["ok"] and r["rows"] == [["HOG"]] and b.restarts == 0
+    assert calls                              # ps was tried
+
+
+def test_rss_mb():
+    assert 1 < mod._rss_mb(os.getpid()) < 100_000
+    gone = subprocess.Popen([sys.executable, "-c", "pass"])
+    gone.wait()
+    assert mod._rss_mb(gone.pid) == 0   # an ended process reads as nothing
+
+
 def test_dead_process_before_write_is_a_crash(tmp_path):
     with mod.Bridge(_dummy_tsv(tmp_path), command=FAKE) as b:
         b._proc.kill()
@@ -142,6 +196,7 @@ def test_failed_load_raises(tmp_path):
 def test_defaults_and_unique_db_file():
     a, b = mod.Bridge(Path("x.tsv")), mod.Bridge(Path("x.tsv"))
     assert a.timeout_s == 30.0 and a.command == [str(mod.BRIDGE)] and a.restarts == 0
+    assert a.max_rss_mb == mod.an.MAX_RSS_MB == 4096
     assert a.db_file != b.db_file and str(os.getpid()) in a.db_file.name
 
 
@@ -214,6 +269,20 @@ def test_real_bridge_crash_restarts(tmp_path):
         b._proc.kill()
         assert b.query("SELECT COUNT(*) FROM t")["error"]["kind"] == "crash"
         assert b.restarts == 1 and b.query("SELECT COUNT(*) FROM t")["rows"] == [[3]]
+    assert not b.db_file.exists()
+
+
+@needs_bridge
+def test_real_bridge_memory_cap_restarts(tmp_path):
+    rows = [[str(n)] for n in range(4000)]
+    tsv = _dataset(tmp_path, {"x": ("n:INTEGER", rows), "y": ("m:INTEGER", rows)})
+    with mod.Bridge(tsv, timeout_s=20) as b:
+        b.max_rss_mb = mod._rss_mb(b._proc.pid) + 100   # a little above the loaded bridge
+        old = b._proc
+        r = b.query("SELECT n, m FROM x, y")           # 16M rows, about 1.3 GB if it ran to the end
+        assert r["error"] == {"kind": "memory", "message": f"over {b.max_rss_mb:g} MB"} and r["ms"] < 10_000
+        assert old.poll() is not None and b._proc is not old   # the killed bridge is reaped
+        assert b.restarts == 1 and b.query("SELECT COUNT(*) FROM x")["rows"] == [[4000]]
     assert not b.db_file.exists()
 
 

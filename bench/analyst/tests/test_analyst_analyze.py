@@ -6,6 +6,7 @@ import csv
 import importlib.util
 import json
 import os
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -36,7 +37,8 @@ MANIFEST = {"dataset": "tpch", "tables": [{"name": "orders", "file": "orders.tbl
 GOLD = {"columns": ["total"], "rows": [[10.5]]}
 SUM_SQL = "SELECT SUM(o_totalprice) AS total FROM orders"
 TRAP_SQL = "SELECT SUM(o_totalprice) AS total FROM orders WHERE 1 = 0"
-SKIPPED = {"raw": None, "text": None, "seconds": None, "prompt_sha1": None, "attempts": [], "final": "skipped", "sql": None, "result": None}
+SKIPPED = {"raw": None, "text": None, "seconds": None, "prompt_sha1": None, "attempts": [], "final": "skipped",
+           "sql": None, "result": None}
 
 
 # --- synthetic outcomes -------------------------------------------------------------
@@ -52,7 +54,8 @@ def oc(qid: str, right: bool, label: str = "clean", shown: bool = True, crash: b
 
 
 # Wrong ones first (caught ones warned), then right ones (refused, then other flagged ones warned).
-def make(wrong: int = 0, caught: int = 0, right: int = 0, refused: int = 0, flagged: int = 0, crashed: int = 0) -> list[dict]:
+def make(wrong: int = 0, caught: int = 0, right: int = 0, refused: int = 0, flagged: int = 0,
+         crashed: int = 0) -> list[dict]:
     outs = []
     for i in range(wrong):
         outs.append(oc(f"t{len(outs) + 1:03d}", False, "warned" if i < caught else "clean"))
@@ -86,26 +89,33 @@ def rec(qid: str, final: str = "shown", rows=((10.5,),), sql: str = SUM_SQL, sql
         model: str = MODEL, seconds: float = 5.0, levels: dict | None = None, split: str = "test") -> dict:
     shown = final == "shown"
     result = _result(rows) if shown else None
-    attempts = [{"raw": "", "kind": "sql", "sql": sql, "reply": _failed("crash"), "seconds": 1.0, "prompt_sha1": "x"}] if crash else []
+    attempts = [{"raw": "", "kind": "sql", "sql": sql, "reply": _failed("crash"), "seconds": 1.0,
+                 "prompt_sha1": "x"}] if crash else []
     if final == "shown":
         attempts.append({"raw": "", "kind": "sql", "sql": sql, "reply": result, "seconds": 1.0, "prompt_sha1": "x"})
     elif final == "cannot":
         attempts.append({"raw": "", "kind": "cannot", "sql": None, "reply": None, "seconds": 1.0, "prompt_sha1": "x"})
     else:
-        attempts.append({"raw": "", "kind": "sql", "sql": sql, "reply": _failed("run"), "seconds": 1.0, "prompt_sha1": "x"})
+        attempts.append({"raw": "", "kind": "sql", "sql": sql, "reply": _failed("run"), "seconds": 1.0,
+                         "prompt_sha1": "x"})
 
     primary = {"attempts": attempts, "final": final, "sql": sql if shown else None, "result": result,
-               "claims": {"grain": None, "columns": [{"name": "total", "meaning": "", "entity": None}]} if shown else None,
+               "claims": ({"grain": None, "columns": [{"name": "total", "meaning": "", "entity": None}]}
+                          if shown else None),
                "reason": "no such data" if final == "cannot" else None}
     rephrase = copy.deepcopy(SKIPPED)
     if shown:
-        rephrase.update(raw="", text="Same question?", seconds=1.0, prompt_sha1="x", final="shown", sql=sql, result=copy.deepcopy(result),
-                        attempts=[{"raw": "", "kind": "sql", "sql": sql, "reply": copy.deepcopy(result), "seconds": 1.0, "prompt_sha1": "x"}])
+        rephrase.update(raw="", text="Same question?", seconds=1.0, prompt_sha1="x", final="shown", sql=sql,
+                        result=copy.deepcopy(result),
+                        attempts=[{"raw": "", "kind": "sql", "sql": sql, "reply": copy.deepcopy(result), "seconds": 1.0,
+                                   "prompt_sha1": "x"}])
 
-    record = {"qid": qid, "dataset": "tpch" if qid[0] == "t" else "reviews", "split": split, "model": model, "prompt_sha1": "x",
+    record = {"qid": qid, "dataset": "tpch" if qid[0] == "t" else "reviews", "split": split, "model": model,
+              "prompt_sha1": "x",
               "primary": primary, "rephrase": rephrase, "seconds_total": seconds, "bridge_restarts": 0}
     if shown:
-        record["sqlite_cause"] = {"ok": True, "columns": ["total"], "rows": [list(r) for r in rows]} if sqlite_cause == "same" else sqlite_cause
+        record["sqlite_cause"] = ({"ok": True, "columns": ["total"], "rows": [list(r) for r in rows]}
+                                  if sqlite_cause == "same" else sqlite_cause)
     if levels:
         record["levels"] = levels  # read only by the fake checks below
     return record
@@ -189,7 +199,8 @@ def test_freeze_mismatch_is_no_verdict():
 
 def test_every_no_verdict_reason_listed():
     outs = make(wrong=5, right=100, crashed=10)
-    verdict, reasons = mod.verdict(outs, ["checks.py changed"], ["t900: the answer key has no answer"], missing=["t901"])
+    verdict, reasons = mod.verdict(outs, ["checks.py changed"], ["t900: the answer key has no answer"],
+                                   missing=["t901"])
     assert verdict == "NO VERDICT" and len(reasons) == 5
 
 
@@ -231,10 +242,12 @@ def test_per_check_counts():
     counts = mod.per_check(outs)
     assert list(counts) == list(ck.CHECKS)
     none, model = {"model": 0, "engine": 0, "unknown": 0}, {"model": 1, "engine": 0, "unknown": 0}
-    assert counts["fanout"] == {"catches": 1, "causes": {**none, "engine": 1}, "sole": 0, "false_alarms": 0}
-    assert counts["grain"] == {"catches": 1, "causes": {**none, "engine": 1}, "sole": 0, "false_alarms": 1}
-    assert counts["engine_traps"] == {"catches": 1, "causes": model, "sole": 1, "false_alarms": 0}
-    assert counts["terms"] == {"catches": 0, "causes": none, "sole": 0, "false_alarms": 0}  # a note never fires
+    engine = {**none, "engine": 1}
+    assert counts["fanout"] == {"catches": 1, "causes": engine, "sole": 0, "sole_causes": none, "false_alarms": 0}
+    assert counts["grain"] == {"catches": 1, "causes": engine, "sole": 0, "sole_causes": none, "false_alarms": 1}
+    assert counts["engine_traps"] == {"catches": 1, "causes": model, "sole": 1, "sole_causes": model, "false_alarms": 0}
+    # a note never fires
+    assert counts["terms"] == {"catches": 0, "causes": none, "sole": 0, "sole_causes": none, "false_alarms": 0}
 
 
 def test_wilson_known_values():
@@ -256,11 +269,13 @@ def test_cause_engine_vs_model():
     wrong = ((99.0,),)
     engine = out(rec("t001", rows=wrong, sqlite_cause={"ok": True, "columns": ["total"], "rows": [[10.5]]}), q("t001"))
     model = out(rec("t002", rows=wrong, sqlite_cause={"ok": True, "columns": ["total"], "rows": [[99.0]]}), q("t002"))
-    failed = out(rec("t003", rows=wrong, sqlite_cause={"ok": False, "kind": "sql", "error": "no such function"}), q("t003"))
+    failed = out(rec("t003", rows=wrong, sqlite_cause={"ok": False, "kind": "sql", "error": "no such function"}),
+                 q("t003"))
     absent = rec("t004", rows=wrong)
     del absent["sqlite_cause"]
     assert [o["right"] for o in (engine, model, failed)] == [False, False, False]
-    assert [engine["cause"], model["cause"], failed["cause"], out(absent, q("t004"))["cause"]] == ["engine", "model", "unknown", "unknown"]
+    assert [engine["cause"], model["cause"], failed["cause"], out(absent, q("t004"))["cause"]] == ["engine", "model",
+                                                                                                   "unknown", "unknown"]
 
 
 def test_unanswerable_right_only_when_cannot():
@@ -276,22 +291,50 @@ def test_unanswerable_right_only_when_cannot():
     assert not other["right"] and other["cause"] is None
 
 
-def test_truncated_result_scored_on_shown_rows():
+def test_truncated_result_is_never_right():
     record = rec("t001")
     record["primary"]["result"]["truncated"] = True
-    assert out(record, q("t001"))["right"]
+    assert not out(record, q("t001"))["right"]  # the shown rows match, but more were cut
     longer = q("t002", answer={"columns": ["total"], "rows": [[10.5], [11.0]]})  # the cut dropped a key row
     record = rec("t002")
     record["primary"]["result"]["truncated"] = True
     assert not out(record, longer)["right"]
 
 
+ROWS_10K = [[float(i)] for i in range(10000)]
+
+
+def test_truncated_reply_matching_a_10000_row_key_is_wrong():
+    key = q("t001", answer={"columns": ["total"], "rows": ROWS_10K})
+    record = rec("t001", rows=ROWS_10K)
+    assert out(record, key)["right"]
+    record["primary"]["result"]["truncated"] = True
+    assert not out(record, key)["right"]
+
+
+def test_truncated_sqlite_result_is_never_engine():
+    key = q("t001", answer={"columns": ["total"], "rows": ROWS_10K})
+    sqlite = {"ok": True, "columns": ["total"], "rows": ROWS_10K}
+    assert out(rec("t001", rows=((99.0,),), sqlite_cause=sqlite), key)["cause"] == "engine"
+    o = out(rec("t001", rows=((99.0,),), sqlite_cause={**sqlite, "truncated": True}), key)
+    assert not o["right"] and o["cause"] == "model"
+
+
 def test_crash_from_any_attempt():
     assert out(rec("t001", crash=True), q("t001"))["crash"]
     assert not out(rec("t001", final="failed"), q("t001"))["crash"]  # a run error isn't a crash
     record = rec("t001")
-    record["rephrase"]["attempts"].insert(0, {"raw": "", "kind": "sql", "sql": SUM_SQL, "reply": _failed("crash"), "seconds": 1.0, "prompt_sha1": "x"})
+    record["rephrase"]["attempts"].insert(0, {"raw": "", "kind": "sql", "sql": SUM_SQL, "reply": _failed("crash"),
+                                              "seconds": 1.0, "prompt_sha1": "x"})
     assert out(record, q("t001"))["crash"]
+
+
+def test_memory_or_timeout_is_never_a_crash():
+    for kind in ("memory", "timeout"):
+        record = rec("t001")
+        record["primary"]["attempts"].insert(0, {"raw": "", "kind": "sql", "sql": SUM_SQL, "reply": _failed(kind),
+                                                 "seconds": 1.0, "prompt_sha1": "x"})
+        assert not out(record, q("t001"))["crash"]
 
 
 def test_catch_without_engine_traps():
@@ -311,7 +354,7 @@ def test_catch_without_engine_traps():
 # A results folder and a code folder, frozen for one model; questions written first.
 def _folders(tmp_path: Path, questions: list[dict], frozen: str | None = MODEL) -> tuple[Path, Path]:
     res, code = tmp_path / f"res_{os.getpid()}", tmp_path / f"code_{os.getpid()}"
-    for name in fz.FROZEN_CODE:
+    for name in fz.FROZEN_CODE + fz.WATCHED:
         path = code / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(f"original {name}\n", encoding="utf-8")
@@ -326,18 +369,26 @@ def _folders(tmp_path: Path, questions: list[dict], frozen: str | None = MODEL) 
     return res, code
 
 
-# Write one run file of records; returns its path.
-def _write_run(res: Path, records: list[dict], split: str = "test", model: str = MODEL) -> Path:
+# Copies of test records stamped with today's freeze.json, as the pipeline writes them.
+def _stamped(res: Path, records: list[dict]) -> list[dict]:
+    stamp = fz.freeze_sha1(res)
+    return [r if stamp is None else {**r, "freeze_sha1": stamp} for r in records]
+
+
+# Write one run file of records; returns its path. Test records get today's freeze stamp.
+def _write_run(res: Path, records: list[dict], split: str = "test", model: str = MODEL, stamp: bool = True) -> Path:
     path = an.paths(res).run_file(split, model)
     path.parent.mkdir(parents=True, exist_ok=True)
+    if split == "test" and stamp:
+        records = _stamped(res, records)
     path.write_text("".join(json.dumps(r) + "\n" for r in records), encoding="utf-8")
     return path
 
 
 def test_model_mismatch_is_freeze_problem(tmp_path):
     res, code = _folders(tmp_path, [q("t001")], frozen="gemma4-26b")
-    assert mod.check_freeze(res, code, "gemma4-26b", [rec("t001", model="gemma4-26b")]) == []
-    problems = mod.check_freeze(res, code, "gemma4-26b", [rec("t001", model="qwen36-35b")])
+    assert mod.check_freeze(res, code, "gemma4-26b", _stamped(res, [rec("t001", model="gemma4-26b")])) == []
+    problems = mod.check_freeze(res, code, "gemma4-26b", _stamped(res, [rec("t001", model="qwen36-35b")]))
     assert problems == ["run model qwen36-35b isn't the frozen model gemma4-26b"]
     assert mod.check_freeze(res, code, MODEL, []) == [f"run model {MODEL} isn't the frozen model gemma4-26b"]
 
@@ -348,6 +399,18 @@ def test_check_freeze_reports_changed_files(tmp_path):
     assert mod.check_freeze(res, code, MODEL, []) == ["checks.py changed"]
     (res / "freeze.json").unlink()
     assert mod.check_freeze(res, code, MODEL, []) == ["missing freeze.json"]
+
+
+def test_records_not_stamped_with_todays_freeze(tmp_path):
+    res, code = _folders(tmp_path, [q("t001")])
+    stamp = fz.freeze_sha1(res)
+    assert mod.check_freeze(res, code, MODEL, [{**rec("t001"), "freeze_sha1": stamp}]) == []
+    records = [rec("t001"), {**rec("t002"), "freeze_sha1": "0" * 40}, {**rec("t003"), "freeze_sha1": stamp}]
+    assert mod.check_freeze(res, code, MODEL, records) == [
+        "2 of 3 test records weren't made under today's freeze.json (freeze_sha1: 1 from another freeze, 1 missing)"
+    ]
+    (res / "freeze.json").unlink()  # verify already names it; no second line
+    assert mod.check_freeze(res, code, MODEL, records) == ["missing freeze.json"]
 
 
 # --- the test CLI ---------------------------------------------------------------------------
@@ -402,6 +465,8 @@ def test_report_gives_accuracy(tmp_path, fake_checks):
 
 
 ENGINE_CAUSE = {"ok": True, "columns": ["total"], "rows": [[10.5]]}  # SQLite gets the key's answer
+CAUSE_NOTE = "A shown answer to a question that can't be answered counts as the model's error, whatever SQLite does."
+WATCHED_HEAD = "Changed since the freeze, not part of the verdict rules: "
 UNKNOWN_CAUSE = {"ok": False, "kind": "sql", "error": "no such function"}
 
 
@@ -441,28 +506,35 @@ def test_test_split_go(tmp_path, fake_checks, capsys):
     expected = [
         # bar 1 by cause, and without engine_traps
         "| cause model | 20 of 30 | 0.667 |", "| cause engine | 0 of 5 | 0.000 |", "| cause unknown | 5 of 5 | 1.000 |",
-        "| all, without engine_traps | 22 of 40 | 0.550 |",
+        "| all, without engine_traps | 22 of 40 (model 17 of 30, engine 0 of 5, unknown 5 of 5) | 0.550 |",
         # the without / with table's wrong rows, split by cause
         "| Wrong, shown clean (silent) | 40 (model 30, engine 5, unknown 5) | 15 (model 10, engine 5, unknown 0) |",
         "| Wrong, warned or refused (caught) | 0 (model 0, engine 0, unknown 0) | 25 (model 20, engine 0, unknown 5) |",
         # not shown
         "| Correct \"can't answer\" (unanswerable question) | 1 |", "| Other \"can't answer\" | 1 |",
-        "| Failed (every try errored, crashed or timed out) | 1 |", "| No record | 0 |",
+        "| Failed (every try errored, crashed, timed out or ran out of memory) | 1 |", "| No record | 0 |",
         # each check's catches, split by cause
-        "| fanout | 22 | model 17, engine 0, unknown 5 | 22 | 0 |",
-        "| engine_traps | 3 | model 3, engine 0, unknown 0 | 3 | 5 |",
-        "| grain | 0 | model 0, engine 0, unknown 0 | 0 | 15 |",
+        "| fanout | 22 | model 17, engine 0, unknown 5 | 22 | model 17, engine 0, unknown 5 | 0 |",
+        "| engine_traps | 3 | model 3, engine 0, unknown 0 | 3 | model 3, engine 0, unknown 0 | 5 |",
+        "| grain | 0 | model 0, engine 0, unknown 0 | 0 | model 0, engine 0, unknown 0 | 15 |",
     ]
     for text in expected:
         assert any(line.startswith(text) for line in lines), text
+    assert "Changed since the freeze" not in report
+    after_causes = lines.index(next(line for line in lines if line.startswith("| all, without engine_traps |"))) + 2
+    assert lines[after_causes] == CAUSE_NOTE
     # per-dataset and per-kind wrong counts, split by cause
-    assert next(line for line in lines if line.startswith("| reviews |")).endswith("| model 10 of 14, engine 0 of 3, unknown 3 of 3 |")
-    assert next(line for line in lines if line.startswith("| tpch |")).endswith("| model 10 of 16, engine 0 of 2, unknown 2 of 2 |")
-    assert next(line for line in lines if line.startswith("| single |")).endswith("| model 7 of 10, engine 0 of 2, unknown 2 of 2 |")
+    assert next(line for line in lines if line.startswith("| reviews |")).endswith(
+        "| model 10 of 14, engine 0 of 3, unknown 3 of 3 |")
+    assert next(line for line in lines if line.startswith("| tpch |")).endswith(
+        "| model 10 of 16, engine 0 of 2, unknown 2 of 2 |")
+    assert next(line for line in lines if line.startswith("| single |")).endswith(
+        "| model 7 of 10, engine 0 of 2, unknown 2 of 2 |")
 
     with an.paths(res).cells.open(newline="", encoding="utf-8") as f:
         rows = list(csv.DictReader(f))
-    assert list(rows[0]) == ["qid", "dataset", "kind", "shown", "right", "label", "cause", "crash", "seconds", *ck.CHECKS]
+    assert list(rows[0]) == ["qid", "dataset", "kind", "shown", "right", "label", "cause", "crash", "seconds",
+                             *ck.CHECKS]
     assert len(rows) == 143 and {r["qid"] for r in rows} == {x["qid"] for x in qs}
     first = next(r for r in rows if r["qid"] == "r001")
     assert (first["label"], first["fanout"], first["right"], first["cause"]) == ("warned", "warn", "False", "model")
@@ -497,11 +569,40 @@ def test_model_flag_other_than_frozen_is_no_verdict(tmp_path, fake_checks):
     assert head.startswith("**NO VERDICT**") and f"run model {MODEL} isn't the frozen model gemma4-26b" in head
 
 
-def test_no_frozen_model_needs_model_flag(tmp_path, capsys):
+def test_no_frozen_model_and_no_run_file_exits_1(tmp_path, capsys):
     res, code = _folders(tmp_path, [q("t001")], frozen=None)
     assert _main(res, code) == 1
-    assert "no frozen model; pass --model" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "no frozen model and no test run file in" in err and "pass --model" in err
     assert not an.paths(res).report.exists()
+
+
+def test_no_frozen_model_and_two_run_files_exits_1(tmp_path, capsys):
+    res, code = _folders(tmp_path, [q("t001")], frozen=None)
+    runs = [_write_run(res, [rec("t001")]), _write_run(res, [rec("t001", model="gemma4-26b")], model="gemma4-26b")]
+    _write_run(res, [rec("t001", split="dev")], split="dev")  # dev runs don't count
+    assert _main(res, code) == 1
+    err = capsys.readouterr().err
+    assert "no frozen model and 2 test run files" in err and all(run.name in err for run in runs)
+    assert not an.paths(res).report.exists()
+
+
+@pytest.mark.parametrize("freeze_text, problem", [
+    (None, "missing freeze.json"),
+    ('{"files": ', "freeze.json doesn't parse"),
+])
+def test_one_run_file_without_a_frozen_model_reports_no_verdict(tmp_path, fake_checks, capsys, freeze_text, problem):
+    qs, records = _good_run()
+    res, code = _folders(tmp_path, qs, frozen=None)
+    if freeze_text is not None:
+        (res / "freeze.json").write_text(freeze_text, encoding="utf-8")
+    _write_run(res, records, stamp=False)
+    assert _main(res, code) == 1
+    report = an.paths(res).report.read_text(encoding="utf-8")
+    head = report.split("## ")[0]
+    assert head.startswith("**NO VERDICT**")
+    assert f"- freeze: {problem}" in head and f"Model {MODEL}: 140 records" in head
+    assert "NO VERDICT" in capsys.readouterr().out
 
 
 def test_missing_run_file_exits_1(tmp_path, capsys):
@@ -516,6 +617,152 @@ def test_refuses_results_under_ai_queries(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(an, "AI_ROOT", tmp_path)
     assert _main(res, code) == 1
     assert "won't write inside" in capsys.readouterr().err
+
+
+def test_refreeze_with_the_run_moved_aside_is_no_verdict(tmp_path, fake_checks):
+    qs, records = _good_run()
+    res, code = _folders(tmp_path, qs)
+    run = _write_run(res, records)
+    assert _main(res, code) == 0
+
+    aside = tmp_path / f"aside_{os.getpid()}.jsonl"
+    run.rename(aside)
+    (code / "checks.py").write_text("tuned after reading the report\n", encoding="utf-8")
+    fz.write(res, code, MODEL, fz.read_model_configs(code / "model_mlx.py"))
+    aside.rename(run)
+    assert fz.verify(res, code, fz.read_model_configs(code / "model_mlx.py")) == []  # the files alone look clean
+
+    assert _main(res, code) == 1
+    head = an.paths(res).report.read_text(encoding="utf-8").split("## ")[0]
+    assert head.startswith("**NO VERDICT**")
+    assert ("- freeze: 140 of 140 test records weren't made under today's freeze.json "
+            "(freeze_sha1: 140 from another freeze, 0 missing)") in head
+
+
+def test_unstamped_test_run_is_no_verdict(tmp_path, fake_checks):
+    qs, records = _good_run()
+    res, code = _folders(tmp_path, qs)
+    _write_run(res, records, stamp=False)
+    assert _main(res, code) == 1
+    head = an.paths(res).report.read_text(encoding="utf-8").split("## ")[0]
+    assert head.startswith("**NO VERDICT**")
+    assert ("- freeze: 140 of 140 test records weren't made under today's freeze.json "
+            "(freeze_sha1: 0 from another freeze, 140 missing)") in head
+
+
+def test_watched_changes_shown_under_the_verdict_not_judged(tmp_path, fake_checks, capsys):
+    qs, records = _good_run()
+    res, code = _folders(tmp_path, qs)
+    _write_run(res, records)
+    (code / "run_pipeline.py").write_text("changed\n", encoding="utf-8")
+    (code / "freeze.py").unlink()
+    assert _main(res, code) == 0
+    lines = an.paths(res).report.read_text(encoding="utf-8").splitlines()
+    watched = WATCHED_HEAD + "run_pipeline.py changed; freeze.py is missing."
+    assert lines[:2] == ["**GO**", ""] and lines[2:5] == [line for line in lines[2:5] if line.startswith("- ")]
+    assert lines[5:8] == ["", watched, ""] and lines[8].startswith("Accuracy without checks")
+    assert watched in capsys.readouterr().out
+
+
+def test_freeze_without_watched_files_says_so(tmp_path, fake_checks):
+    qs, records = _good_run()
+    res, code = _folders(tmp_path, qs)
+    frozen = json.loads((res / "freeze.json").read_text(encoding="utf-8"))
+    del frozen["watched"]  # a freeze written before files were watched
+    (res / "freeze.json").write_text(json.dumps(frozen), encoding="utf-8")
+    _write_run(res, records)
+    assert _main(res, code) == 0
+    report = an.paths(res).report.read_text(encoding="utf-8")
+    assert report.startswith("**GO**") and WATCHED_HEAD + "freeze.json doesn't record the watched files." in report
+
+
+# Each "name n" or "name n of m" part of a cell,
+# as (n, m or None).
+def _parts(cell: str) -> list[tuple[int, int | None]]:
+    return [(int(n), int(m) if m else None) for n, m in re.findall(r"[a-z]+ (\d+)(?: of (\d+))?", cell)]
+
+
+def test_only_catch_and_without_engine_traps_add_up_by_cause(tmp_path, fake_checks):
+    qs, records = _good_run()
+    records[30]["levels"] = {"fanout": "warn", "grain": "warn"}  # an engine-cause catch two checks share
+    records[31]["levels"] = {"grain": "warn"}                    # an engine-cause catch only grain makes
+    records[32]["levels"] = {"engine_traps": "refuse"}           # gone without engine_traps
+    res, code = _folders(tmp_path, qs)
+    _write_run(res, records)
+    _main(res, code)
+    lines = an.paths(res).report.read_text(encoding="utf-8").splitlines()
+
+    header = next(line for line in lines if line.startswith("| Check |"))
+    assert header == "| Check | Catches | Catches by cause | Only catch | Only catch by cause | False alarms |"
+    table = [line for line in lines[lines.index(header) + 2:] if line.startswith("| ")]
+    rows = {cells[0]: cells for cells in (line.strip("| ").split(" | ") for line in table)}
+    assert set(rows) == set(ck.CHECKS)
+    for name, cells in rows.items():
+        assert int(cells[1]) == sum(n for n, _ in _parts(cells[2])), name
+        assert int(cells[3]) == sum(n for n, _ in _parts(cells[4])), name
+    assert rows["grain"][3:5] == ["1", "model 0, engine 1, unknown 0"]
+    assert rows["engine_traps"][3:5] == ["4", "model 3, engine 1, unknown 0"]
+
+    cell = next(line for line in lines if line.startswith("| all, without engine_traps |")).split(" | ")[1]
+    caught, total = map(int, re.match(r"(\d+) of (\d+) ", cell).groups())
+    parts = _parts(cell.split("(", 1)[1])
+    assert len(parts) == 3 and caught == sum(n for n, _ in parts) and total == sum(m for _, m in parts)
+    assert cell == "24 of 40 (model 17 of 30, engine 2 of 5, unknown 5 of 5)"
+
+
+# Dev questions and runs beside the good test run;
+# dev_runs maps config -> right answers of 2.
+def _with_dev_runs(tmp_path: Path, dev_runs: dict[str, int], frozen: str | None = MODEL) -> tuple[Path, Path]:
+    qs, records = _good_run()
+    res, code = _folders(tmp_path, qs + [q("t901", split="dev"), q("r902", split="dev")], frozen=frozen)
+    _write_run(res, records, stamp=frozen is not None)
+    for config, right in dev_runs.items():
+        rows = [((10.5,),) if i < right else ((1.0,),) for i in range(2)]
+        dev = [rec(qid, split="dev", model=config, rows=r) for qid, r in zip(("t901", "r902"), rows)]
+        _write_run(res, dev, split="dev", model=config)
+    return res, code
+
+
+# The report line that names the dev pick, right after the model line.
+def _pick_line(res: Path) -> str:
+    lines = an.paths(res).report.read_text(encoding="utf-8").splitlines()
+    at = next(i for i, line in enumerate(lines) if line.startswith(f"Model {MODEL}: "))
+    return lines[at + 2]
+
+
+def test_dev_pick_same_as_the_frozen_model(tmp_path, fake_checks):
+    res, code = _with_dev_runs(tmp_path, {MODEL: 2, "gemma4-26b": 1})
+    assert _main(res, code) == 0
+    assert _pick_line(res) == f"Frozen model {MODEL}; dev pick {MODEL}, the same."
+
+
+def test_dev_pick_differs_from_the_frozen_model(tmp_path, fake_checks):
+    res, code = _with_dev_runs(tmp_path, {MODEL: 1, "gemma4-26b": 2})
+    assert _main(res, code) == 0  # shown, never judged
+    assert _pick_line(res) == f"Frozen model {MODEL}; dev pick gemma4-26b: they differ."
+
+
+def test_dev_pick_not_available(tmp_path, fake_checks):
+    res, code = _with_dev_runs(tmp_path, {})
+    assert _main(res, code) == 0
+    assert _pick_line(res) == f"Frozen model {MODEL}; dev pick not available (no dev runs)."
+
+    dev = an.paths(res).run_file("dev", "gemma4-26b")
+    dev.write_text("not json\n{}\n", encoding="utf-8")  # a dev file that doesn't read never blocks the report
+    assert _main(res, code) == 0
+    assert _pick_line(res).startswith(f"Frozen model {MODEL}; dev pick not available (the dev runs don't read: ")
+
+    # A record in the wrong shape doesn't either.
+    dev.write_text(json.dumps({"qid": "t901", "primary": "x"}) + "\n", encoding="utf-8")
+    an.paths(res).report.unlink()
+    assert _main(res, code) == 0
+    assert _pick_line(res).startswith(f"Frozen model {MODEL}; dev pick not available (the dev runs don't read: ")
+
+
+def test_dev_pick_without_a_frozen_model(tmp_path, fake_checks):
+    res, code = _with_dev_runs(tmp_path, {"gemma4-26b": 2}, frozen=None)
+    assert _main(res, code) == 1
+    assert _pick_line(res) == "Frozen model none; dev pick gemma4-26b."
 
 
 # --- dev: model choice and grow ---------------------------------------------------------------
@@ -589,7 +836,8 @@ def test_dev_missing_records_count_as_not_right(tmp_path, fake_checks, capsys):
     assert any("qwen36-35b" in line and "answered 60 of 60" in line for line in lines)
     pick_at = next(i for i, line in enumerate(lines) if line.startswith("pick: "))
     assert lines[pick_at].startswith("pick: gemma4-26b")
-    assert "incomplete" in lines[pick_at - 1] and "gemma4-26b" in lines[pick_at - 1] and "the pick" in lines[pick_at - 1]
+    assert ("incomplete" in lines[pick_at - 1] and "gemma4-26b" in lines[pick_at - 1]
+            and "the pick" in lines[pick_at - 1])
     report = an.paths(res).dev_report.read_text(encoding="utf-8")
     assert "answered 2 of 60" in report and "## Per check" in report
     assert not an.paths(res).report.exists()
@@ -598,7 +846,9 @@ def test_dev_missing_records_count_as_not_right(tmp_path, fake_checks, capsys):
 def test_dev_report_grow_and_checks(tmp_path, fake_checks, capsys):
     res, code = _folders(tmp_path, _dev_questions(), frozen=None)
     records = [rec(f"{p}{i:03d}", split="dev", seconds=10.0) for p in "tr" for i in range(1, 31)]
-    for r in records[:6]:  # 6 wrong of 60, 4 of them warned by fanout; 2 right ones warned by grain
+    # 6 wrong of 60, 4 of them warned by fanout;
+    # 2 right ones warned by grain
+    for r in records[:6]:
         r["primary"]["result"]["rows"] = [[1.0]]
     for r in records[:4]:
         r["levels"] = {"fanout": "warn"}

@@ -41,12 +41,13 @@ CODE_NAMES = [
     "datasets/tpch.json", "datasets/reviews.json", "an_common.py", "describe_datasets.py", "model_mlx.py",
 ]
 ALL_NAMES = RESULTS_NAMES + CODE_NAMES
+WATCHED_NAMES = ["analyze_analyst_check.py", "run_pipeline.py", "bridge_client.py", "analyst_bridge.cpp", "freeze.py"]
 
 
-# A results folder and a code folder holding every frozen file.
+# A results folder and a code folder holding every frozen and watched file.
 def _folders(tmp_path: Path) -> tuple[Path, Path]:
     res, code = tmp_path / f"res_{os.getpid()}", tmp_path / f"code_{os.getpid()}"
-    for base, names in ((res, RESULTS_NAMES), (code, CODE_NAMES)):
+    for base, names in ((res, RESULTS_NAMES), (code, CODE_NAMES + WATCHED_NAMES)):
         for name in names:
             path = base / name
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -78,15 +79,19 @@ def test_frozen_lists():
     assert mod.FROZEN_RESULTS == RESULTS_NAMES
     assert mod.FROZEN_CODE == CODE_NAMES
     assert set(mod.FROZEN_RESULTS).isdisjoint(mod.FROZEN_CODE)  # names key one flat map
+    assert mod.WATCHED == WATCHED_NAMES
+    assert set(mod.WATCHED).isdisjoint(ALL_NAMES)
+    assert all((ANALYST / name).is_file() for name in mod.WATCHED)
 
 
 def test_compute_shape(tmp_path):
     res, code = _folders(tmp_path)
     record = mod.compute(res, code, "qwen36-35b", CONFIGS)
-    assert set(record) == {"files", "model"}
+    assert set(record) == {"files", "model", "watched"}
     assert set(record["files"]) == set(ALL_NAMES)
     for name in ALL_NAMES:
         assert record["files"][name] == an.sha1_file(_base(name, res, code) / name)
+    assert record["watched"] == {name: an.sha1_file(code / name) for name in WATCHED_NAMES}
     assert record["model"] == {"id": "qwen36-35b", **CONFIGS["qwen36-35b"]}
     assert not (res / "freeze.json").exists()  # compute writes nothing
 
@@ -140,6 +145,61 @@ def test_unfrozen_file_is_ignored(tmp_path):
     (code / "run_pipeline.py").write_text("new\n", encoding="utf-8")
     (res / "key_answers.json").write_text("{}\n", encoding="utf-8")
     assert mod.verify(res, code, CONFIGS) == []
+    assert mod.watched_changes(res, code) == ["run_pipeline.py changed"]  # shown, never a mismatch
+
+
+@pytest.mark.parametrize("name", WATCHED_NAMES)
+def test_each_watched_file_shows_but_never_fails_verify(tmp_path, name):
+    res, code = _folders(tmp_path)
+    mod.write(res, code, "qwen36-35b", CONFIGS)
+    assert mod.watched_changes(res, code) == []
+    (code / name).write_text("edited\n", encoding="utf-8")
+    assert mod.watched_changes(res, code) == [f"{name} changed"]
+    (code / name).unlink()
+    assert mod.watched_changes(res, code) == [f"{name} is missing"]
+    assert mod.verify(res, code, CONFIGS) == []
+
+
+def test_watched_files_kept_apart_from_frozen_ones(tmp_path):
+    res, code = _folders(tmp_path)
+    mod.write(res, code, "qwen36-35b", CONFIGS)
+    frozen = _read_freeze(res)
+    assert set(frozen["files"]) == set(ALL_NAMES) and set(frozen["watched"]) == set(WATCHED_NAMES)
+
+
+def test_missing_watched_file_does_not_block_a_freeze(tmp_path):
+    res, code = _folders(tmp_path)
+    (code / "analyst_bridge.cpp").unlink()
+    mod.write(res, code, "qwen36-35b", CONFIGS)
+    assert mod.verify(res, code, CONFIGS) == []
+    assert mod.watched_changes(res, code) == ["analyst_bridge.cpp wasn't recorded in freeze.json"]
+
+
+def test_freeze_without_watched_files_says_so_once(tmp_path):
+    res, code = _folders(tmp_path)
+    mod.write(res, code, "qwen36-35b", CONFIGS)
+    old = {k: v for k, v in _read_freeze(res).items() if k != "watched"}  # written before files were watched
+    _write_freeze(res, old)
+    (code / "freeze.py").write_text("edited\n", encoding="utf-8")
+    assert mod.watched_changes(res, code) == ["freeze.json doesn't record the watched files"]
+    assert mod.verify(res, code, CONFIGS) == []
+    _write_freeze(res, {**old, "watched": ["freeze.py"]})
+    assert mod.watched_changes(res, code) == ["freeze.json doesn't record the watched files"]
+
+
+def test_no_watched_lines_without_a_usable_freeze(tmp_path):
+    res, code = _folders(tmp_path)
+    assert mod.watched_changes(res, code) == []  # verify already says freeze.json is missing
+    (res / "freeze.json").write_text('{"files": ', encoding="utf-8")
+    assert mod.watched_changes(res, code) == []
+
+
+def test_freeze_sha1(tmp_path):
+    res, code = _folders(tmp_path)
+    assert mod.freeze_sha1(res) is None
+    mod.write(res, code, "qwen36-35b", CONFIGS)
+    assert mod.freeze_sha1(res) == an.sha1_file(res / "freeze.json")
+    assert mod.freeze_sha1(str(res)) == an.sha1_file(res / "freeze.json")
 
 
 def test_code_after_the_literal_is_caught(tmp_path):
@@ -162,6 +222,8 @@ def test_write_refuses_while_a_test_run_exists(tmp_path):
     with pytest.raises(FileExistsError) as e:
         mod.write(res, code, "qwen36-35b", CONFIGS)
     assert all(str(run) in str(e.value) for run in runs)
+    assert "a test run exists" in str(e.value) and "a new freeze would no longer match it" in str(e.value)
+    assert "move it away" not in str(e.value)
     assert not (res / "freeze.json").exists()
 
 
@@ -210,6 +272,18 @@ def test_changed_model_config_is_reported(tmp_path):
         'model qwen36-35b changed: max_tokens 1024 -> 2048, path "mlx-community/Qwen3.6-35B-A3B-4bit" -> unset, '
         "thinking false -> true, top_p unset -> 0.9"
     ]
+
+
+def test_changed_model_revision_is_reported(tmp_path):
+    res, code = _folders(tmp_path)
+    configs = mod.read_model_configs(ANALYST / "model_mlx.py")
+    mod.write(res, code, "qwen38-27b", configs)
+
+    changed = copy.deepcopy(configs)
+    old, new = configs["qwen38-27b"]["revision"], "b935172" + "0" * 33
+    changed["qwen38-27b"]["revision"] = new
+    assert mod.verify(res, code, changed) == [f'model qwen38-27b changed: revision "{old}" -> "{new}"']
+    assert mod.verify(res, code, configs) == []
 
 
 def test_model_config_compared_strictly(tmp_path):
@@ -349,7 +423,8 @@ def test_configs_read_without_running_the_file(tmp_path):
     path.write_text(f"import mlx_that_is_not_installed\n\nMODEL_CONFIGS = {CONFIGS!r}\n", encoding="utf-8")
     assert mod.read_model_configs(path) == CONFIGS
 
-    path.write_text("MODEL_CONFIGS: dict = {'a': {'path': 'x'}}\nMODEL_CONFIGS = {'b': {'path': 'y'}}\n", encoding="utf-8")
+    path.write_text("MODEL_CONFIGS: dict = {'a': {'path': 'x'}}\nMODEL_CONFIGS = {'b': {'path': 'y'}}\n",
+                    encoding="utf-8")
     assert mod.read_model_configs(path) == {"b": {"path": "y"}}  # the last one, as Python would
 
 
@@ -387,10 +462,30 @@ def test_cli_write_and_verify(tmp_path, capsys):
     capsys.readouterr()
 
     (code / "checks.py").write_text("changed", encoding="utf-8")
-    (code / "model_mlx.py").write_text(f"MODEL_CONFIGS = {{'gemma4-26b': {CONFIGS['gemma4-26b']!r}}}\n", encoding="utf-8")
+    (code / "model_mlx.py").write_text(f"MODEL_CONFIGS = {{'gemma4-26b': {CONFIGS['gemma4-26b']!r}}}\n",
+                                       encoding="utf-8")
     assert mod.main(["verify", "--results", str(res)], code_dir=code) == 1
     err = capsys.readouterr().err
     assert "checks.py changed" in err and "model qwen36-35b is no longer in MODEL_CONFIGS" in err
+
+
+def test_cli_verify_notes_watched_files_without_failing(tmp_path, capsys):
+    res, code = _cli_folders(tmp_path)
+    assert mod.main(["write", "--model", "qwen36-35b", "--results", str(res)], code_dir=code) == 0
+    capsys.readouterr()
+
+    (code / "run_pipeline.py").write_text("changed", encoding="utf-8")
+    (code / "freeze.py").unlink()
+    assert mod.main(["verify", "--results", str(res)], code_dir=code) == 0
+    out = capsys.readouterr().out
+    assert "note (watched, not frozen): run_pipeline.py changed" in out
+    assert "note (watched, not frozen): freeze.py is missing" in out
+    assert "everything matches" in out
+
+    (code / "checks.py").write_text("changed", encoding="utf-8")
+    assert mod.main(["verify", "--results", str(res)], code_dir=code) == 1
+    captured = capsys.readouterr()
+    assert "checks.py changed" in captured.err and "run_pipeline.py changed" in captured.out
 
 
 def test_cli_refusals(tmp_path, capsys):

@@ -273,6 +273,47 @@ def test_example_overlap(tmp_path):
     assert statuses(rows) == {"t001": "AGREE", "t002": "AGREE", "t003": "AGREE"}
 
 
+def test_normalize_sql():
+    n = mod.normalize_sql
+    month = "SELECT  r_month, AVG(r_rating) AS avg_rating\nFROM reviews WHERE r_year = 2022 GROUP BY r_month;"
+    assert n(month) == "select r_month , avg ( r_rating ) from reviews where r_year = ? group by r_month"
+    assert n("SELECT COUNT(*) FROM t WHERE n = 'it''s'") == n("select count( * ) from t where n='X'")
+    assert n("SELECT x AS 'y', z as w FROM t") == n("SELECT x, z FROM t")
+    dated = "SELECT 1.5 * a FROM t WHERE d >= DATE '1995-01-01' LIMIT 3 ;"
+    assert n(dated) == "select ? * a from t where d >= date ? limit ?"
+    assert n("SELECT p_has_price FROM t -- a note\nWHERE c1 <> 2") == "select p_has_price from t where c1 <> ?"
+    assert n("SELECT c1 FROM t") != n("SELECT c2 FROM t")       # digits inside names stay
+    assert n("SELECT a FROM t ORDER BY a") != n("SELECT a FROM t ORDER BY a DESC")
+
+
+def test_example_overlap_on_gold_sql(tmp_path):
+    examples = tmp_path / f"examples_{os.getpid()}.json"
+    examples.write_text(json.dumps({
+        "tpch": [{"question": "Who scored over 25?",
+                  "reply": {"sql": "SELECT name, score AS points FROM s WHERE score > 25 ORDER BY score DESC;"}},
+                 {"question": "What did shipping cost?", "reply": {"cannot_answer": "no shipping costs"}}],
+        "reviews": [{"question": "Odd reply?", "reply": "not an object"}],
+    }))
+    sqlite_form = "SELECT name, score FROM s WHERE score >= 20"
+    questions = [q("t001", "select name ,score as pts\nfrom s where score > 10 order by score desc"),
+                 q("t002", sqlite_form, subset="SELECT name, score AS x FROM s WHERE score > 19 ORDER BY score DESC"),
+                 q("t003", "SELECT name FROM s WHERE score > 25")]
+    seconds = [second(x["qid"], x["gold_sqlite"], x["question"]) for x in questions]
+    results = make_results(tmp_path, questions, seconds)
+
+    rows = mod.check(results, bridge_factory=Factory(), examples_path=examples)
+    assert statuses(rows) == {"t001": "EXAMPLE_OVERLAP", "t002": "EXAMPLE_OVERLAP", "t003": "AGREE"}
+    assert details(rows)["t001"] == "the gold SQL matches a prompt example's SQL"
+
+
+def test_missing_examples_file_says_so(tmp_path, capsys):
+    questions = [q("t001", "SELECT name FROM s WHERE score > 25")]
+    results = make_results(tmp_path, questions, [second("t001", questions[0]["gold_sqlite"])])
+    assert statuses(mod.check(results, bridge_factory=Factory())) == {"t001": "AGREE"}
+    err = capsys.readouterr().err
+    assert err.count("\n") == 1 and f"no_examples_{os.getpid()}.json" in err and "EXAMPLE_OVERLAP" in err
+
+
 def test_tie_rules(tmp_path):
     questions = [
         q("t001", "SELECT name, score FROM s ORDER BY score DESC LIMIT 1", ordered=True, order_cols=[1]),
@@ -415,6 +456,29 @@ def test_timeouts_not_cached(tmp_path, monkeypatch):
     rows = mod.check(results, bridge_factory=Factory())
     assert statuses(rows) == {"t001": "GOLD_ERROR"} and "timeout" in details(rows)["t001"]
     assert "RECURSIVE" not in (results / "key_answers.json").read_text()
+
+
+class FailingBridge(SqliteBridge):
+    """Fails every query with one error kind, the way the client reports a stopped bridge."""
+
+    def __init__(self, tables_tsv: Path, kind: str):
+        super().__init__(tables_tsv)
+        self.kind = kind
+
+    def query(self, sql: str) -> dict:
+        self.sent.append(sql)
+        return {"id": str(len(self.sent)), "ok": False, "error": {"kind": self.kind, "message": f"bad {self.kind}"},
+                "ms": 0}
+
+
+@pytest.mark.parametrize("kind", ["timeout", "crash", "memory"])
+def test_engine_failures_that_may_not_repeat_are_not_cached(tmp_path, kind):
+    gold = "SELECT COUNT(*) AS n FROM s"
+    results = make_results(tmp_path, [q("t001", gold)], [second("t001", gold)])
+    rows = mod.check(results, bridge_factory=lambda tsv: FailingBridge(tsv, kind))
+    assert statuses(rows) == {"t001": "GOLD_ERROR"} and kind in details(rows)["t001"]
+    entries = json.loads((results / "key_answers.json").read_text())["entries"].values()
+    assert [e["engine"] for e in entries] == ["sqlite"]   # only SQLite's run is kept
 
 
 def test_check_refuses_bad_records_and_missing_files(tmp_path):

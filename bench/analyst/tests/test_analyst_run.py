@@ -7,6 +7,7 @@ import re
 import shlex
 import subprocess
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -28,10 +29,13 @@ def _load(module_name: str, file_name: str):
 
 
 mod = _load("an_run_analyst_check", "run_analyst_check.py")
+fz = _load("an_run_test_freeze", "freeze.py")
+KNOWN = list(fz.read_model_configs(ANALYST / "model_mlx.py"))
 
 PY, AI_PY = ".venv/bin/python", ".venv-ai/bin/python"
 BUILD = ("cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSHILMANDB_ENABLE_ML=ON "
          "-DSHILMANDB_BUILD_BENCH=ON && cmake --build build --target analyst_bridge")
+REBUILD = "cmake --build build --target analyst_bridge"
 DEFAULT_COMMANDS = [
     ("prepare", [PY, "bench/analyst/prepare_datasets.py"]),
     ("describe", [PY, "bench/analyst/describe_datasets.py"]),
@@ -46,13 +50,24 @@ def _no_process(*args, **kwargs):
     raise AssertionError("a process was started")
 
 
-# Every test gets a fake bridge that exists and a driver that can't start processes.
+# Every test gets a fake bridge newer than its fake source, an empty results folder
+# and a driver that can't start processes.
 @pytest.fixture(autouse=True)
-def _guard(tmp_path, monkeypatch):
+def fakes(tmp_path, monkeypatch):
+    source = tmp_path / f"analyst_bridge_{os.getpid()}.cpp"
     bridge = tmp_path / f"analyst_bridge_{os.getpid()}"
+    results = tmp_path / f"results_{os.getpid()}"
+    source.write_text("")
     bridge.write_text("")
+    results.mkdir()
+    os.utime(source, (1_000_000, 1_000_000))
+    os.utime(bridge, (2_000_000, 2_000_000))
+
     monkeypatch.setattr(mod, "BRIDGE", bridge)
+    monkeypatch.setattr(mod, "BRIDGE_SOURCE", source)
+    monkeypatch.setattr(mod, "RESULTS", results)
     monkeypatch.setattr(mod, "subprocess", SimpleNamespace(Popen=_no_process))
+    return SimpleNamespace(source=source, bridge=bridge, results=results)
 
 
 # Swap the driver's Popen for a fake; outcomes maps script names to wait() results.
@@ -139,9 +154,11 @@ def test_generate_needs_split_and_model(capsys):
 
 # generate runs on .venv-ai with split, model and limit; a given python stays as given.
 def test_generate_uses_ai_python(capsys):
-    assert _dry(GENERATE, capsys) == (0, [("generate", [AI_PY, "bench/analyst/run_pipeline.py", "--split", "dev", "--model", "qwen36-35b"])])
+    assert _dry(GENERATE, capsys) == (0, [("generate", [AI_PY, "bench/analyst/run_pipeline.py", "--split", "dev",
+                                                        "--model", "qwen36-35b"])])
 
-    code, rows = _dry([*GENERATE, "--limit-per-dataset", "4", "--ai-python", "/opt/ai/python", "--python", "py3"], capsys)
+    code, rows = _dry([*GENERATE, "--limit-per-dataset", "4", "--ai-python", "/opt/ai/python", "--python", "py3"],
+                      capsys)
     assert code == 0
     assert rows == [("generate", ["/opt/ai/python", "bench/analyst/run_pipeline.py", "--split", "dev",
                                   "--model", "qwen36-35b", "--limit-per-dataset", "4"])]
@@ -180,6 +197,73 @@ def test_missing_bridge_exits_2(tmp_path, monkeypatch, capsys):
     code, rows = _dry(["--steps", "prepare,describe,analyze"], capsys)
     assert code == 0
     assert [step for step, _ in rows] == ["prepare", "describe", "analyze"]
+
+
+# A bridge older than its source: exit 2 with the rebuild command, nothing started.
+def test_stale_bridge_exits_2(fakes, monkeypatch, capsys):
+    os.utime(fakes.source, (3_000_000, 3_000_000))
+    log = _fake_popen(monkeypatch)
+
+    for steps in (["--steps", "prepare,probe"], ["--steps", "key"], GENERATE, []):
+        for dry in ([], ["--dry-run"]):
+            assert mod.main([*steps, *dry]) == 2
+            captured = capsys.readouterr()
+            assert captured.out == ""
+            err = captured.err.splitlines()
+            assert len(err) == 2 and err[1] == REBUILD
+            assert "older than" in err[0] and fakes.source.name in err[0]
+    assert log == []
+
+    # Steps without the bridge still run; a bridge as new as its source is fine.
+    code, rows = _dry(["--steps", "prepare,describe,analyze"], capsys)
+    assert code == 0 and [step for step, _ in rows] == ["prepare", "describe", "analyze"]
+    os.utime(fakes.bridge, (3_000_000, 3_000_000))
+    assert _dry(["--steps", "key"], capsys)[0] == 0
+
+
+# With freeze.json in the results folder, prepare, describe and probe refuse (exit 2).
+def test_freeze_blocks_prep_steps(fakes, tmp_path, monkeypatch, capsys):
+    (fakes.results / "freeze.json").write_text("{}")
+    log = _fake_popen(monkeypatch)
+
+    for steps in (["--steps", "prepare"], ["--steps", "describe"], ["--steps", "probe,key"], []):
+        for dry in ([], ["--dry-run"]):
+            assert mod.main([*steps, *dry]) == 2
+            captured = capsys.readouterr()
+            assert captured.out == ""
+            err = captured.err.splitlines()
+            assert len(err) == 1 and err[0].startswith("error: ") and "freeze.json" in err[0]
+    assert log == []
+
+    # key, generate and analyze still run.
+    code, rows = _dry(["--steps", "key,generate,analyze", "--split", "dev", "--model", "qwen36-35b"], capsys)
+    assert code == 0 and [step for step, _ in rows] == ["key", "generate", "analyze"]
+
+    # --results names the folder checked; a relative one is taken from the repo root.
+    other = tmp_path / f"other_{os.getpid()}"
+    other.mkdir()
+    assert _dry(["--steps", "prepare", "--results", str(other)], capsys)[0] == 0
+    (other / "freeze.json").write_text("{}")
+    monkeypatch.chdir(fakes.results)
+    assert mod.main(["--steps", "prepare", "--results", os.path.relpath(other, REPO_ROOT), "--dry-run"]) == 2
+    assert "freeze.json" in capsys.readouterr().err
+
+
+# generate with a model id model_mlx.py doesn't know: exit 2 listing the known ids.
+def test_unknown_model_exits_2(monkeypatch, capsys):
+    log = _fake_popen(monkeypatch)
+    for steps in ("generate", "generate,analyze"):
+        for dry in ([], ["--dry-run"]):
+            assert mod.main(["--steps", steps, "--split", "dev", "--model", "qwen-typo", *dry]) == 2
+            captured = capsys.readouterr()
+            assert captured.out == ""
+            assert captured.err.splitlines() == [f"error: unknown model 'qwen-typo'; known: {', '.join(KNOWN)}"]
+    assert log == []
+
+    for model in KNOWN:
+        assert _dry(["--steps", "generate", "--split", "dev", "--model", model], capsys)[0] == 0
+    # Without generate the id isn't checked.
+    assert _dry(["--steps", "analyze", "--model", "qwen-typo"], capsys)[0] == 0
 
 
 # The first failing step's exit code stops the run; later steps never start.
@@ -223,13 +307,17 @@ def test_results_passed_only_when_given(capsys):
 def test_analyze_gets_model_only_with_test(capsys):
     analyze = [PY, "bench/analyst/analyze_analyst_check.py"]
     assert _dry(["--steps", "analyze"], capsys) == (0, [("analyze", [*analyze, "--split", "test"])])
-    assert _dry(["--steps", "analyze", "--model", "m1"], capsys) == (0, [("analyze", [*analyze, "--split", "test", "--model", "m1"])])
-    assert _dry(["--steps", "analyze", "--split", "dev", "--model", "m1"], capsys) == (0, [("analyze", [*analyze, "--split", "dev"])])
+    assert (_dry(["--steps", "analyze", "--model", "m1"], capsys)
+            == (0, [("analyze", [*analyze, "--split", "test", "--model", "m1"])]))
+    assert (_dry(["--steps", "analyze", "--split", "dev", "--model", "m1"], capsys)
+            == (0, [("analyze", [*analyze, "--split", "dev"])]))
 
-    code, rows = _dry(["--steps", "generate,analyze", "--split", "dev", "--model", "m1", "--limit-per-dataset", "4"], capsys)
+    code, rows = _dry(["--steps", "generate,analyze", "--split", "dev", "--model", "qwen36-35b",
+                       "--limit-per-dataset", "4"], capsys)
     assert code == 0
     assert rows == [
-        ("generate", [AI_PY, "bench/analyst/run_pipeline.py", "--split", "dev", "--model", "m1", "--limit-per-dataset", "4"]),
+        ("generate", [AI_PY, "bench/analyst/run_pipeline.py", "--split", "dev", "--model", "qwen36-35b",
+                      "--limit-per-dataset", "4"]),
         ("analyze", [*analyze, "--split", "dev"]),
     ]
 
@@ -273,16 +361,50 @@ def test_second_ctrl_c_kills(monkeypatch, capsys):
     assert capsys.readouterr().err.splitlines() == ["== prepare: stopped by Ctrl-C"]
 
 
-# A python that can't start stops the run with 1.
-def test_cant_start_exits_1(monkeypatch, capsys):
+# A step that can't start (no interpreter or no script) stops the run with 127.
+def test_cant_start_exits_127(monkeypatch, capsys):
     # Raises the way Popen does for a missing interpreter.
     def missing(cmd, **kwargs):
         raise FileNotFoundError(2, "No such file or directory", cmd[0])
 
     monkeypatch.setattr(mod, "subprocess", SimpleNamespace(Popen=missing))
-    assert mod.main(["--steps", "prepare,describe", "--python", "nope/python"]) == 1
+    assert mod.main(["--steps", "prepare,describe", "--python", "nope/python"]) == 127
     err = capsys.readouterr().err.splitlines()
     assert len(err) == 1 and err[0].startswith("== prepare: can't start nope/python: ")
+
+    # A missing script never reaches Popen.
+    monkeypatch.setattr(mod, "subprocess", SimpleNamespace(Popen=_no_process))
+    script = f"bench/analyst/missing_{os.getpid()}.py"
+    assert mod._run("prepare", [PY, script]) == 127
+    assert capsys.readouterr().err.splitlines() == [f"== prepare: can't start {script}: no such file"]
+
+    # A step's own exit code 1 (analyze's NO VERDICT) stays 1.
+    _fake_popen(monkeypatch, {"analyze_analyst_check.py": [1]})
+    assert mod.main(["--steps", "analyze"]) == 1
+
+
+# Ctrl-C between steps, outside any child, prints one line and exits 130.
+def test_ctrl_c_between_steps_exits_130(monkeypatch, capsys):
+    log = _fake_popen(monkeypatch)
+    calls = []
+
+    # The clock for the start lines; Ctrl-C lands on the second step's.
+    def strftime(fmt):
+        calls.append(fmt)
+        if len(calls) == 2:
+            raise KeyboardInterrupt
+        return "12:00:00"
+
+    monkeypatch.setattr(mod, "time", SimpleNamespace(monotonic=time.monotonic, strftime=strftime))
+    try:
+        code = mod.main([])
+    except KeyboardInterrupt:
+        pytest.fail("Ctrl-C between steps escaped main")
+    assert code == 130
+    assert _scripts(log) == ["prepare_datasets.py"]
+    captured = capsys.readouterr()
+    assert captured.err.splitlines() == ["== stopped by Ctrl-C"]
+    assert "== prepare: done in" in captured.out
 
 
 # --limit-per-dataset must be a whole number of at least 1.
@@ -292,9 +414,11 @@ def test_limit_must_be_positive():
 
 
 # The script itself, run from elsewhere, prints the same repo-relative commands.
-def test_script_dry_run_from_another_folder(tmp_path):
+# Its own results folder keeps a real freeze.json from refusing prepare.
+def test_script_dry_run_from_another_folder(fakes, tmp_path):
     script = ANALYST / "run_analyst_check.py"
-    done = subprocess.run([sys.executable, str(script), "--steps", "prepare,describe", "--dry-run"],
+    results = ["--results", str(fakes.results)]
+    done = subprocess.run([sys.executable, str(script), "--steps", "prepare,describe", *results, "--dry-run"],
                           cwd=tmp_path, capture_output=True, text=True, timeout=60)
     assert done.returncode == 0, done.stderr
-    assert _commands(done.stdout) == DEFAULT_COMMANDS[:2]
+    assert _commands(done.stdout) == [(step, [*cmd, *results]) for step, cmd in DEFAULT_COMMANDS[:2]]

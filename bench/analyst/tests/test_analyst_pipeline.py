@@ -36,13 +36,15 @@ QIDS = ["t001", "t002", "t003"]
 GOOD_SQL = "SELECT COUNT(*) AS open_orders FROM orders WHERE o_status = 'O'"
 BAD_SQL = "SELEC COUNT(*) AS open_orders FROM orders"
 COLUMN = {"name": "open_orders", "meaning": "orders still open", "entity": "orders"}
-DESCRIPTION = {"tpch": "# tpch\n\n## Tables\n\n- `orders`: one row per order\n", "reviews": "# reviews\n\n## Tables\n\n- `reviews`: one row per review\n"}
+DESCRIPTION = {"tpch": "# tpch\n\n## Tables\n\n- `orders`: one row per order\n",
+               "reviews": "# reviews\n\n## Tables\n\n- `reviews`: one row per review\n"}
 RULES = "# SQL you can use\n\n- COUNT(*) works\n"
 CTX = mod.Context(description=DESCRIPTION["tpch"], rules=RULES, examples=[])
 TABLES = {
     "tpch": [
         "CREATE TABLE orders (o_orderkey INTEGER, o_status TEXT, o_orderdate TEXT)",
-        "INSERT INTO orders VALUES (1, 'O', '1995-03-01'), (2, 'F', '1994-07-15'), (3, 'O', '1996-01-02'), (4, 'O', '1995-11-30')",
+        "INSERT INTO orders VALUES (1, 'O', '1995-03-01'), (2, 'F', '1994-07-15'), "
+        "(3, 'O', '1996-01-02'), (4, 'O', '1995-11-30')",
     ],
     "reviews": [
         "CREATE TABLE orders (o_orderkey INTEGER, o_status TEXT, o_orderdate TEXT)",
@@ -50,11 +52,13 @@ TABLES = {
     ],
 }
 
-TOP_KEYS = {"qid", "dataset", "split", "model", "prompt_sha1", "primary", "rephrase", "sqlite_cause", "seconds_total", "bridge_restarts"}
+TOP_KEYS = {"qid", "dataset", "split", "model", "prompt_sha1", "primary", "rephrase", "sqlite_cause", "seconds_total",
+            "bridge_restarts"}
 PRIMARY_KEYS = {"attempts", "final", "sql", "result", "claims", "reason"}
 REPHRASE_KEYS = {"raw", "text", "seconds", "prompt_sha1", "attempts", "final", "sql", "result"}
 ATTEMPT_KEYS = {"raw", "kind", "sql", "reply", "seconds", "prompt_sha1"}
-SKIPPED = {"raw": None, "text": None, "seconds": None, "prompt_sha1": None, "attempts": [], "final": "skipped", "sql": None, "result": None}
+SKIPPED = {"raw": None, "text": None, "seconds": None, "prompt_sha1": None, "attempts": [], "final": "skipped",
+           "sql": None, "result": None}
 
 
 # One question record as the pipeline reads it.
@@ -106,7 +110,7 @@ class FakeModel:
 class FakeBridge:
     """Stands in for Bridge: runs SQL on the dataset's SQLite file, or fails as scripted.
 
-    failures maps SQL to error kinds used in turn; a timeout or crash counts a restart.
+    failures maps SQL to error kinds used in turn; a timeout, crash or memory counts a restart.
     replies maps SQL to a canned good reply, for SQL only the engine runs.
     """
 
@@ -131,7 +135,7 @@ class FakeBridge:
         kinds = self.failures.get(sql)
         if kinds:
             kind = kinds.pop(0)
-            self.restarts += kind in ("timeout", "crash")
+            self.restarts += kind in ("timeout", "crash", "memory")
             return {"id": rid, "ok": False, "error": {"kind": kind, "message": f"bad {kind}"}, "ms": MS}
         if sql in self.replies:
             return {"id": rid, **self.replies[sql], "ms": MS}
@@ -190,6 +194,11 @@ def answer(tmp_path: Path, script: dict, **bridge_kwargs) -> tuple[dict, FakeMod
     return rec, model, bridge
 
 
+# A model_factory that answers every question in QIDS.
+def fake_model(config_id: str) -> FakeModel:
+    return FakeModel(script_for(QIDS), config_id)
+
+
 # A model_factory that must never be called.
 def no_model(config_id: str):
     raise AssertionError("the model should not load")
@@ -235,13 +244,15 @@ def test_shown_answer_record_shape(tmp_path):
 
 
 def test_error_then_fix_uses_retry_prompt(tmp_path):
-    script = {rewrite_prompt("t001"): "Tell me the puzzle t001 answer.", "## Problem": reply(GOOD_SQL), "puzzle t001": reply(BAD_SQL)}
+    script = {rewrite_prompt("t001"): "Tell me the puzzle t001 answer.", "## Problem": reply(GOOD_SQL),
+              "puzzle t001": reply(BAD_SQL)}
     rec, model, bridge = answer(tmp_path, script)
     attempts = rec["primary"]["attempts"]
     assert [a["kind"] for a in attempts] == ["sql", "sql"] and rec["primary"]["final"] == "shown"
     error = attempts[0]["reply"]["error"]
     assert error["kind"] == "parse" and "SELEC" in error["message"]
-    assert model.prompts[1] == pr.build_retry_prompt(model.prompts[0], reply(BAD_SQL), f"parse error: {error['message']}")
+    assert model.prompts[1] == pr.build_retry_prompt(model.prompts[0], reply(BAD_SQL),
+                                                     f"parse error: {error['message']}")
     assert [a["prompt_sha1"] for a in attempts] == [an.sha1_text(p) for p in model.prompts[:2]]
     assert rec["prompt_sha1"] == an.sha1_text(model.prompts[0])  # the first prompt, not the retry
     assert rec["primary"]["sql"] == GOOD_SQL and rec["primary"]["result"] == attempts[1]["reply"]
@@ -254,7 +265,8 @@ def test_malformed_replies_end_as_visible_failure(tmp_path):
     assert len(rec["primary"]["attempts"]) == 3 and rec["primary"]["final"] == "failed"
     assert rec["rephrase"]["final"] == "skipped" and "sqlite_cause" not in rec
     assert [(a["kind"], a["sql"], a["reply"]) for a in attempts] == [("malformed", None, None)] * 3
-    assert {k: rec["primary"][k] for k in ("sql", "result", "claims", "reason")} == dict.fromkeys(("sql", "result", "claims", "reason"))
+    assert ({k: rec["primary"][k] for k in ("sql", "result", "claims", "reason")}
+            == dict.fromkeys(("sql", "result", "claims", "reason")))
     assert rec["rephrase"] == SKIPPED
     assert [problem_in(p) for p in model.prompts[1:]] == [pr.NOT_A_REPLY] * 2
     assert len(model.prompts) == 3 and bridge.sent == []
@@ -287,16 +299,26 @@ def test_timeout_counts_as_attempt(tmp_path):
     assert rec["bridge_restarts"] == 1
 
 
-@pytest.mark.parametrize("kind", ["parse", "plan", "run", "request", "timeout", "crash"])
+def test_memory_counts_as_attempt(tmp_path):
+    rec, model, bridge = answer(tmp_path, script_for(["t001"]), failures={GOOD_SQL: ["memory"]})
+    attempts = rec["primary"]["attempts"]
+    assert len(attempts) == 2 and rec["primary"]["final"] == "shown"
+    assert attempts[0]["reply"]["error"]["kind"] == "memory"
+    assert problem_in(model.prompts[1]) == pr.TOO_MUCH_MEMORY
+    assert rec["bridge_restarts"] == 1
+
+
+@pytest.mark.parametrize("kind", ["parse", "plan", "run", "request", "timeout", "crash", "memory"])
 def test_each_bridge_error_uses_an_attempt(tmp_path, kind):
     rec, model, bridge = answer(tmp_path, script_for(["t001"]), failures={GOOD_SQL: [kind] * 5})
     attempts = rec["primary"]["attempts"]
     assert len(attempts) == 3 and rec["primary"]["final"] == "failed"
     assert [a["reply"]["error"]["kind"] for a in attempts] == [kind] * 3
-    want = {"timeout": pr.TOO_SLOW, "crash": pr.CRASHED}.get(kind, f"{kind} error: bad {kind}")
+    want = {"timeout": pr.TOO_SLOW, "crash": pr.CRASHED,
+            "memory": pr.TOO_MUCH_MEMORY}.get(kind, f"{kind} error: bad {kind}")
     assert [problem_in(p) for p in model.prompts[1:]] == [want] * 2
     assert len(bridge.sent) == 3 and rec["rephrase"] == SKIPPED and "sqlite_cause" not in rec
-    assert rec["bridge_restarts"] == (3 if kind in ("timeout", "crash") else 0)
+    assert rec["bridge_restarts"] == (3 if kind in ("timeout", "crash", "memory") else 0)
 
 
 def test_malformed_and_errors_share_three_attempts(tmp_path):
@@ -307,7 +329,8 @@ def test_malformed_and_errors_share_three_attempts(tmp_path):
 
 def test_retry_prompt_strips_thinking(tmp_path):
     raw = "<think>let me guess</think>I think 5"
-    rec, model, _ = answer(tmp_path, {rewrite_prompt("t001"): "Again?", "puzzle t001": [raw, reply(GOOD_SQL)], "Again?": reply(GOOD_SQL)})
+    rec, model, _ = answer(tmp_path, {rewrite_prompt("t001"): "Again?", "puzzle t001": [raw, reply(GOOD_SQL)],
+                                      "Again?": reply(GOOD_SQL)})
     assert model.prompts[1] == pr.build_retry_prompt(model.prompts[0], "I think 5", pr.NOT_A_REPLY)
     assert "let me guess" not in model.prompts[1]
     assert rec["primary"]["attempts"][0]["raw"] == raw  # the record keeps the reply whole
@@ -323,7 +346,8 @@ def test_empty_rewrite_skips_rephrase(tmp_path):
 
 
 def test_seconds_total_adds_model_and_bridge_time(tmp_path):
-    script = {rewrite_prompt("t001"): "Tell me the puzzle t001 answer.", "## Problem": reply(GOOD_SQL), "puzzle t001": reply(BAD_SQL)}
+    script = {rewrite_prompt("t001"): "Tell me the puzzle t001 answer.", "## Problem": reply(GOOD_SQL),
+              "puzzle t001": reply(BAD_SQL)}
     rec, model, bridge = answer(tmp_path, script)
     assert len(model.prompts) == 5 and len(bridge.sent) == 4  # two tries each, plus the rewrite
     assert rec["seconds_total"] == pytest.approx(5 * SECONDS + 4 * MS / 1000)
@@ -345,10 +369,28 @@ def test_sqlite_cause_uses_sqlite_dates(tmp_path):
 
 def test_sqlite_cause_keeps_sqlite_errors(tmp_path):
     sql = "SELECT engine_only() AS x"
-    canned = {"ok": True, "columns": [{"name": "x", "type": "INTEGER"}], "rows": [[1]], "row_count": 1, "truncated": False, "profile": {}}
+    canned = {"ok": True, "columns": [{"name": "x", "type": "INTEGER"}], "rows": [[1]], "row_count": 1,
+              "truncated": False, "profile": {}}
     rec, _, _ = answer(tmp_path, script_for(["t001"], sql), replies={sql: canned})
     assert rec["primary"]["final"] == "shown"
     assert rec["sqlite_cause"] == {"ok": False, "kind": "sql", "error": "no such function: engine_only"}
+
+
+def test_sqlite_cause_runs_the_line_the_engine_ran(tmp_path, monkeypatch):
+    sql = "SELECT COUNT(*) AS n FROM orders\nWHERE o_status = 'O\tX' -- not open"
+    ran, real = [], an.sqlite_query
+    monkeypatch.setattr(an, "sqlite_query", lambda db, s, **kwargs: ran.append(s) or real(db, s, **kwargs))
+    rec, _, _ = answer(tmp_path, script_for(["t001"], sql))
+    assert rec["primary"]["final"] == "shown"
+    assert ran == [mod.bc.one_line(sql)] == ["SELECT COUNT(*) AS n FROM orders WHERE o_status = 'O X'"]
+
+
+def test_sql_that_is_not_utf8_is_a_malformed_reply(tmp_path):
+    raw = '{"sql": "SELECT \'\\ud800\'"}'   # JSON text whose escape decodes to a lone surrogate
+    rec, model, bridge = answer(tmp_path, {"puzzle t001": raw})
+    assert rec["primary"]["final"] == "failed" and bridge.sent == []
+    assert [(a["kind"], a["sql"], a["raw"]) for a in rec["primary"]["attempts"]] == [("malformed", None, raw)] * 3
+    assert [problem_in(p) for p in model.prompts[1:]] == [pr.NOT_A_REPLY] * 2
 
 
 def test_resume_drops_partial_line_and_skips_done(tmp_path):
@@ -357,7 +399,8 @@ def test_resume_drops_partial_line_and_skips_done(tmp_path):
     assert mod.run("dev", model, res, ["tpch"], limit_per_dataset=1, bridge_factory=Factory()) == 1
     f = an.paths(res).run_file("dev", MODEL)
     f.write_text(f.read_text() + '{"qid": "t0')       # interrupted
-    assert mod.run("dev", model, res, ["tpch"], bridge_factory=Factory()) == 2 and [r["qid"] for r in an.read_jsonl(f)] == ["t001", "t002", "t003"]
+    assert (mod.run("dev", model, res, ["tpch"], bridge_factory=Factory()) == 2
+            and [r["qid"] for r in an.read_jsonl(f)] == ["t001", "t002", "t003"])
     assert len(f.read_text().splitlines()) == 3
 
 
@@ -381,15 +424,19 @@ def test_run_order_split_and_output(tmp_path, capsys):
 
     records = an.read_jsonl(an.paths(res).run_file("dev", MODEL))
     assert [r["qid"] for r in records] == ["r001", "r002", "t001", "t003"]
-    assert [(r["dataset"], r["split"], r["model"]) for r in records] == [("reviews", "dev", MODEL)] * 2 + [("tpch", "dev", MODEL)] * 2
-    assert [b.tables_tsv for b in factory.made] == [res / "datasets/reviews/tables.tsv", res / "datasets/tpch/tables.tsv"]
+    assert ([(r["dataset"], r["split"], r["model"]) for r in records]
+            == [("reviews", "dev", MODEL)] * 2 + [("tpch", "dev", MODEL)] * 2)
+    assert [b.tables_tsv for b in factory.made] == [res / "datasets/reviews/tables.tsv",
+                                                    res / "datasets/tpch/tables.tsv"]
     assert all(b.closed for b in factory.made)
     assert [len(b.sent) for b in factory.made] == [4, 4]
     assert all(set(r) == TOP_KEYS for r in records)
 
     out = capsys.readouterr().out.splitlines()
-    assert [line for line in out if "bridge ready" in line] == ["reviews bridge ready in 0.0 s", "tpch bridge ready in 0.0 s"]
-    assert [line for line in out if "bridge ready" not in line] == [f"{q} shown 5.0 s" for q in ("r001", "r002", "t001", "t003")]
+    assert [line for line in out if "bridge ready" in line] == ["reviews bridge ready in 0.0 s",
+                                                                "tpch bridge ready in 0.0 s"]
+    assert [line for line in out if "bridge ready" not in line] == [f"{q} shown 5.0 s"
+                                                                    for q in ("r001", "r002", "t001", "t003")]
 
 
 def test_bridge_restarts_count_per_question(tmp_path, capsys):
@@ -414,10 +461,26 @@ def test_each_record_is_saved_before_the_next_question(tmp_path):
     assert len(factory.made) == 1 and factory.made[0].closed
 
 
+def test_main_stops_cleanly_on_ctrl_c(tmp_path, capsys):
+    res = make_results(tmp_path)
+    model = FakeModel({"puzzle t001": json.dumps({"cannot_answer": "no data"}), "puzzle t002": KeyboardInterrupt()})
+    factory = Factory()
+    argv = ["--split", "dev", "--model", MODEL, "--results", str(res), "--datasets", "tpch"]
+    assert mod.main(argv, bridge_factory=factory, model_factory=lambda cid: model) == 130
+    assert len(model.prompts) == 2   # the second generate was the one stopped
+
+    f = an.paths(res).run_file("dev", MODEL)
+    assert [r["qid"] for r in an.read_jsonl(f)] == ["t001"] and f.read_text().endswith("\n")
+    assert len(factory.made) == 1 and factory.made[0].closed
+    err = capsys.readouterr().err
+    assert err == "stopped by Ctrl-C; rerun the same command to resume\n"
+
+
 # A bridge command that writes a line to stderr, then runs the fake bridge.
 def _noisy_bridge(tmp_path: Path) -> Path:
     script = tmp_path / f"noisy_bridge_{os.getpid()}.sh"
-    script.write_text(f'#!/bin/sh\necho "noisy bridge says hello" >&2\nexec "{sys.executable}" "{HERE / "fake_bridge.py"}" "$@"\n')
+    script.write_text(f'#!/bin/sh\necho "noisy bridge says hello" >&2\nexec "{sys.executable}" '
+                      f'"{HERE / "fake_bridge.py"}" "$@"\n')
     script.chmod(0o755)
     return script
 
@@ -435,7 +498,8 @@ def test_default_bridge_logs_stderr_next_to_the_run_file(tmp_path, monkeypatch):
 
 def test_rephrase_can_end_cannot(tmp_path):
     cannot = json.dumps({"cannot_answer": "no such data"})
-    rec, model, _ = answer(tmp_path, {rewrite_prompt("t001"): "Other words?", "puzzle t001": reply(GOOD_SQL), "Other words?": cannot})
+    rec, model, _ = answer(tmp_path, {rewrite_prompt("t001"): "Other words?", "puzzle t001": reply(GOOD_SQL),
+                                      "Other words?": cannot})
     rephrase = rec["rephrase"]
     assert rephrase["final"] == "cannot" and (rephrase["sql"], rephrase["result"]) == (None, None)
     assert [a["kind"] for a in rephrase["attempts"]] == ["cannot"] and rephrase["text"] == "Other words?"
@@ -443,7 +507,8 @@ def test_rephrase_can_end_cannot(tmp_path):
 
 
 def test_rephrase_can_run_out_of_attempts(tmp_path):
-    rec, model, bridge = answer(tmp_path, {rewrite_prompt("t001"): "Other words?", "puzzle t001": reply(GOOD_SQL), "Other words?": "no idea"})
+    rec, model, bridge = answer(tmp_path, {rewrite_prompt("t001"): "Other words?", "puzzle t001": reply(GOOD_SQL),
+                                           "Other words?": "no idea"})
     rephrase = rec["rephrase"]
     assert rephrase["final"] == "failed" and (rephrase["sql"], rephrase["result"]) == (None, None)
     assert [a["kind"] for a in rephrase["attempts"]] == ["malformed"] * 3
@@ -456,7 +521,8 @@ def test_run_uses_each_datasets_prompt_context(tmp_path):
     assert mod.run("dev", model, res, ["tpch", "reviews"], bridge_factory=Factory()) == 2
     examples = json.loads((ANALYST / "prompt_examples.json").read_text(encoding="utf-8"))
     tpch_prompt = pr.build_sql_prompt(DESCRIPTION["tpch"], RULES, examples["tpch"], question("t001")["question"])
-    reviews_prompt = pr.build_sql_prompt(DESCRIPTION["reviews"], RULES, examples["reviews"], question("r001")["question"])
+    reviews_prompt = pr.build_sql_prompt(DESCRIPTION["reviews"], RULES, examples["reviews"],
+                                         question("r001")["question"])
     assert model.prompts[0] == tpch_prompt and model.prompts[3] == reviews_prompt
 
 
@@ -484,7 +550,8 @@ def test_to_sqlite_dates():
 def test_test_split_refuses_without_freeze(tmp_path, capsys):
     res = make_results(tmp_path)
     assert mod.main(["--split", "test", "--model", "qwen36-35b", "--results", str(res)]) == 2
-    assert capsys.readouterr().err == "test generation needs a clean freeze for --model qwen36-35b: missing freeze.json\n"
+    assert capsys.readouterr().err == ("test generation needs a clean freeze for --model qwen36-35b: "
+                                       "missing freeze.json\n")
     assert not (res / "runs").exists()
 
 
@@ -506,8 +573,10 @@ def _frozen(tmp_path: Path, res: Path, model: str) -> Path:
 def test_test_split_refuses_a_freeze_for_another_model(tmp_path, capsys):
     res = make_results(tmp_path, [question("t001", "test")])
     code = _frozen(tmp_path, res, "gemma4-26b")
-    assert mod.main(["--split", "test", "--model", MODEL, "--results", str(res)], code_dir=code, model_factory=no_model) == 2
-    assert capsys.readouterr().err == f"test generation needs a clean freeze for --model {MODEL}: freeze.json is for model gemma4-26b\n"
+    assert mod.main(["--split", "test", "--model", MODEL, "--results", str(res)], code_dir=code,
+                    model_factory=no_model) == 2
+    assert capsys.readouterr().err == (f"test generation needs a clean freeze for --model {MODEL}: "
+                                       f"freeze.json is for model gemma4-26b\n")
     assert not (res / "runs").exists()
 
 
@@ -515,8 +584,10 @@ def test_test_split_refuses_a_changed_file(tmp_path, capsys):
     res = make_results(tmp_path, [question("t001", "test")])
     code = _frozen(tmp_path, res, MODEL)
     (res / "subset_rules.md").write_text(RULES + "- one more rule\n")
-    assert mod.main(["--split", "test", "--model", MODEL, "--results", str(res)], code_dir=code, model_factory=no_model) == 2
-    assert capsys.readouterr().err == f"test generation needs a clean freeze for --model {MODEL}: subset_rules.md changed\n"
+    assert mod.main(["--split", "test", "--model", MODEL, "--results", str(res)], code_dir=code,
+                    model_factory=no_model) == 2
+    assert capsys.readouterr().err == (f"test generation needs a clean freeze for --model {MODEL}: "
+                                       f"subset_rules.md changed\n")
 
 
 def test_test_split_runs_on_a_clean_freeze(tmp_path, capsys):
@@ -531,10 +602,36 @@ def test_test_split_runs_on_a_clean_freeze(tmp_path, capsys):
     argv = ["--split", "test", "--model", "gemma4-26b", "--results", str(res), "--datasets", "tpch"]
     assert mod.main(argv, code_dir=code, bridge_factory=Factory(), model_factory=models) == 0
     records = an.read_jsonl(an.paths(res).run_file("test", "gemma4-26b"))
-    assert [(r["qid"], r["split"], r["model"]) for r in records] == [("t001", "test", "gemma4-26b"), ("t002", "test", "gemma4-26b")]
+    assert ([(r["qid"], r["split"], r["model"]) for r in records]
+            == [("t001", "test", "gemma4-26b"), ("t002", "test", "gemma4-26b")])
     assert [m.config_id for m in made] == ["gemma4-26b"]
     out = capsys.readouterr().out
     assert "model gemma4-26b loaded in 0.0 s\n" in out and "wrote 2 records" in out
+
+
+def test_test_records_carry_the_freeze_stamp(tmp_path):
+    res = make_results(tmp_path, [question("t001", "test"), question("t002", "test")])
+    code = _frozen(tmp_path, res, MODEL)
+    stamp = an.sha1_file(res / "freeze.json")
+    argv = ["--split", "test", "--model", MODEL, "--results", str(res), "--datasets", "tpch"]
+
+    def run(*extra: str) -> int:
+        return mod.main([*argv, *extra], code_dir=code, bridge_factory=Factory(), model_factory=fake_model)
+
+    assert run("--limit-per-dataset", "1") == 0
+    assert run() == 0  # a resumed run
+    records = an.read_jsonl(an.paths(res).run_file("test", MODEL))
+    assert [(r["qid"], r["freeze_sha1"]) for r in records] == [("t001", stamp), ("t002", stamp)]
+    assert all(set(r) == TOP_KEYS | {"freeze_sha1"} for r in records)
+
+
+def test_dev_records_carry_no_freeze_stamp(tmp_path):
+    res = make_results(tmp_path)
+    code = _frozen(tmp_path, res, MODEL)  # a freeze exists, but dev never reads it
+    argv = ["--split", "dev", "--model", MODEL, "--results", str(res), "--datasets", "tpch"]
+    assert mod.main(argv, code_dir=code, bridge_factory=Factory(), model_factory=fake_model) == 0
+    records = an.read_jsonl(an.paths(res).run_file("dev", MODEL))
+    assert len(records) == 3 and all("freeze_sha1" not in r for r in records)
 
 
 def test_unknown_model_refused(tmp_path, capsys):
@@ -550,7 +647,8 @@ def test_main_dev_run(tmp_path, capsys):
     assert mod.main(argv, bridge_factory=Factory(), model_factory=lambda cid: FakeModel(script_for(QIDS), cid)) == 0
     out = capsys.readouterr().out.splitlines()
     run_file = an.paths(res).run_file("dev", MODEL)
-    assert out == [f"model {MODEL} loaded in 0.0 s", "tpch bridge ready in 0.0 s", "t001 shown 5.0 s", f"wrote 1 record -> {run_file}"]
+    assert out == [f"model {MODEL} loaded in 0.0 s", "tpch bridge ready in 0.0 s", "t001 shown 5.0 s",
+                   f"wrote 1 record -> {run_file}"]
     assert [r["qid"] for r in an.read_jsonl(run_file)] == ["t001"]
 
 

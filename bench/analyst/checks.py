@@ -1,4 +1,4 @@
-#Label one shown answer: each check says pass, note, warn or refuse, with its evidence
+# Label one shown answer: each check says pass, note, warn or refuse, with its evidence
 from __future__ import annotations
 
 import importlib.util
@@ -95,10 +95,10 @@ def entity_table(text: str | None, spec: dict) -> str | None:
     return None if key is None else tables[key]
 
 
-# Tables whose rows the joins repeat: some path out of the table crosses a join
-# that matches many rows, one whose columns on the far side don't cover its key.
-def repeating_tables(facts: sf.SqlFacts, spec: dict) -> set[str]:
-    tables, keys = set(facts.tables), spec.get("primary_keys", {})
+# Tables whose rows the joins repeat: a path out crosses a join matching many rows,
+# or a table it has no equality path to scans over one row.
+def repeating_tables(facts: sf.SqlFacts, spec: dict, scan_rows: dict | None = None) -> set[str]:
+    tables, keys, scan_rows = set(facts.tables), spec.get("primary_keys", {}), scan_rows or {}
 
     # Equalities between two tables share one edge, so together they can cover a key.
     far_side: dict[tuple[str, str], set[str]] = defaultdict(set)
@@ -119,26 +119,52 @@ def repeating_tables(facts: sf.SqlFacts, spec: dict) -> set[str]:
     def reaches_fanout(node: str, path: frozenset) -> bool:
         return any(q not in path and (fans_out(node, q) or reaches_fanout(q, path | {q})) for q in neighbours[node])
 
-    return {t for t in tables if reaches_fanout(t, frozenset({t}))}
+    # Tables joined to t by equalities; any other table crosses every row of t.
+    def component(t: str) -> set[str]:
+        seen, stack = {t}, [t]
+        while stack:
+            for q in neighbours[stack.pop()]:
+                if q not in seen:
+                    seen.add(q)
+                    stack.append(q)
+        return seen
+
+    # A table with no scan count might have many rows.
+    def many_rows(t: str) -> bool:
+        n = scan_rows.get(t)
+        return not isinstance(n, int) or n > 1
+
+    def crossed(t: str) -> bool:
+        return any(many_rows(u) for u in tables - component(t))
+
+    return {t for t in tables if reaches_fanout(t, frozenset({t})) or crossed(t)}
 
 
-# Refuse SQL the engine runs wrong: LEFT JOIN, self-joins, dropped WHERE terms, text math.
+# Refuse SQL the engine runs wrong: LEFT JOIN, self-joins,
+# dropped WHERE / ON terms, text math.
 def _engine_traps(f: sf.SqlFacts) -> CheckResult:
     if not f.ok:
         return _unread("engine_traps", f)
 
     repeated = sorted(t for t, n in Counter(f.tables).items() if n > 1)
+    # Only a one-table query drops a WHERE term with no column; a join applies it.
+    constants = list(f.constant_conjuncts) if len(f.tables) == 1 else []
     traps = ["LEFT JOIN runs as an inner join"] if f.has_left_join else []
     traps += [f"{t} appears twice, and table qualifiers are ignored" for t in repeated]
-    traps += [f"WHERE {c} names no column, so it's dropped" for c in f.constant_conjuncts]
+    for c in constants:
+        place = " outside a CASE" if c in f.case_only_conjuncts else ""
+        traps.append(f"WHERE {c} names no column{place}, so it's dropped")
+        
+    traps += [f"ON {on} names {f'only {ts[0]}' if ts else 'no table'}, so the engine drops it" for on, ts in f.few_table_ons]
     traps += ["arithmetic on text or a date"] if f.text_arithmetic else []
     evidence = {
         "left_join": f.has_left_join,
         "repeated_tables": repeated,
-        "constant_conjuncts": list(f.constant_conjuncts), 
+        "constant_conjuncts": constants,
+        "few_table_ons": [{"on": on, "tables": list(ts)} for on, ts in f.few_table_ons],
         "text_arithmetic": f.text_arithmetic,
     }
-    
+
     if traps:
         return CheckResult("engine_traps", "refuse", "the engine runs this wrong: " + "; ".join(traps), evidence)
     return CheckResult("engine_traps", "pass", "no engine traps", evidence)
@@ -160,8 +186,8 @@ def _empty_input(f: sf.SqlFacts, result: dict) -> CheckResult:
     scan, step = list(profile.get("scan_rows") or []), list(profile.get("step_rows") or [])
     row_count = result.get("row_count", len(result.get("rows") or []))
     evidence = {
-        "row_count": row_count, 
-        "scan_rows": scan, 
+        "row_count": row_count,
+        "scan_rows": scan,
         "step_rows": step
     }
 
@@ -181,20 +207,22 @@ def _empty_input(f: sf.SqlFacts, result: dict) -> CheckResult:
     return CheckResult("empty_input", "pass", "every input had rows", evidence)
 
 
-# Per repeating table: rows out of its scan, and rows after the last join step.
+# Rows out of each table's scan, by name; a repeated table keeps its first.
 # scan_rows is in join order, so entry i belongs to tables[order[i]].
-def _fanout_rows(repeating: set[str], profile: dict) -> dict:
+def _scan_rows_by_table(profile: dict) -> dict:
     join = profile.get("join") or {}
-    tables, order = join.get("tables") or [], join.get("order") or []
-    scan, step = profile.get("scan_rows") or [], profile.get("step_rows") or []
-    in_order = [tables[j] if isinstance(j, int) and 0 <= j < len(tables) else None for j in order]
-
+    tables, order, scan = join.get("tables") or [], join.get("order") or [], profile.get("scan_rows") or []
     rows = {}
-    for t in sorted(repeating):
-        i = in_order.index(t) if t in in_order else None
-        scanned = scan[i] if i is not None and i < len(scan) else None
-        rows[t] = {"scan_rows": scanned, "joined_rows": step[-1] if step else None}
+    for i, j in enumerate(order):
+        if isinstance(j, int) and 0 <= j < len(tables) and i < len(scan):
+            rows.setdefault(tables[j], scan[i])
     return rows
+
+
+# Per repeating table: rows out of its scan, and rows after the last join step.
+def _fanout_rows(repeating: set[str], profile: dict) -> dict:
+    scanned, step = _scan_rows_by_table(profile), profile.get("step_rows") or []
+    return {t: {"scan_rows": scanned.get(t), "joined_rows": step[-1] if step else None} for t in sorted(repeating)}
 
 
 # Problems with each select item holding COUNT(*): its claim must map to a non-repeating table.
@@ -206,7 +234,7 @@ def _count_star_problems(f: sf.SqlFacts, claims: dict, spec: dict, repeating: se
         claim = columns[i] if i < len(columns) and isinstance(columns[i], dict) else {}
         text = claim.get("entity")
         entity = entity_table(text, spec)
-        
+
         if entity is None:
             why = f"its entity {text!r} doesn't map to a table" if text else "it has no claimed entity"
             problems.append(f"COUNT(*) in column {i + 1} counts joined rows, and {why}")
@@ -224,8 +252,9 @@ def _fanout(f: sf.SqlFacts, result: dict, claims: dict, spec: dict) -> CheckResu
     if not f.ok:
         return _unread("fanout", f)
 
-    repeating = repeating_tables(f, spec)
-    rows = _fanout_rows(repeating, result.get("profile") or {})
+    profile = result.get("profile") or {}
+    repeating = repeating_tables(f, spec, _scan_rows_by_table(profile))
+    rows = _fanout_rows(repeating, profile)
     if not repeating:
         return CheckResult("fanout", "pass", "no table repeats in the joins", {"repeating": rows, "problems": []})
 
@@ -275,7 +304,7 @@ def _grain(f: sf.SqlFacts, result: dict, claims: dict, spec: dict) -> CheckResul
     claimed = claimed_grain(text, spec)
     evidence = {"group_by": f.group_by, "claimed": text if isinstance(text, str) else None, "grain": claimed}
     if claimed is None:
-        why = f"the claimed grain {text!r} isn't one I can map" if evidence["claimed"] else "no claimed grain to compare"
+        why = (f"the claimed grain {text!r} isn't one I can map" if evidence["claimed"] else "no claimed grain to compare")
         return CheckResult("grain", "note", why, evidence)
 
     sets = [list(cols) for cols in spec["grains"][claimed]]
@@ -291,7 +320,7 @@ def _grain(f: sf.SqlFacts, result: dict, claims: dict, spec: dict) -> CheckResul
 def _matches(shown: dict, gold: dict) -> bool:
     shown_cols, gold_cols = shown.get("columns") or [], gold.get("columns") or []
     shares = [i for i, c in enumerate(gold_cols) if c.get("type") in NUMERIC_TYPES]
-    
+
     return sc.match_result(
         [c.get("name") for c in shown_cols], shown.get("rows") or [],
         [c.get("name") for c in gold_cols], gold.get("rows") or [],
@@ -325,10 +354,10 @@ def _term_verdict(term: dict, fits: list[dict]) -> tuple[str, str]:
     if len(fits) == 1 and fits[0]["default"]:
         others = [r["name"] for r in term["readings"] if not r["default"]]
         return "note", f"{name} read as {fits[0]['name']}; other readings: {', '.join(others) or 'none'}"
-    
+
     if not fits:
         return "warn", f"{name}: no reading fits the SQL (readings: {', '.join(r['name'] for r in term['readings'])})"
-    
+
     if len(fits) == 1:
         return "warn", f"{name} read as {fits[0]['name']}, not the default {default}"
     return "warn", f"{name} fits several readings: {', '.join(r['name'] for r in fits)}"
@@ -357,7 +386,7 @@ def _terms(f: sf.SqlFacts, question: dict, spec: dict, sql: str) -> CheckResult:
 def _integer_division(f: sf.SqlFacts) -> CheckResult:
     if not f.ok:
         return _unread("integer_division", f)
-    
+
     evidence = {"divisions": list(f.int_divisions)}
     if f.int_divisions:
         message = "integer division drops the fraction: " + "; ".join(f.int_divisions)

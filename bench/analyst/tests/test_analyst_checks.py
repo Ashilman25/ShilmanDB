@@ -28,7 +28,8 @@ CheckResult = mod.CheckResult
 SPEC = mod.dd.load_spec("tpch")
 
 # Row counts at SF=0.1.
-ROWS = {"region": 5, "nation": 25, "part": 20000, "supplier": 1000, "customer": 15000, "orders": 150000, "lineitem": 600572}
+ROWS = {"region": 5, "nation": 25, "part": 20000, "supplier": 1000, "customer": 15000, "orders": 150000,
+        "lineitem": 600572}
 COLUMNS = {
     "region": "r_regionkey:BIGINT r_name:VARCHAR",
     "nation": "n_nationkey:BIGINT n_name:VARCHAR n_regionkey:BIGINT",
@@ -75,7 +76,8 @@ def _result(rows, columns=None, row_count=None, tables=(), order=None, scan_rows
     scan = list(scan_rows) if scan_rows is not None else [ROWS[t] for t in tables]
     step = list(step_rows) if step_rows is not None else [max(scan[:i + 1]) for i in range(len(scan))]
     if operators is None:
-        operators = [{"name": f"SeqScan {t}", "depth": 1, "rows": ROWS[t], "total_ms": 1.0, "self_ms": 1.0} for t in tables]
+        operators = [{"name": f"SeqScan {t}", "depth": 1, "rows": ROWS[t], "total_ms": 1.0, "self_ms": 1.0}
+                     for t in tables]
     return {
         "id": "1", "ok": True,
         "columns": [{"name": n, "type": k} for n, k in zip(columns or [f"c{i}" for i in range(width)], types)],
@@ -95,7 +97,8 @@ def rec(sql: str, q: str = "How much?", rows=None, claims_entity=None, grain=Non
     result = _result([[1.0]] if rows is None else rows, tables=tables, **result_kw)
     if claims is None:
         width = len(result["columns"])
-        claims = {"grain": grain, "columns": [{"name": f"c{i}", "meaning": "", "entity": claims_entity} for i in range(width)]}
+        claims = {"grain": grain,
+                  "columns": [{"name": f"c{i}", "meaning": "", "entity": claims_entity} for i in range(width)]}
     if rephrase is None:
         rephrase = {"raw": "", "text": "Same question?", "seconds": 1.0, "prompt_sha1": "x", "attempts": [],
                     "final": "shown", "sql": sql, "result": copy.deepcopy(result)}
@@ -129,12 +132,15 @@ def level(name: str, sql: str, **kw) -> str:
 OL = "FROM orders JOIN lineitem ON l_orderkey = o_orderkey"
 
 
-def test_left_join_refused(): assert level("engine_traps", sql="SELECT COUNT(*) FROM orders LEFT JOIN lineitem ON l_orderkey = o_orderkey") == "refuse"
+def test_left_join_refused():
+    assert level("engine_traps",
+                 sql="SELECT COUNT(*) FROM orders LEFT JOIN lineitem ON l_orderkey = o_orderkey") == "refuse"
 def test_empty_filter_warns():
     r = rec("SELECT SUM(o_totalprice) FROM orders WHERE o_orderstatus = 'f'", row_count=1, scan_rows=[0], step_rows=[0])
     assert level_of(r, "empty_input") == "warn"
 def test_fanout_sum_of_order_totals_over_lineitem():
-    r = rec("SELECT SUM(o_totalprice) FROM orders JOIN lineitem ON l_orderkey = o_orderkey", scan_rows=[150000, 600572], step_rows=[150000, 600572])
+    r = rec("SELECT SUM(o_totalprice) FROM orders JOIN lineitem ON l_orderkey = o_orderkey", scan_rows=[150000, 600572],
+            step_rows=[150000, 600572])
     res = get(r, "fanout"); assert res.level == "warn" and "orders" in res.message
 def test_fanout_evidence_follows_join_order():
     r = rec(f"SELECT SUM(o_totalprice) {OL}", tables=["orders", "lineitem"], order=[1, 0],
@@ -144,7 +150,8 @@ def test_fanout_evidence_follows_join_order():
     assert res.evidence["repeating"] == {"orders": {"scan_rows": 150000, "joined_rows": 600572}}
     assert "150,000" in res.message and "600,572" in res.message
 def test_no_fanout_sum_of_lineitem_over_orders():
-    assert level_of(rec("SELECT SUM(l_quantity) FROM lineitem JOIN orders ON l_orderkey = o_orderkey"), "fanout") == "pass"
+    assert level_of(rec("SELECT SUM(l_quantity) FROM lineitem JOIN orders ON l_orderkey = o_orderkey"),
+                    "fanout") == "pass"
 def test_transitive_fanout_through_nation():
     sql = ("SELECT SUM(o_totalprice) FROM orders JOIN customer ON o_custkey = c_custkey "
            "JOIN nation ON c_nationkey = n_nationkey JOIN supplier ON s_nationkey = n_nationkey")
@@ -157,26 +164,33 @@ def test_count_star_counting_orders_over_lineitem():
 def test_count_star_mapping():
     assert level_of(rec(f"SELECT COUNT(*) {OL}", claims_entity="line items"), "fanout") == "pass"
     assert level_of(rec(f"SELECT SUM(l_quantity) / COUNT(*) {OL}", claims_entity="line items"), "fanout") == "pass"
-    assert level_of(rec(f"SELECT SUM(l_quantity) / COUNT(*) {OL}", claims_entity="orders"), "fanout") == "warn"   # a ratio over orders
+    assert level_of(rec(f"SELECT SUM(l_quantity) / COUNT(*) {OL}", claims_entity="orders"),
+                    "fanout") == "warn"   # a ratio over orders
     assert level_of(rec(f"SELECT COUNT(*) {OL} ORDER BY COUNT(*) DESC", claims_entity="line items"), "fanout") == "pass"
     assert level_of(rec(f"SELECT COUNT(*) {OL} ORDER BY COUNT(*) DESC", claims_entity="orders"), "fanout") == "warn"
     assert level_of(rec(f"SELECT COUNT(*) {OL}", claims_entity="revenue"), "fanout") == "warn"   # can't be mapped
-    assert level_of(rec(f"SELECT COUNT(*) {OL}", claims={"grain": None, "columns": []}), "fanout") == "warn"   # past the claims
-    assert level_of(rec("SELECT COUNT(*) FROM orders", claims={"grain": None, "columns": []}), "fanout") == "pass"   # nothing repeats
+    assert level_of(rec(f"SELECT COUNT(*) {OL}", claims={"grain": None, "columns": []}),
+                    "fanout") == "warn"   # past the claims
+    assert level_of(rec("SELECT COUNT(*) FROM orders", claims={"grain": None, "columns": []}),
+                    "fanout") == "pass"   # nothing repeats
     # A COUNT(*) only in HAVING or ORDER BY has no select item's claim.
     no_item = "SELECT n_name FROM customer JOIN nation ON c_nationkey = n_nationkey GROUP BY n_name {}"
     res = get(rec(no_item.format("ORDER BY COUNT(*) DESC"), rows=[["FRANCE"]], claims_entity="nation"), "fanout")
     assert res.level == "warn" and "outside the select list" in res.message
-    assert level_of(rec(no_item.format("HAVING COUNT(*) > 5"), rows=[["FRANCE"]], claims_entity="nation"), "fanout") == "warn"
+    assert level_of(rec(no_item.format("HAVING COUNT(*) > 5"), rows=[["FRANCE"]], claims_entity="nation"),
+                    "fanout") == "warn"
 def test_grain_covered_and_not():
     sql = "SELECT n_name, SUM(c_acctbal) FROM customer JOIN nation ON c_nationkey = n_nationkey GROUP BY {}"
     rows = [["FRANCE", 1.0], ["GERMANY", 2.0]]
     assert level_of(rec(sql.format("n_name"), rows=rows, grain="one row per nation"), "grain") == "pass"
-    seg = "SELECT c_mktsegment, SUM(c_acctbal) FROM customer JOIN nation ON c_nationkey = n_nationkey GROUP BY c_mktsegment"
-    assert level_of(rec(seg, rows=[["AUTOMOBILE", 1.0], ["BUILDING", 2.0]], grain="one row per nation"), "grain") == "warn"
+    seg = ("SELECT c_mktsegment, SUM(c_acctbal) FROM customer JOIN nation ON c_nationkey = n_nationkey "
+           "GROUP BY c_mktsegment")
+    assert level_of(rec(seg, rows=[["AUTOMOBILE", 1.0], ["BUILDING", 2.0]], grain="one row per nation"),
+                    "grain") == "warn"
     assert level_of(rec(sql.format("n_name"), rows=rows, grain="one row per widget"), "grain") == "note"
 def test_grain_rows_repeat_on_shown_group_by():
-    sql = "SELECT c_name, SUM(o_totalprice) FROM customer JOIN orders ON c_custkey = o_custkey GROUP BY c_name, o_orderyear"
+    sql = ("SELECT c_name, SUM(o_totalprice) FROM customer JOIN orders ON c_custkey = o_custkey "
+           "GROUP BY c_name, o_orderyear")
     res = get(rec(sql, rows=[["Customer#1", 10.0], ["Customer#1", 12.0]], grain="one row per customer"), "grain")
     assert res.level == "warn" and res.evidence["columns"] == ["c_name"] and res.evidence["repeated"] == ["Customer#1"]
     unique = [["Customer#1", 10.0], ["Customer#2", 12.0]]
@@ -198,7 +212,8 @@ def test_second_phrasing_share_on_either_side():
     case.record["rephrase"]["result"]["columns"][0]["type"] = "VARCHAR"   # the swap scales only the rephrase's numbers
     assert level_of(case, "second_phrasing") == "warn"
 def test_terms_default_note_other_warn():
-    assert level_of(rec("SELECT SUM(l_extendedprice * (1 - l_discount)) FROM lineitem", q="Total revenue?"), "terms") == "note"
+    assert level_of(rec("SELECT SUM(l_extendedprice * (1 - l_discount)) FROM lineitem", q="Total revenue?"),
+                    "terms") == "note"
     assert level_of(rec("SELECT SUM(l_extendedprice) FROM lineitem", q="Total revenue?"), "terms") == "warn"
 def test_integer_division_warns():
     res = get(rec("SELECT COUNT(*) / 7 FROM orders"), "integer_division")
@@ -220,18 +235,91 @@ def test_unreadable_sql_gives_notes():
 
 
 def test_engine_traps_name_each():
-    res = get(rec("SELECT SUM(o_totalprice) FROM orders a, orders b WHERE 1 = 0 AND o_orderdate + 1 > 2"), "engine_traps")
+    res = get(rec("SELECT SUM(o_totalprice) FROM orders a, orders b WHERE 1 = 0 AND o_orderdate + 1 > 2"),
+              "engine_traps")
     assert res.level == "refuse"
-    assert "orders" in res.message and "1 = 0" in res.message and "arithmetic" in res.message
-    assert res.evidence["repeated_tables"] == ["orders"] and res.evidence["constant_conjuncts"] == ["1 = 0"]
+    assert "orders" in res.message and "arithmetic" in res.message
+    assert "1 = 0" not in res.message   # two table references, so the engine applies it
+    assert res.evidence["repeated_tables"] == ["orders"] and res.evidence["constant_conjuncts"] == []
     assert res.evidence["text_arithmetic"] and not res.evidence["left_join"]
     left = get(rec("SELECT COUNT(*) FROM orders LEFT JOIN lineitem ON l_orderkey = o_orderkey"), "engine_traps")
     assert "LEFT JOIN" in left.message
     assert level("engine_traps", f"SELECT SUM(l_quantity) {OL}") == "pass"
 
 
+def test_engine_traps_refuse_a_constant_conjunct_only_on_one_table():
+    for sql in ["SELECT SUM(o_totalprice) FROM orders WHERE 1 = 0",
+                "SELECT COUNT(*) FROM orders o WHERE o.o_orderyear > 1995 AND 1 = 0"]:
+        res = get(rec(sql), "engine_traps")
+        assert res.level == "refuse"
+        assert res.message == "the engine runs this wrong: WHERE 1 = 0 names no column, so it's dropped"
+        assert res.evidence["constant_conjuncts"] == ["1 = 0"]
+
+    # With two or more table references the engine applies it.
+    for sql in ["SELECT COUNT(*) FROM nation JOIN region ON n_regionkey = r_regionkey WHERE 1 = 0",
+                "SELECT COUNT(*) FROM nation, region WHERE n_regionkey = r_regionkey AND 1 = 0",
+                "SELECT COUNT(*) FROM nation, region WHERE 1 = 0",
+                "SELECT COUNT(*) FROM supplier JOIN nation ON s_nationkey = n_nationkey "
+                "JOIN region ON n_regionkey = r_regionkey WHERE 1 = 0",
+                "SELECT COUNT(*) FROM supplier, nation, region WHERE s_nationkey = n_nationkey "
+                "AND n_regionkey = r_regionkey AND 1 = 0"]:
+        res = get(rec(sql), "engine_traps")
+        assert res.level == "pass" and res.evidence["constant_conjuncts"] == [], sql
+
+
+def test_engine_traps_refuse_a_case_only_term_on_one_table():
+    case = "CASE WHEN n_regionkey > 1 THEN 1 ELSE 0 END = 1"
+    res = get(rec(f"SELECT COUNT(*) FROM nation WHERE {case}"), "engine_traps")
+    assert res.level == "refuse" and res.evidence["constant_conjuncts"] == [case]
+    assert res.message == f"the engine runs this wrong: WHERE {case} names no column outside a CASE, so it's dropped"
+
+    # Next to a column term, only the CASE term is dropped.
+    res = get(rec(f"SELECT COUNT(*) FROM nation WHERE n_nationkey > 0 AND {case}"), "engine_traps")
+    assert res.level == "refuse" and res.evidence["constant_conjuncts"] == [case]
+
+    # A column outside the CASE in the same term, or a join,
+    # and the engine applies it.
+    for sql in ["SELECT COUNT(*) FROM nation WHERE n_nationkey + CASE WHEN n_regionkey > 1 THEN 1 ELSE 0 END > 3",
+                f"SELECT COUNT(*) FROM nation WHERE {case} OR n_nationkey = 0",
+                f"SELECT COUNT(*) FROM nation JOIN region ON n_regionkey = r_regionkey WHERE {case}"]:
+        assert level("engine_traps", sql) == "pass", sql
+
+    # A CASE with no column at all keeps the plain message.
+    res = get(rec("SELECT COUNT(*) FROM nation WHERE CASE WHEN 1 = 0 THEN 1 ELSE 0 END = 1"), "engine_traps")
+    assert res.message == ("the engine runs this wrong: WHERE CASE WHEN 1 = 0 THEN 1 ELSE 0 END = 1 "
+                           "names no column, so it's dropped")
+
+
+def test_engine_traps_refuse_an_on_naming_under_two_tables():
+    res = get(rec("SELECT COUNT(*), SUM(n_nationkey) FROM nation JOIN region ON r_name = 'ASIA' "
+                  "WHERE n_regionkey = r_regionkey", rows=[[4, 100.0]]), "engine_traps")
+    assert res.level == "refuse" and "ON r_name = 'ASIA' names only region" in res.message
+    assert "engine drops it" in res.message
+    assert res.evidence["few_table_ons"] == [{"on": "r_name = 'ASIA'", "tables": ["region"]}]
+
+    res = get(rec("SELECT COUNT(*) FROM nation JOIN region ON 1 = 1"), "engine_traps")
+    assert res.level == "refuse" and "ON 1 = 1 names no table" in res.message and "engine drops it" in res.message
+
+
+def test_engine_traps_self_join_refuses_only_for_the_repeated_table():
+    res = get(rec("SELECT COUNT(*) FROM nation a JOIN nation b ON a.n_regionkey = b.n_nationkey"), "engine_traps")
+    assert res.level == "refuse" and "nation appears twice" in res.message
+    assert "drops it" not in res.message and res.evidence["few_table_ons"] == []
+
+
+def test_engine_traps_pass_ons_naming_two_tables():
+    for sql in ["SELECT COUNT(*) FROM nation JOIN region ON n_regionkey = r_regionkey AND r_name = 'ASIA'",
+                "SELECT COUNT(*) FROM nation n JOIN region r ON n.n_regionkey = r.r_regionkey",
+                "SELECT COUNT(*) FROM nation JOIN region ON n_regionkey < r_regionkey",
+                "SELECT SUM(o_totalprice) FROM orders JOIN customer ON o_custkey = c_custkey "
+                "JOIN nation ON c_nationkey = n_nationkey JOIN supplier ON s_nationkey = n_nationkey",
+                f"SELECT SUM(l_quantity) {OL}"]:
+        assert level("engine_traps", sql) == "pass", sql
+
+
 def test_empty_result_warns_without_aggregates():
-    res = get(rec("SELECT o_orderkey FROM orders WHERE o_orderstatus = 'X'", rows=[], scan_rows=[0], step_rows=[0]), "empty_input")
+    res = get(rec("SELECT o_orderkey FROM orders WHERE o_orderstatus = 'X'", rows=[], scan_rows=[0], step_rows=[0]),
+              "empty_input")
     assert res.level == "warn" and res.evidence["scan_rows"] == [0] and res.evidence["step_rows"] == [0]
     assert level("empty_input", "SELECT o_orderkey FROM orders", rows=[[1]]) == "pass"
     # Zero rows in a step matter only under an aggregate, which shows 0, not NULL.
@@ -270,7 +358,8 @@ def test_repeating_tables_by_hand():
         return mod.repeating_tables(mod.sf.facts(sql, MANIFEST), spec)
 
     assert rep(f"SELECT 1 {OL}") == {"orders"}                                         # lineitem fans out from orders
-    assert rep("SELECT 1 FROM lineitem JOIN orders ON l_orderkey = o_orderkey") == {"orders"}  # lineitem itself doesn't repeat
+    assert rep("SELECT 1 FROM lineitem "
+               "JOIN orders ON l_orderkey = o_orderkey") == {"orders"}  # lineitem itself doesn't repeat
     assert rep("SELECT 1 FROM orders JOIN customer ON o_custkey = c_custkey JOIN nation ON c_nationkey = n_nationkey "
                "JOIN supplier ON s_nationkey = n_nationkey") == {"orders", "customer", "nation", "supplier"}
     assert rep("SELECT 1 FROM orders JOIN customer ON o_custkey = c_custkey") == {"customer"}
@@ -281,7 +370,94 @@ def test_repeating_tables_by_hand():
     two = "SELECT 1 FROM orders JOIN lineitem ON l_orderkey = o_orderkey AND l_linenumber = o_orderyear"
     assert rep(two) == set()
     # A table with no declared key always fans out.
-    assert rep(f"SELECT 1 {OL}", {"primary_keys": {"lineitem": ["l_orderkey", "l_linenumber"]}}) == {"orders", "lineitem"}
+    assert rep(f"SELECT 1 {OL}",
+               {"primary_keys": {"lineitem": ["l_orderkey", "l_linenumber"]}}) == {"orders", "lineitem"}
+
+
+def test_cross_join_repeats_every_row_of_the_other_side():
+    # The engine put region first: scan_rows and step_rows follow join order.
+    r = rec("SELECT SUM(n_nationkey) FROM nation, region", order=[1, 0], scan_rows=[5, 25], step_rows=[5, 125])
+    res = get(r, "fanout")
+    assert res.level == "warn" and set(res.evidence["repeating"]) == {"nation", "region"}
+    assert res.evidence["repeating"]["nation"] == {"scan_rows": 25, "joined_rows": 125}
+    assert "25 rows scanned, 125 after the joins" in res.message
+
+
+def test_forgotten_join_repeats_the_summed_table():
+    sql = ("SELECT n_name, SUM(o_totalprice) FROM orders, customer, nation WHERE o_custkey = c_custkey "
+           "GROUP BY n_name")
+    r = rec(sql, rows=[["FRANCE", 1.0], ["GERMANY", 1.0]], types=["VARCHAR", "DECIMAL"],
+            scan_rows=[150000, 15000, 25], step_rows=[150000, 150000, 3750000])
+    res = get(r, "fanout")
+    assert res.level == "warn" and "orders" in res.evidence["repeating"]
+    assert res.evidence["repeating"]["orders"] == {"scan_rows": 150000, "joined_rows": 3750000}
+
+
+def test_cross_join_with_a_one_row_side_passes():
+    r = rec("SELECT SUM(n_nationkey) FROM nation, region WHERE r_name = 'ASIA'", order=[1, 0],
+            scan_rows=[1, 25], step_rows=[1, 25])
+    res = get(r, "fanout")
+    assert res.level == "pass" and set(res.evidence["repeating"]) == {"region"}   # nation's rows show once
+
+
+def test_forgotten_join_after_a_selective_join_repeats_the_summed_table():
+    # Nation is never joined; a month of orders cuts lineitem, then nation repeats each row.
+    sql = ("SELECT SUM(l_extendedprice) FROM lineitem, orders, nation WHERE l_orderkey = o_orderkey "
+           "AND o_orderdate >= DATE '1995-01-01' AND o_orderdate < DATE '1995-02-01'")
+    r = rec(sql, order=[2, 1, 0], scan_rows=[25, 1923, 600572], step_rows=[25, 48075, 191900])
+    res = get(r, "fanout")
+    assert res.level == "warn" and "SUM(l_extendedprice) adds up lineitem" in res.message
+    assert res.evidence["repeating"]["lineitem"] == {"scan_rows": 600572, "joined_rows": 191900}
+
+
+def test_forgotten_customer_nation_join_in_a_q5_shape_warns():
+    sql = ("SELECT SUM(l_extendedprice * (1 - l_discount)) FROM lineitem, orders, customer, nation, region "
+           "WHERE l_orderkey = o_orderkey AND o_custkey = c_custkey AND n_regionkey = r_regionkey "
+           "AND r_name = 'EUROPE' AND o_orderdate >= DATE '1995-01-01' AND o_orderdate < DATE '1996-01-01'")
+    r = rec(sql, order=[4, 3, 2, 1, 0], scan_rows=[1, 25, 15000, 22909, 600572],
+            step_rows=[1, 5, 75000, 114545, 459725])
+    res = get(r, "fanout")
+    assert res.level == "warn" and "lineitem" in res.evidence["repeating"]
+
+
+def test_non_equi_join_with_fewer_rows_out_than_in_warns():
+    r = rec("SELECT SUM(n_nationkey) FROM nation JOIN region ON n_nationkey < r_regionkey", order=[1, 0],
+            scan_rows=[5, 25], step_rows=[5, 10])
+    res = get(r, "fanout")
+    assert res.level == "warn" and "nation" in res.evidence["repeating"]   # nation 0 shows 4 times
+
+
+def test_join_inside_every_or_branch_passes():
+    # Every OR branch carries the equality, so it holds and covers region's key.
+    sql = ("SELECT SUM(n_nationkey) FROM nation, region WHERE (n_regionkey = r_regionkey AND r_name = 'ASIA') "
+           "OR (n_regionkey = r_regionkey AND r_name = 'EUROPE')")
+    assert mod.sf.facts(sql, MANIFEST).equalities == [("n_regionkey", "r_regionkey")]
+    r = rec(sql, order=[1, 0], scan_rows=[3, 6], step_rows=[3, 4])
+    res = get(r, "fanout")
+    assert res.level == "pass" and set(res.evidence["repeating"]) == {"region"}
+    assert res.evidence["repeating"]["region"] == {"scan_rows": 3, "joined_rows": 4}
+
+
+def test_repeating_tables_across_components():
+    def rep(sql, scans=None):
+        return mod.repeating_tables(mod.sf.facts(sql, MANIFEST), SPEC, scans)
+
+    assert rep("SELECT 1 FROM nation, region") == {"nation", "region"}                      # no profile: both repeat
+    assert rep("SELECT 1 FROM nation, region", {"nation": 25, "region": 1}) == {"region"}
+    assert rep("SELECT 1 FROM nation, region", {"nation": 1, "region": 0}) == set()
+    assert rep("SELECT 1 FROM nation JOIN region ON n_regionkey < r_regionkey",
+               {"nation": 25, "region": 5}) == {"nation", "region"}                         # a non-equi ON ties nothing
+    assert rep("SELECT 1 FROM orders, customer, nation WHERE o_custkey = c_custkey",
+               {"orders": 150000, "customer": 15000}) == {"orders", "customer", "nation"}   # nation has no entry
+    assert rep("SELECT 1 FROM orders, customer, nation WHERE o_custkey = c_custkey",
+               {"orders": 150000, "customer": 15000, "nation": 1}) == {"customer", "nation"}
+
+    # An equality in every OR branch ties the tables; in only some, it doesn't.
+    every = ("SELECT 1 FROM nation, region WHERE (n_regionkey = r_regionkey AND r_name = 'ASIA') "
+             "OR (r_regionkey = n_regionkey AND r_name = 'EUROPE')")
+    some = "SELECT 1 FROM nation, region WHERE (n_regionkey = r_regionkey AND r_name = 'ASIA') OR r_name = 'EUROPE'"
+    assert rep(every, {"nation": 6, "region": 3}) == {"region"}
+    assert rep(some, {"nation": 6, "region": 3}) == {"nation", "region"}
 
 
 def test_claimed_grain_and_entity_table():
@@ -324,7 +500,8 @@ def test_grain_on_the_prompt_reviews_example():
            "WHERE r_verified = 1 GROUP BY p_store ORDER BY verified_reviews DESC, p_store LIMIT 3")
     claims = {"grain": "one row per store, for the three stores with the most verified-purchase reviews", "columns": [
         {"name": "p_store", "meaning": "store name on Amazon", "entity": "store"},
-        {"name": "verified_reviews", "meaning": "number of verified-purchase reviews of the store's products", "entity": "reviews"},
+        {"name": "verified_reviews", "meaning": "number of verified-purchase reviews of the store's products",
+         "entity": "reviews"},
     ]}
     case = rec(sql, q="Which three stores have the most verified-purchase reviews?",
                rows=[["Store A", 120], ["Store B", 90], ["Store C", 80]], types=["VARCHAR", "INTEGER"],
@@ -341,7 +518,8 @@ def test_prompt_ratio_example_is_clean():
            "WHERE r_name = 'AMERICA'")
     claims = {"grain": "one row", "columns": [{
         "name": "building_share",
-        "meaning": "customers in AMERICA in the BUILDING segment divided by all customers in AMERICA, a fraction from 0 to 1",
+        "meaning": "customers in AMERICA in the BUILDING segment divided by all customers in "
+                   "AMERICA, a fraction from 0 to 1",
         "entity": "customers",
     }]}
     case = rec(sql, q="What share of the customers in the AMERICA region belong to the BUILDING market segment?",
@@ -403,7 +581,8 @@ def test_exact_always_passes():
 
 def test_run_checks_shape():
     cases = [rec(f"SELECT SUM(o_totalprice) {OL}"), rec("SELECT FROM WHERE", tables=["orders"]),
-             rec("SELECT c_name, COUNT(*) FROM customer GROUP BY c_name", rows=[["a", 1], ["a", 2]], q="Sales in 1995?")]
+             rec("SELECT c_name, COUNT(*) FROM customer GROUP BY c_name", rows=[["a", 1], ["a", 2]],
+                 q="Sales in 1995?")]
     for case in cases:
         results = run(case)
         assert [r.name for r in results] == list(mod.CHECKS)

@@ -28,12 +28,18 @@ def _load_common():
 
 an = _load_common()
 qm = an.load_sibling("an_questions", "questions.py")
+fz = an.load_sibling("an_freeze", "freeze.py")
 
 STEPS = ("prepare", "describe", "probe", "key", "generate", "analyze")
 DEFAULT_STEPS = "prepare,describe,probe,key"
 BRIDGE = an.BRIDGE
+BRIDGE_SOURCE = an.HERE / "analyst_bridge.cpp"
+RESULTS = an.RESULTS
+MODEL_MLX = an.HERE / "model_mlx.py"
 BRIDGE_STEPS = ("probe", "key", "generate")
-BUILD_BRIDGE = ("cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSHILMANDB_ENABLE_ML=ON -DSHILMANDB_BUILD_BENCH=ON && cmake --build build --target analyst_bridge")
+FROZEN_STEPS = ("prepare", "describe", "probe")  # they rewrite files the freeze hashes
+REBUILD_BRIDGE = "cmake --build build --target analyst_bridge"
+BUILD_BRIDGE = (f"cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSHILMANDB_ENABLE_ML=ON -DSHILMANDB_BUILD_BENCH=ON && {REBUILD_BRIDGE}")
 
 
 # argparse type for --steps: known names, in my fixed order, each once.
@@ -101,20 +107,47 @@ def build_commands(args) -> list[tuple[str, list[str]]]:
     return [(step, [*per_step[step], *results]) for step in STEPS if step in args.steps]
 
 
-# The bridge path as I print it: from the repo root when it's inside.
+# A path as I print it: from the repo root when it's inside.
 def _shown(path: Path) -> str:
     path = Path(path)
     return path.relative_to(an.REPO_ROOT).as_posix() if path.is_relative_to(an.REPO_ROOT) else str(path)
 
 
-# Run one command from the repo root.
-# Returns its exit code, 128 + signal, or 130 on Ctrl-C.
+# Why the chosen steps won't start, as lines to print; [] when they can.
+def _refusal(args) -> list[str]:
+    if "generate" in args.steps:
+        try:
+            configs = fz.read_model_configs(MODEL_MLX)
+        except (OSError, SyntaxError, ValueError) as e:
+            return [f"error: can't read model configs: {e}"]
+        if args.model not in configs:
+            return [f"error: unknown model {args.model!r}; known: {', '.join(configs)}"]
+
+    frozen = [s for s in FROZEN_STEPS if s in args.steps]
+    freeze = an.paths(RESULTS if args.results is None else an.REPO_ROOT / args.results).freeze
+    if frozen and freeze.exists():
+        return [f"error: {_shown(freeze)} exists, and {', '.join(frozen)} would rewrite files it hashes; leave them out after the freeze"]
+
+    if not any(s in BRIDGE_STEPS for s in args.steps):
+        return []
+    if not Path(BRIDGE).is_file():
+        return [f"error: {_shown(BRIDGE)} is missing (probe, key and generate use it); build it from the repo root with:", BUILD_BRIDGE]
+    if Path(BRIDGE_SOURCE).is_file() and Path(BRIDGE).stat().st_mtime_ns < Path(BRIDGE_SOURCE).stat().st_mtime_ns:
+        return [f"error: {_shown(BRIDGE)} is older than {_shown(BRIDGE_SOURCE)}; rebuild it from the repo root with:", REBUILD_BRIDGE]
+    return []
+
+
+# Run one command from the repo root. Returns its exit code,
+# 128 + signal, 127 when it can't start, or 130 on Ctrl-C.
 def _run(step: str, cmd: list[str]) -> int:
+    if not (an.REPO_ROOT / cmd[1]).is_file():
+        print(f"== {step}: can't start {cmd[1]}: no such file", file=sys.stderr, flush=True)
+        return 127
     try:
         proc = subprocess.Popen(cmd, cwd=an.REPO_ROOT)
     except OSError as e:
         print(f"== {step}: can't start {cmd[0]}: {e}", file=sys.stderr, flush=True)
-        return 1
+        return 127
     except KeyboardInterrupt:
         print(f"== {step}: stopped by Ctrl-C", file=sys.stderr, flush=True)
         return 130
@@ -139,8 +172,8 @@ def _run(step: str, cmd: list[str]) -> int:
     return code
 
 
-# Check the steps, split, model and bridge, then print and run each step.
-# Returns 0, 2 when it won't start, or the first failing step's code.
+# Check the steps, split, model, freeze and bridge, then print and run each step.
+# Returns 0, 2 on a refusal, 130 on Ctrl-C, else the failing step's code.
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     try:
@@ -149,9 +182,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: {e}", file=sys.stderr)
         return 2
 
-    if any(s in BRIDGE_STEPS for s in args.steps) and not Path(BRIDGE).is_file():
-        print(f"error: {_shown(BRIDGE)} is missing (probe, key and generate use it); build it from the repo root with:", file=sys.stderr)
-        print(BUILD_BRIDGE, file=sys.stderr)
+    refusal = _refusal(args)
+    if refusal:
+        print("\n".join(refusal), file=sys.stderr)
         return 2
 
     if args.dry_run:
@@ -161,14 +194,18 @@ def main(argv: list[str] | None = None) -> int:
             print(shlex.join(cmd))
         return 0
 
-    for step, cmd in commands:
-        started = time.monotonic()
-        print(f"== {step}: start {time.strftime('%H:%M:%S')}", flush=True)
-        print(shlex.join(cmd), flush=True)
-        code = _run(step, cmd)
-        if code:
-            return code
-        print(f"== {step}: done in {time.monotonic() - started:.1f} s", flush=True)
+    try:
+        for step, cmd in commands:
+            started = time.monotonic()
+            print(f"== {step}: start {time.strftime('%H:%M:%S')}", flush=True)
+            print(shlex.join(cmd), flush=True)
+            code = _run(step, cmd)
+            if code:
+                return code
+            print(f"== {step}: done in {time.monotonic() - started:.1f} s", flush=True)
+    except KeyboardInterrupt:  # between steps; _run handles one during a step
+        print("== stopped by Ctrl-C", file=sys.stderr, flush=True)
+        return 130
     return 0
 
 

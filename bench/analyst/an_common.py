@@ -23,6 +23,7 @@ BRIDGE = REPO_ROOT / "build/bench/analyst_bridge"
 DATASETS = ("tpch", "reviews")
 SEED = 1
 TIMEOUT_S = 30.0
+MAX_RSS_MB = 4096  # the bridge's memory cap while a query runs
 MAX_RETRIES = 2
 ROW_CAP = 10000
 TEXT_CAP_BYTES = 4000
@@ -216,7 +217,7 @@ def append_jsonl(path: Path, record: dict) -> None:
             f.seek(-1, os.SEEK_END)
             if f.read(1) != b"\n":
                 raise ValueError(f"{path} doesn't end with a newline; run repair_jsonl first")
-            
+
         f.write((json.dumps(record) + "\n").encode("utf-8"))
         f.flush()
         os.fsync(f.fileno())

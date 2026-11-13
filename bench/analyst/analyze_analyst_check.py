@@ -52,6 +52,8 @@ FLAGGED = ("warned", "refused")
 FIRING = ("warn", "refuse")
 CAUSES = ("model", "engine", "unknown")
 EXAMPLES = 10        # examples of catches and of false alarms in the report
+WATCHED_HEAD = "Changed since the freeze, not part of the verdict rules"
+CAUSE_NOTE = "A shown answer to a question that can't be answered counts as the model's error, whatever SQLite does."
 QUESTION_CUT = 90    # characters of a question an example shows
 MESSAGE_CUT = 200    # characters of a check message an example shows
 # Each bar: its name, what it counts, and its limit.
@@ -68,11 +70,12 @@ def _names(columns) -> list:
 
 
 # True if a result's rows match the question's answer key; False with no key.
+# A truncated result never matches: no key is that long.
 def _matches(result, question: dict) -> bool:
     answer = question.get("answer")
-    if not isinstance(result, dict) or not isinstance(answer, dict):
+    if not isinstance(result, dict) or not isinstance(answer, dict) or result.get("truncated"):
         return False
-    
+
     return sc.match_result(
         _names(result.get("columns")), result.get("rows") or [],
         list(answer.get("columns") or []), answer.get("rows") or [],
@@ -86,7 +89,7 @@ def _matches(result, question: dict) -> bool:
 def _cause(record: dict, question: dict) -> str:
     if question.get("kind") == "unanswerable":
         return "model"
-    
+
     sqlite = record.get("sqlite_cause")
     if not isinstance(sqlite, dict) or sqlite.get("ok") is not True or not isinstance(question.get("answer"), dict):
         return "unknown"
@@ -143,7 +146,7 @@ def relabel(outcomes: list[dict], skip) -> list[dict]:
 def wilson(count: int, total: int, z: float = Z) -> tuple[float, float] | None:
     if total == 0:
         return None
-    
+
     p = count / total
     denom = 1 + z * z / total
     centre = (p + z * z / (2 * total)) / denom
@@ -157,11 +160,11 @@ def _bar(count: int, total: int, limit: float, at_least: bool) -> dict:
     if total == 0:
         return {"count": 0, "total": 0, "rate": None, "interval": None, "holds": False}
     share, bar = Fraction(count, total), Fraction(str(limit))
-    
+
     return {
-        "count": count, 
+        "count": count,
         "total": total,
-        "rate": count / total, 
+        "rate": count / total,
         "interval": wilson(count, total),
         "holds": share >= bar if at_least else share <= bar
     }
@@ -183,18 +186,32 @@ def check_key(questions: list[dict], split: str) -> list[str]:
     in_split = [q for q in questions if q.get("split") == split]
     if not in_split:
         return [f"no {split} questions: the key isn't frozen"]
-    
+
     return [f"{q.get('qid')} has no frozen answer (an unresolved disagreement)" for q in in_split if q.get("kind") != "unanswerable" and not isinstance(q.get("answer"), dict)]
 
 
-# What changed since the freeze, plus each run model that isn't the frozen one.
+# One line if any test record wasn't stamped with today's freeze.json; [] when all were.
+def _stamp_problems(results: Path, records: list[dict]) -> list[str]:
+    today = fz.freeze_sha1(results)
+    if today is None:
+        return []  # verify already names the missing or unreadable freeze.json
+
+    missing = sum(r.get("freeze_sha1") is None for r in records)
+    other = sum(r.get("freeze_sha1") not in (None, today) for r in records)
+    if not missing and not other:
+        return []
+    noun = "record wasn't" if missing + other == 1 else "records weren't"
+    return [f"{missing + other} of {len(records)} test {noun} made under today's freeze.json (freeze_sha1: {other} from another freeze, {missing} missing)"]
+
+
+# Freeze problems: changed files, records from another freeze, run models that aren't frozen.
 def check_freeze(results: Path, code_dir: Path, model: str, records: list[dict]) -> list[str]:
     try:
         configs = fz.read_model_configs(Path(code_dir) / "model_mlx.py")
     except (OSError, SyntaxError, ValueError) as e:
         return [f"can't read model configs: {e}"]
 
-    problems = fz.verify(results, code_dir, configs)
+    problems = fz.verify(results, code_dir, configs) + _stamp_problems(results, records)
     frozen = fz.frozen_model_id(results)
     if frozen is not None:
         ids = {model} | {r.get("model") for r in records}
@@ -231,7 +248,7 @@ def _bar_line(name: str, bar: dict) -> str:
     title, counts, side, limit = BARS[name]
     if bar["rate"] is None:
         return f"{title}: no {'wrong' if name == 'catch' else 'right'} shown answers, so no rate; it doesn't hold"
-    
+
     state = "holds" if bar["holds"] else "fails"
     return f"{title} {state}: {_share(bar['count'], bar['total'])} {counts}, needs {side} {limit:.2f}"
 
@@ -244,7 +261,7 @@ def verdict(outcomes: list[dict], freeze_problems: list[str], key_problems: list
     if wrong < MIN_WRONG:
         noun = "answer" if wrong == 1 else "answers"
         reasons.append(f"only {wrong} wrong shown {noun}; at least {MIN_WRONG} are needed to measure the checks")
-        
+
     reasons += [f"freeze: {p}" for p in freeze_problems]
     reasons += [f"answer key: {p}" for p in key_problems]
     if missing:
@@ -273,13 +290,21 @@ def _median_p90(values) -> tuple[float | None, float | None]:
     return statistics.median(nums), nums[math.ceil(0.9 * len(nums)) - 1]
 
 
-# Per check: catches (wrong shown it fired on) and their causes, sole catches, false alarms.
+# Per check: catches (wrong shown it fired on), sole catches, both by cause, false alarms.
 def per_check(outcomes: list[dict]) -> dict[str, dict]:
-    counts = {name: {"catches": 0, "causes": dict.fromkeys(CAUSES, 0), "sole": 0, "false_alarms": 0} for name in ck.CHECKS}
+    counts = {
+        name: {
+            "catches": 0, 
+            "causes": dict.fromkeys(CAUSES, 0), 
+            "sole": 0,
+            "sole_causes": dict.fromkeys(CAUSES, 0), 
+            "false_alarms": 0
+        } for name in ck.CHECKS
+    }
     for o in outcomes:
         if not o["shown"]:
             continue
-        
+
         fired = [name for name, level in o["checks"].items() if level in FIRING and name in counts]
         for name in fired:
             if o["right"]:
@@ -287,9 +312,11 @@ def per_check(outcomes: list[dict]) -> dict[str, dict]:
             else:
                 counts[name]["catches"] += 1
                 counts[name]["causes"][o["cause"]] = counts[name]["causes"].get(o["cause"], 0) + 1
-                
+
         if len(fired) == 1 and not o["right"]:
-            counts[fired[0]]["sole"] += 1
+            sole = counts[fired[0]]
+            sole["sole"] += 1
+            sole["sole_causes"][o["cause"]] = sole["sole_causes"].get(o["cause"], 0) + 1
     return counts
 
 
@@ -360,7 +387,7 @@ def _group_row(name: str, qids: list[str], by_qid: dict) -> list:
     b = bars(outs)
     right = sum(o["right"] for o in outs)
     wrong = [o for o in outs if o["shown"] and not o["right"]]
-    
+
     return [
         name, len(qids), _share(right, len(qids)),
         _share(b["catch"]["count"], b["catch"]["total"]),
@@ -400,7 +427,7 @@ def _without_with(a: Analysis) -> list[str]:
     lines += ["", *_table(["Not shown", "Count"], [
         ['Correct "can\'t answer" (unanswerable question)', correct],
         ['Other "can\'t answer"', other],
-        ["Failed (every try errored, crashed or timed out)", len(not_shown) - correct - other],
+        ["Failed (every try errored, crashed, timed out or ran out of memory)", len(not_shown) - correct - other],
         ["No record", len(a.missing)],
     ])]
     return lines
@@ -413,27 +440,42 @@ def _example(o: dict, question: dict) -> str:
     return f"- {o['qid']} ({question.get('dataset')}, {question.get('kind')}): \"{text}\" -- " + "; ".join(fired)
 
 
-# The per-check table: catches, sole catches and false alarms.
+# The per-check table: catches and sole catches, each split by cause, then false alarms.
 def _check_table(outcomes: list[dict]) -> list[str]:
     counts = per_check(outcomes)
     rows = []
     for name, c in counts.items():
         causes = ", ".join(f"{cause} {c['causes'].get(cause, 0)}" for cause in CAUSES)
-        rows.append([name, c["catches"], causes, c["sole"], c["false_alarms"]])
-        
-    lines = _table(["Check", "Catches", "Catches by cause", "Only catch", "False alarms"], rows)
+        sole_causes = ", ".join(f"{cause} {c['sole_causes'].get(cause, 0)}" for cause in CAUSES)
+        rows.append([name, c["catches"], causes, c["sole"], sole_causes, c["false_alarms"]])
+
+    lines = _table(["Check", "Catches", "Catches by cause", "Only catch", "Only catch by cause", "False alarms"], rows)
     return lines + ["", "A catch counts for every check that fired on it; exact always passes today, so it can't catch anything."]
 
 
-# The test report: verdict and reasons first, then accuracy, bars and breakdowns.
-def report_text(model: str, a: Analysis, decision: str, reasons: list[str]) -> str:
+# The one line under the verdict that lists watched files changed since the freeze.
+def _watched_line(watched: list[str]) -> str:
+    return f"{WATCHED_HEAD}: {'; '.join(watched)}."
+
+
+# The test report: verdict, reasons and watched files first, then accuracy, bars and breakdowns.
+def report_text(model: str, a: Analysis, decision: str, reasons: list[str], watched=(), pick_line: str = "") -> str:
     by_qid = {o["qid"]: o for o in a.outcomes}
     tested = len(a.outcomes) + len(a.missing)
     right = sum(o["right"] for o in a.outcomes)
     crashed = sum(bool(o["crash"]) for o in a.outcomes)
     lines = [f"**{decision}**", "", *[f"- {r}" for r in reasons], ""]
-    lines += [f"Accuracy without checks: {right} of {tested} test questions right ({right / tested:.3f}); a correct \"can't answer\" counts as right." if tested else "Accuracy without checks: no test questions.", ""]
+    if watched:
+        lines += [_watched_line(watched), ""]
+        
+    lines += [
+        f"Accuracy without checks: {right} of {tested} test questions right ({right / tested:.3f}); "
+        f"a correct \"can't answer\" counts as right."
+        if tested else "Accuracy without checks: no test questions.", ""
+    ]
     lines += [f"Model {model}: {len(a.outcomes)} records for {tested} test questions; bridge crashes on {crashed} of them (at most {CRASH_LIMIT:.0%} allowed).", ""]
+    if pick_line:
+        lines += [pick_line, ""]
     if a.ignored:
         lines += [f"Ignored {a.ignored} {'record' if a.ignored == 1 else 'records'} for qids outside the test split.", ""]
     if a.repeats:
@@ -453,10 +495,13 @@ def report_text(model: str, a: Analysis, decision: str, reasons: list[str]) -> s
     for cause in CAUSES:
         bar = bars([o for o in wrong if o["cause"] == cause])["catch"]
         cause_rows.append([f"cause {cause}", f"{bar['count']} of {bar['total']}", *_rate_text(bar)])
-        
-    bar = bars(relabel(wrong, {"engine_traps"}))["catch"]
-    cause_rows.append(["all, without engine_traps", f"{bar['count']} of {bar['total']}", *_rate_text(bar)])
+
+    without = relabel(wrong, {"engine_traps"})
+    bar = bars(without)["catch"]
+    caught = f"{bar['count']} of {bar['total']} ({_caught_by_cause(without)})"
+    cause_rows.append(["all, without engine_traps", caught, *_rate_text(bar)])
     lines += ["### Bar 1 by cause, and without engine_traps", "", *_table(["Wrong shown answers", "Caught", "Rate", "95% Wilson"], cause_rows), ""]
+    lines += [CAUSE_NOTE, ""]
 
     lines += ["## Without and with checks", "", *_without_with(a), ""]
 
@@ -492,18 +537,54 @@ def cells_csv(a: Analysis) -> str:
         if o is None:
             w.writerow([qid, q.get("dataset"), q.get("kind"), "", "", "no_record", "", "", "", *[""] * len(ck.CHECKS)])
             continue
-        w.writerow([qid, q.get("dataset"), q.get("kind"), o["shown"], o["right"], o["label"], o["cause"] or "", o["crash"], "" if o["seconds"] is None else o["seconds"], *(o["checks"].get(n, "") for n in ck.CHECKS)])
+        w.writerow([
+            qid, q.get("dataset"), q.get("kind"), o["shown"], o["right"], o["label"], o["cause"] or "",
+            o["crash"], "" if o["seconds"] is None else o["seconds"],
+            *(o["checks"].get(n, "") for n in ck.CHECKS)
+        ])
     return buf.getvalue()
 
 
+# One split's run files under the results folder, in name order.
+def _run_files(results: Path, split: str) -> list[Path]:
+    pattern = an.paths(results).run_file(split, "*")
+    return sorted(pattern.parent.glob(pattern.name))
+
+
+# The only test run file's model; None, with a printed reason, for zero or several.
+def _only_test_run_model(results: Path) -> str | None:
+    runs = _run_files(results, "test")
+    if len(runs) == 1:
+        return runs[0].name[len("test_"):-len(".jsonl")]
+
+    if runs:
+        found = f"{len(runs)} test run files ({', '.join(r.name for r in runs)})"
+    else:
+        found = f"no test run file in {an.paths(results).run_file('test', '*').parent}"
+    print(f"no frozen model and {found}; pass --model", file=sys.stderr)
+    return None
+
+
+# The frozen model beside the dev pick, saying plainly whether they differ.
+def _pick_line(frozen: str | None, chosen: str | None, why: str) -> str:
+    if chosen is None:
+        return f"Frozen model {frozen or 'none'}; dev pick not available ({why})."
+    if frozen is None:
+        return f"Frozen model none; dev pick {chosen}."
+    if chosen == frozen:
+        return f"Frozen model {frozen}; dev pick {chosen}, the same."
+    return f"Frozen model {frozen}; dev pick {chosen}: they differ."
+
+
 # Analyze the test run of one model: report.md, cells.csv; 1 on NO VERDICT.
+# With no model given or frozen, the only test run file names it.
 def run_test(results: Path, model: str | None, code_dir: Path) -> int:
     p = an.paths(results)
-    model = model or fz.frozen_model_id(results)
+    frozen = fz.frozen_model_id(results)
+    model = model or frozen or _only_test_run_model(results)
     if model is None:
-        print("no frozen model; pass --model", file=sys.stderr)
         return 1
-    
+
     run_file = p.run_file("test", model)
     if not run_file.is_file():
         print(f"no run file {run_file}", file=sys.stderr)
@@ -511,15 +592,20 @@ def run_test(results: Path, model: str | None, code_dir: Path) -> int:
 
     records = an.read_jsonl(run_file)
     questions = qm.read_questions(p.questions)
-    a = analyze(records, questions, "test", _Context(results))
+    context = _Context(results)
+    a = analyze(records, questions, "test", context)
     freeze_problems = check_freeze(results, code_dir, model, records)
     decision, reasons = verdict(a.outcomes, freeze_problems, check_key(questions, "test"), a.missing)
+    watched = fz.watched_changes(results, code_dir)
+    pick_line = _pick_line(frozen, *dev_pick(results, questions, context))
 
-    an.write_text_atomic(p.report, report_text(model, a, decision, reasons))
+    an.write_text_atomic(p.report, report_text(model, a, decision, reasons, watched, pick_line))
     an.write_text_atomic(p.cells, cells_csv(a))
     print(decision)
     for r in reasons:
         print(f"- {r}")
+    if watched:
+        print(_watched_line(watched))
     print(f"wrote {p.report} and {p.cells}")
     return 1 if decision == NO_VERDICT else 0
 
@@ -528,10 +614,10 @@ def run_test(results: Path, model: str | None, code_dir: Path) -> int:
 def dev_summary(outcomes: list[dict], dev_count: int) -> dict:
     right = sum(o["right"] for o in outcomes)
     median, _ = _median_p90(o["seconds"] for o in outcomes)
-    
+
     return {
-        "answered": len(outcomes), 
-        "right": right, 
+        "answered": len(outcomes),
+        "right": right,
         "accuracy": right / dev_count if dev_count else 0.0,
         "median": median,
         "wrong": sum(1 for o in outcomes if o["shown"] and not o["right"]),
@@ -544,12 +630,12 @@ def pick(summaries: dict[str, dict]) -> tuple[str | None, str]:
     timed = {c: s for c, s in summaries.items() if s["median"] is not None}
     if not timed:
         return None, "no config has a record, so there's no pick"
-    
+
     qualify = {c: s for c, s in timed.items() if s["median"] <= MEDIAN_SECONDS}
     if qualify:
         best = min(qualify, key=lambda c: (-qualify[c]["right"], qualify[c]["median"], c))
         return best, f"best accuracy among configs with a median of at most {MEDIAN_SECONDS:.1f} s"
-    
+
     fastest = min(timed, key=lambda c: (timed[c]["median"], c))
     return fastest, f"no config has a median of at most {MEDIAN_SECONDS:.1f} s, so I took the fastest"
 
@@ -565,7 +651,7 @@ def grow(wrong: int, dev_count: int, test_count: int) -> dict:
     else:
         needed = min(TEST_CAP, -(-GROW_TARGET * dev_count // wrong)) - test_count
     needed = max(0, needed)
-    
+
     return {
         "wrong": wrong, "rate": wrong / dev_count, "projected": wrong * test_count / dev_count,
         "enough": enough, "needed": needed, "at_cap": wrong * TEST_CAP / dev_count,
@@ -580,21 +666,47 @@ def _grow_line(g: dict, dev_count: int, test_count: int) -> str:
         return f"{head}, at least {GROW_TARGET}: no new questions needed"
     if g["needed"] == 0:
         return f"{head}, under {GROW_TARGET}, but the test set is already at the cap of {TEST_CAP}"
-    line = f"{head}, under {GROW_TARGET}: add {g['needed']} test questions (to {test_count + g['needed']}, cap {TEST_CAP})"
+    line = (f"{head}, under {GROW_TARGET}: add {g['needed']} test questions (to {test_count + g['needed']}, cap {TEST_CAP})")
     if g["short_at_cap"]:
         line += f"; even at {TEST_CAP} the projection is {g['at_cap']:.1f}, still under {GROW_TARGET}"
     return line
 
 
+# Each dev run file's analysis and summary, keyed by config in file-name order.
+def _dev_runs(files: list[Path], questions: list[dict], context: _Context, dev_count: int) -> tuple[dict, dict]:
+    analyses, summaries = {}, {}
+    for f in files:
+        config = f.name[len("dev_"):-len(".jsonl")]
+        analyses[config] = analyze(an.read_jsonl(f), questions, "dev", context)
+        summaries[config] = dev_summary(analyses[config].outcomes, dev_count)
+    return analyses, summaries
+
+
+# dev_report.md's pick from the dev runs, or None and why there's none.
+# A dev file that doesn't read gives no pick rather than stopping the test report.
+def dev_pick(results: Path, questions: list[dict], context: _Context) -> tuple[str | None, str]:
+    files = _run_files(results, "dev")
+    dev_count = sum(q.get("split") == "dev" for q in questions)
+    if not files:
+        return None, "no dev runs"
+    if dev_count == 0:
+        return None, "no dev questions"
+
+    try:
+        _, summaries = _dev_runs(files, questions, context, dev_count)
+    except Exception as e:   # a file or record in any wrong shape
+        return None, f"the dev runs don't read: {e}"
+    return pick(summaries)
+
+
 # Every dev run: accuracy and time per config, the pick, the grow projection; dev_report.md.
 def run_dev(results: Path) -> int:
     p = an.paths(results)
-    pattern = p.run_file("dev", "*")
-    files = sorted(pattern.parent.glob(pattern.name))
+    files = _run_files(results, "dev")
     if not files:
-        print(f"no dev runs in {pattern.parent}", file=sys.stderr)
+        print(f"no dev runs in {p.run_file('dev', '*').parent}", file=sys.stderr)
         return 1
-    
+
     questions = qm.read_questions(p.questions)
     dev_count = sum(q.get("split") == "dev" for q in questions)
     test_count = sum(q.get("split") == "test" for q in questions)
@@ -602,12 +714,7 @@ def run_dev(results: Path) -> int:
         print(f"no dev questions in {p.questions}", file=sys.stderr)
         return 1
 
-    context = _Context(results)
-    analyses, summaries = {}, {}
-    for f in files:
-        config = f.name[len("dev_"):-len(".jsonl")]
-        analyses[config] = analyze(an.read_jsonl(f), questions, "dev", context)
-        summaries[config] = dev_summary(analyses[config].outcomes, dev_count)
+    analyses, summaries = _dev_runs(files, questions, _Context(results), dev_count)
 
     config_lines = []
     for config, s in summaries.items():
@@ -622,7 +729,7 @@ def run_dev(results: Path) -> int:
         listed = ", ".join(f"{c} ({summaries[c]['answered']} of {dev_count})" for c in incomplete)
         tail = f"; the pick {chosen} is one of them" if chosen in incomplete else ""
         decision.append(f"incomplete runs: {listed}{tail}")
-        
+
     decision.append(f"pick: {chosen} ({why})" if chosen else f"pick: none ({why})")
     if chosen:
         decision.append(_grow_line(grow(summaries[chosen]["wrong"], dev_count, test_count), dev_count, test_count))

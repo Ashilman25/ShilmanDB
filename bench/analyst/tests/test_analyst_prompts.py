@@ -4,6 +4,7 @@ from __future__ import annotations
 import ast
 import importlib.util
 import json
+import os
 import re
 import sqlite3
 import sys
@@ -29,9 +30,11 @@ def _load(module_name: str, file_name: str):
 
 mod = _load("an_prompts", "prompts.py")
 an = mod.an
+key = _load("an_answer_key", "answer_key.py")
 
 SECTIONS = ["## Dataset", "## SQL you can use", "## Examples", "## Reply format", "## Question"]
-DESCRIPTION = "# tpch\n\n## About\n\nSales data.\n\n## Tables\n\n### region (5 rows)\n\n- `r_name` VARCHAR, e.g. 'Brand#MN'\n"
+DESCRIPTION = ("# tpch\n\n## About\n\nSales data.\n\n## Tables\n\n"
+               "### region (5 rows)\n\n- `r_name` VARCHAR, e.g. 'Brand#MN'\n")
 RULES = "# SQL you can use\n\nUse only these.\n\n## Works\n\n- count_star\n\n## Doesn't work\n\n- having\n"
 EXAMPLES = [
     {"question": "How many regions are there?",
@@ -40,7 +43,20 @@ EXAMPLES = [
     {"question": "What did shipping cost?", "reply": {"cannot_answer": "no shipping costs"}},
 ]
 # Words for SQL the engine can't run, from the rules' "Doesn't work" list.
-UNSUPPORTED = re.compile(r"\b(HAVING|OFFSET|LEFT|DISTINCT|WITH|UNION|NULL|COALESCE|EXTRACT|SUBSTRING|UPPER|CAST)\b", re.I)
+UNSUPPORTED = re.compile(r"\b(HAVING|OFFSET|LEFT|DISTINCT|WITH|UNION|NULL|COALESCE|EXTRACT|SUBSTRING|UPPER|CAST)\b",
+                         re.I)
+# The subject words of each "can't answer" prompt example; no question may use them.
+CANNOT_TOPICS = {
+    "How many people visited our website in 1996?":
+        {"website", "web", "visitor", "visit", "visited", "traffic", "click", "pageview", "online", "site", "internet"},
+    "Which age group of reviewers gives the lowest ratings?": {"age", "aged", "birth", "demographic"},
+}
+
+
+# Whether text uses any of the words, alone or with a plural s.
+def _mentions(text: str, words: set[str]) -> bool:
+    found = set(re.findall(r"[a-z0-9_#]+", text.casefold()))
+    return any(w in words or (w.endswith("s") and w[:-1] in words) for w in found)
 
 
 # Every frozen question, read through code only; skips when the file isn't there.
@@ -60,7 +76,8 @@ def _prompt() -> str:
 
 
 def test_parse_reply_tolerates_wrapping():
-    raw = 'Sure!\n<think>hmm {"sql": "x"}</think>\n```json\n{"sql": "SELECT 1", "grain": "one row", "columns": []}\n```\nDone.'
+    raw = ('Sure!\n<think>hmm {"sql": "x"}</think>\n'
+           '```json\n{"sql": "SELECT 1", "grain": "one row", "columns": []}\n```\nDone.')
     r = mod.parse_reply(raw)
     assert r.kind == "sql" and r.sql == "SELECT 1" and r.grain == "one row"
     assert r.raw == raw
@@ -71,7 +88,8 @@ def test_parse_reply_tolerates_wrapping():
 
 
 def test_braces_inside_strings():
-    text = 'Here: {"sql": "SELECT \'}\' AS a, \'{\' AS b, \'say \\"hi\\"\' AS c FROM t", "grain": "one row per row of t", "columns": []}'
+    text = ('Here: {"sql": "SELECT \'}\' AS a, \'{\' AS b, \'say \\"hi\\"\' AS c FROM t", '
+            '"grain": "one row per row of t", "columns": []}')
     r = mod.parse_reply(text)
     assert r.kind == "sql"
     assert r.sql == "SELECT '}' AS a, '{' AS b, 'say \"hi\"' AS c FROM t"
@@ -81,7 +99,8 @@ def test_braces_inside_strings():
 def test_parse_reply_fields():
     cols = [{"name": "n", "meaning": "number of orders", "entity": "orders"}]
     r = mod.parse_reply(json.dumps({"sql": "SELECT COUNT(*) AS n FROM orders", "grain": "one row", "columns": cols}))
-    assert (r.kind, r.sql, r.grain, r.columns, r.reason) == ("sql", "SELECT COUNT(*) AS n FROM orders", "one row", cols, None)
+    assert ((r.kind, r.sql, r.grain, r.columns, r.reason)
+            == ("sql", "SELECT COUNT(*) AS n FROM orders", "one row", cols, None))
 
     no_extras = mod.parse_reply('{"sql": "SELECT 1"}')
     assert (no_extras.kind, no_extras.grain, no_extras.columns) == ("sql", None, [])
@@ -115,12 +134,14 @@ def test_prompt_sections_in_order():
     assert list(at.values()) == sorted(at.values())
     assert at["## Dataset"] < prompt.index("Sales data.") < at["## SQL you can use"]
     assert at["## SQL you can use"] < prompt.index("Use only these.") < at["## Examples"]
-    assert at["## Examples"] < prompt.index("How many regions are there?") < prompt.index('{"cannot_answer": "no shipping costs"}') < at["## Reply format"]
+    assert (at["## Examples"] < prompt.index("How many regions are there?")
+            < prompt.index('{"cannot_answer": "no shipping costs"}') < at["## Reply format"])
     assert json.dumps(EXAMPLES[0]["reply"]) in prompt
     assert prompt.rstrip().endswith("## Question\n\nWhich region has the most nations?")
 
     reply_format = prompt[at["## Reply format"]:at["## Question"]]
-    for word in ('"sql"', '"grain"', '"columns"', '"name"', '"meaning"', '"entity"', '"cannot_answer"', "exactly one JSON object"):
+    for word in ('"sql"', '"grain"', '"columns"', '"name"', '"meaning"', '"entity"', '"cannot_answer"',
+                 "exactly one JSON object"):
         assert word in reply_format
 
 
@@ -141,7 +162,8 @@ def test_real_description_and_rules_nest_under_their_sections():
     if not desc.exists() or not rules.exists():
         pytest.skip("the description or rules haven't been written")
 
-    prompt = mod.build_sql_prompt(desc.read_text(encoding="utf-8"), rules.read_text(encoding="utf-8"), _examples()["tpch"], "Q?")
+    prompt = mod.build_sql_prompt(desc.read_text(encoding="utf-8"), rules.read_text(encoding="utf-8"),
+                                  _examples()["tpch"], "Q?")
     lines = prompt.splitlines()
     assert [line for line in lines if line.startswith("## ")] == SECTIONS
     assert not [line for line in lines if line.startswith("# ")]
@@ -163,6 +185,7 @@ def test_retry_problems_say_what_went_wrong():
     assert mod.NOT_A_REPLY == "the reply wasn't one JSON object in the reply format"
     assert mod.TOO_SLOW == "the query took longer than 30 seconds"
     assert mod.CRASHED == "the engine crashed on that query"
+    assert mod.TOO_MUCH_MEMORY == "the query used more than 4096 MB of memory"
 
 
 def test_rephrase_prompt():
@@ -175,7 +198,8 @@ def test_rephrase_prompt():
 def test_parse_rephrase():
     assert mod.parse_rephrase('"How many orders?"\n') == "How many orders?"
     assert mod.parse_rephrase("") is None
-    assert mod.parse_rephrase("<think>hmm\nsome thought</think>\n\n  'What was 1995 revenue?'  \nextra line") == "What was 1995 revenue?"
+    assert (mod.parse_rephrase("<think>hmm\nsome thought</think>\n\n  'What was 1995 revenue?'  \nextra line")
+            == "What was 1995 revenue?")
     assert mod.parse_rephrase("“Which nation is largest?”") == "Which nation is largest?"
     assert mod.parse_rephrase("<think>ran out of tokens") is None
     assert mod.parse_rephrase('  \n""\n') is None
@@ -209,6 +233,21 @@ def test_examples_shape_and_no_overlap():
     norm = lambda s: " ".join(s.casefold().split())
     overlap = {norm(e["question"]) for e in ex["tpch"] + ex["reviews"]} & {norm(q["question"]) for q in qs}
     assert not overlap, f"examples repeat {len(overlap)} question(s)"
+
+    # No example's SQL is a gold once case, spacing, literals and aliases are set aside.
+    example_sql = {key.normalize_sql(e["reply"]["sql"]) for e in ex["tpch"] + ex["reviews"] if "sql" in e["reply"]}
+    same_sql = sorted(q["qid"] for q in qs
+                      if example_sql & {key.normalize_sql(s) for s in (q["gold_sqlite"], q["gold_subset"]) if s})
+    assert not same_sql, f"example SQL matches the gold of {same_sql}"
+
+    # No "can't answer" example shares its subject with a question's text or reason.
+    for e in ex["tpch"] + ex["reviews"]:
+        if "cannot_answer" not in e["reply"]:
+            continue
+        assert e["question"] in CANNOT_TOPICS, f"give CANNOT_TOPICS the subject words of {e['question']!r}"
+        terms = CANNOT_TOPICS[e["question"]]
+        hits = sorted(q["qid"] for q in qs if _mentions(f"{q['question']} {q['unanswerable_reason'] or ''}", terms))
+        assert not hits, f"questions touch a can't-answer example's subject: {hits}"
 
 
 def test_example_columns_match_their_sql():
@@ -252,10 +291,23 @@ class FakeTokenizer:
         return head + ("<think>\n" if thinking == self.open_when else "<think>\n\n</think>\n\n")
 
 
-def _fake_mlx_lm(monkeypatch, reply: str) -> list:
+# A fake mlx_lm in sys.modules; returns what generate was sent.
+# loads gets each load call's arguments and HF_HUB_OFFLINE at that moment.
+def _fake_mlx_lm(monkeypatch, reply: str, loads: list | None = None) -> list:
+    old = os.environ.get("HF_HUB_OFFLINE")
+    monkeypatch.setenv("HF_HUB_OFFLINE", old or "")  # MlxModel sets it; this puts it back after the test
+    if old is None:
+        monkeypatch.delenv("HF_HUB_OFFLINE")
+
     sent: list = []
     fake = types.ModuleType("mlx_lm")
-    fake.load = lambda path: (f"model at {path}", FakeTokenizer())
+
+    def load(path, **kwargs):
+        if loads is not None:
+            loads.append({"path": path, **kwargs, "offline": os.environ.get("HF_HUB_OFFLINE")})
+        return f"model at {path}", FakeTokenizer()
+
+    fake.load = load
 
     def generate(model, tokenizer, prompt, verbose=False, **kwargs):
         sent.append({"model": model, "prompt": prompt, **kwargs})
@@ -266,15 +318,26 @@ def _fake_mlx_lm(monkeypatch, reply: str) -> list:
     return sent
 
 
+REVISIONS = {
+    "mlx-community/gemma-4-26b-a4b-it-4bit": "0d77464eeb233a2da68ebf9d7dc4edaac7db956d",
+    "mlx-community/Qwen3.6-35B-A3B-4bit": "38740b847e4cb78f352aba30aa41c76e08e6eb46",
+    "mlx-community/Qwen3.8-27B-4bit": "10c35caafbb80f7dc6a7a432cdd11af10a6d4818",
+}
+
+
 def test_model_configs():
     m = _load("an_model_mlx", "model_mlx.py")
     assert set(m.MODEL_CONFIGS) == {"gemma4-26b", "qwen36-35b", "qwen36-35b-think", "qwen38-27b", "qwen38-27b-think"}
-    assert m.MODEL_CONFIGS["qwen36-35b-think"]["max_tokens"] == 8192 and m.MODEL_CONFIGS["gemma4-26b"]["max_tokens"] == 1024
+    assert (m.MODEL_CONFIGS["qwen36-35b-think"]["max_tokens"] == 8192
+            and m.MODEL_CONFIGS["gemma4-26b"]["max_tokens"] == 1024)
     assert m.MODEL_CONFIGS["gemma4-26b"]["path"] == "mlx-community/gemma-4-26b-a4b-it-4bit"
-    assert m.MODEL_CONFIGS["qwen36-35b"]["path"] == m.MODEL_CONFIGS["qwen36-35b-think"]["path"] == "mlx-community/Qwen3.6-35B-A3B-4bit"
-    assert m.MODEL_CONFIGS["qwen38-27b"]["path"] == m.MODEL_CONFIGS["qwen38-27b-think"]["path"] == "mlx-community/Qwen3.8-27B-4bit"
+    assert (m.MODEL_CONFIGS["qwen36-35b"]["path"] == m.MODEL_CONFIGS["qwen36-35b-think"]["path"]
+            == "mlx-community/Qwen3.6-35B-A3B-4bit")
+    assert (m.MODEL_CONFIGS["qwen38-27b"]["path"] == m.MODEL_CONFIGS["qwen38-27b-think"]["path"]
+            == "mlx-community/Qwen3.8-27B-4bit")
     for cid, config in m.MODEL_CONFIGS.items():
-        assert set(config) == {"path", "thinking", "max_tokens"}
+        assert set(config) == {"path", "revision", "thinking", "max_tokens"}
+        assert re.fullmatch(r"[0-9a-f]{40}", config["revision"]) and config["revision"] == REVISIONS[config["path"]]
         assert config["thinking"] is cid.endswith("-think")
         assert config["max_tokens"] == (8192 if config["thinking"] else 1024)
 
@@ -345,6 +408,20 @@ def test_mlx_model_refuses_open_thinking_when_off(monkeypatch):
     model.tokenizer = FakeTokenizer(open_when=False)   # a template that ignores enable_thinking=False
     with pytest.raises(ValueError, match="thinking"):
         model.generate("Q?")
+
+
+@pytest.mark.parametrize("preset, want", [(None, "1"), ("0", "0")])
+def test_mlx_model_loads_the_pinned_revision_offline(monkeypatch, preset, want):
+    loads: list = []
+    _fake_mlx_lm(monkeypatch, "unused", loads)
+    if preset is None:
+        monkeypatch.delenv("HF_HUB_OFFLINE", raising=False)
+    else:
+        monkeypatch.setenv("HF_HUB_OFFLINE", preset)   # a value already set is kept
+    m = _load("an_model_mlx", "model_mlx.py")
+    m.MlxModel("qwen38-27b")
+    path = "mlx-community/Qwen3.8-27B-4bit"
+    assert loads == [{"path": path, "revision": REVISIONS[path], "offline": want}]
 
 
 def test_mlx_model_unknown_config(monkeypatch):

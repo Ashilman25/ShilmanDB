@@ -9,6 +9,7 @@ import sys
 from collections import Counter
 from contextlib import ExitStack
 from pathlib import Path
+from typing import NamedTuple
 
 
 # Load an_common from next to this file, reusing it if it's already loaded.
@@ -38,7 +39,7 @@ STATUSES = ("GOLD_ERROR", "SECOND_MISSING", "UNANSWERABLE_DIFFER", "WRITERS_DIFF
 EXAMPLES = an.HERE / "prompt_examples.json"
 TIMEOUT_S = an.TIMEOUT_S
 LOG_ROWS = 5                     # rows of each result shown in key_log.md
-UNCACHED = ("timeout", "crash")  # failures that may not happen again
+UNCACHED = ("timeout", "crash", "memory")  # failures that may not happen again
 
 LIMIT_NEEDS_ORDER = "a LIMIT needs ordered: true"
 ONE_TRAILING_LIMIT = "use one trailing LIMIT n; the tie check can't rerun this LIMIT"
@@ -46,11 +47,21 @@ NOT_SORTED = "rows aren't sorted on order_cols"
 RERUN_DIFFERS = "the tie check's rerun didn't reproduce the gold"
 
 _STRING = re.compile(r"'(?:[^']|'')*'")
+_STRING_OR_COMMENT = re.compile(r"'(?:[^']|'')*'|--[^\n]*")
+_NUMBER = re.compile(r"\b\d+(?:\.\d+)?\b")
+_AS_ALIAS = re.compile(r'\bas\s+(?:\w+|\?|"[^"]*")')
+_SQL_TOKEN = re.compile(r"\w+|<=|>=|<>|!=|\S")
 _ORDER_BY = re.compile(r"\bORDER\s+BY\b", re.IGNORECASE)
 _LIMIT = re.compile(r"\bLIMIT\b", re.IGNORECASE)
 _TRAILING_LIMIT = re.compile(r"\bLIMIT\s+(\d+)\s*;?\s*$", re.IGNORECASE)
 # What SQLite skips over: 'strings', "names", `names`, [names], -- comments and /* comments */.
 _SQL_SKIP = re.compile(r"""'(?:[^']|'')*'?|"(?:[^"]|"")*"?|`(?:[^`]|``)*`?|\[[^\]]*\]?|--[^\n]*|/\*.*?(?:\*/|\Z)""", re.DOTALL)
+
+
+# The prompt examples, normalized for comparing with the questions.
+class Examples(NamedTuple):
+    questions: set[str]
+    sqls: set[str]
 
 
 # A failed result, shaped like a good one.
@@ -69,10 +80,10 @@ def _from_bridge(reply: dict) -> dict:
         err = reply.get("error") or {}
         kind = err.get("kind", "request")
         return _error(kind, f"{kind}: {err.get('message', '')}")
-    
+
     return {
         "ok": True,
-        "columns": [c["name"] for c in reply["columns"]], 
+        "columns": [c["name"] for c in reply["columns"]],
         "rows": reply["rows"],
         "truncated": bool(reply.get("truncated"))
     }
@@ -87,7 +98,8 @@ def _load_cache(path: Path) -> dict:
     return entries if isinstance(entries, dict) else {}
 
 
-#Runs SQL on SQLite or the engine, reusing cached results while the dataset files are unchanged
+# Runs SQL on SQLite or the engine, reusing cached results
+# while the dataset files are unchanged
 class _Runner:
     def __init__(self, p, bridge_factory, stack: ExitStack, datasets: list[str]):
         self.p = p
@@ -118,23 +130,23 @@ class _Runner:
             self.bridges[ds] = self.stack.enter_context(self.factory(self.p.dataset_dir(ds) / "tables.tsv"))
         return self.bridges[ds]
 
-    # A cached result while still good, else a fresh run; timeouts and crashes aren't kept.
+    # A cached result while still good, else a fresh run; UNCACHED failures aren't kept.
     def _run(self, engine: str, ds: str, sql: str, run) -> dict:
         key = an.sha1_text(f"{engine}\n{ds}\n{sql}")
         if key in self.memo:
             return self.memo[key]
 
         entry = self.old.get(key)
-        fresh = isinstance(entry, dict) and entry.get("data_sha1") == self.data_sha1[ds] and entry.get("sql") == sql and isinstance(entry.get("result"), dict)
+        fresh = (isinstance(entry, dict) and entry.get("data_sha1") == self.data_sha1[ds] and entry.get("sql") == sql and isinstance(entry.get("result"), dict))
         result = entry["result"] if fresh else run()
         self.memo[key] = result
-        
+
         if result.get("kind") not in UNCACHED:
             self.kept[key] = {
-                "engine": engine, 
+                "engine": engine,
                 "dataset": ds,
                 "sql": sql,
-                "data_sha1": self.data_sha1[ds], 
+                "data_sha1": self.data_sha1[ds],
                 "result": result
             }
         return result
@@ -149,29 +161,44 @@ def _normalize(text: str) -> str:
     return " ".join(text.casefold().split())
 
 
-# Every prompt example's question, normalized; empty when the file doesn't exist.
-def _example_questions(path: Path) -> set[str]:
+# SQL for comparing: lower case, one space between tokens,
+# string and number literals as ?, no comments, AS aliases or trailing ;.
+def normalize_sql(sql: str) -> str:
+    text = _STRING_OR_COMMENT.sub(lambda m: " ? " if m.group(0).startswith("'") else " ", sql).casefold()
+    text = _AS_ALIAS.sub(" ", _NUMBER.sub("?", text))
+    tokens = _SQL_TOKEN.findall(text)
+    while tokens and tokens[-1] == ";":
+        tokens.pop()
+    return " ".join(tokens)
+
+
+# The prompt examples' questions and SQL, normalized.
+# With no file, says so in one line and compares nothing.
+def _load_examples(path: Path) -> Examples:
     path = Path(path)
     if not path.exists():
-        return set()
+        print(f"no prompt examples at {path}; EXAMPLE_OVERLAP compares nothing", file=sys.stderr)
+        return Examples(set(), set())
 
     data = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(data, dict) or not all(isinstance(v, list) for v in data.values()):
         raise ValueError(f"{path}: expected {{dataset: [{{question, reply}}, ...]}}")
-    
+
     for ds, examples in data.items():
         for i, e in enumerate(examples):
             if not isinstance(e, dict) or not isinstance(e.get("question"), str):
                 raise ValueError(f"{path}: {ds}[{i}] isn't an object with a question string: {e!r}")
-            
-    return {_normalize(e["question"]) for examples in data.values() for e in examples}
+
+    every = [e for examples in data.values() for e in examples]
+    replies = [e["reply"] for e in every if isinstance(e.get("reply"), dict)]
+    return Examples({_normalize(e["question"]) for e in every}, {normalize_sql(r["sql"]) for r in replies if isinstance(r.get("sql"), str)})
 
 
 # The .tbl files a dataset's manifest lists, sorted by name.
 def _listed_tbl_files(ds_dir: Path) -> list[Path]:
     manifest = json.loads((ds_dir / "manifest.json").read_text(encoding="utf-8"))
     tables = manifest.get("tables") if isinstance(manifest, dict) else None
-    
+
     if not isinstance(tables, list) or not all(isinstance(t, dict) and isinstance(t.get("file"), str) for t in tables):
         raise ValueError(f"{ds_dir / 'manifest.json'}: expected tables with a file each")
     return sorted(ds_dir / t["file"] for t in tables)
@@ -191,7 +218,7 @@ def _require_files(p, datasets: list[str]) -> None:
         needed = [ds_dir / "manifest.json", ds_dir / f"{ds}.sqlite", ds_dir / "tables.tsv"]
         if needed[0].exists():
             needed += _listed_tbl_files(ds_dir)
-            
+
         missing += [path for path in needed if not path.exists()]
     if missing:
         raise FileNotFoundError(f"missing {', '.join(map(str, missing))}; run prepare_datasets.py first")
@@ -211,7 +238,7 @@ def _scan(sql: str) -> tuple[str, list[int]]:
         chars[m.start():m.end()] = (" " if token.startswith(("--", "/*")) else "#") * len(token)
         if token.startswith("/*"):
             blocks.append(m.start())
-            
+
     return "".join(chars), blocks
 
 
@@ -239,11 +266,11 @@ def _limit_problems(q: dict) -> list[str]:
 def _rerun_sql(q: dict) -> tuple[str, int] | None:
     if not q["ordered"] or q["gold_sqlite"] is None or _limit_problems(q):
         return None
-    
+
     sql, m = q["gold_sqlite"], _trailing_limit(q["gold_sqlite"])
     if m is None or int(m.group(1)) < 1:
         return None
-    
+
     n = int(m.group(1))
     return f"{sql[:m.start(1)]}{n + 1}{sql[m.end(1):]}", n
 
@@ -252,17 +279,17 @@ def _rerun_sql(q: dict) -> tuple[str, int] | None:
 def _second_problem(rec: dict | None, question: str) -> str | None:
     if rec is None:
         return "no second answer"
-    
+
     if not isinstance(rec.get("question"), str) or "sqlite" not in rec or not isinstance(rec.get("unanswerable"), bool):
         return "the second answer needs question, sqlite and unanswerable (true or false)"
-    
+
     if " ".join(rec["question"].split()) != " ".join(question.split()):
         return "answered an older wording"
 
     sql = rec["sqlite"]
     if sql is not None and not isinstance(sql, str):
         return "the second answer's sqlite must be text or null"
-    
+
     has_sql = bool(sql and sql.strip())
     if rec["unanswerable"]:
         return "the second answer is marked unanswerable but has SQL" if has_sql else None
@@ -312,7 +339,7 @@ def _gold_problems(q: dict, res: dict) -> list[str]:
     problems = _limit_problems(q)
     if q["ordered"]:
         bare = {
-            "gold_sqlite": _scan(q["gold_sqlite"])[0], 
+            "gold_sqlite": _scan(q["gold_sqlite"])[0],
             "gold_subset": _bare(q["gold_subset"])
         }
         problems += [f"ordered, but {field} has no ORDER BY" for field, sql in bare.items() if not _ORDER_BY.search(sql)]
@@ -324,14 +351,14 @@ def _gold_problems(q: dict, res: dict) -> list[str]:
         problems.append(f"gold_subset failed: {subset['error']}")
     if rerun is not None and not rerun["ok"]:
         problems.append(f"the LIMIT n+1 rerun failed: {rerun['error']}")
-        
+
     if gold["ok"]:
         width = len(gold["columns"])
         for field in ("order_cols", "share_cols"):
             outside = [i for i in q[field] if i >= width]
             if outside:
                 problems.append(f"{field} {outside} outside the gold's {width} columns")
-                
+
         if all(i < width for i in q["order_cols"]):
             unsorted = _sort_problem(gold["rows"], q["order_cols"])
             if unsorted:
@@ -381,11 +408,11 @@ def _compare(q: dict, res: dict) -> tuple[str, str] | None:
 
 
 # The first status that applies and its detail, given every result already run.
-def _first_status(q: dict, rec: dict | None, res: dict, examples: set[str]) -> tuple[str, str]:
+def _first_status(q: dict, rec: dict | None, res: dict, examples: Examples) -> tuple[str, str]:
     gold_problems = _gold_problems(q, res)
     if gold_problems:
         return "GOLD_ERROR", "; ".join(gold_problems)
-    
+
     second_problem = _second_problem(rec, q["question"])
     if second_problem:
         return "SECOND_MISSING", second_problem
@@ -397,14 +424,16 @@ def _first_status(q: dict, rec: dict | None, res: dict, examples: set[str]) -> t
         found = _compare(q, res)
         if found:
             return found
-        
-    if _normalize(q["question"]) in examples:
+
+    if _normalize(q["question"]) in examples.questions:
         return "EXAMPLE_OVERLAP", "the question matches a prompt example"
+    if any(normalize_sql(s) in examples.sqls for s in (q["gold_sqlite"], q["gold_subset"]) if s):
+        return "EXAMPLE_OVERLAP", "the gold SQL matches a prompt example's SQL"
     return "AGREE", ""
 
 
 # The first status that applies; an earlier one still notes a tied LIMIT cut.
-def _decide(q: dict, rec: dict | None, res: dict, examples: set[str]) -> tuple[str, str]:
+def _decide(q: dict, rec: dict | None, res: dict, examples: Examples) -> tuple[str, str]:
     status, detail = _first_status(q, rec, res, examples)
     if status != "TIE" and _tied_cut(q, res) is not None:
         detail += "; the cut also falls on a tie"
@@ -412,7 +441,7 @@ def _decide(q: dict, rec: dict | None, res: dict, examples: set[str]) -> tuple[s
 
 
 # Run every SQL a question has, then decide its status.
-def _evaluate(q: dict, rec: dict | None, runner: _Runner, examples: set[str]) -> dict:
+def _evaluate(q: dict, rec: dict | None, runner: _Runner, examples: Examples) -> dict:
     ds, res = q["dataset"], {}
     if q["gold_sqlite"] is not None:
         res["gold"] = runner.sqlite(ds, q["gold_sqlite"])
@@ -420,16 +449,16 @@ def _evaluate(q: dict, rec: dict | None, runner: _Runner, examples: set[str]) ->
         cut = _rerun_sql(q)
         if cut is not None and res["gold"]["ok"]:
             res["rerun"] = runner.sqlite(ds, cut[0])
-            
+
     if _second_problem(rec, q["question"]) is None and not rec["unanswerable"]:
         res["second"] = runner.sqlite(ds, rec["sqlite"])
 
     status, detail = _decide(q, rec, res, examples)
     return {
-        "qid": q["qid"], 
-        "status": status, 
-        "detail": detail, 
-        "results": res, 
+        "qid": q["qid"],
+        "status": status,
+        "detail": detail,
+        "results": res,
         "second": rec
     }
 
@@ -459,7 +488,7 @@ def _render_log(qs: list[dict], evaluated: list[dict], restarts: int) -> str:
     for q, e in zip(qs, evaluated):
         if e["status"] == "AGREE":
             continue
-        
+
         res, rec = e["results"], e["second"]
         lines += ["", f"## {q['qid']} ({q['dataset']}, {q['kind']}): {e['status']}", "", e["detail"], "", f"Question: {q['question']}", ""]
         if q["gold_sqlite"] is None:
@@ -489,7 +518,7 @@ def _check(results: Path, bridge_factory, examples_path: Path) -> tuple[list[dic
         raise ValueError(f"bad questions in {p.questions}: {'; '.join(problems)}")
 
     seconds = {r["qid"]: r for r in an.read_jsonl(p.second_answers) if isinstance(r.get("qid"), str)}  # last wins
-    examples = _example_questions(examples_path)
+    examples = _load_examples(examples_path)
     datasets = sorted({q["dataset"] for q in qs})
     _require_files(p, datasets)
 
@@ -509,8 +538,8 @@ def _check(results: Path, bridge_factory, examples_path: Path) -> tuple[list[dic
 def check(results: Path, bridge_factory=None, examples_path: Path | None = None) -> list[dict]:
     _, evaluated = _check(Path(results), bc.Bridge if bridge_factory is None else bridge_factory, EXAMPLES if examples_path is None else examples_path)
     return [{
-        "qid": e["qid"], 
-        "status": e["status"], 
+        "qid": e["qid"],
+        "status": e["status"],
         "detail": e["detail"]
     } for e in evaluated]
 
