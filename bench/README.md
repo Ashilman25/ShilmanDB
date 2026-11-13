@@ -47,6 +47,8 @@ bench/
 │   ├── run_pipeline.py          runs one model on one split, one resumable record per question (.venv-ai)
 │   ├── sql_facts.py             reads one SQL statement the way the engine's parser does, returns plain facts
 │   ├── checks.py                labels one shown answer from its record (pass / note / warn / refuse, with evidence)
+│   ├── analyze_analyst_check.py the verdict against the fixed bars (report.md, cells.csv); the dev model choice (dev_report.md)
+│   ├── run_analyst_check.py     one command: prepare, describe, probe, key, generate, analyze in order; --dry-run prints them
 │   └── tests/                   (fake_bridge.py stands in for the bridge in client tests)
 └── vector_check/      vector search check: pgvector strategy grid and learned stopping (Python)
     ├── vc_common.py             shared paths, text rules, distances, top-k, recall@10
