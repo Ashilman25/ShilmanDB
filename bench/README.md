@@ -45,6 +45,8 @@ bench/
 │   ├── model_mlx.py             the five model configs and the MLX wrapper (.venv-ai)
 │   ├── freeze.py                hashes the frozen inputs before the test run; verify names changes
 │   ├── run_pipeline.py          runs one model on one split, one resumable record per question (.venv-ai)
+│   ├── sql_facts.py             reads one SQL statement the way the engine's parser does, returns plain facts
+│   ├── checks.py                labels one shown answer from its record (pass / note / warn / refuse, with evidence)
 │   └── tests/                   (fake_bridge.py stands in for the bridge in client tests)
 └── vector_check/      vector search check: pgvector strategy grid and learned stopping (Python)
     ├── vc_common.py             shared paths, text rules, distances, top-k, recall@10

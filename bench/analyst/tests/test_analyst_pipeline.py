@@ -497,6 +497,8 @@ def _frozen(tmp_path: Path, res: Path, model: str) -> Path:
         path.write_text(f"original {name}\n", encoding="utf-8")
     shutil.copy(ANALYST / "model_mlx.py", code / "model_mlx.py")
     (res / "probe.json").write_text("{}\n")
+    for ds in ("tpch", "reviews"):
+        (res / "datasets" / ds / "manifest.json").write_text("{}\n")
     fz.write(res, code, model, fz.read_model_configs(code / "model_mlx.py"))
     return code
 

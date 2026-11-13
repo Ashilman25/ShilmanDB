@@ -29,7 +29,10 @@ def _load_common():
 an = _load_common()
 
 # Files under the results folder, then files next to this script.
-FROZEN_RESULTS = ["questions.jsonl", "datasets/tpch/description.md", "datasets/reviews/description.md", "probe.json", "subset_rules.md"]
+FROZEN_RESULTS = [
+    "questions.jsonl", "datasets/tpch/description.md", "datasets/reviews/description.md",
+    "datasets/tpch/manifest.json", "datasets/reviews/manifest.json", "probe.json", "subset_rules.md",
+]
 FROZEN_CODE = [
     "prompts.py", "prompt_examples.json", "sql_facts.py", "checks.py", "scoring.py",
     "datasets/tpch.json", "datasets/reviews.json", "an_common.py", "describe_datasets.py", "model_mlx.py",

@@ -33,7 +33,8 @@ CONFIGS = {
     "qwen36-35b": {"path": "mlx-community/Qwen3.6-35B-A3B-4bit", "thinking": False, "max_tokens": 1024},
 }
 RESULTS_NAMES = [
-    "questions.jsonl", "datasets/tpch/description.md", "datasets/reviews/description.md", "probe.json", "subset_rules.md",
+    "questions.jsonl", "datasets/tpch/description.md", "datasets/reviews/description.md",
+    "datasets/tpch/manifest.json", "datasets/reviews/manifest.json", "probe.json", "subset_rules.md",
 ]
 CODE_NAMES = [
     "prompts.py", "prompt_examples.json", "sql_facts.py", "checks.py", "scoring.py",
