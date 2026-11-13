@@ -4,7 +4,9 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import os
+import sqlite3
 import sys
+from contextlib import closing
 from pathlib import Path
 
 import pytest
@@ -153,3 +155,48 @@ def test_to_sqlite_skips_comments():
     assert mod.to_sqlite(sql) == want
     assert mod.to_sqlite("SELECT 1 -- it's\n, DATE '1995-01-01' -- don't") == \
         "SELECT 1 -- it's\n, '1995-01-01' -- don't"
+
+
+# A small SQLite file: four names, one of them stored as bytes.
+def _names_db(tmp_path: Path) -> Path:
+    db = tmp_path / f"names_{os.getpid()}.sqlite"
+    with closing(sqlite3.connect(db)) as conn:
+        conn.execute("CREATE TABLE t (id INTEGER, name)")
+        conn.execute("INSERT INTO t VALUES (1, 'Apple'), (2, 'apple'), (3, 'banana'), (4, X'00ff')")
+        conn.commit()
+    return db
+
+
+def test_sqlite_query_shape_and_bytes_as_hex(tmp_path):
+    db = _names_db(tmp_path)
+    assert mod.sqlite_query(db, "SELECT id, name AS n FROM t ORDER BY id") == {
+        "ok": True, "columns": ["id", "n"], "rows": [[1, "Apple"], [2, "apple"], [3, "banana"], [4, "00ff"]]}
+    assert mod.sqlite_query(db, "SELEC 1") == {"ok": False, "kind": "sql", "error": 'near "SELEC": syntax error'}
+
+
+def test_sqlite_query_row_cap(tmp_path):
+    db = _names_db(tmp_path)
+    sql = "SELECT id FROM t ORDER BY id"
+    assert mod.sqlite_query(db, sql, row_cap=2) == {"ok": True, "columns": ["id"], "rows": [[1], [2]], "truncated": True}
+    assert mod.sqlite_query(db, sql, row_cap=4) == {"ok": True, "columns": ["id"], "rows": [[1], [2], [3], [4]]}
+    assert mod.sqlite_query(db, sql) == mod.sqlite_query(db, sql, row_cap=4)
+
+
+def test_sqlite_query_is_read_only(tmp_path):
+    db = _names_db(tmp_path)
+    result = mod.sqlite_query(db, "INSERT INTO t VALUES (5, 'cherry')")
+    assert result["ok"] is False and result["kind"] == "sql" and "readonly" in result["error"]
+    assert mod.sqlite_query(db, "SELECT COUNT(*) FROM t")["rows"] == [[4]]
+
+
+def test_sqlite_query_like_is_case_sensitive(tmp_path):
+    db = _names_db(tmp_path)
+    assert mod.sqlite_query(db, "SELECT name FROM t WHERE name LIKE 'a%'")["rows"] == [["apple"]]
+
+
+def test_sqlite_query_timeout(tmp_path, monkeypatch):
+    db = _names_db(tmp_path)
+    loop = "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) SELECT MAX(x) FROM c"
+    assert mod.sqlite_query(db, loop, timeout_s=0.05) == {"ok": False, "kind": "timeout", "error": "timeout"}
+    monkeypatch.setattr(mod, "TIMEOUT_S", 0.05)  # the default is read at call time
+    assert mod.sqlite_query(db, loop) == {"ok": False, "kind": "timeout", "error": "timeout"}

@@ -40,6 +40,11 @@ bench/
 │   ├── probe_subset.py          runs 41 SQL shapes on the bridge and SQLite, writes subset_rules.md
 │   ├── questions.py             the question file: validation and the dev / test split
 │   ├── answer_key.py            checks the key (writers, engines, empty, ties) and freezes it
+│   ├── prompts.py               the model's prompts and the reply parser
+│   ├── prompt_examples.json     3 worked examples per dataset for the prompt
+│   ├── model_mlx.py             the five model configs and the MLX wrapper (.venv-ai)
+│   ├── freeze.py                hashes the frozen inputs before the test run; verify names changes
+│   ├── run_pipeline.py          runs one model on one split, one resumable record per question (.venv-ai)
 │   └── tests/                   (fake_bridge.py stands in for the bridge in client tests)
 └── vector_check/      vector search check: pgvector strategy grid and learned stopping (Python)
     ├── vc_common.py             shared paths, text rules, distances, top-k, recall@10

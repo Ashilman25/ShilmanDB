@@ -5,7 +5,10 @@ import importlib.util
 import json
 import os
 import re
+import sqlite3
 import sys
+import time
+from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
@@ -26,6 +29,7 @@ TEXT_CAP_BYTES = 4000
 DISTINCT_CAP = 50
 REL_TOL = 1e-4
 ABS_TOL = 0.01
+PROGRESS_STEPS = 10_000  # SQLite steps between deadline checks
 
 # A 'string' or -- comment (kept), or the DATE keyword just before a string (dropped).
 _DATE_LITERAL = re.compile(r"'(?:[^']|'')*'|--[^\r\n]*|(\bDATE\s*(?='))", re.IGNORECASE)
@@ -51,6 +55,41 @@ def load_sibling(module_name: str, file_name: str) -> ModuleType:
 # SQL for SQLite, which has no DATE '...' literal: DATE '1995-01-01' becomes '1995-01-01'.
 def to_sqlite(sql: str) -> str:
     return _DATE_LITERAL.sub(lambda m: "" if m.group(1) else m.group(), sql)
+
+
+# A cell JSON can hold: bytes become hex text.
+def _cell(v):
+    return v.hex() if isinstance(v, bytes) else v
+
+
+# Run one query on a SQLite file: read-only, case-sensitive LIKE, at most TIMEOUT_S.
+# With row_cap, keeps that many rows and adds truncated: True when there were more.
+def sqlite_query(db: Path, sql: str, row_cap: int | None = None, timeout_s: float | None = None) -> dict:
+    deadline = time.monotonic() + (TIMEOUT_S if timeout_s is None else timeout_s)
+    timed_out = False
+
+    def past_deadline() -> bool:
+        nonlocal timed_out
+        timed_out = time.monotonic() > deadline
+        return timed_out
+
+    with closing(sqlite3.connect(f"{Path(db).resolve().as_uri()}?mode=ro", uri=True)) as conn:
+        conn.execute("PRAGMA case_sensitive_like = ON")  # the engine's LIKE is case-sensitive
+        conn.set_progress_handler(past_deadline, PROGRESS_STEPS)
+
+        try:
+            cur = conn.execute(sql)
+            fetched = cur.fetchall() if row_cap is None else cur.fetchmany(row_cap + 1)
+            rows = [[_cell(v) for v in row] for row in fetched]
+        except sqlite3.Error as e:
+            if timed_out:
+                return {"ok": False, "kind": "timeout", "error": "timeout"}
+            return {"ok": False, "kind": "sql", "error": str(e)}
+
+        result = {"ok": True, "columns": [d[0] for d in cur.description or ()], "rows": rows}
+    if row_cap is not None and len(rows) > row_cap:
+        result.update(rows=rows[:row_cap], truncated=True)
+    return result
 
 
 @dataclass(frozen=True)

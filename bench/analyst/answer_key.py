@@ -6,9 +6,8 @@ import json
 import re
 import sqlite3
 import sys
-import time
 from collections import Counter
-from contextlib import ExitStack, closing
+from contextlib import ExitStack
 from pathlib import Path
 
 
@@ -38,7 +37,6 @@ bc = an.load_sibling("an_bridge_client", "bridge_client.py")
 STATUSES = ("GOLD_ERROR", "SECOND_MISSING", "UNANSWERABLE_DIFFER", "WRITERS_DIFFER", "ENGINES_DIFFER", "EMPTY", "TIE", "EXAMPLE_OVERLAP", "AGREE")
 EXAMPLES = an.HERE / "prompt_examples.json"
 TIMEOUT_S = an.TIMEOUT_S
-PROGRESS_STEPS = 10_000          # SQLite steps between deadline checks
 LOG_ROWS = 5                     # rows of each result shown in key_log.md
 UNCACHED = ("timeout", "crash")  # failures that may not happen again
 
@@ -60,31 +58,9 @@ def _error(kind: str, message: str) -> dict:
     return {"ok": False, "kind": kind, "error": message}
 
 
-# A cell JSON can hold: bytes become hex text.
-def _cell(v):
-    return v.hex() if isinstance(v, bytes) else v
-
-
-# Run one query on a dataset's SQLite file: read-only, case-sensitive LIKE, at most TIMEOUT_S.
+# One query on a dataset's SQLite file, using this module's TIMEOUT_S at call time.
 def _sqlite_query(db: Path, sql: str) -> dict:
-    deadline = time.monotonic() + TIMEOUT_S
-    timed_out = False
-
-    def past_deadline() -> bool:
-        nonlocal timed_out
-        timed_out = time.monotonic() > deadline
-        return timed_out
-
-    with closing(sqlite3.connect(f"{db.resolve().as_uri()}?mode=ro", uri=True)) as conn:
-        conn.execute("PRAGMA case_sensitive_like = ON")  # the engine's LIKE is case-sensitive
-        conn.set_progress_handler(past_deadline, PROGRESS_STEPS)
-        
-        try:
-            cur = conn.execute(sql)
-            rows = [[_cell(v) for v in row] for row in cur.fetchall()]
-        except sqlite3.Error as e:
-            return _error("timeout", "timeout") if timed_out else _error("sql", str(e))
-        return {"ok": True, "columns": [d[0] for d in cur.description or ()], "rows": rows}
+    return an.sqlite_query(db, sql, timeout_s=TIMEOUT_S)
 
 
 # A bridge reply in the same shape as a SQLite result.
