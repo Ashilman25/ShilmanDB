@@ -125,3 +125,31 @@ def test_load_sibling_registers_module():
         assert sys.modules["an_common_again"] is other and other.SEED == 1
     finally:
         sys.modules.pop("an_common_again", None)
+
+
+def test_to_sqlite_drops_the_date_keyword():
+    sql = "SELECT o_orderdate FROM orders WHERE o_orderdate >= DATE '1995-01-01' AND o_orderdate < date'1996-01-01'"
+    want = "SELECT o_orderdate FROM orders WHERE o_orderdate >= '1995-01-01' AND o_orderdate < '1996-01-01'"
+    assert mod.to_sqlite(sql) == want
+    assert mod.to_sqlite("WHERE d BETWEEN Date\n'1995-01-01' AND DATE  '1995-12-31'") == \
+        "WHERE d BETWEEN '1995-01-01' AND '1995-12-31'"
+
+
+@pytest.mark.parametrize("sql", [
+    "SELECT l_shipdate, o_orderdate FROM lineitem, orders",
+    "SELECT COUNT(*) FROM part WHERE p_comment LIKE '%date'",   # DATE inside a string stays
+    "SELECT * FROM t WHERE s = 'a DATE ''x'''",
+    "SELECT update_date FROM t WHERE update_date = '1995-01-01'",
+    "SELECT s FROM t WHERE s = 'a -- DATE ''x'''",                     # -- inside a string isn't a comment
+    "SELECT COUNT(*) FROM t -- since DATE '1995-01-01'\nWHERE k > 1",  # DATE inside a comment stays
+])
+def test_to_sqlite_leaves_everything_else_alone(sql):
+    assert mod.to_sqlite(sql) == sql
+
+
+def test_to_sqlite_skips_comments():
+    sql = "SELECT COUNT(*) AS n FROM orders -- customers' orders\nWHERE o_orderdate >= DATE '1995-01-01'"
+    want = "SELECT COUNT(*) AS n FROM orders -- customers' orders\nWHERE o_orderdate >= '1995-01-01'"
+    assert mod.to_sqlite(sql) == want
+    assert mod.to_sqlite("SELECT 1 -- it's\n, DATE '1995-01-01' -- don't") == \
+        "SELECT 1 -- it's\n, '1995-01-01' -- don't"

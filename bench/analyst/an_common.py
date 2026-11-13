@@ -4,6 +4,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,6 +27,9 @@ DISTINCT_CAP = 50
 REL_TOL = 1e-4
 ABS_TOL = 0.01
 
+# A 'string' or -- comment (kept), or the DATE keyword just before a string (dropped).
+_DATE_LITERAL = re.compile(r"'(?:[^']|'')*'|--[^\r\n]*|(\bDATE\s*(?='))", re.IGNORECASE)
+
 
 # Load a script next to this one by path, under a name in sys.modules.
 def load_sibling(module_name: str, file_name: str) -> ModuleType:
@@ -42,6 +46,11 @@ def load_sibling(module_name: str, file_name: str) -> ModuleType:
         sys.modules.pop(module_name, None)
         raise
     return module
+
+
+# SQL for SQLite, which has no DATE '...' literal: DATE '1995-01-01' becomes '1995-01-01'.
+def to_sqlite(sql: str) -> str:
+    return _DATE_LITERAL.sub(lambda m: "" if m.group(1) else m.group(), sql)
 
 
 @dataclass(frozen=True)
