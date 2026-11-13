@@ -53,43 +53,72 @@ SHAPES: list[tuple[str, str]] = [
     ("avg", "SELECT AVG(o_totalprice) AS avg_price FROM orders WHERE o_orderyear = 1996"),
     ("min_max", "SELECT MIN(o_orderdate) AS first_order, MAX(o_orderdate) AS last_order FROM orders"),
     ("group_by", "SELECT o_orderpriority, COUNT(*) AS order_count FROM orders GROUP BY o_orderpriority"),
-    ("having", "SELECT c_nationkey, COUNT(*) AS customer_count FROM customer GROUP BY c_nationkey HAVING COUNT(*) > 600"),
+    ("having",
+     "SELECT c_nationkey, COUNT(*) AS customer_count FROM customer GROUP BY c_nationkey HAVING COUNT(*) > 600"),
     ("order_by_column", "SELECT n_name, n_regionkey FROM nation ORDER BY n_name"),
-    ("order_by_alias", "SELECT l_shipmode, SUM(l_quantity) AS total_quantity FROM lineitem GROUP BY l_shipmode ORDER BY total_quantity DESC, l_shipmode"),
-    ("order_by_aggregate", "SELECT l_shipmode, SUM(l_quantity) AS total_quantity FROM lineitem GROUP BY l_shipmode ORDER BY SUM(l_quantity) DESC, l_shipmode"),
+    ("order_by_alias",
+     "SELECT l_shipmode, SUM(l_quantity) AS total_quantity FROM lineitem GROUP BY l_shipmode "
+     "ORDER BY total_quantity DESC, l_shipmode"),
+    ("order_by_aggregate",
+     "SELECT l_shipmode, SUM(l_quantity) AS total_quantity FROM lineitem GROUP BY l_shipmode "
+     "ORDER BY SUM(l_quantity) DESC, l_shipmode"),
     ("order_by_position", "SELECT n_name, n_regionkey FROM nation ORDER BY 1"),
     ("limit", "SELECT o_orderkey, o_totalprice FROM orders ORDER BY o_totalprice DESC, o_orderkey LIMIT 5"),
     ("offset", "SELECT o_orderkey, o_totalprice FROM orders ORDER BY o_totalprice DESC, o_orderkey LIMIT 5 OFFSET 5"),
     ("table_alias", "SELECT o.o_orderkey, o.o_orderdate FROM orders o WHERE o.o_orderkey <= 7"),
     # joins
-    ("join_on", "SELECT n_name, COUNT(*) AS customer_count FROM customer JOIN nation ON c_nationkey = n_nationkey GROUP BY n_name"),
-    ("implicit_join", "SELECT r_name, COUNT(*) AS nation_count FROM nation, region WHERE n_regionkey = r_regionkey GROUP BY r_name"),
-    ("three_way_join", "SELECT r_name, SUM(c_acctbal) AS total_balance FROM customer JOIN nation ON c_nationkey = n_nationkey JOIN region ON n_regionkey = r_regionkey GROUP BY r_name"),
-    ("self_join", "SELECT a.n_name, b.n_name AS neighbor FROM nation a JOIN nation b ON a.n_regionkey = b.n_regionkey WHERE a.n_nationkey = 0"),
-    ("left_join", "SELECT c_custkey, o_orderkey FROM customer LEFT JOIN orders ON c_custkey = o_custkey WHERE c_custkey <= 3"),
+    ("join_on",
+     "SELECT n_name, COUNT(*) AS customer_count FROM customer "
+     "JOIN nation ON c_nationkey = n_nationkey GROUP BY n_name"),
+    ("implicit_join",
+     "SELECT r_name, COUNT(*) AS nation_count FROM nation, region WHERE n_regionkey = r_regionkey GROUP BY r_name"),
+    ("three_way_join",
+     "SELECT r_name, SUM(c_acctbal) AS total_balance FROM customer JOIN nation ON c_nationkey = n_nationkey "
+     "JOIN region ON n_regionkey = r_regionkey GROUP BY r_name"),
+    ("self_join",
+     "SELECT a.n_name, b.n_name AS neighbor FROM nation a "
+     "JOIN nation b ON a.n_regionkey = b.n_regionkey WHERE a.n_nationkey = 0"),
+    ("left_join",
+     "SELECT c_custkey, o_orderkey FROM customer LEFT JOIN orders ON c_custkey = o_custkey WHERE c_custkey <= 3"),
     # predicates
     ("between", "SELECT COUNT(*) AS order_count FROM orders WHERE o_totalprice BETWEEN 100000 AND 200000"),
     ("in_list", "SELECT COUNT(*) AS line_count FROM lineitem WHERE l_shipmode IN ('MAIL', 'SHIP')"),
     ("not_in_list", "SELECT COUNT(*) AS line_count FROM lineitem WHERE l_shipmode NOT IN ('MAIL', 'SHIP')"),
     ("like", "SELECT COUNT(*) AS part_count FROM part WHERE p_type LIKE '%BRASS'"),
     ("not_like", "SELECT COUNT(*) AS part_count FROM part WHERE p_type NOT LIKE 'PROMO%'"),
-    ("case_when", "SELECT o_orderpriority, SUM(CASE WHEN o_orderstatus = 'F' THEN 1 ELSE 0 END) AS finished FROM orders GROUP BY o_orderpriority"),
-    ("date_literal", "SELECT COUNT(*) AS order_count FROM orders WHERE o_orderdate >= DATE '1995-01-01' AND o_orderdate < DATE '1996-01-01'"),
-    ("date_compare_string", "SELECT COUNT(*) AS order_count FROM orders WHERE o_orderdate >= '1995-01-01' AND o_orderdate < '1996-01-01'"),
+    ("case_when",
+     "SELECT o_orderpriority, SUM(CASE WHEN o_orderstatus = 'F' THEN 1 ELSE 0 END) AS finished "
+     "FROM orders GROUP BY o_orderpriority"),
+    ("date_literal",
+     "SELECT COUNT(*) AS order_count FROM orders "
+     "WHERE o_orderdate >= DATE '1995-01-01' AND o_orderdate < DATE '1996-01-01'"),
+    ("date_compare_string",
+     "SELECT COUNT(*) AS order_count FROM orders WHERE o_orderdate >= '1995-01-01' AND o_orderdate < '1996-01-01'"),
     # arithmetic
-    ("arithmetic", "SELECT l_linenumber, l_extendedprice * (1 - l_discount) * (1 + l_tax) AS charge FROM lineitem WHERE l_orderkey = 1 ORDER BY l_linenumber"),
-    ("integer_division", "SELECT p_partkey, p_size, p_size / 10 AS size_band FROM part WHERE p_partkey <= 5 ORDER BY p_partkey"),
+    ("arithmetic",
+     "SELECT l_linenumber, l_extendedprice * (1 - l_discount) * (1 + l_tax) AS charge FROM lineitem "
+     "WHERE l_orderkey = 1 ORDER BY l_linenumber"),
+    ("integer_division",
+     "SELECT p_partkey, p_size, p_size / 10 AS size_band FROM part WHERE p_partkey <= 5 ORDER BY p_partkey"),
     # what the engine lacks
     ("distinct", "SELECT DISTINCT o_orderpriority FROM orders"),
     ("count_distinct", "SELECT COUNT(DISTINCT o_custkey) AS customer_count FROM orders"),
-    ("subquery_where", "SELECT COUNT(*) AS big_orders FROM orders WHERE o_totalprice > (SELECT AVG(o_totalprice) FROM orders)"),
-    ("subquery_from", "SELECT AVG(line_count) AS avg_lines FROM (SELECT l_orderkey, COUNT(*) AS line_count FROM lineitem GROUP BY l_orderkey) AS per_order"),
-    ("with_cte", "WITH big AS (SELECT o_orderkey FROM orders WHERE o_totalprice > 400000) SELECT COUNT(*) AS big_orders FROM big"),
+    ("subquery_where",
+     "SELECT COUNT(*) AS big_orders FROM orders WHERE o_totalprice > (SELECT AVG(o_totalprice) FROM orders)"),
+    ("subquery_from",
+     "SELECT AVG(line_count) AS avg_lines FROM (SELECT l_orderkey, COUNT(*) AS line_count FROM lineitem "
+     "GROUP BY l_orderkey) AS per_order"),
+    ("with_cte",
+     "WITH big AS (SELECT o_orderkey FROM orders WHERE o_totalprice > 400000) SELECT COUNT(*) AS big_orders FROM big"),
     ("union", "SELECT n_name FROM nation WHERE n_regionkey = 0 UNION SELECT n_name FROM nation WHERE n_regionkey = 1"),
     ("is_null", "SELECT COUNT(*) AS customer_count FROM customer WHERE c_comment IS NULL"),
     ("coalesce", "SELECT c_custkey, COALESCE(c_acctbal, 0) AS balance FROM customer WHERE c_custkey <= 3"),
-    ("extract", "SELECT EXTRACT(YEAR FROM o_orderdate) AS order_year, COUNT(*) AS order_count FROM orders GROUP BY EXTRACT(YEAR FROM o_orderdate)"),
-    ("substring", "SELECT SUBSTRING(c_phone, 1, 2) AS country_code, COUNT(*) AS customer_count FROM customer GROUP BY SUBSTRING(c_phone, 1, 2)"),
+    ("extract",
+     "SELECT EXTRACT(YEAR FROM o_orderdate) AS order_year, COUNT(*) AS order_count FROM orders "
+     "GROUP BY EXTRACT(YEAR FROM o_orderdate)"),
+    ("substring",
+     "SELECT SUBSTRING(c_phone, 1, 2) AS country_code, COUNT(*) AS customer_count FROM customer "
+     "GROUP BY SUBSTRING(c_phone, 1, 2)"),
     ("upper", "SELECT p_partkey, UPPER(p_name) AS name FROM part WHERE p_partkey <= 3"),
     ("cast", "SELECT o_orderkey, CAST(o_totalprice AS INTEGER) AS whole_price FROM orders WHERE o_orderkey <= 3"),
     ("select_no_from", "SELECT 1 + 1 AS two"),
@@ -109,9 +138,9 @@ def _sqlite_result(conn: sqlite3.Connection, sql: str) -> tuple[list[str], list[
 def _check(bridge, conn: sqlite3.Connection | None, sql: str) -> dict:
     reply = bridge.query(sql)
     entry = {
-        "sql": sql, 
-        "ok": reply.get("ok") is True, 
-        "error": reply.get("error"), 
+        "sql": sql,
+        "ok": reply.get("ok") is True,
+        "error": reply.get("error"),
         "same_as_sqlite": None
     }
     if not entry["ok"]:

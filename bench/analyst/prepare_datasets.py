@@ -102,7 +102,7 @@ def add_year_month(columns: list[tuple[str, str]], rows: list[list]) -> tuple[li
             d = row[i]
             if d not in parts:
                 parts[d] = (int(d[:4]), int(d[:4] + d[5:7]))
-                
+
             row.extend(parts[d])
     return list(columns) + added, rows
 
@@ -294,10 +294,10 @@ def write_dataset(ds: str, tables: list[Table], out_dir: Path) -> None:
     _write_via_temp(out / f"{ds}.sqlite", _write_sqlite, tables)
 
     manifest = {
-        "dataset": ds, 
+        "dataset": ds,
         "tables": [{
-            "name": t.name, 
-            "file": f"{t.name}.tbl", 
+            "name": t.name,
+            "file": f"{t.name}.tbl",
             "rows": len(t.rows),
             "columns": [{"name": c, "type": k} for c, k in t.columns]
         } for t in tables]
@@ -317,12 +317,12 @@ def main(argv: list[str] | None = None) -> int:
     chosen = list(dict.fromkeys(d.strip() for d in args.datasets.split(",") if d.strip()))
     if not chosen:
         ap.error("--datasets names no dataset")
-        
+
     try:
         out_dirs = {ds: an.paths(args.results).dataset_dir(ds) for ds in chosen}
     except ValueError as e:
         ap.error(str(e))
-        
+
     for out in out_dirs.values():
         an.refuse_ai_root(out)
 
@@ -330,7 +330,7 @@ def main(argv: list[str] | None = None) -> int:
         "tpch": lambda: build_tpch(args.tpch_dir),
         "reviews": lambda: build_reviews(args.ai)
     }
-    
+
     for ds, out in out_dirs.items():
         start = time.perf_counter()
         tables = builders[ds]()

@@ -177,7 +177,8 @@ def test_sqlite_query_shape_and_bytes_as_hex(tmp_path):
 def test_sqlite_query_row_cap(tmp_path):
     db = _names_db(tmp_path)
     sql = "SELECT id FROM t ORDER BY id"
-    assert mod.sqlite_query(db, sql, row_cap=2) == {"ok": True, "columns": ["id"], "rows": [[1], [2]], "truncated": True}
+    assert (mod.sqlite_query(db, sql, row_cap=2)
+            == {"ok": True, "columns": ["id"], "rows": [[1], [2]], "truncated": True})
     assert mod.sqlite_query(db, sql, row_cap=4) == {"ok": True, "columns": ["id"], "rows": [[1], [2], [3], [4]]}
     assert mod.sqlite_query(db, sql) == mod.sqlite_query(db, sql, row_cap=4)
 

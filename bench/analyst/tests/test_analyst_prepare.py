@@ -214,8 +214,10 @@ def test_lines_end_with_delimiter_and_sqlite_counts(tmp_path):
 
     with closing(sqlite3.connect(out / "tpch.sqlite")) as conn:
         assert [conn.execute(f"SELECT COUNT(*) FROM {n}").fetchone()[0] for n in ("t", "u")] == [2, 1]
-        assert [r[2] for r in conn.execute("PRAGMA table_info(t)")] == ["INTEGER", "TEXT", "REAL", "TEXT", "INTEGER", "TEXT"]
-        typed = "SELECT typeof(t_id), typeof(t_name), typeof(t_price), typeof(t_day), typeof(t_n), typeof(t_note) FROM t"
+        assert [r[2] for r in conn.execute("PRAGMA table_info(t)")] == ["INTEGER", "TEXT", "REAL", "TEXT", "INTEGER",
+                                                                        "TEXT"]
+        typed = ("SELECT typeof(t_id), typeof(t_name), typeof(t_price), typeof(t_day), typeof(t_n), typeof(t_note) "
+                 "FROM t")
         assert conn.execute(typed).fetchall() == [("integer", "text", "real", "text", "integer", "text")] * 2
         assert conn.execute("SELECT * FROM t ORDER BY t_id").fetchall() == [tuple(r) for r in t.rows]
         assert conn.execute("SELECT u_id, typeof(u_amt), u_amt FROM u").fetchall() == [(5, "real", 3.0)]
@@ -225,13 +227,15 @@ def test_lines_end_with_delimiter_and_sqlite_counts(tmp_path):
 def test_write_rejects_a_value_that_breaks_the_line(tmp_path, bad):
     out = tmp_path / "ds"
     with pytest.raises(ValueError, match="row 2"):
-        mod.write_dataset("tpch", [mod.Table("t", [("t_id", "BIGINT"), ("t_s", "VARCHAR")], [[1, "ok"], [2, bad]])], out)
+        mod.write_dataset("tpch", [mod.Table("t", [("t_id", "BIGINT"), ("t_s", "VARCHAR")], [[1, "ok"], [2, bad]])],
+                          out)
     assert (sorted(p.name for p in out.iterdir()) if out.exists() else []) == []   # no temp file left behind
 
 
 def test_write_rejects_a_short_row(tmp_path):
     with pytest.raises(ValueError, match="row 1"):
-        mod.write_dataset("tpch", [mod.Table("t", [("t_a", "VARCHAR"), ("t_b", "VARCHAR")], [["a|b"]])], tmp_path / "ds")
+        mod.write_dataset("tpch", [mod.Table("t", [("t_a", "VARCHAR"), ("t_b", "VARCHAR")], [["a|b"]])],
+                          tmp_path / "ds")
 
 
 def test_duplicate_column_names_rejected(tmp_path):
@@ -291,7 +295,8 @@ def test_bridge_loads_what_sqlite_holds(tmp_path):
 
     sql = "SELECT t_id, t_price, t_date, t_note, t_year, t_month FROM t ORDER BY t_id"
     with bridge_client.Bridge(out / "tables.tsv") as b:
-        assert b.ready["rows"] == {t["name"]: t["rows"] for t in json.loads((out / "manifest.json").read_text())["tables"]}
+        assert b.ready["rows"] == {t["name"]: t["rows"]
+                                   for t in json.loads((out / "manifest.json").read_text())["tables"]}
         reply = b.query(sql)
     with closing(sqlite3.connect(out / "tpch.sqlite")) as conn:
         assert reply["ok"] and reply["rows"] == [list(r) for r in conn.execute(sql)]

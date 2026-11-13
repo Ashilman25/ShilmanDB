@@ -32,7 +32,8 @@ an = _load_common()
 DISTINCT_CAP = an.DISTINCT_CAP
 
 SPEC_DIR = an.HERE / "datasets"
-SECTIONS = ("dataset", "about", "columns", "primary_keys", "foreign_keys", "grains", "entity_tables", "missing", "glossary")
+SECTIONS = ("dataset", "about", "columns", "primary_keys", "foreign_keys", "grains", "entity_tables", "missing",
+            "glossary")
 SIGNATURE = ("any", "all", "none")
 NOTHING_MISSING = "Nothing: every value in every column is real."
 _QUALIFIER = re.compile(r"\b[A-Za-z_]\w*\.(?=[A-Za-z_])")  # the "l." in l.l_shipdate
@@ -55,7 +56,7 @@ def distinct_values(conn: sqlite3.Connection, manifest: dict, cap: int = DISTINC
         for col in table["columns"]:
             if col["type"] != "VARCHAR":
                 continue
-            
+
             rows = conn.execute(f'SELECT DISTINCT "{col["name"]}" FROM "{table["name"]}" LIMIT ?', (cap + 1,))
             found = [str(v) for (v,) in rows]
             if len(found) <= cap:
@@ -177,7 +178,7 @@ def render(spec: dict, manifest: dict, distinct: dict[str, list[str]]) -> str:
         lines += [f"### {table['name']} ({table['rows']:,} rows)", ""]
         for col in table["columns"]:
             lines.append(f"- `{col['name']}` {col['type']} — {spec['columns'][col['name']]}")
-            
+
             if col["name"] in distinct:
                 lines.append("  Values: " + ", ".join(_quote(v) for v in sorted(distinct[col["name"]])))
         lines.append("")
@@ -195,7 +196,7 @@ def render(spec: dict, manifest: dict, distinct: dict[str, list[str]]) -> str:
         lines += [f"### {term['term']}", ""]
         if term.get("meaning"):
             lines += [term["meaning"], ""]
-            
+
         for r in sorted(term["readings"], key=lambda r: not r["default"]):
             label = "Default" if r["default"] else "Other reading"
             lines.append(f"- {label}, {r['name']}: `{r['sql']}`")
@@ -233,7 +234,7 @@ def main(argv: list[str] | None = None) -> int:
     for ds, (spec, manifest, db) in ready.items():
         with closing(sqlite3.connect(f"{db.resolve().as_uri()}?mode=ro", uri=True)) as conn:
             distinct = distinct_values(conn, manifest)
-            
+
         text = render(spec, manifest, distinct)
         path = p.dataset_dir(ds) / "description.md"
         an.write_text_atomic(path, text)
