@@ -159,7 +159,7 @@ def _same_key(a, b) -> bool:
 
 
 # Two gold rows with the same value in every order column.
-def _ties(a: Sequence, b: Sequence, order_cols: Sequence[int]) -> bool:
+def rows_tie(a: Sequence, b: Sequence, order_cols: Sequence[int]) -> bool:
     return all(_same_key(a[j], b[j]) for j in order_cols)
 
 
@@ -168,7 +168,7 @@ def _tie_runs(gold_rows: list[list], order_cols: Sequence[int]) -> list[tuple[in
     runs, start = [], 0
     while start < len(gold_rows):
         first, end = gold_rows[start], start + 1
-        while order_cols and end < len(gold_rows) and _ties(first, gold_rows[end], order_cols):
+        while order_cols and end < len(gold_rows) and rows_tie(first, gold_rows[end], order_cols):
             end += 1
         runs.append((start, end))
         start = end

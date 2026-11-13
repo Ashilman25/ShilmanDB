@@ -30,10 +30,16 @@ bench/
 │   ├── switch_check/  switching between policies as the workload changes
 │   └── tests/
 ├── analyst/           AI-analyst check: local model writes SQL, the engine checks the answer (C++ bridge + Python)
-│   ├── an_common.py             shared paths, fixed values, crash-safe JSON-lines files
+│   ├── an_common.py             shared paths, fixed values, crash-safe JSON-lines files, to_sqlite
 │   ├── scoring.py               does a shown result match the answer key
 │   ├── analyst_bridge.cpp       loads a dataset once, answers SQL lines with rows and profile as JSON
 │   ├── bridge_client.py         talks to the bridge: 30 s timeout, restart on timeout or crash
+│   ├── prepare_datasets.py      TPC-H SF=0.1 and the reviews as .tbl + tables.tsv + manifest + SQLite copy
+│   ├── datasets/                tpch.json, reviews.json: column sentences, keys, grains, glossary
+│   ├── describe_datasets.py     checks those against the data, writes each description.md
+│   ├── probe_subset.py          runs 41 SQL shapes on the bridge and SQLite, writes subset_rules.md
+│   ├── questions.py             the question file: validation and the dev / test split
+│   ├── answer_key.py            checks the key (writers, engines, empty, ties) and freezes it
 │   └── tests/                   (fake_bridge.py stands in for the bridge in client tests)
 └── vector_check/      vector search check: pgvector strategy grid and learned stopping (Python)
     ├── vc_common.py             shared paths, text rules, distances, top-k, recall@10
