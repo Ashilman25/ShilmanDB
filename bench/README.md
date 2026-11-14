@@ -29,6 +29,27 @@ bench/
 │   ├── v3_check/      small learned policies on sampled candidates
 │   ├── switch_check/  switching between policies as the workload changes
 │   └── tests/
+├── analyst/           AI-analyst check: local model writes SQL, the engine checks the answer (C++ bridge + Python)
+│   ├── an_common.py             shared paths, fixed values, crash-safe JSON-lines files, to_sqlite
+│   ├── scoring.py               does a shown result match the answer key
+│   ├── analyst_bridge.cpp       loads a dataset once, answers SQL lines with rows and profile as JSON
+│   ├── bridge_client.py         talks to the bridge: 30 s timeout, restart on timeout or crash
+│   ├── prepare_datasets.py      TPC-H SF=0.1 and the reviews as .tbl + tables.tsv + manifest + SQLite copy
+│   ├── datasets/                tpch.json, reviews.json: column sentences, keys, grains, glossary
+│   ├── describe_datasets.py     checks those against the data, writes each description.md
+│   ├── probe_subset.py          runs 41 SQL shapes on the bridge and SQLite, writes subset_rules.md
+│   ├── questions.py             the question file: validation and the dev / test split
+│   ├── answer_key.py            checks the key (writers, engines, empty, ties) and freezes it
+│   ├── prompts.py               the model's prompts and the reply parser
+│   ├── prompt_examples.json     3 worked examples per dataset for the prompt
+│   ├── model_mlx.py             the five model configs and the MLX wrapper (.venv-ai)
+│   ├── freeze.py                hashes the frozen inputs before the test run; verify names changes
+│   ├── run_pipeline.py          runs one model on one split, one resumable record per question (.venv-ai)
+│   ├── sql_facts.py             reads one SQL statement the way the engine's parser does, returns plain facts
+│   ├── checks.py                labels one shown answer from its record (pass / note / warn / refuse, with evidence)
+│   ├── analyze_analyst_check.py the verdict against the fixed bars (report.md, cells.csv); the dev model choice (dev_report.md)
+│   ├── run_analyst_check.py     one command: prepare, describe, probe, key, generate, analyze in order; --dry-run prints them
+│   └── tests/                   (fake_bridge.py stands in for the bridge in client tests)
 └── vector_check/      vector search check: pgvector strategy grid and learned stopping (Python)
     ├── vc_common.py             shared paths, text rules, distances, top-k, recall@10
     ├── questions.csv            the 210 written questions used as queries

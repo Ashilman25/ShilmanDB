@@ -1,0 +1,61 @@
+{
+  "tpch": [
+    {
+      "question": "For each ship mode, what was the net revenue of the lines shipped in 1994, highest first?",
+      "reply": {
+        "sql": "SELECT l_shipmode, SUM(l_extendedprice * (1 - l_discount)) AS net_revenue FROM lineitem WHERE l_shipyear = 1994 GROUP BY l_shipmode ORDER BY net_revenue DESC, l_shipmode",
+        "grain": "one row per ship mode",
+        "columns": [
+          {"name": "l_shipmode", "meaning": "how the lines were shipped", "entity": "ship mode"},
+          {"name": "net_revenue", "meaning": "sum of l_extendedprice * (1 - l_discount) over the lines shipped in 1994 by that mode", "entity": "revenue"}
+        ]
+      }
+    },
+    {
+      "question": "How many people visited our website in 1996?",
+      "reply": {
+        "cannot_answer": "The data has no website or visitor records; it holds only the regions, nations, parts, suppliers, customers, orders and order lines of the sales records."
+      }
+    },
+    {
+      "question": "What share of the customers in the AMERICA region belong to the BUILDING market segment?",
+      "reply": {
+        "sql": "SELECT 1.0 * SUM(CASE WHEN c_mktsegment = 'BUILDING' THEN 1 ELSE 0 END) / COUNT(*) AS building_share FROM customer JOIN nation ON c_nationkey = n_nationkey JOIN region ON n_regionkey = r_regionkey WHERE r_name = 'AMERICA'",
+        "grain": "one row",
+        "columns": [
+          {"name": "building_share", "meaning": "customers in AMERICA in the BUILDING segment divided by all customers in AMERICA, a fraction from 0 to 1", "entity": "customers"}
+        ]
+      }
+    }
+  ],
+  "reviews": [
+    {
+      "question": "Which three stores have the most verified-purchase reviews?",
+      "reply": {
+        "sql": "SELECT p_store, COUNT(*) AS verified_reviews FROM reviews JOIN products ON r_asin = p_asin WHERE r_verified = 1 GROUP BY p_store ORDER BY verified_reviews DESC, p_store LIMIT 3",
+        "grain": "one row per store, for the three stores with the most verified-purchase reviews",
+        "columns": [
+          {"name": "p_store", "meaning": "store name on Amazon", "entity": "store"},
+          {"name": "verified_reviews", "meaning": "number of verified-purchase reviews of the store's products", "entity": "reviews"}
+        ]
+      }
+    },
+    {
+      "question": "Which age group of reviewers gives the lowest ratings?",
+      "reply": {
+        "cannot_answer": "The data identifies each reviewer only by an Amazon user ID; it has nothing about reviewers' ages."
+      }
+    },
+    {
+      "question": "During 2019, how many unverified reviews appeared each month?",
+      "reply": {
+        "sql": "SELECT r_month, COUNT(*) AS unverified_reviews FROM reviews WHERE r_year = 2019 AND r_verified = 0 GROUP BY r_month ORDER BY r_month",
+        "grain": "one row per month of 2019",
+        "columns": [
+          {"name": "r_month", "meaning": "year and month the reviews were posted, as YYYYMM", "entity": "month"},
+          {"name": "unverified_reviews", "meaning": "number of reviews posted that month that Amazon didn't mark as a verified purchase (r_verified = 0)", "entity": "reviews"}
+        ]
+      }
+    }
+  ]
+}
