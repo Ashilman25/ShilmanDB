@@ -1,0 +1,9 @@
+# Python packages the bench tests need in CI (pinned to the versions I develop with).
+# The ML, Postgres and vector-search packages (torch, psycopg, pgvector, faiss, LightGBM, MLX) are left out;
+# their tests skip without them.
+pytest==9.0.3
+numpy==2.4.4
+pandas==3.0.2
+matplotlib==3.10.8
+scipy==1.18.1
+duckdb==2.0.0

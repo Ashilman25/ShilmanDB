@@ -13,8 +13,9 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import psycopg
 import pytest
+
+psycopg = pytest.importorskip("psycopg")
 
 HERE = Path(__file__).resolve().parent
 

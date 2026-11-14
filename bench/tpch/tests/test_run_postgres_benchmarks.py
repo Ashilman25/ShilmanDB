@@ -12,6 +12,8 @@ from pathlib import Path
 
 import pytest
 
+pytest.importorskip("psycopg")
+
 TPCH_DIR = Path(__file__).resolve().parents[1]
 SERVER_SCRIPT = TPCH_DIR / "pg_baseline_server.sh"
 

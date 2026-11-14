@@ -131,8 +131,6 @@ The performance gap is expected. ShilmanDB is an educational row-store with no q
 - Learned eviction: marginal latency impact (small dataset fits mostly in buffer pool)
 - All 16/16 correctness verifications PASS (every config x every query matches SQLite results)
 
-For detailed benchmark analysis, see [docs/benchmarking_results.md](docs/benchmarking_results.md).
-
 Charts: `bench/results/query_latency.png`, `bench/results/join_order_accuracy.png`, `bench/results/hit_rate.png`
 
 ## Build Instructions
@@ -246,4 +244,4 @@ ShilmanDB/
 
 ## License
 
-MIT
+Apache-2.0. See [LICENSE](LICENSE).

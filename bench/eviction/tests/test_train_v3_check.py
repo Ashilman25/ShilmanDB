@@ -18,6 +18,8 @@ sys.modules["train_v3_check"] = mod
 spec.loader.exec_module(mod)
 
 SIM = Path(__file__).resolve().parents[3] / "build" / "bench" / "eviction_sim"
+needs_torch = pytest.mark.skipif(importlib.util.find_spec("torch") is None, reason="torch is not installed")
+needs_lightgbm = pytest.mark.skipif(importlib.util.find_spec("lightgbm") is None, reason="lightgbm is not installed")
 POOL = 40
 SF = "0.01"
 
@@ -108,6 +110,7 @@ def trained_mlp(tmp_path, name="mlp_small_richer", n=20000):
     return spec, x, y, mod.train_mlp(x, y, spec)
 
 
+@needs_torch
 def test_standardization_from_training_rows_only(tmp_path):
     write_samples(tmp_path, rows_each=500)
     x, y = mod.load_samples(tmp_path, SF, POOL)
@@ -117,6 +120,7 @@ def test_standardization_from_training_rows_only(tmp_path):
     np.testing.assert_allclose(trained["std"], x[:, :3].std(axis=0), rtol=1e-4)
 
 
+@needs_torch
 def test_mlp_export_round_trip(tmp_path):
     spec, x, y, trained = trained_mlp(tmp_path)
     path = tmp_path / "m.txt"
@@ -128,6 +132,7 @@ def test_mlp_export_round_trip(tmp_path):
     assert path.read_text().split()[:4] == ["model", "mlp", "features", "richer"]
 
 
+@needs_lightgbm
 def test_gbdt_export_round_trip(tmp_path):
     rows = make_rows(np.random.default_rng(6), 6000)
     x, y = rows[:, 1:].copy(), rows[:, 0].copy()
@@ -140,6 +145,7 @@ def test_gbdt_export_round_trip(tmp_path):
     np.testing.assert_allclose(mine, booster.predict(probe, raw_score=True), atol=1e-5)
 
 
+@needs_lightgbm
 def test_no_owner_cell_uses_11_inputs(tmp_path):
     spec = mod.ablation_cell("gbdt_richer")
     assert spec.features == "richer_no_owner" and spec.kind == "gbdt"
@@ -151,6 +157,7 @@ def test_no_owner_cell_uses_11_inputs(tmp_path):
     assert path.read_text().split()[:8] == ["model", "gbdt", "features", "richer_no_owner", "inputs", "11", "pool", str(POOL)]
 
 
+@needs_lightgbm
 def test_export_refuses_non_finite_threshold(tmp_path):
     rows = make_rows(np.random.default_rng(8), 2000)
     x, y = rows[:, 1:].copy(), rows[:, 0].copy()
@@ -164,6 +171,8 @@ def test_export_refuses_non_finite_threshold(tmp_path):
 
 
 @pytest.mark.skipif(not SIM.exists(), reason="build/bench/eviction_sim is not built")
+@needs_torch
+@needs_lightgbm
 def test_cpp_loader_accepts_exported_files(tmp_path):
     spec, x, y, trained = trained_mlp(tmp_path, n=8000)
     rows = make_rows(np.random.default_rng(6), 6000)
@@ -178,6 +187,8 @@ def test_cpp_loader_accepts_exported_files(tmp_path):
         assert err < 1e-5
 
 
+@needs_torch
+@needs_lightgbm
 def test_main_writes_models_and_log(tmp_path):
     (tmp_path / "s").mkdir()
     write_samples(tmp_path / "s", rows_each=400)
@@ -210,6 +221,7 @@ def test_load_refuses_sidecar_for_another_prefix(tmp_path):
         mod.load_samples(tmp_path, SF, POOL)
 
 
+@needs_torch
 def test_scoring_in_chunks_matches_one_pass(tmp_path):
     spec, x, y, trained = trained_mlp(tmp_path, n=3000)
     whole = mod.torch_logits(trained, x, chunk=10**9)
@@ -218,6 +230,7 @@ def test_scoring_in_chunks_matches_one_pass(tmp_path):
     assert mod.log_stats(spec, trained, x, y, chunk=500) == pytest.approx(mod.log_stats(spec, trained, x, y, chunk=10**9), abs=1e-3)
 
 
+@needs_lightgbm
 def test_gbdt_training_returns_train_scores(tmp_path):
     rows = make_rows(np.random.default_rng(6), 3000)
     x, y = rows[:, 1:].copy(), rows[:, 0].copy()

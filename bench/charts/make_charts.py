@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+"""Draw the README and docs charts from docs/data/ as light and dark PNGs."""
 from __future__ import annotations
 
 import argparse
@@ -479,7 +480,7 @@ def chart_analyst(data: Path, out: Path) -> Optional[List[Path]]:
         for i, r in enumerate(rows):
             rate, lo, hi = float(r["rate"]), float(r["wilson_low"]), float(r["wilson_high"])
             ax.barh(i, rate, height=0.36, color=color, zorder=2)
-            ax.errorbar(rate, i, xerr=[[rate - lo], [hi - rate]], fmt="none", olor=theme["ink2"], elinewidth=1.5, capsize=4, capthick=1.5, zorder=3)
+            ax.errorbar(rate, i, xerr=[[rate - lo], [hi - rate]], fmt="none", color=theme["ink2"], elinewidth=1.5, capsize=4, capthick=1.5, zorder=3)
             sign, limit = needs_text(r["needs"])
             ax.plot([limit, limit], [i - 0.3, i + 0.3], color=theme["ink"], linewidth=2.0, solid_capstyle="butt", zorder=4)
             ax.text(limit, i - 0.33, f"needs {sign} {limit:.2f}", ha="center", va="bottom", fontsize=8.5, color=theme["ink"])

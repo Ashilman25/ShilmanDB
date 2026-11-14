@@ -11,6 +11,9 @@ import numpy as np
 import pandas as pd
 import pytest
 
+pytest.importorskip("psycopg")
+pytest.importorskip("pgvector")
+
 SPEC_PATH = Path(__file__).resolve().parents[1] / "pg_vector_load.py"
 spec = importlib.util.spec_from_file_location("vc_pg_load", SPEC_PATH)
 assert spec and spec.loader

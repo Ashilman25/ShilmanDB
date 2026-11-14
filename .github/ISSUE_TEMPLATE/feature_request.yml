@@ -1,0 +1,33 @@
+name: Feature request
+description: Suggest something new for the engine, the app or the docs.
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What you are trying to do and what gets in the way. Start here, before the solution.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Your proposal
+      description: What you'd like to see. A sketch of the SQL, command or output helps.
+    validations:
+      required: true
+  - type: dropdown
+    id: track
+    attributes:
+      label: Which track
+      options:
+        - Engine
+        - App
+        - Docs
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered
+      description: Workarounds you use today, or how another database handles it.
