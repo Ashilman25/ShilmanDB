@@ -213,8 +213,9 @@ bash bench/tpch/generate_tpch_data.sh
 # Run full benchmark suite (ShilmanDB + SQLite, all configs)
 python bench/tpch/run_benchmarks.py --sf 0.01 --runs 5
 
-# Generate charts from results
-.venv/bin/python bench/tpch/plot_results.py
+# Chart data (reads bench/results/, writes docs/data/) and the charts (docs/data/ -> docs/images/)
+.venv/bin/python bench/charts/export_chart_data.py --out docs/data
+.venv/bin/python bench/charts/make_charts.py --data docs/data --out docs/images
 ```
 
 ## Project Structure

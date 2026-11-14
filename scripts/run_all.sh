@@ -3,7 +3,8 @@
 # run_all.sh — Full reproducible pipeline for ShilmanDB
 #
 # Builds, tests, generates data, trains ML models, benchmarks against SQLite,
-# and produces visualization charts. One command to reproduce everything.
+# and writes the results. One command to reproduce everything.
+# The charts are remade by hand from docs/data/ (bench/charts/make_charts.py).
 #
 # Usage:
 #   bash scripts/run_all.sh           # run full pipeline from project root
@@ -260,21 +261,9 @@ echo ""
 echo "Step 10 completed in $(elapsed_since "$STEP_START")"
 
 # ---------------------------------------------------------------------------
-# Step 11: Generate charts
+# Step 11: Summary
 # ---------------------------------------------------------------------------
-step_header 11 "Generate visualization charts"
-
-STEP_START=$(date +%s)
-
-$PYTHON bench/tpch/plot_results.py --results-dir "$RESULTS_DIR"
-
-echo ""
-echo "Step 11 completed in $(elapsed_since "$STEP_START")"
-
-# ---------------------------------------------------------------------------
-# Step 12: Summary
-# ---------------------------------------------------------------------------
-step_header 12 "Pipeline summary"
+step_header 11 "Pipeline summary"
 
 TOTAL_ELAPSED=$(elapsed_since "$PIPELINE_START")
 
@@ -313,13 +302,6 @@ done
 echo ""
 echo "  Benchmark results:"
 echo "    $RESULTS_DIR/latencies.csv      — Merged latency data"
-
-for chart in query_latency.png join_order_accuracy.png hit_rate.png; do
-    path="$RESULTS_DIR/$chart"
-    if [ -f "$path" ]; then
-        echo "    $path"
-    fi
-done
 
 echo ""
 echo "Pipeline complete."

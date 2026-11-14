@@ -1,0 +1,4 @@
+bar,count,total,rate,wilson_low,wilson_high,needs
+catch (bar 1): wrong shown answers warned or refused,20,35,0.571,0.409,0.720,at least 0.50
+"keep, refusals (bar 2): right shown answers refused",0,227,0.000,0.000,0.017,at most 0.10
+"keep, warnings (bar 3): right shown answers warned or refused",18,227,0.079,0.051,0.122,at most 0.25

@@ -134,8 +134,9 @@ The offline evaluation demonstrates the model's capability: +3.64% hit rate impr
 # Baseline only (faster, no ML needed)
 .venv/bin/python bench/tpch/run_benchmarks.py --config baseline --sf 0.01 --runs 5
 
-# Generate charts from results
-.venv/bin/python bench/tpch/plot_results.py
+# Chart data (reads bench/results/, writes docs/data/) and the charts (docs/data/ -> docs/images/)
+.venv/bin/python bench/charts/export_chart_data.py --out docs/data
+.venv/bin/python bench/charts/make_charts.py --data docs/data --out docs/images
 ```
 
 ### Output Files

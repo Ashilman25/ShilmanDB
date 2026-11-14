@@ -18,7 +18,6 @@ bench/
 │   ├── pg_baseline_server.sh    init / start / stop / status of that server (data in bench/results/tpch_postgres/)
 │   ├── baseline_common.py       helpers shared by the engine baseline runners
 │   ├── check_stream_results.py  checks workload answers against SQLite
-│   ├── plot_results.py          charts from a results folder
 │   ├── run_shilmandb_benchmarks.py  the older runner
 │   └── tests/                   (tpch_tiny_tables.py: the 7-table .tbl fixture the runner tests share)
 ├── join/              join-order experiments
@@ -32,6 +31,10 @@ bench/
 │   ├── engine/        the classical policies run inside the engine
 │   ├── v3_check/      small learned policies on sampled candidates
 │   ├── switch_check/  switching between policies as the workload changes
+│   └── tests/
+├── charts/            the README and docs charts: export from results/ to docs/data/, then PNGs to docs/images/
+│   ├── export_chart_data.py     reads result folders (never writes there), writes small CSVs to docs/data/
+│   ├── make_charts.py           reads only docs/data/, writes <name>-light.png and <name>-dark.png
 │   └── tests/
 ├── analyst/           AI-analyst check: local model writes SQL, the engine checks the answer (C++ bridge + Python)
 │   ├── an_common.py             shared paths, fixed values, crash-safe JSON-lines files, to_sqlite
@@ -89,7 +92,7 @@ Only folders changed; no file was renamed.
 | Old | New |
 |---|---|
 | `bench/load_tpch.cpp`, `tpch_workload.hpp`, `tpch_streams.hpp`, `page_owners.hpp`, `generate_tpch_data.sh` | `bench/tpch/` |
-| `bench/run_benchmarks.py`, `run_sqlite_benchmarks.py`, `check_stream_results.py`, `plot_results.py`, `run_shilmandb_benchmarks.py` | `bench/tpch/` |
+| `bench/run_benchmarks.py`, `run_sqlite_benchmarks.py`, `check_stream_results.py`, `run_shilmandb_benchmarks.py` | `bench/tpch/` |
 | `bench/join_headroom.cpp`, `generate_join_training_data.cpp`, `bench/headroom/analyze_join_headroom.py` | `bench/join/` |
 | `bench/eviction_*.{hpp,cpp}` | `bench/eviction/sim/` |
 | `bench/headroom/{run,analyze}_eviction_headroom.py`, `export_v2_weights.py` | `bench/eviction/headroom/` |
