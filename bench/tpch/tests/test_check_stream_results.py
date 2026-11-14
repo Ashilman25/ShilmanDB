@@ -111,3 +111,11 @@ def test_check_reports_fail(tmp_path: Path) -> None:
     assert rows[0].status == "FAIL"
     assert rows[0].detail != ""
     assert (rows[0].seq, rows[0].query) == (0, "Q0")
+
+
+def test_check_stream_accepts_sf10(tmp_path: Path) -> None:
+    args = mod.parse_args(["--sf", "10", "--output", str(tmp_path / "check.csv"), str(tmp_path / "run")])
+    assert args.sf == "10"
+    assert mod.SCALE_FACTORS == ["0.01", "0.1", "1.0"]
+    with pytest.raises(SystemExit):
+        mod.parse_args(["--sf", "3", "--output", str(tmp_path / "check.csv"), str(tmp_path / "run")])

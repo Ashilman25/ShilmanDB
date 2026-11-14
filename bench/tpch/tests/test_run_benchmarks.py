@@ -136,6 +136,19 @@ def test_resolve_sfs_defaults_to_all() -> None:
     assert mod.resolve_sfs(["0.1", "0.01"]) == ["0.01", "0.1"]
 
 
+def test_sf_all_is_still_three(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sys, "argv", ["run_benchmarks.py", "--sf", "all"])
+    assert mod.resolve_sfs(mod.parse_args().sf) == ["0.01", "0.1", "1.0"]
+
+
+def test_sf10_accepted_when_named(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sys, "argv", ["run_benchmarks.py", "--sf", "10"])
+    assert mod.resolve_sfs(mod.parse_args().sf) == ["10"]
+    monkeypatch.setattr(sys, "argv", ["run_benchmarks.py", "--sf", "10", "--sf", "0.01"])
+    assert mod.resolve_sfs(mod.parse_args().sf) == ["0.01", "10"]
+    assert mod.POOL_SIZES["10"] == 8192
+
+
 def test_resolve_configs_rejects_unknown() -> None:
     assert mod.resolve_configs("all") == mod.ALL_CONFIG_NAMES
     assert mod.resolve_configs("baseline,+learned") == ["baseline", "+learned"]
@@ -228,6 +241,11 @@ def test_pool_for_fraction() -> None:
     assert mod.pool_for_fraction("1.0", 0.01) == 1440
     assert mod.pool_for_fraction("0.01", 0.001) == 16
     assert mod.pool_for_fraction("0.01", 1.0) == 1448
+
+
+def test_pool_for_fraction_sf10_needs_db_pages() -> None:
+    with pytest.raises(ValueError, match="DB_PAGES has no entry for SF=10 yet"):
+        mod.pool_for_fraction("10", 0.25)
 
 
 def test_config_label() -> None:

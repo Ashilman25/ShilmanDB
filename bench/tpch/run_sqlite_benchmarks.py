@@ -9,6 +9,8 @@ import sys
 import time
 from typing import Dict, List, Tuple
 
+ALL_SCALE_FACTORS: List[str] = ["0.01", "0.1", "1.0"]
+KNOWN_SCALE_FACTORS: List[str] = [*ALL_SCALE_FACTORS, "10"]  # 10 runs only when named
 
 TABLE_SCHEMAS: Dict[str, List[Tuple[str, str]]] = {
     "lineitem": [
@@ -420,7 +422,7 @@ def parse_args() -> argparse.Namespace:
         "--sf",
         nargs="+",
         default=["all"],
-        help="Scale factors to run: 0.01, 0.1, 1.0, or 'all' (default: all)",
+        help="Scale factors to run: 0.01, 0.1, 1.0, 10, or 'all' (0.01, 0.1, 1.0; default: all)",
     )
     parser.add_argument(
         "--output-dir",
@@ -439,18 +441,17 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
-    all_sfs = ["0.01", "0.1", "1.0"]
     if args.runs < 1:
         print("Error: --runs must be at least 1.")
         sys.exit(1)
 
     if "all" in args.sf:
-        scale_factors = all_sfs
+        scale_factors = ALL_SCALE_FACTORS
     else:
         scale_factors = []
         for sf in args.sf:
-            if sf not in all_sfs:
-                print(f"Error: unknown scale factor '{sf}'. Choose from {all_sfs} or 'all'.")
+            if sf not in KNOWN_SCALE_FACTORS:
+                print(f"Error: unknown scale factor '{sf}'. Choose from {KNOWN_SCALE_FACTORS} or 'all'.")
                 sys.exit(1)
             scale_factors.append(sf)
 

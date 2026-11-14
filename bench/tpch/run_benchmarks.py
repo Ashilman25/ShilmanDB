@@ -53,12 +53,14 @@ DEFAULT_DATA_DIR = REPO_ROOT / "bench" / "tpch_data"
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "bench" / "results"
 
 ALL_SCALE_FACTORS: List[str] = ["0.01", "0.1", "1.0"]
+KNOWN_SCALE_FACTORS: List[str] = [*ALL_SCALE_FACTORS, "10"]  # 10 runs only when named
 QUERIES: List[str] = ["Q1", "Q3", "Q5", "Q6", "Q10", "Q12", "Q14", "Q19"]
 
 POOL_SIZES: Dict[str, int] = {
     "0.01": 128,
     "0.1": 512,
     "1.0": 2048,
+    "10": 8192,
 }
 
 # Pages in the tables alone (no indexes), measured by loading each scale factor.
@@ -141,6 +143,8 @@ def eprint(msg: str) -> None:
 def pool_for_fraction(sf: str, fraction: float) -> int:
     if fraction <= 0:
         raise ValueError(f"pool fraction must be positive, got {fraction}")
+    if sf not in DB_PAGES:
+        raise ValueError(f"DB_PAGES has no entry for SF={sf} yet")
     return max(MIN_POOL_PAGES, round(fraction * DB_PAGES[sf]))
 
 
@@ -1148,7 +1152,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--binary", type=Path, default=DEFAULT_BINARY, help=f"Path to load_tpch binary (default: {DEFAULT_BINARY})")
     p.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR, help=f"TPC-H data dir (default: {DEFAULT_DATA_DIR})")
     p.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR, help=f"Output dir (default: {DEFAULT_OUTPUT_DIR})")
-    p.add_argument("--sf", action="append", choices=ALL_SCALE_FACTORS + ["all"], help="Scale factor(s). Repeat flag or use 'all'. Default: 'all'.")
+    p.add_argument("--sf", action="append", choices=KNOWN_SCALE_FACTORS + ["all"], help="Scale factor(s). Repeat flag or use 'all'. Default: 'all'.")
     p.add_argument("--configs", default="all", help=("Comma-separated configs. Accepts 'all' or a subset of: " + ",".join(ALL_CONFIG_NAMES)))
     p.add_argument("--warmup", type=int, default=1, help="Warmup runs per query (default 1)")
     p.add_argument("--runs", type=int, default=5, help="Timed runs per query (default 5)")
@@ -1172,7 +1176,7 @@ def resolve_sfs(arg: Optional[Sequence[str]]) -> List[str]:
     if not arg or "all" in arg:
         return list(ALL_SCALE_FACTORS)
     s = set(arg)
-    return [sf for sf in ALL_SCALE_FACTORS if sf in s]
+    return [sf for sf in KNOWN_SCALE_FACTORS if sf in s]
 
 
 def resolve_configs(arg: str) -> List[str]:
