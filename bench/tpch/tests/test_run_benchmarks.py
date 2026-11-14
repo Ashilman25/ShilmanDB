@@ -679,3 +679,300 @@ def test_run_info_eviction_is_read(tmp_path: Path, monkeypatch: pytest.MonkeyPat
         output_dir=tmp_path / "out", pool_size=128, warmup_runs=0, timed_runs=1,
         timeout_seconds=30, label="baseline_arc", extra_flags=mod.option_flags(eviction="arc"))
     assert stats is not None and stats["Q1"].eviction == "arc"
+
+
+# DuckDB and Postgres in the same call
+def _fake_shilmandb(calls: list):
+    def run(**k):
+        label = k.get("label") or k["config_name"]     # the pool sweep passes no label
+        calls.append(label)
+        return {q: mod.QueryStats(sf=k["sf"], config=label, query=q, median_latency_ms=1.0, rows=1,
+                                  median_hits=10, median_misses=1, median_visits=2) for q in mod.QUERIES}
+    return run
+
+
+# Stands in for a runner subprocess: writes its latencies and info files, like the real one.
+def _fake_engine(calls: list, ok: bool = True):
+    def run(engine, scale_factors, data_dir, output_dir, timed_runs):
+        calls.append((engine, list(scale_factors), timed_runs))
+        if not ok:
+            return False
+        lines = ["sf,query,config,run,latency_ms"]
+        for sf in scale_factors:
+            for config in mod.ENGINE_CONFIGS[engine]:
+                lines += [f"{sf},{q},{config},{r},{r + 1.0}" for q in mod.QUERIES for r in (1, 2, 3)]
+        (output_dir / f"{engine}_latencies.csv").write_text("\n".join(lines) + "\n")
+        info = {"duckdb": "key,value\nduckdb_version,2.0.0\n",
+                "postgres": "key,value\npostgres_version,PostgreSQL 18.1\nshared_buffers,16GB\njit,on\n"}[engine]
+        (output_dir / f"{engine}_info.csv").write_text(info)
+        return True
+    return run
+
+
+# Stands in for compare_results.py: answers by the --reference-name it was given.
+def _fake_compare(answers: dict, calls: list):
+    def run(cmd):
+        name = cmd[cmd.index("--reference-name") + 1]
+        cfg, sf = cmd[cmd.index("--configs") + 1], cmd[cmd.index("--sf") + 1]
+        calls.append((cfg, name))
+        line = answers.get(name, "PASS")
+        return "\n".join(f"  {line.split()[0]:<5} [{cfg}] {q} SF={sf}{line[len(line.split()[0]):]}"
+                         for q in mod.QUERIES) + "\n"
+    return run
+
+
+def _stub_main(monkeypatch, shilmandb_calls, engine_calls, compare_calls, sqlite_calls, answers=None, engine_ok=True):
+    monkeypatch.setattr(mod, "run_shilmandb_config", _fake_shilmandb(shilmandb_calls))
+    monkeypatch.setattr(mod, "run_engine_benchmarks", _fake_engine(engine_calls, engine_ok))
+    monkeypatch.setattr(mod, "run_sqlite_benchmarks", lambda *a, **k: sqlite_calls.append(a) or True)
+    monkeypatch.setattr(mod, "compare_output", _fake_compare(answers or {}, compare_calls))
+    monkeypatch.setattr(mod, "command_output", lambda cmd: "stub")
+
+
+def test_default_call_writes_no_new_engine_rows(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    out = tmp_path / "out"
+    out.mkdir()
+    # an old DuckDB run in the same folder must not be picked up
+    (out / "duckdb_latencies.csv").write_text("sf,query,config,run,latency_ms\n0.01,Q1,duckdb,1,1.0\n")
+    shilmandb, engines, compares, sqlite = [], [], [], []
+    _stub_main(monkeypatch, shilmandb, engines, compares, sqlite)
+    monkeypatch.setattr(sys, "argv", ["run_benchmarks.py", "--sf", "0.01", "--configs", "baseline",
+                                      "--output-dir", str(out)])
+    assert mod.main() == 0
+
+    assert engines == []
+    for name in ("latencies.csv", "correctness.csv", "hit_rates.csv"):
+        configs = {r["config"] for r in _read_dicts(out / name)}
+        assert configs == {"baseline"}, name
+    assert not (out / "reference_checks.csv").exists()
+    assert not (out / "environment.csv").exists()
+    assert compares == [("baseline", "SQLite")]
+
+
+def test_runner_imports_without_duckdb_or_psycopg(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(sys.modules, "duckdb", None)
+    monkeypatch.setitem(sys.modules, "psycopg", None)
+    fresh_spec = importlib.util.spec_from_file_location("run_benchmarks_no_engines", SPEC_PATH)
+    assert fresh_spec and fresh_spec.loader
+    fresh = importlib.util.module_from_spec(fresh_spec)
+    monkeypatch.setitem(sys.modules, "run_benchmarks_no_engines", fresh)
+    fresh_spec.loader.exec_module(fresh)
+    assert fresh.resolve_configs("baseline") == ["baseline"]
+
+
+def test_duckdb_flag_adds_rows(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    out = tmp_path / "out"
+    shilmandb, engines, compares, sqlite = [], [], [], []
+    _stub_main(monkeypatch, shilmandb, engines, compares, sqlite)
+    monkeypatch.setattr(sys, "argv", ["run_benchmarks.py", "--sf", "0.01", "--configs", "baseline", "--duckdb",
+                                      "--runs", "3", "--output-dir", str(out)])
+    assert mod.main() == 0
+
+    assert engines == [("duckdb", ["0.01"], 3)]
+    lat = _read_dicts(out / "latencies.csv")
+    assert {r["config"] for r in lat} == {"baseline", "duckdb", "duckdb_1thread"}
+    q1 = next(r for r in lat if r["config"] == "duckdb" and r["query"] == "Q1")
+    assert q1["median_latency_ms"] == "3.0000"
+    assert q1["rows"] == "" and q1["misses"] == ""
+    correctness = _read_dicts(out / "correctness.csv")
+    for cfg in ("duckdb", "duckdb_1thread"):
+        assert [r["status"] for r in correctness if r["config"] == cfg] == ["PASS"] * len(mod.QUERIES)
+    assert list(correctness[0]) == ["sf", "query", "config", "status"]
+    hit_rates = {r["config"]: r for r in _read_dicts(out / "hit_rates.csv")}
+    assert hit_rates["duckdb"]["raw_hit_rate"] == ""
+    assert (out / "reference_checks.csv").exists()
+    assert (out / "environment.csv").exists()
+
+
+def test_references_for_sf1_is_sqlite(tmp_path: Path) -> None:
+    expected = [("SQLite", tmp_path / "sqlite_results", None)]
+    for flags in ((False, False), (True, False), (True, True)):
+        assert mod.references_for("1.0", *flags, output_dir=tmp_path) == expected
+    assert mod.references_for("0.01", True, True, output_dir=tmp_path) == expected
+
+
+def test_references_for_sf10_is_duckdb_and_postgres(tmp_path: Path) -> None:
+    duck = ("DuckDB", tmp_path / "duckdb_results", "duckdb")
+    pg = ("Postgres", tmp_path / "postgres_results", "postgres")
+    assert mod.references_for("10", True, True, output_dir=tmp_path) == [duck, pg]
+    assert mod.references_for("10", True, False, output_dir=tmp_path) == [duck]
+    assert mod.references_for("10", False, True, output_dir=tmp_path) == [pg]
+    # neither flag: SQLite, as before the engines existed
+    assert mod.references_for("10", False, False, output_dir=tmp_path) == [("SQLite", tmp_path / "sqlite_results", None)]
+
+
+def test_worst_status_over_references(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list = []
+    answers = {"DuckDB": "PASS", "Postgres": "DRIFT  (max abs 0.0234, max rel 3.1e-12)"}
+    monkeypatch.setattr(mod, "compare_output", _fake_compare(answers, calls))
+    path, checks = tmp_path / "correctness.csv", tmp_path / "reference_checks.csv"
+    mod.write_correctness_csv(path, ["10"], ["baseline", "duckdb", "postgres_1worker", "sqlite_disk"], tmp_path,
+                              queries=["Q1"], duckdb=True, postgres=True, checks_path=checks)
+
+    status = {r["config"]: r["status"] for r in _read_dicts(path)}
+    assert status == {"baseline": "DRIFT", "duckdb": "DRIFT", "postgres_1worker": "PASS", "sqlite_disk": "SKIP"}
+    rows = _read_dicts(checks)
+    assert list(rows[0]) == ["sf", "query", "config", "reference", "status", "max_abs_diff", "max_rel_diff"]
+    got = {(r["config"], r["reference"]): (r["status"], r["max_abs_diff"], r["max_rel_diff"]) for r in rows}
+    assert got == {
+        ("baseline", "DuckDB"): ("PASS", "", ""),
+        ("baseline", "Postgres"): ("DRIFT", "0.0234", "3.1e-12"),
+        ("duckdb", "Postgres"): ("DRIFT", "0.0234", "3.1e-12"),        # never against itself
+        ("postgres_1worker", "DuckDB"): ("PASS", "", ""),
+    }
+
+
+def test_worst_status_order() -> None:
+    assert mod.worst_status(["PASS", "DRIFT"]) == "DRIFT"
+    assert mod.worst_status(["DRIFT", "FAIL", "PASS"]) == "FAIL"
+    assert mod.worst_status(["SKIP", "PASS"]) == "PASS"
+    assert mod.worst_status([]) == "SKIP"
+
+
+def test_compare_line_parsing() -> None:
+    text = ("  PASS  [baseline] Q1 SF=0.01\n"
+            "  DRIFT [baseline] Q3 SF=0.01  (max abs 0.02, max rel 1e-11)\n"
+            "       row 0 col 2: 1.00 vs 1.02\n"
+            "  FAIL  [baseline] Q5 SF=0.01  (2 mismatch(es))\n"
+            "  SKIP  [baseline] Q6 SF=0.01\n")
+    assert mod.parse_compare_output(text) == {
+        "Q1": ("PASS", "", ""), "Q3": ("DRIFT", "0.02", "1e-11"), "Q5": ("FAIL", "", ""), "Q6": ("SKIP", "", ""),
+    }
+
+
+def test_failed_engine_shows_skip(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    out = tmp_path / "out"
+    shilmandb, engines, compares, sqlite = [], [], [], []
+    _stub_main(monkeypatch, shilmandb, engines, compares, sqlite, engine_ok=False)
+    monkeypatch.setattr(sys, "argv", ["run_benchmarks.py", "--sf", "0.01", "--configs", "baseline", "--postgres",
+                                      "--output-dir", str(out)])
+    assert mod.main() == 0
+    assert {r["config"] for r in _read_dicts(out / "latencies.csv")} == {"baseline"}
+    status = {(r["config"], r["status"]) for r in _read_dicts(out / "correctness.csv")}
+    assert status == {("baseline", "PASS"), ("postgres", "SKIP"), ("postgres_1worker", "SKIP")}
+    assert ("postgres", "SQLite") not in compares
+
+
+def test_environment_csv_keys(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    commands: list = []
+
+    def fake_run(cmd, **kwargs):
+        commands.append(list(cmd))
+        return mod.subprocess.CompletedProcess(cmd, 0, stdout="value\n", stderr="")
+
+    monkeypatch.setattr(mod.subprocess, "run", fake_run)
+    record = mod.environment_record({"duckdb_version": "2.0.0"},
+                                    {"postgres_version": "PostgreSQL 18.1", "shared_buffers": "16GB"})
+    path = tmp_path / "environment.csv"
+    mod.write_environment_csv(path, record)
+    got = {r["key"]: r["value"] for r in _read_dicts(path)}
+    for key in ("date", "git_commit", "chip", "memory_bytes", "macos", "compiler", "build_type", "sqlite",
+                "duckdb", "postgres", "psycopg", "libtorch", "pytorch", *mod.POSTGRES_SETTING_NAMES):
+        assert key in got, key
+    assert got["git_commit"] == "value"
+    assert got["duckdb"] == "2.0.0"
+    assert got["postgres"] == "PostgreSQL 18.1"
+    assert got["shared_buffers"] == "16GB"
+    assert got["jit"] == ""
+    assert ["git", "rev-parse", "HEAD"] in commands
+    assert all(c[0] != "git" or c[1] == "rev-parse" for c in commands)
+
+
+def test_environment_without_packages(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(mod, "command_output", lambda cmd: "")
+    monkeypatch.setattr(mod, "package_version", lambda name: "")
+    record = mod.environment_record({}, {})
+    assert record["duckdb"] == "" and record["psycopg"] == "" and record["pytorch"] == ""
+
+
+def test_configs_none_runs_only_new_engines(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    assert mod.resolve_configs("none") == []
+    with pytest.raises(SystemExit) as e:
+        mod.resolve_configs("none,baseline")
+    assert e.value.code != 0
+
+    out = tmp_path / "out"
+    shilmandb, engines, compares, sqlite = [], [], [], []
+    _stub_main(monkeypatch, shilmandb, engines, compares, sqlite)
+    monkeypatch.setattr(sys, "argv", ["run_benchmarks.py", "--sf", "0.01", "--configs", "none", "--duckdb",
+                                      "--output-dir", str(out)])
+    assert mod.main() == 0
+    assert shilmandb == [] and sqlite == []
+    assert {r["config"] for r in _read_dicts(out / "latencies.csv")} == {"duckdb", "duckdb_1thread"}
+
+    monkeypatch.setattr(sys, "argv", ["run_benchmarks.py", "--configs", "none,baseline", "--output-dir", str(out)])
+    with pytest.raises(SystemExit):
+        mod.main()
+
+
+def test_workload_only_call_skips_engines(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    out = tmp_path / "out"
+    shilmandb, engines, compares, sqlite = [], [], [], []
+    _stub_main(monkeypatch, shilmandb, engines, compares, sqlite)
+    monkeypatch.setattr(mod, "run_workload_config", lambda **k: _workload_stats(k["label"], k["pool_size"]))
+    monkeypatch.setattr(mod, "workload_query_rows", lambda *a, **k: [])
+    monkeypatch.setattr(sys, "argv", ["run_benchmarks.py", "--sf", "0.01", "--configs", "baseline", "--duckdb",
+                                      "--workloads", "stream", "--skip-correctness", "--output-dir", str(out)])
+    assert mod.main() == 0
+    assert engines == []
+
+
+# a workload-only call never runs the engines, so it must not read their folders or write their files
+def test_skipped_engines_are_not_references(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    out = tmp_path / "out"
+    shilmandb, engines, compares, sqlite = [], [], [], []
+    _stub_main(monkeypatch, shilmandb, engines, compares, sqlite)
+    monkeypatch.setattr(mod, "run_workload_config", lambda **k: _workload_stats(k["label"], k["pool_size"], sf=k["sf"]))
+    monkeypatch.setattr(mod, "workload_query_rows", lambda *a, **k: [])
+    monkeypatch.setattr(mod, "check_workload_runs", lambda *a, **k: {})
+    monkeypatch.setattr(mod, "POOL_SWEEP_SIZES", [128])
+    monkeypatch.setattr(sys, "argv", ["run_benchmarks.py", "--sf", "10", "--configs", "baseline", "--duckdb", "--postgres",
+                                      "--workloads", "stream", "--pool-sweep", "--output-dir", str(out)])
+    assert mod.main() == 0
+    assert engines == []
+    assert compares and all(name == "SQLite" for _, name in compares)
+    assert not (out / "reference_checks.csv").exists()
+    assert not (out / "environment.csv").exists()
+
+
+def test_no_engine_files_when_every_engine_failed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    out = tmp_path / "out"
+    shilmandb, engines, compares, sqlite = [], [], [], []
+    _stub_main(monkeypatch, shilmandb, engines, compares, sqlite, engine_ok=False)
+    monkeypatch.setattr(sys, "argv", ["run_benchmarks.py", "--sf", "10", "--configs", "baseline", "--duckdb", "--postgres",
+                                      "--output-dir", str(out)])
+    assert mod.main() == 0
+    assert len(engines) == 2
+    assert compares == []                       # no reference left at SF=10, not a fall back to SQLite
+    status = {(r["config"], r["status"]) for r in _read_dicts(out / "correctness.csv")}
+    assert status == {(c, "SKIP") for c in ("baseline", "duckdb", "duckdb_1thread", "postgres", "postgres_1worker")}
+    assert not (out / "reference_checks.csv").exists()
+    assert not (out / "environment.csv").exists()
+
+
+def _fake_cmake_build(build_dir: Path, versions: dict, cache_version: tuple) -> None:
+    build_dir.mkdir(parents=True)
+    major, minor, patch = cache_version
+    (build_dir / "CMakeCache.txt").write_text(
+        "CMAKE_BUILD_TYPE:STRING=Release\nCMAKE_CXX_COMPILER:FILEPATH=/usr/bin/c++\n"
+        f"CMAKE_CACHE_MAJOR_VERSION:INTERNAL={major}\nCMAKE_CACHE_MINOR_VERSION:INTERNAL={minor}\n"
+        f"CMAKE_CACHE_PATCH_VERSION:INTERNAL={patch}\n")
+    for folder, (compiler_version, mtime) in versions.items():
+        f = build_dir / "CMakeFiles" / folder / "CMakeCXXCompiler.cmake"
+        f.parent.mkdir(parents=True)
+        f.write_text(f'set(CMAKE_CXX_COMPILER_ID "AppleClang")\nset(CMAKE_CXX_COMPILER_VERSION "{compiler_version}")\n')
+        import os
+        os.utime(f, (mtime, mtime))
+
+
+def test_build_info_uses_the_cache_cmake_version(tmp_path: Path) -> None:
+    # 10.1.0 sorts first as text and is newer on disk, but the cache says 3.9.0
+    build = tmp_path / "build"
+    _fake_cmake_build(build, {"3.9.0": ("17.0.0", 1_000), "10.1.0": ("15.0.0", 2_000)}, (3, 9, 0))
+    assert mod.build_info(build) == ("/usr/bin/c++ (AppleClang 17.0.0)", "Release")
+
+
+def test_build_info_falls_back_to_newest_folder(tmp_path: Path) -> None:
+    build = tmp_path / "build"
+    _fake_cmake_build(build, {"4.0.0": ("16.0.0", 1_000), "4.2.0": ("17.0.0", 2_000)}, (4, 3, 1))
+    assert mod.build_info(build) == ("/usr/bin/c++ (AppleClang 17.0.0)", "Release")
