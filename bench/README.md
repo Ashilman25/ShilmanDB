@@ -5,7 +5,7 @@ Benchmarks and experiment tools. Code is grouped by topic; each topic keeps its 
 ```
 bench/
 ├── CMakeLists.txt     builds every tool into build/bench/<name>
-├── tpch/              TPC-H benchmarks against SQLite
+├── tpch/              TPC-H benchmarks against SQLite, DuckDB and Postgres
 │   ├── load_tpch.cpp            the loader and benchmark binary
 │   ├── tpch_workload.hpp        schemas, indexes, the 8 queries, SameResult
 │   ├── tpch_streams.hpp         stream / lookup / mixed workload generators
@@ -13,10 +13,14 @@ bench/
 │   ├── generate_tpch_data.sh    builds dbgen and writes bench/tpch_data/
 │   ├── run_benchmarks.py        the main runner (SQLite + every config)
 │   ├── run_sqlite_benchmarks.py SQLite timings and the answer key
+│   ├── run_duckdb_benchmarks.py DuckDB timings (same queries, file reused while its marker matches)
+│   ├── run_postgres_benchmarks.py  Postgres timings (own server on port 5434, 8 indexes, database reused while its marker matches)
+│   ├── pg_baseline_server.sh    init / start / stop / status of that server (data in bench/results/tpch_postgres/)
+│   ├── baseline_common.py       helpers shared by the engine baseline runners
 │   ├── check_stream_results.py  checks workload answers against SQLite
 │   ├── plot_results.py          charts from a results folder
 │   ├── run_shilmandb_benchmarks.py  the older runner
-│   └── tests/
+│   └── tests/                   (tpch_tiny_tables.py: the 7-table .tbl fixture the runner tests share)
 ├── join/              join-order experiments
 │   ├── join_headroom.cpp        times every connected join order
 │   ├── analyze_join_headroom.py
