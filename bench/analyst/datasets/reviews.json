@@ -92,14 +92,14 @@
   {"term": "product rating",
    "words": ["\\bproduct\\s+ratings?\\b", "\\b(?:average|mean|avg)\\s+(?:\\w+\\s+)?ratings?\\b", "\\b(?:best|worst|highest|lowest|top|bottom)[-\\s]rated\\b", "\\bratings?\\s+of\\s+(?:\\w+\\s+)?products?\\b"],
    "readings": [
-    {"name": "average of r_rating", "default": true, "sql": "AVG(r_rating)", "any": [], "all": ["r_rating"], "none": ["p_avg_rating"]},
-    {"name": "Amazon's average", "default": false, "sql": "p_avg_rating", "any": [], "all": ["p_avg_rating"], "none": ["r_rating"]}
+    {"name": "average of r_rating", "default": true, "sql": "AVG(r_rating)", "any": [], "all": ["r_rating"], "none": ["p_avg_rating"], "cues": ["\\b(?:in|from|across)\\s+(?:these|the|our|this)\\s+(?:reviews|data)\\b"]},
+    {"name": "Amazon's average", "default": false, "sql": "p_avg_rating", "any": [], "all": ["p_avg_rating"], "none": ["r_rating"], "cues": ["\\bon\\s+amazon\\b", "\\bamazon(?:'s)?\\s+(?:average\\s+)?(?:ratings?|rating\\s+counts?|counts?|scores?|average)\\b"]}
    ]},
   {"term": "review count",
    "words": ["\\b(?:number|count)\\s+of\\s+(?:reviews|ratings)\\b", "\\bhow\\s+many\\s+(?:reviews|ratings)\\b", "\\b(?:review|rating)\\s+counts?\\b", "\\bmost[-\\s]reviewed\\b", "\\bmost\\s+(?:reviews|ratings)\\b"],
    "readings": [
-    {"name": "reviews in this data", "default": true, "sql": "SELECT COUNT(*) FROM reviews", "any": [], "all": [], "none": ["p_rating_count"]},
-    {"name": "Amazon's count", "default": false, "sql": "p_rating_count", "any": [], "all": ["p_rating_count"], "none": []}
+    {"name": "reviews in this data", "default": true, "sql": "SELECT COUNT(*) FROM reviews", "any": [], "all": [], "none": ["p_rating_count"], "cues": ["\\b(?:in|from|across)\\s+(?:these|the|our|this)\\s+(?:reviews|data)\\b"]},
+    {"name": "Amazon's count", "default": false, "sql": "p_rating_count", "any": [], "all": ["p_rating_count"], "none": [], "cues": ["\\bon\\s+amazon\\b", "\\bamazon(?:'s)?\\s+(?:average\\s+)?(?:ratings?|rating\\s+counts?|counts?|scores?|average)\\b"]}
    ]}
  ]
 }

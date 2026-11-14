@@ -95,8 +95,8 @@ def entity_table(text: str | None, spec: dict) -> str | None:
     return None if key is None else tables[key]
 
 
-# Tables whose rows the joins repeat: a path out crosses a join matching many rows,
-# or a table it has no equality path to scans over one row.
+# A table repeats when key equalities from it don't reach every table joined to it,
+# or a table off its equality paths scans over one row. Other equalities only filter.
 def repeating_tables(facts: sf.SqlFacts, spec: dict, scan_rows: dict | None = None) -> set[str]:
     tables, keys, scan_rows = set(facts.tables), spec.get("primary_keys", {}), scan_rows or {}
 
@@ -112,19 +112,19 @@ def repeating_tables(facts: sf.SqlFacts, spec: dict, scan_rows: dict | None = No
     for p, q in far_side:
         neighbours[p].append(q)
 
-    def fans_out(p: str, q: str) -> bool:
+    # p's equalities cover q's key, so each p row meets at most one q row.
+    def covers_key(p: str, q: str) -> bool:
         key = keys.get(q)
-        return not key or not set(key) <= far_side[p, q]
+        return bool(key) and set(key) <= far_side[p, q]
 
-    def reaches_fanout(node: str, path: frozenset) -> bool:
-        return any(q not in path and (fans_out(node, q) or reaches_fanout(q, path | {q})) for q in neighbours[node])
-
-    # Tables joined to t by equalities; any other table crosses every row of t.
-    def component(t: str) -> set[str]:
+    # Tables reached from t, stepping from p to q only when step(p, q) holds.
+    # With covers_key, the tables t determines; with no step rule, t's whole component.
+    def reach(t: str, step=lambda p, q: True) -> set[str]:
         seen, stack = {t}, [t]
         while stack:
-            for q in neighbours[stack.pop()]:
-                if q not in seen:
+            p = stack.pop()
+            for q in neighbours[p]:
+                if q not in seen and step(p, q):
                     seen.add(q)
                     stack.append(q)
         return seen
@@ -134,10 +134,11 @@ def repeating_tables(facts: sf.SqlFacts, spec: dict, scan_rows: dict | None = No
         n = scan_rows.get(t)
         return not isinstance(n, int) or n > 1
 
+    # A table outside t's component crosses every row of t.
     def crossed(t: str) -> bool:
-        return any(many_rows(u) for u in tables - component(t))
+        return any(many_rows(u) for u in tables - reach(t))
 
-    return {t for t in tables if reaches_fanout(t, frozenset({t})) or crossed(t)}
+    return {t for t in tables if reach(t, covers_key) != reach(t) or crossed(t)}
 
 
 # Refuse SQL the engine runs wrong: LEFT JOIN, self-joins,
@@ -258,9 +259,10 @@ def _fanout(f: sf.SqlFacts, result: dict, claims: dict, spec: dict) -> CheckResu
     if not repeating:
         return CheckResult("fanout", "pass", "no table repeats in the joins", {"repeating": rows, "problems": []})
 
+    # A CASE's conditions only choose rows, unless its values are all constants (a row count).
     problems = []
     for a in f.aggregates:
-        read = sorted({f.column_table.get(c) for c in a.columns} & repeating)
+        read = sorted({f.column_table.get(c) for c in a.value_columns or a.columns} & repeating)
         if a.func in ADDITIVE and not a.star and read:
             problems.append(f"{a.func}({', '.join(sorted(a.columns))}) adds up {', '.join(read)}")
     problems += _count_star_problems(f, claims, spec, repeating)
@@ -348,8 +350,16 @@ def _second_phrasing(primary: dict, rephrase: dict) -> CheckResult:
 
 
 # One glossary term's level and message, from the readings that fit the SQL.
-def _term_verdict(term: dict, fits: list[dict]) -> tuple[str, str]:
+# When the question cues just one reading, that's the one expected.
+def _term_verdict(term: dict, fits: list[dict], cued: list[dict]) -> tuple[str, str]:
     name = term["term"]
+    if len(cued) == 1 and fits:
+        said = cued[0]["name"]
+        if fits == cued:
+            return "note", f"{name} read as {said}, as the question says"
+        if cued[0] not in fits:
+            return "warn", f"{name}: the question says {said}, the SQL reads {', '.join(r['name'] for r in fits)}"
+
     default = next((r["name"] for r in term["readings"] if r["default"]), "?")
     if len(fits) == 1 and fits[0]["default"]:
         others = [r["name"] for r in term["readings"] if not r["default"]]
@@ -363,7 +373,8 @@ def _term_verdict(term: dict, fits: list[dict]) -> tuple[str, str]:
     return "warn", f"{name} fits several readings: {', '.join(r['name'] for r in fits)}"
 
 
-# Note a glossary term read the default way; warn on any other reading.
+# Note a glossary term read the expected way, warn on any other.
+# The expected reading is the one the question cues, else the default.
 def _terms(f: sf.SqlFacts, question: dict, spec: dict, sql: str) -> CheckResult:
     if not f.ok:
         return _unread("terms", f)
@@ -373,12 +384,14 @@ def _terms(f: sf.SqlFacts, question: dict, spec: dict, sql: str) -> CheckResult:
     for term in spec.get("glossary", []):
         if any(re.search(w, text, re.IGNORECASE) for w in term["words"]):
             fits = [r for r in term["readings"] if dd.reading_matches(r, f.columns, sql)]
-            level, message = _term_verdict(term, fits)
-            found.append({"term": term["term"], "readings": [r["name"] for r in fits], "level": level, "message": message})
+            cued = dd.cued_readings(term, text)
+            level, message = _term_verdict(term, fits, cued)
+            found.append({"term": term["term"], "readings": [r["name"] for r in fits],
+                          "cued": [r["name"] for r in cued], "level": level, "message": message})
 
     if not found:
         return CheckResult("terms", "pass", "no glossary term in the question", {"terms": []})
-    evidence = {"terms": [{k: t[k] for k in ("term", "readings", "level")} for t in found]}
+    evidence = {"terms": [{k: t[k] for k in ("term", "readings", "cued", "level")} for t in found]}
     return CheckResult("terms", _worst(t["level"] for t in found), "; ".join(t["message"] for t in found), evidence)
 
 

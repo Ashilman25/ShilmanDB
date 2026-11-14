@@ -30,6 +30,11 @@ class Agg:
     func: str
     columns: set[str]
     star: bool
+    value_columns: set[str] | None = None   # columns whose values flow in; defaults to all of columns
+
+    def __post_init__(self) -> None:
+        if self.value_columns is None:
+            self.value_columns = set(self.columns)
 
 
 @dataclass
@@ -593,6 +598,20 @@ def _column_names(root: Node | None, skip: frozenset[str] = frozenset()) -> list
     return [n.name for n in _nodes(root) if isinstance(n, Col) and n.name not in skip]
 
 
+# Bare column names whose values flow out of root; a CASE's WHEN conditions only choose.
+def _value_column_names(root: Node | None, skip: frozenset[str] = frozenset()) -> list[str]:
+    out, stack = [], [root] if root is not None else []
+    while stack:
+        node = stack.pop()
+        if isinstance(node, Col) and node.name not in skip:
+            out.append(node.name)
+        elif isinstance(node, Case):
+            stack += [result for _, result in node.whens] + ([node.otherwise] if node.otherwise else [])
+        else:
+            stack += _children(node)
+    return out
+
+
 # Column names the planner sees when it places a predicate; it never looks inside CASE.
 def _placement_columns(root: Node) -> list[str]:
     out, stack = [], [root]
@@ -630,7 +649,8 @@ def _facts(stmt: Select, manifest: dict) -> SqlFacts:
                     f.columns.add(node.name)
                 case AggCall():
                     star = node.arg is None or isinstance(node.arg, Star)
-                    f.aggregates.append(Agg(node.func, set(_column_names(node.arg, skip)), star))
+                    values = set(_value_column_names(node.arg, skip))
+                    f.aggregates.append(Agg(node.func, set(_column_names(node.arg, skip)), star, values))
                 case Bin(op=op) if op in ARITHMETIC:
                     sides = (node_types[id(node.left)], node_types[id(node.right)])
                     f.text_arithmetic |= any(s in TEXT_TYPES for s in sides)

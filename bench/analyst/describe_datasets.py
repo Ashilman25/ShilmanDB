@@ -81,6 +81,13 @@ def _columns_problem(where: str, columns: object, known: Container[str], allow_e
     return [f"{where} names unknown columns {unknown}"] if unknown else []
 
 
+# Problems with a reading's cues: a list of regexes searched in the question.
+def _cue_problems(where: str, cues: object) -> list[str]:
+    if not isinstance(cues, list) or not all(isinstance(c, str) for c in cues):
+        return [f"{where}: cues needs a list of regexes, got {cues!r}"]
+    return [p for cue in cues for p in _regex_problem(f"{where}: cue", cue)]
+
+
 # Problems with one glossary term: its words, readings and default.
 def _term_problems(term: dict, columns: dict[str, str]) -> list[str]:
     name = term.get("term", "?")
@@ -105,6 +112,8 @@ def _term_problems(term: dict, columns: dict[str, str]) -> list[str]:
             problems += _columns_problem(f"{where}: {field}", r.get(field), columns, allow_empty=True)
         if "pattern" in r:
             problems += _regex_problem(f"{where}: pattern", r["pattern"])
+        if "cues" in r:
+            problems += _cue_problems(where, r["cues"])
     return problems
 
 
@@ -159,6 +168,11 @@ def reading_matches(reading: dict, columns: Iterable[str], sql: str) -> bool:
         return True
     plain = re.sub(r"\s+", " ", _QUALIFIER.sub("", sql))
     return re.search(pattern, plain, re.IGNORECASE) is not None
+
+
+# A term's readings with a cue found in the question text, any case.
+def cued_readings(term: dict, text: str) -> list[dict]:
+    return [r for r in term["readings"] if any(re.search(c, text, re.IGNORECASE) for c in r.get("cues", []))]
 
 
 # A value as a SQL string literal.

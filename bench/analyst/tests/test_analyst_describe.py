@@ -137,6 +137,9 @@ def _break_word(s): s["glossary"][0]["words"] = ["(revenue"]
 def _break_dataset(s): s["dataset"] = "reviews"
 def _break_missing_section(s): del s["missing"]
 def _break_meaning(s): s["glossary"][0]["meaning"] = 5
+def _break_cues_not_a_list(s): s["glossary"][0]["readings"][0]["cues"] = r"\bgross\b"
+def _break_cue_not_text(s): s["glossary"][0]["readings"][0]["cues"] = [r"\bgross\b", 5]
+def _break_cue_regex(s): s["glossary"][0]["readings"][1]["cues"] = [r"\bnet\b", "(net"]
 
 
 @pytest.mark.parametrize("breaker, needle", [
@@ -144,7 +147,8 @@ def _break_meaning(s): s["glossary"][0]["meaning"] = 5
     (_break_reading_column, "l_nope"), (_break_foreign_key, "o_nope"), (_break_key_table, "orders"),
     (_break_key_unknown_table, "widgets"), (_break_entity, "widgets"), (_break_no_default, "revenue"),
     (_break_pattern, "pattern"), (_break_word, "(revenue"), (_break_dataset, "reviews"),
-    (_break_missing_section, "missing"), (_break_meaning, "meaning"),
+    (_break_missing_section, "missing"), (_break_meaning, "meaning"), (_break_cues_not_a_list, "cues"),
+    (_break_cue_not_text, "cues"), (_break_cue_regex, "(net"),
 ])
 def test_validate_names_each_problem(breaker, needle):
     spec = _spec()
@@ -197,6 +201,69 @@ def test_date_basis_meaning_is_rendered():
     assert "order date" in date_basis["meaning"] and "in 1995" in date_basis["meaning"]
     text = mod.render(mod.load_spec("tpch"), _manifest_from_spec(mod.load_spec("tpch")), {})
     assert f"### date basis\n\n{date_basis['meaning']}\n\n- Default, order date:" in text
+
+
+def test_cues_are_valid_and_never_rendered():
+    spec = _spec()
+    spec["glossary"][0]["readings"][0]["cues"] = [r"\bgross\b"]
+    spec["glossary"][0]["readings"][1]["cues"] = []
+    assert mod.validate(spec, MANIFEST) == []
+    assert mod.render(spec, MANIFEST, {}) == mod.render(_spec(), MANIFEST, {})
+
+    # The real descriptions read the same with their cues taken out.
+    for ds in an.DATASETS:
+        real = mod.load_spec(ds)
+        bare = copy.deepcopy(real)
+        for term in bare["glossary"]:
+            for r in term["readings"]:
+                r.pop("cues", None)
+        manifest = _manifest_from_spec(real)
+        assert bare != real and mod.render(real, manifest, {}) == mod.render(bare, manifest, {}), ds
+
+
+def test_cues_only_on_the_terms_that_need_them():
+    cued = {(ds, g["term"]) for ds in an.DATASETS for g in mod.load_spec(ds)["glossary"]
+            if any("cues" in r for r in g["readings"])}
+    assert cued == {("tpch", "revenue"), ("tpch", "date basis"), ("reviews", "product rating"),
+                    ("reviews", "review count")}
+    for ds, term in cued:
+        entry = next(g for g in mod.load_spec(ds)["glossary"] if g["term"] == term)
+        assert all(r.get("cues") for r in entry["readings"]), (ds, term)
+
+
+@pytest.mark.parametrize("ds, term, question, expected", [
+    ("tpch", "revenue", "Net sales by nation?", ["net"]),
+    ("tpch", "revenue", "Gross revenue in 1995?", ["gross"]),
+    ("tpch", "revenue", "Sales through the network?", []),
+    ("tpch", "date basis", "Revenue by order month?", ["order date"]),
+    ("tpch", "date basis", "How many orders were placed in 1995?", ["order date"]),
+    ("tpch", "date basis", "Lines by shipping quarter?", ["ship date"]),
+    ("tpch", "date basis", "How many lines shipped in 1994?", ["ship date"]),
+    ("tpch", "date basis", "Lines by receipt dates?", ["receipt date"]),
+    ("tpch", "date basis", "How many lines were received in 1996?", ["receipt date"]),
+    ("tpch", "date basis", "Revenue in 1995?", []),
+    ("tpch", "date basis", "Lines ordered and shipped in 1995?", ["order date", "ship date"]),
+    ("reviews", "product rating", "Average rating of products in these reviews?", ["average of r_rating"]),
+    ("reviews", "product rating", "Best-rated products on Amazon?", ["Amazon's average"]),
+    ("reviews", "review count", "How many reviews across the data mention a store?", ["reviews in this data"]),
+    ("reviews", "review count", "Most-reviewed product on AMAZON?", ["Amazon's count"]),
+    ("reviews", "review count", "How many products have more than 10,000 ratings on Amazon?", ["Amazon's count"]),
+    ("reviews", "product rating", "How many products have an Amazon average rating of 4.5 or higher?",
+     ["Amazon's average"]),
+    ("reviews", "review count", "How many reviews mention Amazon?", []),
+    ("tpch", "date basis", "Parts shipped in 1995, ordered by revenue?", ["ship date"]),
+])
+def test_cues_find_the_reading_a_question_names(ds, term, question, expected):
+    entry = next(g for g in mod.load_spec(ds)["glossary"] if g["term"] == term)
+    assert [r["name"] for r in mod.cued_readings(entry, question)] == expected
+
+
+def test_cued_readings_without_cues_or_text():
+    revenue = _spec()["glossary"][0]   # no reading has cues
+    assert mod.cued_readings(revenue, "net revenue") == []
+    revenue["readings"][1]["cues"] = [r"\bnet\b"]
+    assert mod.cued_readings(revenue, "NET revenue") == [revenue["readings"][1]]
+    assert mod.cued_readings(revenue, "") == []
 
 
 def test_render_says_when_nothing_is_missing():

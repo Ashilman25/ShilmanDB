@@ -167,16 +167,16 @@
   {"term": "revenue",
    "words": ["\\brevenue\\b", "\\bsales\\b"],
    "readings": [
-    {"name": "net", "default": true, "sql": "l_extendedprice * (1 - l_discount)", "any": ["l_extendedprice"], "all": ["l_discount"], "none": []},
-    {"name": "gross", "default": false, "sql": "l_extendedprice", "any": ["l_extendedprice"], "all": [], "none": ["l_discount"]}
+    {"name": "net", "default": true, "sql": "l_extendedprice * (1 - l_discount)", "any": ["l_extendedprice"], "all": ["l_discount"], "none": [], "cues": ["\\bnet\\b"]},
+    {"name": "gross", "default": false, "sql": "l_extendedprice", "any": ["l_extendedprice"], "all": [], "none": ["l_discount"], "cues": ["\\bgross\\b"]}
    ]},
   {"term": "date basis",
    "meaning": "A year, quarter or month in a question (for example \"in 1995\") means the order date by default; the ship date and the receipt date are the other readings.",
    "words": ["\\b(?:19|20)\\d\\d\\b", "\\byear(?:s|ly)?\\b", "\\bquarter(?:s|ly)?\\b", "\\bmonth(?:s|ly)?\\b"],
    "readings": [
-    {"name": "order date", "default": true, "sql": "o_orderyear, o_ordermonth, o_orderdate", "any": ["o_orderdate", "o_orderyear", "o_ordermonth"], "all": [], "none": [], "pattern": "\\bo_order(?:year|month)\\b|\\bo_orderdate\\s*(?:>=|<=|<>|!=|=|>|<|between|like|in\\s*\\()\\s*(?:date\\s*)?'|'\\s*(?:>=|<=|<>|!=|=|>|<)\\s*o_orderdate\\b"},
-    {"name": "ship date", "default": false, "sql": "l_shipyear, l_shipmonth, l_shipdate", "any": ["l_shipdate", "l_shipyear", "l_shipmonth"], "all": [], "none": [], "pattern": "\\bl_ship(?:year|month)\\b|\\bl_shipdate\\s*(?:>=|<=|<>|!=|=|>|<|between|like|in\\s*\\()\\s*(?:date\\s*)?'|'\\s*(?:>=|<=|<>|!=|=|>|<)\\s*l_shipdate\\b"},
-    {"name": "receipt date", "default": false, "sql": "l_receiptyear, l_receiptmonth, l_receiptdate", "any": ["l_receiptdate", "l_receiptyear", "l_receiptmonth"], "all": [], "none": [], "pattern": "\\bl_receipt(?:year|month)\\b|\\bl_receiptdate\\s*(?:>=|<=|<>|!=|=|>|<|between|like|in\\s*\\()\\s*(?:date\\s*)?'|'\\s*(?:>=|<=|<>|!=|=|>|<)\\s*l_receiptdate\\b"}
+    {"name": "order date", "default": true, "sql": "o_orderyear, o_ordermonth, o_orderdate", "any": ["o_orderdate", "o_orderyear", "o_ordermonth"], "all": [], "none": [], "pattern": "\\bo_order(?:year|month)\\b|\\bo_orderdate\\s*(?:>=|<=|<>|!=|=|>|<|between|like|in\\s*\\()\\s*(?:date\\s*)?'|'\\s*(?:>=|<=|<>|!=|=|>|<)\\s*o_orderdate\\b", "cues": ["\\border\\s+(?:date|year|month|quarter)s?\\b", "\\bplaced\\b", "\\bordered\\b(?!\\s+by\\b)"]},
+    {"name": "ship date", "default": false, "sql": "l_shipyear, l_shipmonth, l_shipdate", "any": ["l_shipdate", "l_shipyear", "l_shipmonth"], "all": [], "none": [], "pattern": "\\bl_ship(?:year|month)\\b|\\bl_shipdate\\s*(?:>=|<=|<>|!=|=|>|<|between|like|in\\s*\\()\\s*(?:date\\s*)?'|'\\s*(?:>=|<=|<>|!=|=|>|<)\\s*l_shipdate\\b", "cues": ["\\bship(?:ping)?\\s+(?:date|year|month|quarter)s?\\b", "\\bshipped\\b"]},
+    {"name": "receipt date", "default": false, "sql": "l_receiptyear, l_receiptmonth, l_receiptdate", "any": ["l_receiptdate", "l_receiptyear", "l_receiptmonth"], "all": [], "none": [], "pattern": "\\bl_receipt(?:year|month)\\b|\\bl_receiptdate\\s*(?:>=|<=|<>|!=|=|>|<|between|like|in\\s*\\()\\s*(?:date\\s*)?'|'\\s*(?:>=|<=|<>|!=|=|>|<)\\s*l_receiptdate\\b", "cues": ["\\breceipt\\s+(?:date|year|month|quarter)s?\\b", "\\breceived\\b"]}
    ]},
   {"term": "late shipment",
    "words": ["\\blate(?:ness)?\\b", "\\bdelay(?:s|ed)?\\b", "\\boverdue\\b", "\\bon[-\\s]time\\b"],

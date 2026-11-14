@@ -150,6 +150,28 @@ def test_aggregates_in_order_once_each():
                             Agg("COUNT", set(), True), Agg("MAX", {"l_quantity"}, False)]
 
 
+def test_value_columns_leave_out_case_conditions():
+    f = mod.facts("SELECT SUM(CASE WHEN r_name = 'EUROPE' THEN l_extendedprice * (1 - l_discount) ELSE 0 END) "
+                  "FROM lineitem", M)
+    assert f.aggregates[0].columns == {"r_name", "l_extendedprice", "l_discount"}
+    assert f.aggregates[0].value_columns == {"l_extendedprice", "l_discount"}
+
+    # A CASE inside a THEN works the same way; the ELSE's value counts.
+    f = mod.facts("SELECT SUM(CASE WHEN o_orderyear = 1995 THEN CASE WHEN o_custkey > 5 THEN o_totalprice END "
+                  "ELSE l_quantity END), SUM(l_quantity * CASE WHEN o_orderyear > 1 THEN 2 ELSE 1 END) FROM orders", M)
+    assert f.aggregates[0].columns == {"o_orderyear", "o_custkey", "o_totalprice", "l_quantity"}
+    assert [a.value_columns for a in f.aggregates] == [{"o_totalprice", "l_quantity"}, {"l_quantity"}]
+
+    # Only constant values: nothing flows in, the condition picks rows to count.
+    f = mod.facts("SELECT SUM(CASE WHEN o_orderpriority = '1-URGENT' THEN 1 ELSE 0 END) FROM orders", M)
+    assert f.aggregates[0].columns == {"o_orderpriority"} and f.aggregates[0].value_columns == set()
+
+    # Outside a CASE every column counts, a comparison's too.
+    f = mod.facts("SELECT SUM(o_totalprice * l_quantity), COUNT(*), AVG(o_orderyear > 1995) FROM orders", M)
+    assert [a.value_columns for a in f.aggregates] == [{"o_totalprice", "l_quantity"}, set(), {"o_orderyear"}]
+    assert Agg("SUM", {"o_totalprice"}, False).value_columns == {"o_totalprice"}   # by hand: all of columns
+
+
 def test_group_by_columns_from_expressions():
     f = mod.facts("SELECT COUNT(*) FROM orders GROUP BY o_orderyear + 1, o.o_custkey, o_orderyear", M)
     assert f.group_by == ["o_orderyear", "o_custkey"]

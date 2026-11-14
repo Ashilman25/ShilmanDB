@@ -353,6 +353,20 @@ def test_fanout_reads_count_and_average_of_a_column_not_min_max():
     assert res.level == "pass" and "orders" in res.message   # orders repeats, but nothing adds it up
 
 
+def test_case_conditions_are_not_added_up():
+    joins = ("FROM lineitem JOIN orders ON l_orderkey = o_orderkey JOIN customer ON o_custkey = c_custkey "
+             "JOIN nation ON c_nationkey = n_nationkey JOIN region ON n_regionkey = r_regionkey")
+    net = "l_extendedprice * (1 - l_discount)"
+    res = get(rec(f"SELECT SUM(CASE WHEN r_name = 'EUROPE' THEN {net} ELSE 0 END) / SUM({net}) {joins}"), "fanout")
+    assert res.level == "pass" and "region" in res.evidence["repeating"]   # region repeats, but none of it adds up
+
+    # Constant values are a row count in disguise; orders' own values add up.
+    res = get(rec(f"SELECT SUM(CASE WHEN o_orderpriority = '1-URGENT' THEN 1 ELSE 0 END) {OL}"), "fanout")
+    assert res.level == "warn" and "SUM(o_orderpriority) adds up orders" in res.message
+    res = get(rec(f"SELECT SUM(CASE WHEN l_returnflag = 'R' THEN o_totalprice ELSE 0 END) {OL}"), "fanout")
+    assert res.level == "warn" and "adds up orders" in res.message
+
+
 def test_repeating_tables_by_hand():
     def rep(sql, spec=SPEC):
         return mod.repeating_tables(mod.sf.facts(sql, MANIFEST), spec)
@@ -372,6 +386,29 @@ def test_repeating_tables_by_hand():
     # A table with no declared key always fans out.
     assert rep(f"SELECT 1 {OL}",
                {"primary_keys": {"lineitem": ["l_orderkey", "l_linenumber"]}}) == {"orders", "lineitem"}
+
+
+Q5_TABLES = ("FROM lineitem JOIN orders ON l_orderkey = o_orderkey JOIN customer ON o_custkey = c_custkey "
+             "JOIN supplier ON l_suppkey = s_suppkey WHERE c_nationkey = s_nationkey")
+
+
+def test_an_equality_closing_a_key_tree_only_filters():
+    # lineitem's keys reach orders, customer and supplier; c_nationkey = s_nationkey only filters.
+    f = mod.sf.facts(f"SELECT 1 {Q5_TABLES}", MANIFEST)
+    assert mod.repeating_tables(f, SPEC) == {"orders", "customer", "supplier"}
+    assert level("fanout", f"SELECT SUM(l_extendedprice * (1 - l_discount)) {Q5_TABLES}") == "pass"
+
+    res = get(rec(f"SELECT SUM(o_totalprice) {Q5_TABLES}"), "fanout")   # orders doesn't determine lineitem
+    assert res.level == "warn" and "SUM(o_totalprice) adds up orders" in res.message
+
+
+def test_a_shared_nation_repeats_customers():
+    # Each customer meets every supplier of its nation.
+    sql = ("SELECT SUM(c_acctbal) FROM customer, supplier, nation "
+           "WHERE c_nationkey = n_nationkey AND s_nationkey = n_nationkey")
+    assert mod.repeating_tables(mod.sf.facts(sql, MANIFEST), SPEC) == {"customer", "supplier", "nation"}
+    res = get(rec(sql), "fanout")
+    assert res.level == "warn" and "SUM(c_acctbal) adds up customer" in res.message
 
 
 def test_cross_join_repeats_every_row_of_the_other_side():
@@ -572,6 +609,97 @@ def test_terms_several_terms_give_one_result():
     assert res.level == "warn" and "revenue read as net" in res.message and "ship date" in res.message
     assert level("terms", "SELECT COUNT(*) FROM orders", q="How many orders?") == "pass"
     assert level("terms", "SELECT COUNT(*) FROM orders", q="How many sales?") == "warn"   # no reading fits
+
+
+# The terms check's level and message for one SQL answer to a question.
+def _term_result(sql: str, q: str, **kw) -> tuple[str, str]:
+    res = get(rec(sql, q=q, **kw), "terms")
+    return res.level, res.message
+
+
+def test_terms_a_cued_reading_is_the_one_expected():
+    net, gross = "SUM(l_extendedprice * (1 - l_discount))", "SUM(l_extendedprice)"
+    brass = "FROM lineitem JOIN part ON l_partkey = p_partkey WHERE p_type LIKE '%BRASS'"
+    q = "What were gross sales of brass parts?"
+    assert _term_result(f"SELECT {gross} {brass}", q) == ("note", "revenue read as gross, as the question says")
+    assert _term_result(f"SELECT {net} {brass}", q) == ("warn", "revenue: the question says gross, the SQL reads net")
+    res = get(rec(f"SELECT {net} {brass}", q=q), "terms")
+    assert res.evidence["terms"] == [{"term": "revenue", "readings": ["net"], "cued": ["gross"], "level": "warn"}]
+    res = get(rec(f"SELECT {net} {brass}", q="Total sales of brass parts?"), "terms")
+    assert res.evidence["terms"] == [{"term": "revenue", "readings": ["net"], "cued": [], "level": "note"}]
+
+    q = "By ship year, how many lines went out by MAIL?"
+    ship = "SELECT l_shipyear, COUNT(*) FROM lineitem WHERE l_shipmode = 'MAIL' GROUP BY l_shipyear"
+    order = f"SELECT o_orderyear, COUNT(*) {OL} WHERE l_shipmode = 'MAIL' GROUP BY o_orderyear"
+    assert _term_result(ship, q) == ("note", "date basis read as ship date, as the question says")
+    assert _term_result(order, q) == ("warn", "date basis: the question says ship date, the SQL reads order date")
+
+
+def test_terms_shipped_in_a_year_reads_the_ship_date():
+    for where in ["l_shipdate >= DATE '1994-01-01' AND l_shipdate < DATE '1995-01-01'", "l_shipyear = 1994"]:
+        got = _term_result(f"SELECT COUNT(*) FROM lineitem WHERE {where}", "How many lines shipped in 1994?")
+        assert got == ("note", "date basis read as ship date, as the question says"), where
+
+    # The prompt's first tpch example, which the plain default rule warned.
+    example = json.loads((HERE.parent / "prompt_examples.json").read_text(encoding="utf-8"))["tpch"][0]
+    got_level, message = _term_result(example["reply"]["sql"], example["question"])
+    assert got_level == "note" and "date basis read as ship date, as the question says" in message
+
+    # "ordered by" sorts the answer; it doesn't name the order date.
+    q = "Which 5 parts shipped in 1995 brought the most revenue, ordered by revenue?"
+    sql = ("SELECT p_name, SUM(l_extendedprice * (1 - l_discount)) AS revenue FROM lineitem "
+           "JOIN part ON l_partkey = p_partkey WHERE l_shipyear = 1995 GROUP BY p_name ORDER BY revenue DESC LIMIT 5")
+    assert _term_result(sql, q) == (
+        "note", "revenue read as net; other readings: gross; date basis read as ship date, as the question says")
+
+
+def test_terms_cues_in_reviews():
+    kw = {"spec": REVIEWS_SPEC, "manifest": REVIEWS_MANIFEST, "scan_rows": [8000], "step_rows": [8000],
+          "operators": []}
+    q = "How many ratings do our products have on Amazon in total?"
+    assert _term_result("SELECT SUM(p_rating_count) FROM products", q, **kw) == (
+        "note", "review count read as Amazon's count, as the question says")
+    assert _term_result("SELECT COUNT(*) FROM reviews", q, **kw) == (
+        "warn", "review count: the question says Amazon's count, the SQL reads reviews in this data")
+
+    kw["scan_rows"], kw["step_rows"] = [50000], [50000]
+    q = "How many reviews mention Amazon?"   # names Amazon, not Amazon's count
+    assert _term_result("SELECT COUNT(*) FROM reviews WHERE r_text LIKE '%Amazon%'", q, **kw) == (
+        "note", "review count read as reviews in this data; other readings: Amazon's count")
+
+    q = "What is the average rating of our products in these reviews?"
+    assert _term_result("SELECT AVG(r_rating) FROM reviews", q, **kw) == (
+        "note", "product rating read as average of r_rating, as the question says")
+
+
+def test_terms_one_cued_reading_falls_through_unless_it_alone_fits_or_none_do():
+    # No reading fits: the default rule's warning.
+    assert _term_result("SELECT COUNT(*) FROM orders", "What were gross sales?") == (
+        "warn", "revenue: no reading fits the SQL (readings: net, gross)")
+
+    # Several fit, the cued one among them: the default rule's warning.
+    both = f"SELECT o_orderyear, l_shipyear, COUNT(*) {OL} GROUP BY o_orderyear, l_shipyear"
+    assert _term_result(both, "Lines by ship year?") == (
+        "warn", "date basis fits several readings: order date, ship date")
+
+    # Several fit, none of them cued: the warning names them all.
+    assert _term_result(both, "Lines by receipt year?") == (
+        "warn", "date basis: the question says receipt date, the SQL reads order date, ship date")
+
+
+def test_terms_two_cued_readings_or_none_keep_the_default_rule():
+    # Order date and ship date both cued: the default rule decides.
+    q = "By ship year, how many lines belong to orders placed in 1995?"
+    assert _term_result("SELECT l_shipyear, COUNT(*) FROM lineitem GROUP BY l_shipyear", q) == (
+        "warn", "date basis read as ship date, not the default order date")
+
+    net = "SUM(l_extendedprice * (1 - l_discount))"
+    assert _term_result(f"SELECT l_shipyear, {net} FROM lineitem GROUP BY l_shipyear", "Revenue by year?") == (
+        "warn", "revenue read as net; other readings: gross; date basis read as ship date, not the default order date")
+    assert _term_result(f"SELECT {net} FROM lineitem", "Total revenue?") == (
+        "note", "revenue read as net; other readings: gross")
+    assert _term_result("SELECT SUM(l_extendedprice) FROM lineitem", "Total revenue?") == (
+        "warn", "revenue read as gross, not the default net")
 
 
 def test_exact_always_passes():
