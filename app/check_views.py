@@ -39,6 +39,8 @@ REASK_LINE = "Re-asked with a reading named. Not part of the test, so its rates 
 UNREAD = "Not checked, because the SQL couldn't be read."
 TRAP_FALLBACK = "The SQL uses something today's engine runs wrong."
 GUARD_REASON = ("The SQL couldn't be checked, and it mentions an outer join, which today's engine runs as an inner join.")
+ALIAS_JOIN_REASON = ("The SQL uses an outer join that today's engine reads as a table alias and runs as an inner join, "
+                     "so rows with no match would drop out without a warning.")
 LEFT_JOIN_REASON = ("The SQL uses LEFT JOIN, which today's engine runs as an inner join, so rows with no match would drop out without a warning.")
 
 
@@ -95,7 +97,7 @@ def _fallback(result) -> tuple[str, str | None]:
 def trap_reason(result) -> str:
     evidence = result.evidence if result is not None else {}
     if evidence.get("guard"):
-        return GUARD_REASON
+        return ALIAS_JOIN_REASON if evidence.get("readable") else GUARD_REASON
 
     reasons = [LEFT_JOIN_REASON] if evidence.get("left_join") else []
 

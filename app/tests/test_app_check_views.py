@@ -21,7 +21,7 @@ from app.check_views import (
     trap_reason,
     verdict,
 )
-from app.copy_rules import problems
+from app.copy_rules import plain, problems
 
 CheckResult = sixd.ck.CheckResult
 APP_DIR = Path(__file__).resolve().parents[1]
@@ -61,6 +61,8 @@ SAMPLES = {
         ("refuse", {**NO_TRAPS, "text_arithmetic": True}),
         ("refuse", {**NO_TRAPS, "left_join": True, "repeated_tables": ["nation"], "text_arithmetic": True}),
         ("refuse", {"guard": True}),
+        ("refuse", {"guard": True, "readable": False}),
+        ("refuse", {"guard": True, "readable": True}),
     ],
     "empty_input": [
         ("pass", {"row_count": 5, "scan_rows": [5, 25, 15000], "step_rows": [25, 15000]}),
@@ -160,6 +162,17 @@ def test_copy_rules_catch_each():
         assert found[0].startswith(f"U+{code:04X} at 3"), found
     assert len(problems(chr(0x2014) * 3)) == 3
     assert problems(chr(0x2013) + chr(0x2019)) == []  # en dash and a curly apostrophe aren't on the list
+
+
+def test_plain_turns_dashes_into_commas():
+    dash, bar = chr(0x2014), chr(0x2015)
+    assert plain(f"No weather data {dash} only orders.") == "No weather data, only orders."
+    assert plain(f"a{dash}b") == "a, b"
+    assert plain(f"a {bar}b") == "a, b"
+    assert plain(f"a {dash} {dash} b") == "a, b"  # a run of dashes counts as one
+    keep = "a - b " + chr(0x2013) + " c"
+    assert plain(keep) == keep  # hyphens and en dashes stay
+    assert problems(plain(f"x {dash} y {bar} z")) == []
 
 
 def test_own_files_pass_copy_rules():
@@ -281,6 +294,21 @@ def test_verdict_not_run_guard():
         "text": "Not run. The SQL couldn't be checked, and it mentions an outer join, "
                 "which today's engine runs as an inner join.",
     }
+
+
+def test_readable_guard_reason():
+    sentence = ("The SQL uses an outer join that today's engine reads as a table alias and runs as an inner join, "
+                "so rows with no match would drop out without a warning.")
+    readable = _r("engine_traps", "refuse", {"guard": True, "readable": True})
+    assert trap_reason(readable) == cv.ALIAS_JOIN_REASON == sentence
+    assert problems(sentence) == []
+    assert verdict(_sql(engine_traps=readable), "done", "not_run") == {"kind": "not_run", "text": f"Not run. {sentence}"}
+    assert verdict(_answer(engine_traps=readable), "done", "shown") == {
+        "kind": "refused", "text": f"Can't answer this yet. {sentence}"}
+
+    # Unreadable SQL keeps the old sentence, with readable false or absent.
+    for evidence in ({"guard": True, "readable": False}, {"guard": True}):
+        assert trap_reason(_r("engine_traps", "refuse", evidence)) == cv.GUARD_REASON
 
 
 def test_trap_reason_other_traps():
