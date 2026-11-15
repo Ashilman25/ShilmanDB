@@ -33,6 +33,9 @@ perl -pi -e 's/^DATABASE *=.*/DATABASE = NONE/' makefile
 perl -pi -e 's/^MACHINE *=.*/MACHINE = LINUX/' makefile
 perl -pi -e 's/^WORKLOAD *=.*/WORKLOAD = TPCH/' makefile
 perl -pi -e 's/#include <malloc.h>/#include <stdlib.h>/' bm_utils.c
+# dbgen reads st_mode after a failed stat; zeroed, a new file gets fopen's normal mode
+perl -pi -e 's/struct stat fstats;/struct stat fstats = {0};/' bm_utils.c
+grep -q 'struct stat fstats = {0};' bm_utils.c || { echo "could not patch dbgen's bm_utils.c (fstats)" >&2; exit 1; }
 make clean && make dbgen
 
 
@@ -41,6 +44,14 @@ for SF in "$@"; do
     mkdir -p "$SF_DIR"
     ./dbgen -s "${SF}" -f
     mv *.tbl "$SF_DIR/"
+    for TABLE in customer lineitem nation orders part partsupp region supplier; do
+        TBL="$SF_DIR/$TABLE.tbl"
+        if [ ! -r "$TBL" ]; then
+            echo "SF=${SF}: $TABLE.tbl is missing or unreadable:" >&2
+            ls -l "$TBL" >&2 || true
+            exit 1
+        fi
+    done
     echo "Generated SF=${SF} data in $SF_DIR"
 done
 
