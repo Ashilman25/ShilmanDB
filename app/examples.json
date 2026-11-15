@@ -1,0 +1,16 @@
+{
+  "tpch": [
+    "What's the average customer account balance in each region?",
+    "How many orders came in each month of 1996?",
+    "Which 3 countries bring in the most revenue from their customers?",
+    "Who are the top 10 customers in GERMANY by total spend?",
+    "How many different customers placed an order in 1997?"
+  ],
+  "reviews": [
+    "How many positive reviews are there?",
+    "How many negative reviews does each main category have?",
+    "What was the average rating each month in 2022?",
+    "How many screen protector reviews were posted each year?",
+    "Which day of the week gets the most reviews?"
+  ]
+}
