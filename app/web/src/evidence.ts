@@ -11,9 +11,8 @@ import type { CheckRow, PlanRow, Snapshot, TermRow, VerdictKind } from "./types.
 // Verdicts whose banner is the whole result; the banner carries them, so the panel doesn't repeat them.
 const BANNER_IS_RESULT: readonly VerdictKind[] = ["refused", "cannot", "failed", "not_run"];
 
-// The verdict line at the top of the panel, unless the result column's banner already says it.
-// A typed SQL that failed in the engine has no verdict, so its banner stands alone too.
-// A question's line keeps two lines in every stage, so a two-line warning lands without moving the rows.
+// The verdict line, unless the result's banner already says it. A question's line keeps
+// two lines in every stage, so a two-line warning lands without moving the rows.
 function verdictLine(job: Snapshot, from: Snapshot | null): HTMLElement | null {
   const verdict = job.verdict;
   if (!verdict || BANNER_IS_RESULT.includes(verdict.kind)) return null;
@@ -39,18 +38,13 @@ function checkRow(row: CheckRow, from: Snapshot | null): HTMLElement {
       running ? skeleton([70, 45]) : null));
 }
 
-// How a term's other readings show: live links on a finished question, links that wait while it runs,
-// and none on a stopped one, which can't be asked again. The note sits beside them from the first answer
-// on, so it never arrives later and moves the rows below.
-interface Readings {
-  live: boolean;
-}
-
-function termRow(term: TermRow, readings: Readings | null, actions: Actions): HTMLElement {
-  const links = readings && term.alternatives.length ? h("div", { class: "alts" },
+// A term's other readings: live (true), waiting while the question runs (false), or none on a
+// stopped or failed one (null). The note shows from the first answer on, so nothing moves later.
+function termRow(term: TermRow, live: boolean | null, actions: Actions): HTMLElement {
+  const links = live !== null && term.alternatives.length ? h("div", { class: "alts" },
     term.alternatives.map((alt) => h("button", {
       class: "link",
-      attrs: { type: "button", disabled: !readings.live, "data-focus": `alt-${term.term}-${alt.reading}` },
+      attrs: { type: "button", disabled: !live, "data-focus": `alt-${term.term}-${alt.reading}` },
       onClick: () => actions.reask(term.term, alt.reading),
     }, alt.label)),
     h("span", { class: "detail" }, NOT_TESTED)) : null;
@@ -75,8 +69,8 @@ function sqlSection(job: Snapshot, state: State, actions: Actions): Child[] {
   return [
     h("h2", {}, "SQL"),
     second ? h("p", { class: "sql-label" }, "First answer") : null,
-    h("pre", { class: "sql" }, sql),
-    second ? [h("p", { class: "sql-label" }, "Second answer"), h("pre", { class: "sql" }, second.sql)] : null,
+    h("pre", { class: "sql", attrs: { "data-scroll": "sql-first" } }, sql),
+    second ? [h("p", { class: "sql-label" }, "Second answer"), h("pre", { class: "sql", attrs: { "data-scroll": "sql-second" } }, second.sql)] : null,
     h("div", { class: "actions" },
       h("button", { class: "btn2", attrs: { type: "button", "data-focus": "edit-sql" }, onClick: () => actions.editSql(sql) }, "Edit and run"),
       plan.length ? h("button", {
@@ -101,21 +95,21 @@ function panel(state: State, actions: Actions): Child[] {
 
   const from = state.changedFrom;
   const finished = job.stage === "done" && askBlock(state) === null;
-  const readings: Readings | null = job.stage === "stopped" ? null : { live: finished && !state.submitting };
+  const ended = job.stage === "stopped" || job.stage === "error";
+  const live = ended ? null : finished && !state.submitting;
   const line = verdictLine(job, from);
   return [
     line || job.checks.length ? h("h2", {}, "Checks") : null,
     line,
     job.checks.length ? h("div", { class: "ledger" }, job.checks.map((row) => checkRow(row, from))) : null,
-    job.terms.length ? [h("h2", {}, "Terms"), h("div", { class: "ledger" }, job.terms.map((term) => termRow(term, readings, actions)))] : null,
+    job.terms.length ? [h("h2", {}, "Terms"), h("div", { class: "ledger" }, job.terms.map((term) => termRow(term, live, actions)))] : null,
     sqlSection(job, state, actions),
     job.tested ? h("p", { class: "tested" }, job.tested.text) : null,
   ];
 }
 
-// Draws the panel. An empty one steps aside: the columns get the "alone" class, the result takes
-// the room and keeps a readable measure (set here rather than by a CSS :has() rule, so it never waits on
-// the browser re-checking the panel).
+// Draws the panel. An empty one steps aside: the columns get the "alone" class here, not
+// from a CSS :has() rule, so the result takes the room at once.
 export function drawEvidence(root: HTMLElement, state: State, actions: Actions): void {
   redraw(root, panel(state, actions));
   byId("cols").classList.toggle("alone", root.children.length === 0);

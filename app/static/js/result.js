@@ -3,9 +3,9 @@
 import { chartFor } from "./chart.js";
 import { banner, JOB_FAILED_LEAD, skeleton, SQL_FAILED_LEAD, word } from "./controls.js";
 import { aheadText, ASK_RECOVERY, EMPTY_RESULT, SQL_RECOVERY, STOPPED_QUEUED } from "./copy.js";
-import { h, redraw } from "./dom.js";
+import { fill, h, redraw, redrawFrom } from "./dom.js";
 import { isSql, showsSecond } from "./state.js";
-import { answerTable } from "./table.js";
+import { answerTable, forgetRows } from "./table.js";
 function heading(job) {
     if (isSql(job))
         return [h("h1", { class: "question" }, job.kind === "edit" ? "Edited SQL" : "SQL")];
@@ -42,12 +42,24 @@ function withheld(job, state, actions) {
     }, state.sqlOpen ? "Hide the SQL" : "See the SQL")) : null;
     return [
         banner(verdict.kind, verdict.text, toggle),
-        sql && state.sqlOpen ? h("div", { class: "withheld", attrs: { id: "withheld-sql" } }, h("pre", { class: "sql" }, sql), h("div", { class: "actions" }, h("button", { class: "btn2", attrs: { type: "button", "data-focus": "edit-withheld" }, onClick: () => actions.editSql(sql) }, "Edit and run"))) : null,
+        sql && state.sqlOpen ? h("div", { class: "withheld", attrs: { id: "withheld-sql" } }, h("pre", { class: "sql", attrs: { "data-scroll": "sql-withheld" } }, sql), h("div", { class: "actions" }, h("button", { class: "btn2", attrs: { type: "button", "data-focus": "edit-withheld" }, onClick: () => actions.editSql(sql) }, "Edit and run"))) : null,
     ];
 }
-// The first answer, or both side by side when the second differs. A warned verdict's banner
-// and the second answer's rows arrive together, in the same redraw.
-function answer(job, view, state, actions) {
+// The pair box of the shown job, kept like its tables so they never leave the page between redraws.
+let keptPair = null;
+function pairBox(jobId) {
+    if (keptPair?.job !== jobId)
+        keptPair = { job: jobId, node: h("div") };
+    return keptPair.node;
+}
+// Lets go of everything kept for the shown job's answers, for when another job is shown.
+export function forgetAnswers() {
+    keptPair = null;
+    forgetRows();
+}
+// The first answer, or both side by side when the second differs. A banner (a warning, or the
+// error a job hit after its first answer) sits under the meta lines, above the numbers.
+function answer(job, view, state, actions, notice = null) {
     const verdict = job.verdict;
     const arrived = state.changedFrom !== null && state.changedFrom.verdict?.kind !== verdict?.kind;
     const warned = verdict?.kind === "warned" ? banner("warned", verdict.text) : null;
@@ -56,23 +68,28 @@ function answer(job, view, state, actions) {
     const timing = timingLine(job);
     const parts = [
         h("div", { class: "about" }, h("p", { class: "meta" }, view.meta), timing ? h("p", { class: "meta" }, timing) : null),
-        warned,
+        warned ?? notice,
     ];
     const second = job.second;
     if (second && showsSecond(job)) {
-        parts.push(h("div", { class: arrived ? "pair arrive" : "pair" }, h("h2", {}, "First answer"), h("p", { class: "asked" }, job.asked?.question ?? job.text), h("p", { class: "meta" }, view.meta), answerTable(job.id, "first", view, state, actions), h("h2", {}, "Second answer"), h("p", { class: "asked" }, second.question ?? ""), h("p", { class: "meta" }, second.meta), answerTable(job.id, "second", second, state, actions)));
+        const pair = pairBox(job.id);
+        pair.className = arrived ? "pair arrive" : "pair";
+        fill(pair, h("h2", {}, "First answer"), h("p", { class: "asked" }, job.asked?.question ?? job.text), h("p", { class: "meta" }, view.meta), answerTable(job.id, "first", view, state, actions), h("h2", {}, "Second answer"), h("p", { class: "asked" }, second.question ?? ""), h("p", { class: "meta" }, second.meta), answerTable(job.id, "second", second, state, actions));
+        parts.push(pair);
     }
     else {
         parts.push(chartFor(view), answerTable(job.id, "first", view, state, actions));
     }
     return parts;
 }
-// A job that ended in an error: what went wrong and what to do, in the page's words, then the
-// server's own message as the detail.
+// What went wrong and what to do, in the page's words: the banner's sentence and the live region's.
+export function failedSentence(job) {
+    return isSql(job) ? `${SQL_FAILED_LEAD} ${SQL_RECOVERY}` : `${JOB_FAILED_LEAD} ${ASK_RECOVERY}`;
+}
+// A job that ended in an error: the page's sentence, then the server's own message as the detail.
 function failure(job) {
-    const sentence = isSql(job) ? `${SQL_FAILED_LEAD} ${SQL_RECOVERY}` : `${JOB_FAILED_LEAD} ${ASK_RECOVERY}`;
     const message = job.error?.message;
-    return banner("error", sentence, message ? h("p", { class: "detail" }, `Details: ${message}`) : null);
+    return banner("error", failedSentence(job), message ? h("p", { class: "detail" }, `Details: ${message}`) : null);
 }
 export function drawResult(root, state, actions) {
     const job = state.job;
@@ -81,14 +98,18 @@ export function drawResult(root, state, actions) {
         redraw(root, state.jobError ? banner("error", state.jobError) : h("p", { class: "hint" }, EMPTY_RESULT));
         return;
     }
-    let body;
-    if (job.stage === "queued" || job.stage === "writing")
-        body = waiting(job);
-    else if (job.stage === "error")
-        body = [failure(job)];
-    else if (job.first)
-        body = answer(job, job.first, state, actions);
-    else
-        body = withheld(job, state, actions);
-    redraw(root, heading(job), state.jobError ? h("p", { class: "msg bad", attrs: { role: "alert" } }, state.jobError) : null, body);
+    const first = job.first;
+    redrawFrom(root, () => {
+        let body;
+        if (job.stage === "queued" || job.stage === "writing")
+            body = waiting(job);
+        // a first answer that came back before the error keeps its place, the banner over its numbers
+        else if (job.stage === "error")
+            body = first ? answer(job, first, state, actions, failure(job)) : [failure(job)];
+        else if (first)
+            body = answer(job, first, state, actions);
+        else
+            body = withheld(job, state, actions);
+        return [heading(job), state.jobError ? h("p", { class: "msg bad", attrs: { role: "alert" } }, state.jobError) : null, body];
+    });
 }

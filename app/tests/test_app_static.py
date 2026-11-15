@@ -214,8 +214,12 @@ def test_finish_details():
     assert "border-color: var(--accent)" in _rule(css, ".item.on")
     assert "grid-template-columns: minmax(0, 1fr)" in _rule(css, ".cols.alone")
     assert "display: none" in _rule(css, ".cols.alone > .evidence")
-    assert "max-width: 75ch" in _rule(css, ".cols.alone > .result")
-    assert ":has(" not in css
+    assert "max-width: 66ch" in _rule(css, ".cols.alone > .result")
+    # the columns' layout is set from the script, never by a :has() rule
+    plain = re.sub(r"/\*.*?\*/", "", css, flags=re.DOTALL)
+    for selector, body in re.findall(r"([^{}]+)\{([^{}]*)\}", plain):
+        if ":has(" in selector:
+            assert "cols" not in selector and "grid-template" not in body, selector.strip()
     thumb = _rule(css, "::-webkit-scrollbar-thumb")
     assert "solid transparent" in thumb and "background-clip: padding-box" in thumb
 
@@ -272,3 +276,64 @@ def test_number_types_match_server():
     assert _interface_fields(types, "PlanRow") == set(views.plan_rows(_region_reply()["profile"])[0])
     timing = jobs.Job.__dataclass_fields__["timing"].default_factory()
     assert _interface_fields(types, "Timing") == set(timing)
+
+
+# WCAG relative luminance of a #rrggbb color.
+def _luminance(color: str) -> float:
+    channels = [int(color[i:i + 2], 16) / 255 for i in (1, 3, 5)]
+    linear = [c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4 for c in channels]
+    return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]
+
+
+def _contrast(a: str, b: str) -> float:
+    high, low = sorted((_luminance(a), _luminance(b)), reverse=True)
+    return (high + 0.05) / (low + 0.05)
+
+
+# The text fields' border is what outlines them, so it keeps 3:1 against the paper and the panel
+# in both themes (WCAG 1.4.11). Hover still goes to muted; nothing else uses the token.
+def test_text_field_border_has_3_to_1():
+    css = _read(CSS)
+    for block in (":root", ':root[data-theme="light"]'):
+        tokens = _tokens(_rule(css, block))
+        for ground in ("--paper", "--panel"):
+            assert _contrast(tokens["--field"], tokens[ground]) >= 3.0, (block, ground)
+    assert "border: 1px solid var(--field)" in _rule(css, ".field-line, .field-sql")
+    assert "border-color: var(--muted)" in _rule(css, ".field-line:hover, .field-sql:hover")
+    assert css.count("var(--field)") == 1
+
+
+# Under 760 px the stacked rail is capped and scrolls on its own, so the input row stays near the top.
+def test_stacked_rail_never_buries_the_input():
+    rail = _rule(_media(_read(CSS), "(max-width: 760px)"), ".rail")
+    assert "max-height: 35vh" in rail and "overflow-y: auto" in rail
+    assert "border-bottom: 1px solid var(--line)" in rail
+
+
+# A hovered thumb keeps its clear ring (background-color leaves background-clip alone) and a 4px corner.
+def test_scrollbar_thumb_keeps_its_ring():
+    css = _read(CSS)
+    hover = _rule(css, "::-webkit-scrollbar-thumb:hover")
+    assert "background-color: var(--muted)" in hover and not re.search(r"background\s*:", hover)
+    assert "border-radius: 4px" in _rule(css, "::-webkit-scrollbar-thumb")
+
+
+# The banner under the input (a dataset that isn't available) keeps the lone result column's measure.
+def test_under_banner_keeps_a_readable_measure():
+    assert "max-width: 66ch" in _rule(_read(CSS), ".under > .banner")
+
+
+# Show more stays focusable while its rows load: aria-disabled, drawn like a disabled button, no hover.
+def test_loading_button_looks_disabled():
+    css = _read(CSS)
+    assert "color: var(--muted)" in _rule(css, '.btn2[aria-disabled="true"]')
+    assert _rule(css, '.btn2:hover:not(:disabled):not([aria-disabled="true"])')
+
+
+# Bars lying across take 22px rows, and 16px rows from 13 bars on, so a 50-bar chart stays near 800px.
+def test_dense_bar_rows():
+    chart = _read(SOURCES / "chart.ts")
+    assert re.search(r"const ROW = 22;", chart) and re.search(r"const DENSE_ROW = 16;", chart)
+    assert re.search(r"const DENSE_FROM = 13;", chart)
+    labels = _rule(_read(CSS), ".dense .row-labels span")
+    assert "height: 16px" in labels and "line-height: 16px" in labels

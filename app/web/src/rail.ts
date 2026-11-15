@@ -26,6 +26,17 @@ function historyItem(entry: HistoryEntry, state: State, actions: Actions): HTMLE
     }, h("span", { class: "clamp" }, entryText(entry)), other ? h("span", { class: "item-note" }, other) : null));
 }
 
+// The job whose History entry was last brought into view.
+let revealed: string | null = null;
+
+// Scrolls the rail, and only the rail, just far enough to show the current entry.
+function reveal(root: HTMLElement, item: Element): void {
+  const box = root.getBoundingClientRect();
+  const at = item.getBoundingClientRect();
+  if (at.top < box.top) root.scrollTop -= box.top - at.top;
+  else if (at.bottom > box.bottom) root.scrollTop += Math.min(at.bottom - box.bottom, at.top - box.top);
+}
+
 export function drawRail(root: HTMLElement, state: State, actions: Actions): void {
   const examples = state.status?.examples[state.dataset] ?? [];
   const blocked = askBlock(state);
@@ -43,4 +54,12 @@ export function drawRail(root: HTMLElement, state: State, actions: Actions): voi
         attrs: { type: "button", disabled: !usable, "data-focus": `example-${i}` },
         onClick: () => actions.askExample(question),
       }, question)))));
+
+  // When the shown job changes, its entry comes into view once it's in the list.
+  const job = state.job;
+  const item = job && job.id !== revealed ? root.querySelector(".item.on") : null;
+  if (job && item) {
+    revealed = job.id;
+    reveal(root, item);
+  }
 }

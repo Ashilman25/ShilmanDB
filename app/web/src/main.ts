@@ -3,11 +3,11 @@
 import * as api from "./api.js";
 import { ApiError, isAbort } from "./api.js";
 import { NO_SUCH_JOB, UNREACHABLE } from "./copy.js";
-import { byId } from "./dom.js";
+import { byId, resetScrolls } from "./dom.js";
 import { drawEvidence } from "./evidence.js";
 import { makeInput } from "./input.js";
 import { drawRail } from "./rail.js";
-import { drawResult } from "./result.js";
+import { drawResult, failedSentence, forgetAnswers } from "./result.js";
 import { askBlock, canStart, isRunning, isSql, runBlock, type Actions, type State } from "./state.js";
 import { applyTheme, savedTheme, saveTheme } from "./theme.js";
 import { drawTested, drawTop } from "./topbar.js";
@@ -45,6 +45,7 @@ const actions: Actions = {
     paint("top", "rail", "ask");
   },
   setMode(mode) {
+    modeChosen = true;
     state.mode = mode;
     state.submitError = null;
     paint("ask");
@@ -103,6 +104,13 @@ const actions: Actions = {
 
 const input = makeInput(actions);
 
+// Whether you've switched the mode yourself, so the page never switches it on its own after that.
+let modeChosen = false;
+// The job this page just started from the input; the input keeps your text, not the server's copy.
+let started: string | null = null;
+// Bumped whenever another job is shown, so a page of rows asked for before that is dropped.
+let switches = 0;
+
 const panels = {
   top: () => drawTop(byId("top"), state, actions),
   tested: () => drawTested(byId("tested"), state),
@@ -134,7 +142,7 @@ function announcement(job: Snapshot): string {
     case "first": return "First answer back. The second is running.";
     case "done": return job.verdict?.text ?? "Done.";
     case "stopped": return "Stopped.";
-    case "error": return job.error?.message ?? "The job hit an error.";
+    case "error": return failedSentence(job);
   }
 }
 
@@ -152,18 +160,25 @@ function restoreInput(job: Snapshot): void {
   }
 }
 
-// Draws a snapshot. A newer version of the shown job keeps what's on screen around it, the input
-// included, so typing while your own job runs is never overwritten; another job starts from a clean slate.
+// Draws a snapshot. A newer version of the shown job keeps what's on screen, the input included;
+// another job starts clean, but one you just started from the input keeps your text there.
 function show(job: Snapshot): void {
   const before = state.job?.id === job.id ? state.job : null;
   if (!before) {
+    switches++;
+    forgetAnswers();
+    resetScrolls(byId("result"));
+    resetScrolls(byId("evidence"));
+    state.submitError = null;
     state.extra = { first: [], second: [] };
     state.loadingMore = null;
     state.moreError = null;
     state.planOpen = false;
     state.sqlOpen = false;
     state.stopping = false;
-    restoreInput(job);
+    if (job.id === started) state.editFrom = null;
+    else restoreInput(job);
+    started = null;
     byId("main").scrollTop = 0;
   }
   if (!isRunning(job)) state.stopping = false;
@@ -175,6 +190,17 @@ function show(job: Snapshot): void {
   if (!before) paint("top");
   paint("ask", "rail", "result", "evidence");
   state.changedFrom = null;
+  if (job.id === focusJob) focusShownSql(job);
+}
+
+// The job named in the URL at load. When it turns out to be SQL, the SQL editor takes the focus
+// the question line had, unless you've already moved it.
+let focusJob: string | null = null;
+
+function focusShownSql(job: Snapshot): void {
+  focusJob = null;
+  const active = document.activeElement;
+  if (isSql(job) && (active === null || active === document.body || active === byId("question"))) input.focusSql();
 }
 
 let following = 0;
@@ -183,6 +209,7 @@ let controller: AbortController | null = null;
 // Shows a job and keeps it current: each long poll sends the last version drawn and waits for a newer one.
 async function follow(id: string, first: Snapshot | null): Promise<void> {
   const token = ++following;
+  if (id !== focusJob) focusJob = null;
   controller?.abort();
   const own = new AbortController();
   controller = own;
@@ -200,6 +227,8 @@ async function follow(id: string, first: Snapshot | null): Promise<void> {
     } catch (error) {
       if (token !== following || isAbort(error)) return;
       if (error instanceof ApiError && error.status === 404) {
+        forgetAnswers();
+        focusJob = null;
         state.job = null;
         state.jobError = NO_SUCH_JOB;
         window.history.replaceState(null, "", window.location.pathname);
@@ -230,10 +259,13 @@ async function start(send: () => Promise<Snapshot>): Promise<void> {
   state.submitting = true;
   state.submitError = null;
   paint("ask", "rail", "evidence");
+  const ticket = switches;
   try {
     const job = await send();
     state.submitting = false;
     if (job.kind === "sql" || job.kind === "edit") state.editFrom = null;
+    // a re-ask isn't typed text, and a job opened meanwhile has taken the input, so both restore it
+    started = job.kind !== "reask" && ticket === switches ? job.id : null;
     void loadHistory();
     void follow(job.id, job);
   } catch (error) {
@@ -274,17 +306,30 @@ async function showMore(answer: AnswerName): Promise<void> {
   const onScreen = view.rows.length + state.extra[answer].length;
   if (onScreen >= view.shown) return;
 
+  const ticket = switches;
   state.loadingMore = answer;
   state.moreError = null;
   paint("result");
   try {
     const page = await api.getRows(job.id, answer, onScreen);
-    if (state.job?.id === job.id) state.extra[answer] = [...state.extra[answer], ...page.rows];
+    if (ticket !== switches || state.job?.id !== job.id) return;
+    state.extra[answer] = [...state.extra[answer], ...page.rows];
   } catch (error) {
-    if (state.job?.id === job.id) state.moreError = { answer, message: message(error) };
+    if (ticket !== switches || state.job?.id !== job.id) return;
+    state.moreError = { answer, message: message(error) };
   }
+  const focused = document.activeElement instanceof HTMLElement && document.activeElement.dataset["focus"] === `more-${answer}`;
   state.loadingMore = null;
   paint("result");
+  if (focused) keepFocusAfterMore(answer);
+}
+
+// When the last page is in, Show more is gone; focus moves to the same table's CSV link.
+function keepFocusAfterMore(answer: AnswerName): void {
+  const result = byId("result");
+  if (result.querySelector(`[data-focus="more-${answer}"]`)) return;
+  const csv = result.querySelector(`[data-focus="csv-${answer}"]`);
+  if (csv instanceof HTMLElement) csv.focus({ preventScroll: true });
 }
 
 async function loadHistory(): Promise<void> {
@@ -302,6 +347,21 @@ function stillLoading(): boolean {
   return status.model.state === "loading" || Object.values(status.datasets).some((info) => info.state === "loading");
 }
 
+// The last status reply, error and dataset drawn, so a poll that brings nothing new paints nothing.
+let statusDrawn: string | null = null;
+let statusSeen = false;
+
+// Started with --no-model, Ask can't work: on the first reply, an untouched page with no job opens in SQL.
+function sqlWhenModelOff(): void {
+  if (statusSeen || !state.status) return;
+  statusSeen = true;
+  if (state.status.model.state !== "off" || modeChosen || state.mode !== "ask" || state.job || jobFromHash()) return;
+  const focused = document.activeElement === byId("question");
+  state.mode = "sql";
+  paint("ask");
+  if (focused) input.focusSql();
+}
+
 // Reads what's loaded; polls about once a second only while something is still loading.
 async function loadStatus(): Promise<void> {
   try {
@@ -311,7 +371,12 @@ async function loadStatus(): Promise<void> {
   } catch (error) {
     state.statusError = message(error);
   }
-  paint("top", "tested", "rail", "ask", "evidence");
+  const seen = JSON.stringify([state.status, state.statusError, state.dataset]);
+  if (seen !== statusDrawn) {
+    statusDrawn = seen;
+    paint("top", "tested", "rail", "ask", "evidence");
+  }
+  sqlWhenModelOff();
   if (state.statusError || stillLoading()) setTimeout(() => void loadStatus(), state.statusError ? RETRY_MS : STATUS_POLL_MS);
 }
 
@@ -327,9 +392,11 @@ function jobFromHash(): string | null {
 
 applyTheme(state.theme);
 paint("top", "tested", "rail", "ask", "result", "evidence");
+input.focusQuestion();
 void loadStatus();
 void loadHistory();
 const shown = jobFromHash();
+focusJob = shown;
 if (shown) void follow(shown, null);
 
 window.addEventListener("hashchange", () => {

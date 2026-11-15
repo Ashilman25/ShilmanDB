@@ -84,6 +84,7 @@ export function makeInput(actions) {
         sql: () => sql.value,
         setQuestion: (text) => { question.value = text; },
         setSql: (text) => { sql.value = text; },
+        focusQuestion: () => question.focus(),
         focusSql: () => sql.focus(),
     };
 }

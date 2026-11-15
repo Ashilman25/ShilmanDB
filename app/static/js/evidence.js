@@ -8,9 +8,8 @@ import { byId, h, redraw } from "./dom.js";
 import { askBlock, isSql, secondRow, SECOND_ROW, showsSecond } from "./state.js";
 // Verdicts whose banner is the whole result; the banner carries them, so the panel doesn't repeat them.
 const BANNER_IS_RESULT = ["refused", "cannot", "failed", "not_run"];
-// The verdict line at the top of the panel, unless the result column's banner already says it.
-// A typed SQL that failed in the engine has no verdict, so its banner stands alone too.
-// A question's line keeps two lines in every stage, so a two-line warning lands without moving the rows.
+// The verdict line, unless the result's banner already says it. A question's line keeps
+// two lines in every stage, so a two-line warning lands without moving the rows.
 function verdictLine(job, from) {
     const verdict = job.verdict;
     if (!verdict || BANNER_IS_RESULT.includes(verdict.kind))
@@ -29,10 +28,12 @@ function checkRow(row, from) {
     const classes = ["entry", reserved ? "second" : "", turned ? "arrive" : ""].filter(Boolean).join(" ");
     return h("div", { class: classes }, word(row.word), h("div", { class: "entry-body" }, row.text, row.detail ? [" ", h("span", { class: "detail" }, row.detail)] : null, running ? skeleton([70, 45]) : null));
 }
-function termRow(term, readings, actions) {
-    const links = readings && term.alternatives.length ? h("div", { class: "alts" }, term.alternatives.map((alt) => h("button", {
+// A term's other readings: live (true), waiting while the question runs (false), or none on a
+// stopped or failed one (null). The note shows from the first answer on, so nothing moves later.
+function termRow(term, live, actions) {
+    const links = live !== null && term.alternatives.length ? h("div", { class: "alts" }, term.alternatives.map((alt) => h("button", {
         class: "link",
-        attrs: { type: "button", disabled: !readings.live, "data-focus": `alt-${term.term}-${alt.reading}` },
+        attrs: { type: "button", disabled: !live, "data-focus": `alt-${term.term}-${alt.reading}` },
         onClick: () => actions.reask(term.term, alt.reading),
     }, alt.label)), h("span", { class: "detail" }, NOT_TESTED)) : null;
     return h("div", { class: "entry" }, word(term.word), h("div", { class: "entry-body" }, term.text, links));
@@ -55,8 +56,8 @@ function sqlSection(job, state, actions) {
     return [
         h("h2", {}, "SQL"),
         second ? h("p", { class: "sql-label" }, "First answer") : null,
-        h("pre", { class: "sql" }, sql),
-        second ? [h("p", { class: "sql-label" }, "Second answer"), h("pre", { class: "sql" }, second.sql)] : null,
+        h("pre", { class: "sql", attrs: { "data-scroll": "sql-first" } }, sql),
+        second ? [h("p", { class: "sql-label" }, "Second answer"), h("pre", { class: "sql", attrs: { "data-scroll": "sql-second" } }, second.sql)] : null,
         h("div", { class: "actions" }, h("button", { class: "btn2", attrs: { type: "button", "data-focus": "edit-sql" }, onClick: () => actions.editSql(sql) }, "Edit and run"), plan.length ? h("button", {
             class: "btn2",
             attrs: { type: "button", "aria-expanded": String(state.planOpen), "aria-controls": "plan", "data-focus": "plan" },
@@ -77,20 +78,20 @@ function panel(state, actions) {
         return placeholder();
     const from = state.changedFrom;
     const finished = job.stage === "done" && askBlock(state) === null;
-    const readings = job.stage === "stopped" ? null : { live: finished && !state.submitting };
+    const ended = job.stage === "stopped" || job.stage === "error";
+    const live = ended ? null : finished && !state.submitting;
     const line = verdictLine(job, from);
     return [
         line || job.checks.length ? h("h2", {}, "Checks") : null,
         line,
         job.checks.length ? h("div", { class: "ledger" }, job.checks.map((row) => checkRow(row, from))) : null,
-        job.terms.length ? [h("h2", {}, "Terms"), h("div", { class: "ledger" }, job.terms.map((term) => termRow(term, readings, actions)))] : null,
+        job.terms.length ? [h("h2", {}, "Terms"), h("div", { class: "ledger" }, job.terms.map((term) => termRow(term, live, actions)))] : null,
         sqlSection(job, state, actions),
         job.tested ? h("p", { class: "tested" }, job.tested.text) : null,
     ];
 }
-// Draws the panel. An empty one steps aside: the columns get the "alone" class, the result takes
-// the room and keeps a readable measure (set here rather than by a CSS :has() rule, so it never waits on
-// the browser re-checking the panel).
+// Draws the panel. An empty one steps aside: the columns get the "alone" class here, not
+// from a CSS :has() rule, so the result takes the room at once.
 export function drawEvidence(root, state, actions) {
     redraw(root, panel(state, actions));
     byId("cols").classList.toggle("alone", root.children.length === 0);

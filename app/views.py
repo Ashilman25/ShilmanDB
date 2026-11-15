@@ -13,7 +13,7 @@ CELL_CHARS = 200
 WHOLE_TYPES = ("INTEGER", "BIGINT")
 NUMBER_TYPES = (*WHOLE_TYPES, "DECIMAL")
 TEXT_TYPES = ("VARCHAR", "DATE")
-PLAIN_ENDINGS = ("key", "year", "month")  # whole numbers shown without separators
+PLAIN_ENDINGS = ("key", "_id", "year", "month")  # whole numbers shown without separators
 PERIOD_ENDINGS = ("year", "month")        # whole numbers that can label bars
 MIN_BARS, MAX_BARS = 2, 50
 
@@ -26,6 +26,11 @@ def _cut(text: str) -> str:
 # Whether a column's name ends in one of the given words.
 def _ends_in(column: dict, endings: tuple[str, ...]) -> bool:
     return column["name"].lower().endswith(endings)
+
+
+# Keys, ids, years and months: whole numbers shown without separators, never a measure.
+def _plain(column: dict) -> bool:
+    return _ends_in(column, PLAIN_ENDINGS) or column["name"].lower() == "id"
 
 
 # A number a bar can be drawn from: finite, never the "nan" or "inf" strings.
@@ -47,7 +52,7 @@ def format_cell(value, column: dict) -> str:
         return "0.00" if text == "-0.00" else text
     
     if kind in WHOLE_TYPES:
-        return str(value) if _ends_in(column, PLAIN_ENDINGS) else f"{value:,}"
+        return str(value) if _plain(column) else f"{value:,}"
     return _cut(str(value))
 
 
@@ -58,9 +63,9 @@ def _label_column(columns: list[dict]) -> int | None:
     return next(itertools.chain(texts, periods), None)
 
 
-# Columns that hold a measure: numbers that aren't keys, years or months.
+# Columns that hold a measure: numbers that aren't keys, ids, years or months.
 def _value_columns(columns: list[dict]) -> list[int]:
-    return [i for i, c in enumerate(columns) if c["type"] in NUMBER_TYPES and not _ends_in(c, PLAIN_ENDINGS)]
+    return [i for i, c in enumerate(columns) if c["type"] in NUMBER_TYPES and not _plain(c)]
 
 
 # The chart for a result: one large number, bars, or none.
@@ -143,7 +148,11 @@ def error_text(reply: dict) -> str:
 
     match kind:
         case "parse" | "plan" | "run":
-            return f"{kind.capitalize()} error: {message}"
+            lead = f"{kind.capitalize()} error"
+            # the engine's own message may already start with these words
+            if str(message).lower().startswith(lead.lower()):
+                return str(message)
+            return f"{lead}: {message}"
         case "timeout":
             return f"Stopped after {sixd.an.TIMEOUT_S:g} s. The engine restarted (about 2 s)."
         case "crash":

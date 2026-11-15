@@ -13,6 +13,7 @@ export interface InputPanel {
   sql(): string;
   setQuestion(text: string): void;
   setSql(text: string): void;
+  focusQuestion(): void;
   focusSql(): void;
 }
 
@@ -102,6 +103,7 @@ export function makeInput(actions: Actions): InputPanel {
     sql: () => sql.value,
     setQuestion: (text) => { question.value = text; },
     setSql: (text) => { sql.value = text; },
+    focusQuestion: () => question.focus(),
     focusSql: () => sql.focus(),
   };
 }

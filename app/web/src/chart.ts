@@ -10,6 +10,8 @@ const HEIGHT = 100;
 const MAX_UPRIGHT = 8;  // more bars than this lie across
 const LABEL_ROOM = 64;  // characters of label the upright chart's width holds, shared by its bars
 const ROW = 22;         // pixels per bar lying across
+const DENSE_ROW = 16;   // the same from DENSE_FROM bars on, so a long chart stays short
+const DENSE_FROM = 13;
 
 // Where each value sits on the drawing's 0 to 100 scale, with zero included.
 function scale(chart: ChartBars): { at: (value: number) => number; zero: number; negative: boolean } {
@@ -48,18 +50,21 @@ function upright(chart: ChartBars, view: AnswerView): HTMLElement {
 // Bars lying across, each label in full on its left (cut only past a wide cap).
 function across(chart: ChartBars, view: AnswerView): HTMLElement {
   const { at, zero, negative } = scale(chart);
-  const height = chart.points.length * ROW;
+  const dense = chart.points.length >= DENSE_FROM;
+  const row = dense ? DENSE_ROW : ROW;
+  const inset = dense ? 3 : 5;
+  const height = chart.points.length * row;
   const drawing = svg("svg", {
     viewBox: `0 0 100 ${height}`, preserveAspectRatio: "none", height, role: "img", "aria-label": describe(chart, view),
   },
     chart.points.map(([name, amount], i) => svg("rect", {
-      class: "bar", x: Math.min(at(amount), zero), width: Math.abs(at(amount) - zero), y: i * ROW + 5, height: ROW - 10,
+      class: "bar", x: Math.min(at(amount), zero), width: Math.abs(at(amount) - zero), y: i * row + inset, height: row - 2 * inset,
     }, svg("title", {}, name))),
     negative ? svg("line", { class: "zero", x1: zero, x2: zero, y1: 0, y2: height }) : null);
 
   const labels = h("div", { class: "row-labels", attrs: { "aria-hidden": "true" } },
     chart.points.map(([name]) => h("span", { attrs: { title: name } }, name)));
-  return h("figure", { class: "chart across" }, labels, drawing);
+  return h("figure", { class: dense ? "chart across dense" : "chart across" }, labels, drawing);
 }
 
 export function chartFor(view: AnswerView): HTMLElement | null {

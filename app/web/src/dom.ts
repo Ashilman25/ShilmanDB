@@ -59,39 +59,87 @@ interface Scroll {
   top: number;
 }
 
-// Replaces a panel's children. Focus and scroll positions (both ways) come back on the new nodes
-// that carry the same data-focus or data-scroll key, and the panel keeps its own scroll, so a full
-// redraw keeps your place: a table scrolled to row 500 stays there through "Show 500 more" or a verdict.
-export function redraw(panel: Element, ...children: Child[]): void {
+interface Place {
+  focusKey: string | undefined;
+  own: Scroll;
+  scrolled: Map<string, Scroll>;
+}
+
+function flatten(children: Child[], out: Node[] = []): Node[] {
+  for (const child of children) {
+    if (Array.isArray(child)) flatten(child, out);
+    else if (typeof child === "string") out.push(document.createTextNode(child));
+    else if (child !== null && child !== undefined && child !== false) out.push(child);
+  }
+  return out;
+}
+
+// Gives a node exactly these children. A child that was already there stays in place unless the
+// order changes, so a kept table keeps its layout and its scroll.
+export function fill(node: Element, ...children: Child[]): void {
+  const next = flatten(children);
+  const keep = new Set(next);
+  for (const old of [...node.childNodes]) {
+    if (!keep.has(old)) old.remove();
+  }
+  let at = node.firstChild;
+  for (const child of next) {
+    if (child === at) at = at.nextSibling;
+    else node.insertBefore(child, at);
+  }
+}
+
+function savePlace(panel: Element): Place {
   const active = document.activeElement;
   const focusKey = active instanceof HTMLElement && panel.contains(active) ? active.dataset["focus"] : undefined;
-  const own: Scroll = { left: panel.scrollLeft, top: panel.scrollTop };
   const scrolled = new Map<string, Scroll>();
   for (const node of panel.querySelectorAll("[data-scroll]")) {
     if (node instanceof HTMLElement && node.dataset["scroll"]) {
       scrolled.set(node.dataset["scroll"], { left: node.scrollLeft, top: node.scrollTop });
     }
   }
+  return { focusKey, own: { left: panel.scrollLeft, top: panel.scrollTop }, scrolled };
+}
 
-  panel.replaceChildren();
-  append(panel, children);
-
-  panel.scrollLeft = own.left;
-  panel.scrollTop = own.top;
+function restorePlace(panel: Element, place: Place): void {
+  panel.scrollLeft = place.own.left;
+  panel.scrollTop = place.own.top;
   for (const node of panel.querySelectorAll("[data-scroll]")) {
-    const saved = node instanceof HTMLElement && node.dataset["scroll"] ? scrolled.get(node.dataset["scroll"]) : undefined;
+    const saved = node instanceof HTMLElement && node.dataset["scroll"] ? place.scrolled.get(node.dataset["scroll"]) : undefined;
     if (saved) {
       node.scrollLeft = saved.left;
       node.scrollTop = saved.top;
     }
   }
-  if (focusKey === undefined) return;
+  if (place.focusKey === undefined) return;
   for (const node of panel.querySelectorAll("[data-focus]")) {
-    if (node instanceof HTMLElement && node.dataset["focus"] === focusKey) {
+    if (node instanceof HTMLElement && node.dataset["focus"] === place.focusKey) {
       node.focus({ preventScroll: true });
       return;
     }
   }
+}
+
+// Puts every scroller in a panel back at the top, so the next redraw doesn't carry its place over.
+export function resetScrolls(panel: Element): void {
+  for (const node of panel.querySelectorAll("[data-scroll]")) {
+    node.scrollTop = 0;
+    node.scrollLeft = 0;
+  }
+}
+
+// Replaces a panel's children. Focus and scroll come back on new nodes with the same
+// data-focus or data-scroll key, so a full redraw keeps your place.
+export function redraw(panel: Element, ...children: Child[]): void {
+  redrawFrom(panel, () => children);
+}
+
+// The same, for a panel that reuses nodes already on screen: the place is read before build runs,
+// since build may move a kept node out of the panel.
+export function redrawFrom(panel: Element, build: () => Child[]): void {
+  const place = savePlace(panel);
+  fill(panel, build());
+  restorePlace(panel, place);
 }
 
 // The element with this id from index.html; the page can't run without it.

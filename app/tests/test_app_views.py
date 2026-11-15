@@ -96,6 +96,15 @@ def test_years_months_keys_plain():
     assert format_cell(600572, {"name": "o_orderkey", "type": "BIGINT"}) == "600572"
 
 
+# Id columns are keys too: no separators, and never a measure to chart.
+def test_id_columns_plain():
+    assert format_cell(3792265, {"name": "r_review_id", "type": "INTEGER"}) == "3792265"
+    assert format_cell(3792265, {"name": "ID", "type": "BIGINT"}) == "3792265"
+    assert format_cell(3792265, {"name": "paid", "type": "INTEGER"}) == "3,792,265"
+    ids = [{"name": "r_title", "type": "VARCHAR"}, {"name": "r_review_id", "type": "BIGINT"}]
+    assert chart_for(ids, [["a", 1], ["b", 2], ["c", 3]]) == {"kind": "none"}
+
+
 def test_text_and_dates_pass_through():
     assert format_cell("AFRICA", {"name": "r_name", "type": "VARCHAR"}) == "AFRICA"
     assert format_cell("1995-03-15", {"name": "o_orderdate", "type": "DATE"}) == "1995-03-15"
@@ -262,6 +271,15 @@ def test_error_texts():
     assert error_text(_failure("timeout", "over 30 s")) == "Stopped after 30 s. The engine restarted (about 2 s)."
     assert error_text(_failure("crash", "bridge died (exit code -11)")) == "The engine stopped on this query and restarted."
     assert error_text(_failure("memory", "over 4096 MB")) == "The query used more than 4,096 MB, so the engine restarted."
+
+
+# The engine's parse messages already name their kind, so the lead isn't said twice.
+def test_error_text_no_doubled_lead():
+    message = "Parse error at line 1, column 9: Expected token type 1 but got 50 (';')"
+    assert error_text(_failure("parse", message)) == message
+    assert error_text(_failure("plan", "plan error: odd")) == "plan error: odd"
+    assert error_text(_failure("run", "RUN ERROR somewhere")) == "RUN ERROR somewhere"
+    assert error_text(_failure("run", "Parse error at x")) == "Run error: Parse error at x"
 
 
 def test_error_text_other_kinds_never_raise():
