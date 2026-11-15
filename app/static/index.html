@@ -3,9 +3,36 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
 <title>ShilmanDB</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/static/app.css">
+<script type="module" src="/static/js/main.js"></script>
 </head>
 <body>
-<p>ShilmanDB analyst. The page isn't built yet; the server and its API are running.</p>
+<header class="top" id="top"></header>
+<section class="tested-panel" id="tested" aria-label="How the checks were tested" hidden></section>
+<div class="frame">
+  <nav class="rail" id="rail" aria-label="History and examples"></nav>
+  <main class="main" id="main">
+    <div class="ask">
+      <div class="slot" id="mode"></div>
+      <div class="field">
+        <input class="field-line" id="question" type="text" aria-label="Question" autocomplete="off">
+        <textarea class="field-sql" id="sql" aria-label="SQL" rows="5" hidden
+                  spellcheck="false" autocapitalize="off" autocorrect="off" autocomplete="off"
+                  data-gramm="false" data-gramm_editor="false" data-enable-grammarly="false"></textarea>
+      </div>
+      <div class="slot" id="action"></div>
+    </div>
+    <div class="under" id="under"></div>
+    <div class="cols" id="cols">
+      <section class="result" id="result" aria-label="Result"></section>
+      <section class="evidence" id="evidence" aria-label="Evidence"></section>
+    </div>
+  </main>
+</div>
+<p class="sr" id="announce" aria-live="polite"></p>
+<noscript><p class="noscript">This page needs JavaScript to run.</p></noscript>
 </body>
 </html>

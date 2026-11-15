@@ -1,0 +1,13 @@
+{
+  "name": "shilmandb-app-page",
+  "private": true,
+  "description": "The app's page, compiled to app/static/js.",
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p .",
+    "check": "tsc -p . --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "7.0.2"
+  }
+}
