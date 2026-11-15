@@ -41,7 +41,7 @@ The four `NextBeforeInitAsserts` tests check `assert()`, which Release compiles 
 
 `ctest -R <pattern>` matches gtest test names (PascalCase fixtures such as `DiskManagerTest`), not CMake target names.
 
-The Python tests (bench tools and their analysis scripts) run in a virtual environment at `.venv/`:
+The Python tests (bench tools and their analysis scripts) run in a virtual environment at `.venv/`. It needs Python 3.12 or newer (the pinned `scipy` needs it):
 
 ```bash
 python3 -m venv .venv

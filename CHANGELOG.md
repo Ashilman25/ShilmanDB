@@ -44,6 +44,16 @@ Every number below is a result of the project's own runs (*measured*), recorded 
 
 - `bench/` grouped by topic (TPC-H, join, eviction, vector check), no behavior change. (#37)
 
+### Baseline, docs and a professional repo
+
+- Baseline runners for DuckDB 2.0.0 and Postgres 17.11 (its own server, the same 8 indexes), and `run_benchmarks.py --duckdb` / `--postgres`.
+- A third answer result, DRIFT (only decimal numbers differ, by at most 1e-10 relative), and a reference per scale factor: SQLite up to SF=1, DuckDB and Postgres both from SF=10.
+- SF=10 data and runs. Today's engine answers all 8 queries at SF=10: every answer PASS except Q1, a DRIFT of 2.24e-13 relative from adding decimals as doubles (*measured*).
+- Five charts made by script (latency, vectorized, eviction, ceilings, analyst), in light and dark: CSVs in `docs/data/`, images in `docs/images/`.
+- New `docs/benchmarks.md` (every config, every table, the method) and `docs/research.md` (the learned components and the checks), and a rewritten README.
+- Apache-2.0 license, CI (macOS Debug, macOS Release with the Python tests, Linux Debug), a contributing guide, and issue and pull request templates.
+- Removed `plot_results.py` and `docs/benchmarking_results.md`, replaced by the chart scripts and `docs/benchmarks.md`.
+
 ### Earlier
 
 Pull requests #1-#21 built the engine from the ground up:
