@@ -9,6 +9,8 @@ from pathlib import Path
 
 import pytest
 
+pytest.importorskip("psycopg")
+
 HERE = Path(__file__).resolve().parent
 # Captured live on reviews_70k for query r00020,
 # with filters date_1, none, rating_1 and product_random.

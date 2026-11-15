@@ -32,11 +32,13 @@ CONFIGS: Dict[str, Dict[str, str]] = {
 ALL_CONFIGS = list(CONFIGS.keys())
 
 ALL_SCALE_FACTORS = ["0.01", "0.1", "1.0"]
+KNOWN_SCALE_FACTORS = [*ALL_SCALE_FACTORS, "10"]  # 10 runs only when named
 
 POOL_SIZES: Dict[str, int] = {
     "0.01": 128,
     "0.1": 512,
     "1.0": 2048,
+    "10": 8192,
 }
 
 QUERY_TAGS = ["Q1", "Q3", "Q5", "Q6", "Q10", "Q12", "Q14", "Q19"]
@@ -214,7 +216,7 @@ def parse_args() -> argparse.Namespace:
         "--sf",
         nargs="+",
         default=["all"],
-        help="Scale factors: 0.01, 0.1, 1.0, or 'all' (default: all)",
+        help="Scale factors: 0.01, 0.1, 1.0, 10, or 'all' (0.01, 0.1, 1.0; default: all)",
     )
     parser.add_argument(
         "--output-dir",
@@ -255,8 +257,8 @@ def main() -> None:
     else:
         scale_factors = []
         for sf in args.sf:
-            if sf not in ALL_SCALE_FACTORS:
-                print(f"Error: unknown scale factor '{sf}'. Choose from {ALL_SCALE_FACTORS} or 'all'.")
+            if sf not in KNOWN_SCALE_FACTORS:
+                print(f"Error: unknown scale factor '{sf}'. Choose from {KNOWN_SCALE_FACTORS} or 'all'.")
                 sys.exit(1)
             scale_factors.append(sf)
 

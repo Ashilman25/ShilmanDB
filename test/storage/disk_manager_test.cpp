@@ -260,6 +260,9 @@ TEST_F(DiskManagerTest, ReadPenaltyWaits) {
 }
 
 TEST_F(DiskManagerTest, DirectIORoundTrip) {
+#ifndef __APPLE__
+    GTEST_SKIP() << "direct I/O is macOS only";
+#endif
     DiskManager dm(test_file_);
     dm.SetDirectIO(true);
 

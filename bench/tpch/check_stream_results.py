@@ -15,6 +15,7 @@ from typing import Callable, Dict, List, Optional, Sequence, Union
 HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parents[1]
 SCALE_FACTORS = ["0.01", "0.1", "1.0"]
+KNOWN_SCALE_FACTORS = [*SCALE_FACTORS, "10"]  # 10 runs only when named
 DEFAULT_TOLERANCE = 0.01
 
 
@@ -140,7 +141,7 @@ def write_check_csv(path: Path, rows: Sequence[CheckRow]) -> None:
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Check workload answers against SQLite.")
-    parser.add_argument("--sf", required=True, choices=SCALE_FACTORS)
+    parser.add_argument("--sf", required=True, choices=KNOWN_SCALE_FACTORS)
     parser.add_argument("--data-dir", type=Path, default=Path("bench/tpch_data"), help="TPC-H data root holding sf0.01/, sf0.1/, sf1.0/")
     parser.add_argument("--output", type=Path, required=True, help="check CSV to write")
     parser.add_argument("folders", nargs="+", type=Path, metavar="FOLDER", help="workload result folders")

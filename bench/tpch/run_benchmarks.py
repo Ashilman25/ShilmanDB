@@ -12,6 +12,10 @@ emits three unified CSVs under bench/results/:
   direct_io, hit_rate, raw_hit_rate, improvement_over_lru, eviction)
 - correctness.csv: (sf, query, config, status)
 
+With --duckdb and --postgres it also runs those engines' runners and adds their configs to
+the three files, then writes reference_checks.csv (every config against every reference
+it is checked against) and environment.csv (machine, build and engine versions).
+
 A config label is the config name plus a suffix for each non-default option,
 for example baseline_pen100, baseline_direct, baseline_frac0.25. Columns an
 older load_tpch binary doesn't write are left empty.
@@ -28,6 +32,8 @@ from __future__ import annotations
 
 import argparse
 import csv
+import datetime
+import importlib.metadata
 import importlib.util
 import os
 import re
@@ -53,12 +59,14 @@ DEFAULT_DATA_DIR = REPO_ROOT / "bench" / "tpch_data"
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "bench" / "results"
 
 ALL_SCALE_FACTORS: List[str] = ["0.01", "0.1", "1.0"]
+KNOWN_SCALE_FACTORS: List[str] = [*ALL_SCALE_FACTORS, "10"]  # 10 runs only when named
 QUERIES: List[str] = ["Q1", "Q3", "Q5", "Q6", "Q10", "Q12", "Q14", "Q19"]
 
 POOL_SIZES: Dict[str, int] = {
     "0.01": 128,
     "0.1": 512,
     "1.0": 2048,
+    "10": 8192,
 }
 
 # Pages in the tables alone (no indexes), measured by loading each scale factor.
@@ -66,6 +74,7 @@ DB_PAGES: Dict[str, int] = {
     "0.01": 1448,
     "0.1": 14417,
     "1.0": 144032,
+    "10": 1439816,
 }
 MIN_POOL_PAGES: int = 16
 
@@ -112,6 +121,19 @@ SHILMANDB_CONFIG_NAMES: List[str] = list(PRIMARY_CONFIGS.keys())
 SQLITE_CONFIG_NAMES: List[str] = ["sqlite_disk", "sqlite_memory"]
 ALL_CONFIG_NAMES: List[str] = SHILMANDB_CONFIG_NAMES + SQLITE_CONFIG_NAMES
 
+# Other engines, added to a run only by --duckdb and --postgres.
+DUCKDB_CONFIG_NAMES: List[str] = ["duckdb", "duckdb_1thread"]
+POSTGRES_CONFIG_NAMES: List[str] = ["postgres", "postgres_1worker"]
+ENGINE_CONFIGS: Dict[str, List[str]] = {"duckdb": DUCKDB_CONFIG_NAMES, "postgres": POSTGRES_CONFIG_NAMES}
+REFERENCE_NAMES: Dict[str, str] = {"sqlite": "SQLite", "duckdb": "DuckDB", "postgres": "Postgres"}
+RESULTS_DIRS: Dict[str, str] = {"shilmandb": "shilmandb_results", "duckdb": "duckdb_results", "postgres": "postgres_results"}
+
+# The server settings the Postgres runner records, copied into environment.csv.
+POSTGRES_SETTING_NAMES: List[str] = [
+    "shared_buffers", "effective_cache_size", "work_mem", "maintenance_work_mem",
+    "max_parallel_workers_per_gather", "max_parallel_workers", "max_worker_processes", "jit",
+]
+
 #Helpers
 
 #format seconds as Hh Mm Ss / Mm Ss / Ss.S.
@@ -141,6 +163,8 @@ def eprint(msg: str) -> None:
 def pool_for_fraction(sf: str, fraction: float) -> int:
     if fraction <= 0:
         raise ValueError(f"pool fraction must be positive, got {fraction}")
+    if sf not in DB_PAGES:
+        raise ValueError(f"DB_PAGES has no entry for SF={sf} yet")
     return max(MIN_POOL_PAGES, round(fraction * DB_PAGES[sf]))
 
 
@@ -714,6 +738,57 @@ def parse_sqlite_latencies(output_dir: Path, scale_factors: Sequence[str]) -> Di
     return out
 
 
+# Which engine a config belongs to: shilmandb, sqlite, duckdb or postgres.
+def engine_of(config: str) -> str:
+    if config.startswith("sqlite_"):
+        return "sqlite"
+    
+    for engine, names in ENGINE_CONFIGS.items():
+        if config in names:
+            return engine
+        
+    return "shilmandb"
+
+
+# Run bench/tpch/run_<engine>_benchmarks.py as a subprocess. False if it failed (it says why).
+def run_engine_benchmarks(engine: str, scale_factors: Sequence[str], data_dir: Path, output_dir: Path, timed_runs: int, warmup_runs: int = 1) -> bool:
+    subsection(f"{REFERENCE_NAMES[engine]} benchmarks (SFs: {', '.join(scale_factors)})")
+    script = HERE / f"run_{engine}_benchmarks.py"
+    cmd: List[str] = [
+        sys.executable, str(script),
+        "--data-dir", str(data_dir),
+        "--output-dir", str(output_dir),
+        "--runs", str(timed_runs),
+        "--warmup", str(warmup_runs),
+    ]
+    for sf in scale_factors:
+        cmd += ["--sf", sf]
+
+    print(f"  $ {' '.join(cmd)}", flush=True)
+    t0 = time.time()
+    proc = subprocess.run(cmd, cwd=REPO_ROOT, check=False)
+    print(f"  (wall: {elapsed_str(time.time() - t0)}, exit: {proc.returncode})", flush=True)
+    return proc.returncode == 0
+
+
+# Median latency per (sf, config, query) from a duckdb_ or postgres_latencies.csv.
+def parse_engine_latencies(path: Path, scale_factors: Sequence[str]) -> Dict[Tuple[str, str, str], QueryStats]:
+    if not path.exists():
+        eprint(f"! missing {path}")
+        return {}
+
+    buckets: Dict[Tuple[str, str, str], List[float]] = {}
+    with path.open(newline="") as f:
+        for row in csv.DictReader(f):
+            if row["sf"] in scale_factors:
+                buckets.setdefault((row["sf"], row["config"], row["query"]), []).append(float(row["latency_ms"]))
+
+    return {
+        (sf, config, query): QueryStats(sf=sf, config=config, query=query, median_latency_ms=statistics.median(lats), rows=None, median_hits=None, median_misses=None)
+        for (sf, config, query), lats in buckets.items()
+    }
+
+
 #Secondary sweeps
 #run baseline config at POOL_SWEEP_SF with each pool size
 def run_pool_size_sweep(binary: Path, data_dir: Path, output_dir: Path, 
@@ -854,7 +929,7 @@ def write_hit_rates_csv(path: Path, records: Dict[Tuple[str, str, str], QuerySta
     page_rates: Dict[Tuple[str, str], Optional[float]] = {}
     raw_rates: Dict[Tuple[str, str], Optional[float]] = {}
     for (sf, config), stats_list in by_sc.items():
-        if config.startswith("sqlite_"):
+        if engine_of(config) != "shilmandb":
             page_rates[(sf, config)] = raw_rates[(sf, config)] = None
             continue
 
@@ -872,7 +947,7 @@ def write_hit_rates_csv(path: Path, records: Dict[Tuple[str, str, str], QuerySta
         if base == "baseline": return 0
         if base.startswith("+"): return 1
         if base.startswith("baseline_pool"): return 2
-        if base.startswith("sqlite_"): return 3
+        if engine_of(name) != "shilmandb": return 3
         return 4
 
     keys = sorted(raw_rates.keys(), key=lambda k: (k[0], _config_rank(k[1]), k[1]))
@@ -884,7 +959,7 @@ def write_hit_rates_csv(path: Path, records: Dict[Tuple[str, str, str], QuerySta
 
         for (sf, config) in keys:
             ps = pool_sizes_by_config.get((sf, config), "")
-            if config.startswith("sqlite_"):
+            if engine_of(config) != "shilmandb":
                 w.writerow([sf, config, ps, "", "", "", "", "", "", ""])
                 continue
 
@@ -1025,57 +1100,108 @@ def check_workload_runs(records: Sequence[WorkloadStats], data_dir: Path, output
     return verdicts
 
 
-#For each ShilmanDB config in configs, invoke scripts/compare_results.py and capture per-query PASS/FAIL/SKIP.
-def write_correctness_csv(path: Path, sfs: Sequence[str], configs: Sequence[str], output_dir: Path, queries: Sequence[str] = tuple(QUERIES)) -> None:
+# compare_results.py prints one line per comparison, then indented detail lines:
+#   "  PASS  [<config>] <Qtag> SF=<sf>"
+#   "  DRIFT [<config>] <Qtag> SF=<sf>  (max abs <x>, max rel <y>)"
+#   "  FAIL  [<config>] <Qtag> SF=<sf>  (N mismatch(es))"
+#   "  SKIP  [<config>] <Qtag> SF=<sf>"
+COMPARE_LINE_RE = re.compile(
+    r"^(?P<status>PASS|DRIFT|FAIL|SKIP)\s+\[(?P<config>[^\]]+)\]\s+(?P<query>Q\d+)\s+SF=(?P<sf>\S+)"
+    r"(?:\s+\(max abs (?P<abs>[^,\s]+), max rel (?P<rel>[^)\s]+)\))?"
+)
+STATUS_ORDER: List[str] = ["SKIP", "PASS", "DRIFT", "FAIL"]     # best to worst
+
+
+# The worst of a config's statuses over its references; SKIP when it has none.
+def worst_status(statuses: Sequence[str]) -> str:
+    return max(statuses, key=STATUS_ORDER.index, default="SKIP")
+
+
+# Run compare_results.py; returns its stdout and stderr, and repeats any stderr on ours.
+# A normal run writes nothing to stderr, so anything there means it crashed.
+def compare_output(cmd: List[str]) -> Tuple[str, str]:
+    print(f"  $ {' '.join(cmd)}", flush=True)
+    proc = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True, check=False)
+    if proc.stderr.strip():
+        eprint(f"! compare_results.py wrote to stderr (exit {proc.returncode}):\n{proc.stderr.rstrip()}")
+    return proc.stdout, proc.stderr
+
+
+# {query: (status, max_abs, max_rel)} from compare_results.py's output; the diffs only for DRIFT.
+def parse_compare_output(text: str) -> Dict[str, Tuple[str, str, str]]:
+    seen: Dict[str, Tuple[str, str, str]] = {}
+    for raw_line in text.splitlines():
+        m = COMPARE_LINE_RE.match(raw_line.strip())
+        if not m or m.group("query") in seen:
+            continue
+        drift = m.group("status") == "DRIFT"
+        seen[m.group("query")] = (m.group("status"), (m.group("abs") or "") if drift else "", (m.group("rel") or "") if drift else "")
+    return seen
+
+
+# The answers configs are checked against at one SF: (name, folder, config folder in it).
+# SF=10 uses DuckDB and Postgres when their flags are on; with neither, SQLite as before.
+def references_for(sf: str, duckdb: bool, postgres: bool, output_dir: Path = DEFAULT_OUTPUT_DIR) -> List[Tuple[str, Path, Optional[str]]]:
+    sqlite = [(REFERENCE_NAMES["sqlite"], output_dir / "sqlite_results", None)]
+    if sf in ALL_SCALE_FACTORS or not (duckdb or postgres):
+        return sqlite
+    refs: List[Tuple[str, Path, Optional[str]]] = []
+    if duckdb:
+        refs.append((REFERENCE_NAMES["duckdb"], output_dir / "duckdb_results", "duckdb"))
+    if postgres:
+        refs.append((REFERENCE_NAMES["postgres"], output_dir / "postgres_results", "postgres"))
+    return refs
+
+
+# Check every config with scripts/compare_results.py against each of its references (never its own engine).
+# correctness.csv gets the worst status per query; checks_path, when given, gets every check.
+# SQLite configs, configs of a failed engine and configs left with no reference are SKIP.
+# A query with no line from a compare that crashed is FAIL, else SKIP.
+def write_correctness_csv(path: Path, sfs: Sequence[str], configs: Sequence[str], output_dir: Path,
+                          queries: Sequence[str] = tuple(QUERIES), duckdb: bool = False, postgres: bool = False,
+                          failed_engines: Sequence[str] = (), checks_path: Optional[Path] = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    comparable = [c for c in configs if not c.startswith("sqlite_")]
-    sqlite_configs = [c for c in configs if c.startswith("sqlite_")]
+    script = REPO_ROOT / "scripts" / "compare_results.py"
+    failed_names = {REFERENCE_NAMES[e] for e in failed_engines}
 
     rows: List[Tuple[str, str, str, str]] = []
+    checks: List[Tuple[str, str, str, str, str, str, str]] = []
 
     for sf in sfs:
         for q in queries:
-            for c in sqlite_configs:
-                rows.append((sf, q, c, "SKIP"))
-
-    script = REPO_ROOT / "scripts" / "compare_results.py"
-    # compare_results.py print_results() emits per-comparison lines of the form:
-    #   "  PASS  [<config>] <Qtag> SF=<sf>"
-    #   "  FAIL  [<config>] <Qtag> SF=<sf>  (N mismatch(es))"
-    #   "  SKIP  [<config>] <Qtag> SF=<sf>"
-    # followed by indented mismatch/error detail lines. We scan each line,
-    # strip leading whitespace, match the first token against {PASS,FAIL,SKIP},
-    # then extract the Qtag (the token after the [config] bracket).
-    import re
-    line_re = re.compile(r"^(PASS|FAIL|SKIP)\s+\[(?P<config>[^\]]+)\]\s+(?P<query>Q\d+)\s+SF=(?P<sf>\S+)")
+            for c in configs:
+                if engine_of(c) == "sqlite":
+                    rows.append((sf, q, c, "SKIP"))
 
     for sf in sfs:
-        for cfg in comparable:
-            shilmandb_dir = output_dir / "shilmandb_results"
-            sqlite_dir = output_dir / "sqlite_results"
-            cmd = [
-                sys.executable, str(script),
-                "--shilmandb-dir", str(shilmandb_dir),
-                "--sqlite-dir", str(sqlite_dir),
-                "--sf", sf,
-                "--configs", cfg,
-            ]
-            print(f"  $ {' '.join(cmd)}", flush=True)
-            proc = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True, check=False,)
-            seen: Dict[str, str] = {}
+        refs = [r for r in references_for(sf, duckdb, postgres, output_dir) if r[0] not in failed_names]
+        for cfg in configs:
+            engine = engine_of(cfg)
+            if engine == "sqlite":
+                continue
             
-            for raw_line in proc.stdout.splitlines():
-                m = line_re.match(raw_line.strip())
-                if not m:
-                    continue
-                status = m.group(1)
-                query = m.group("query")
-
-                if query not in seen:
-                    seen[query] = status
-                    
+            statuses: Dict[str, List[str]] = {q: [] for q in queries}
+            if engine not in failed_engines:
+                for name, ref_dir, ref_config in refs:
+                    if name == REFERENCE_NAMES.get(engine):
+                        continue
+                    cmd = [
+                        sys.executable, str(script),
+                        "--shilmandb-dir", str(output_dir / RESULTS_DIRS[engine]),
+                        "--reference-dir", str(ref_dir),
+                        "--reference-name", name,
+                        "--sf", sf,
+                        "--configs", cfg,
+                    ] + (["--reference-config", ref_config] if ref_config else [])
+                    stdout, stderr = compare_output(cmd)
+                    seen = parse_compare_output(stdout)
+                    missing = "FAIL" if stderr.strip() else "SKIP"
+                    for q in queries:
+                        status, max_abs, max_rel = seen.get(q, (missing, "", ""))
+                        statuses[q].append(status)
+                        checks.append((sf, q, cfg, name, status, max_abs, max_rel))
             for q in queries:
-                rows.append((sf, q, cfg, seen.get(q, "SKIP")))
+                rows.append((sf, q, cfg, worst_status(statuses[q])))
 
     query_order = {q: i for i, q in enumerate(QUERIES)}
     rows.sort(key=lambda r: (r[0], query_order.get(r[1], 999), r[2]))
@@ -1085,6 +1211,98 @@ def write_correctness_csv(path: Path, sfs: Sequence[str], configs: Sequence[str]
         w.writerow(["sf", "query", "config", "status"])
         for row in rows:
             w.writerow(row)
+    print(f"  -> {path}")
+
+    if checks_path is not None:
+        checks.sort(key=lambda r: (r[0], query_order.get(r[1], 999), r[2], r[3]))
+        with checks_path.open("w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["sf", "query", "config", "reference", "status", "max_abs_diff", "max_rel_diff"])
+            for check in checks:
+                w.writerow(check)
+        print(f"  -> {checks_path}")
+
+
+# Environment record
+
+# One command's trimmed output, or "" when it can't run or fails.
+def command_output(cmd: Sequence[str]) -> str:
+    try:
+        proc = subprocess.run(list(cmd), cwd=REPO_ROOT, capture_output=True, text=True, check=False, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return proc.stdout.strip() if proc.returncode == 0 else ""
+
+
+# An installed package's version, or "" when it isn't installed.
+def package_version(name: str) -> str:
+    try:
+        return importlib.metadata.version(name)
+    except importlib.metadata.PackageNotFoundError:
+        return ""
+
+
+# The C++ compiler (path, id and version) and build type of the Release build in build/.
+def build_info(build_dir: Path = REPO_ROOT / "build") -> Tuple[str, str]:
+    cache: Dict[str, str] = {}
+    cache_path = build_dir / "CMakeCache.txt"
+    if cache_path.exists():
+        for line in cache_path.read_text(errors="replace").splitlines():
+            m = re.match(r"^(CMAKE_CXX_COMPILER|CMAKE_BUILD_TYPE|CMAKE_CACHE_(?:MAJOR|MINOR|PATCH)_VERSION):[A-Z]+=(.*)$", line)
+            if m:
+                cache[m.group(1)] = m.group(2)
+
+    compiler = cache.get("CMAKE_CXX_COMPILER", "")
+    cmake_file = _compiler_file(build_dir, cache)
+    if cmake_file is not None and compiler:
+        text = cmake_file.read_text(errors="replace")
+        found = [re.search(rf'set\({name} "([^"]*)"\)', text) for name in ("CMAKE_CXX_COMPILER_ID", "CMAKE_CXX_COMPILER_VERSION")]
+        if all(found):
+            compiler += f" ({found[0].group(1)} {found[1].group(1)})"
+    return compiler, cache.get("CMAKE_BUILD_TYPE", "")
+
+
+# CMake's compiler file for the CMake version the cache records, else the newest one.
+# An older CMake can leave its own version folder behind.
+def _compiler_file(build_dir: Path, cache: Dict[str, str]) -> Optional[Path]:
+    version = ".".join(cache.get(f"CMAKE_CACHE_{part}_VERSION", "") for part in ("MAJOR", "MINOR", "PATCH"))
+    exact = build_dir / "CMakeFiles" / version / "CMakeCXXCompiler.cmake"
+    if exact.exists():
+        return exact
+    found = list(build_dir.glob("CMakeFiles/*/CMakeCXXCompiler.cmake"))
+    return max(found, key=lambda f: f.stat().st_mtime) if found else None
+
+
+# Machine, build and engine versions for environment.csv; anything unknown is "".
+def environment_record(duckdb_info: Dict[str, str], postgres_info: Dict[str, str]) -> Dict[str, str]:
+    compiler, build_type = build_info()
+    libtorch_file = REPO_ROOT / "third_party" / "libtorch" / "build-version"
+    record = {
+        "date": datetime.date.today().isoformat(),
+        "git_commit": command_output(["git", "rev-parse", "HEAD"]),
+        "chip": command_output(["sysctl", "-n", "machdep.cpu.brand_string"]),
+        "memory_bytes": command_output(["sysctl", "-n", "hw.memsize"]),
+        "macos": command_output(["sw_vers", "-productVersion"]),
+        "compiler": compiler,
+        "build_type": build_type,
+        "sqlite": sqlite3.sqlite_version,
+        "duckdb": duckdb_info.get("duckdb_version") or package_version("duckdb"),
+        "postgres": postgres_info.get("postgres_version", ""),
+        "psycopg": package_version("psycopg"),
+        "libtorch": libtorch_file.read_text().strip() if libtorch_file.exists() else "",
+        "pytorch": package_version("torch"),
+    }
+    record.update({name: postgres_info.get(name, "") for name in POSTGRES_SETTING_NAMES})
+    return record
+
+
+def write_environment_csv(path: Path, record: Dict[str, str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["key", "value"])
+        for key, value in record.items():
+            w.writerow([key, value])
     print(f"  -> {path}")
 
 
@@ -1144,13 +1362,16 @@ def stream_length_value(text: str) -> int:
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Phase 20.1 benchmark runner")
+    p = argparse.ArgumentParser(description="TPC-H benchmark runner",
+                                epilog="Exit 3: --duckdb or --postgres was asked for and its runner failed; every other output is still written.")
     p.add_argument("--binary", type=Path, default=DEFAULT_BINARY, help=f"Path to load_tpch binary (default: {DEFAULT_BINARY})")
     p.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR, help=f"TPC-H data dir (default: {DEFAULT_DATA_DIR})")
     p.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR, help=f"Output dir (default: {DEFAULT_OUTPUT_DIR})")
-    p.add_argument("--sf", action="append", choices=ALL_SCALE_FACTORS + ["all"], help="Scale factor(s). Repeat flag or use 'all'. Default: 'all'.")
-    p.add_argument("--configs", default="all", help=("Comma-separated configs. Accepts 'all' or a subset of: " + ",".join(ALL_CONFIG_NAMES)))
-    p.add_argument("--warmup", type=int, default=1, help="Warmup runs per query (default 1)")
+    p.add_argument("--sf", action="append", choices=KNOWN_SCALE_FACTORS + ["all"], help="Scale factor(s). Repeat flag or use 'all'. Default: 'all'.")
+    p.add_argument("--configs", default="all", help=("Comma-separated configs. Accepts 'all', 'none' (no ShilmanDB or SQLite config) or a subset of: " + ",".join(ALL_CONFIG_NAMES)))
+    p.add_argument("--duckdb", action="store_true", help="Also run DuckDB (duckdb, duckdb_1thread) through run_duckdb_benchmarks.py; exit 3 if it fails")
+    p.add_argument("--postgres", action="store_true", help="Also run Postgres (postgres, postgres_1worker) through run_postgres_benchmarks.py; needs the server on port 5434; exit 3 if it fails")
+    p.add_argument("--warmup", type=int, default=1, help="Warmup runs per query, DuckDB and Postgres included (default 1)")
     p.add_argument("--runs", type=int, default=5, help="Timed runs per query (default 5)")
     p.add_argument("--pool-sweep", action="store_true", help=f"Also run baseline pool-size sweep at SF={POOL_SWEEP_SF}")
     p.add_argument("--v1-eviction", action="store_true", help="Also run +learned with V1 eviction model per SF")
@@ -1172,17 +1393,20 @@ def resolve_sfs(arg: Optional[Sequence[str]]) -> List[str]:
     if not arg or "all" in arg:
         return list(ALL_SCALE_FACTORS)
     s = set(arg)
-    return [sf for sf in ALL_SCALE_FACTORS if sf in s]
+    return [sf for sf in KNOWN_SCALE_FACTORS if sf in s]
 
 
 def resolve_configs(arg: str) -> List[str]:
     if arg == "all":
         return list(ALL_CONFIG_NAMES)
     requested = [c.strip() for c in arg.split(",") if c.strip()]
+    if "none" in requested:
+        if requested != ["none"]:
+            raise SystemExit("'none' can't be mixed with other configs.")
+        return []
     for c in requested:
         if c not in ALL_CONFIG_NAMES:
-            raise SystemExit(f"unknown config: {c!r}. "
-                             f"Choose from: {','.join(ALL_CONFIG_NAMES)} or 'all'.")
+            raise SystemExit(f"unknown config: {c!r}. Choose from: {','.join(ALL_CONFIG_NAMES)} or 'all'.")
     return requested
 
 
@@ -1194,7 +1418,7 @@ def main() -> int:
     output_dir: Path = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    section(f"Phase 20.1 benchmark runner | SFs={sfs} | configs={configs}")
+    section(f"TPC-H benchmark runner | SFs={sfs} | configs={configs}")
     print(f"  warmup={args.warmup}, runs={args.runs}, "
           f"pool_sweep={args.pool_sweep}, v1_eviction={args.v1_eviction}")
     if args.miss_penalty_us != [0] or args.direct_io or args.pool_fractions or args.policy_timing:
@@ -1203,6 +1427,9 @@ def main() -> int:
     has_workloads = any(w != "single" for w in args.workloads)
     if has_workloads:
         print(f"  workloads={args.workloads}, seed={args.seed}, stream_length={args.stream_length}")
+    engines = [e for e, on in (("duckdb", args.duckdb), ("postgres", args.postgres)) if on]
+    if engines:
+        print(f"  engines={engines}")
 
     shilmandb_configs = [c for c in configs if c in PRIMARY_CONFIGS]
     if "+learned" in shilmandb_configs and args.eviction_policies != ["lru"]:
@@ -1225,6 +1452,25 @@ def main() -> int:
 
     all_records: Dict[Tuple[str, str, str], QueryStats] = {}
     pool_sizes_by_config: Dict[Tuple[str, str], int] = {}
+
+    # DuckDB and Postgres: a runner that fails is reported, and its configs show SKIP.
+    # A call without the single workload skips them, as if their flags were off.
+    tried_engines = engines if runs_single else []
+    engine_configs: List[str] = []
+    failed_engines: List[str] = []
+    engine_infos: Dict[str, Dict[str, str]] = {}          # only engines that ran in this call
+    if engines and not runs_single:
+        print("  (skip: DuckDB and Postgres only run with the single workload)")
+    for engine in tried_engines:
+        engine_configs += ENGINE_CONFIGS[engine]
+        if not run_engine_benchmarks(engine, sfs, args.data_dir, output_dir, args.runs, args.warmup):
+            eprint(f"! {engine} benchmarks failed - continuing without its rows")
+            failed_engines.append(engine)
+            continue
+        engine_infos[engine] = read_run_info(output_dir / f"{engine}_info.csv")
+        for key, qs in parse_engine_latencies(output_dir / f"{engine}_latencies.csv", sfs).items():
+            all_records[key] = qs
+            pool_sizes_by_config[(key[0], key[1])] = ""  # type: ignore[assignment]
 
     ran_labels: List[str] = []      # every single-query ShilmanDB label that was run, for the correctness check
     workload_records: List[WorkloadStats] = []
@@ -1301,9 +1547,17 @@ def main() -> int:
                 sfs=sfs,
                 configs=ran_labels + [c for c in configs if c.startswith("sqlite_")]
                         + (["+learned_v1"] if args.v1_eviction else [])
-                        + ([f"baseline_pool{ps}" for ps in POOL_SWEEP_SIZES] if args.pool_sweep else []),
+                        + ([f"baseline_pool{ps}" for ps in POOL_SWEEP_SIZES] if args.pool_sweep else [])
+                        + engine_configs,
                 output_dir=output_dir,
+                duckdb="duckdb" in tried_engines,
+                postgres="postgres" in tried_engines,
+                failed_engines=failed_engines,
+                checks_path=(output_dir / "reference_checks.csv") if engine_infos else None,
             )
+
+    if engine_infos:
+        write_environment_csv(output_dir / "environment.csv", environment_record(engine_infos.get("duckdb", {}), engine_infos.get("postgres", {})))
 
     if has_workloads:
         section("Writing workload outputs")
@@ -1323,11 +1577,19 @@ def main() -> int:
         print(f"  hit_rates  -> {output_dir / 'hit_rates.csv'}")
         if not args.skip_correctness:
             print(f"  correctness -> {output_dir / 'correctness.csv'}")
+            if engine_infos:
+                print(f"  reference_checks -> {output_dir / 'reference_checks.csv'}")
+                
+    if engine_infos:
+        print(f"  environment -> {output_dir / 'environment.csv'}")
     if has_workloads:
         print(f"  workloads  -> {output_dir / 'workloads.csv'}")
         print(f"  workload_queries -> {output_dir / 'workload_queries.csv'}")
         if not args.skip_correctness:
             print(f"  stream_correctness -> {output_dir / 'stream_correctness.csv'}")
+    if failed_engines:
+        eprint(f"! failed: {', '.join(failed_engines)} (exit 3)")
+        return 3
     return 0
 
 

@@ -1,0 +1,22 @@
+key,value
+date,2026-11-14
+git_commit,f92b7e058029dec99c939d2d62e9935c0e3b2265
+chip,Apple M5 Max
+memory_bytes,68719476736
+macos,26.5.2
+compiler,/usr/bin/c++ (AppleClang 17.0.0.17000404)
+build_type,Release
+sqlite,3.53.4
+duckdb,2.0.0
+postgres,"PostgreSQL 17.11 (Homebrew) on aarch64-apple-darwin25.6.0, compiled by Apple clang version 21.0.0 (clang-2100.3.34.2), 64-bit"
+psycopg,3.3.8
+libtorch,2.11.0
+pytorch,2.11.0
+shared_buffers,16GB
+effective_cache_size,48GB
+work_mem,256MB
+maintenance_work_mem,2GB
+max_parallel_workers_per_gather,2
+max_parallel_workers,8
+max_worker_processes,8
+jit,on

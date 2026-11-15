@@ -1,0 +1,139 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  HOMEBREW_NO_AUTO_UPDATE: "1"
+
+jobs:
+  # Debug build like build-debug/, then every C++ test with the TPC-H SF=0.01 data in place
+  macos-debug:
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Ninja
+        run: brew install ninja
+
+      - name: Cache googletest and dbgen
+        uses: actions/cache@v4
+        with:
+          path: |
+            build/_deps
+            /tmp/tpch-dbgen
+          key: ${{ runner.os }}-${{ github.job }}-${{ hashFiles('CMakeLists.txt', 'bench/tpch/generate_tpch_data.sh') }}
+
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DSHILMANDB_BUILD_BENCH=OFF
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Generate TPC-H SF=0.01 data
+        run: bash bench/tpch/generate_tpch_data.sh 0.01
+
+      - name: Run C++ tests
+        working-directory: build
+        run: |
+          set -o pipefail
+          ctest -j 4 --no-tests=error --output-on-failure | tee ctest.log
+
+      - name: Check no test skipped except the known ones
+        run: bash scripts/ci_check_skips.sh build/ctest.log
+
+  # Release build with the bench tools (no ML), the C++ tests, then the Python tests
+  macos-release:
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Ninja
+        run: brew install ninja
+
+      - name: Cache googletest and dbgen
+        uses: actions/cache@v4
+        with:
+          path: |
+            build/_deps
+            /tmp/tpch-dbgen
+          key: ${{ runner.os }}-${{ github.job }}-${{ hashFiles('CMakeLists.txt', 'bench/tpch/generate_tpch_data.sh') }}
+
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSHILMANDB_ENABLE_ML=OFF -DSHILMANDB_BUILD_BENCH=ON
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Generate TPC-H SF=0.01 data
+        run: bash bench/tpch/generate_tpch_data.sh 0.01
+
+      # The NextBeforeInitAsserts tests need assert(), which Release compiles out
+      - name: Run C++ tests
+        working-directory: build
+        run: |
+          set -o pipefail
+          ctest -j 4 --no-tests=error --output-on-failure -E NextBeforeInitAsserts | tee ctest.log
+
+      - name: Check no test skipped except the known ones
+        run: bash scripts/ci_check_skips.sh build/ctest.log
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      # .venv at the repo root, because some scripts call .venv/bin/python
+      - name: Create .venv
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install -r requirements.txt
+
+      # Tests that need Postgres, torch, faiss, LightGBM or MLX skip here
+      - name: Run Python tests
+        run: .venv/bin/python -m pytest bench -q -W error
+
+  # The Debug job on Linux
+  linux-debug:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Ninja
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build
+
+      - name: Cache googletest and dbgen
+        uses: actions/cache@v4
+        with:
+          path: |
+            build/_deps
+            /tmp/tpch-dbgen
+          key: ${{ runner.os }}-${{ github.job }}-${{ hashFiles('CMakeLists.txt', 'bench/tpch/generate_tpch_data.sh') }}
+
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DSHILMANDB_BUILD_BENCH=OFF
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Generate TPC-H SF=0.01 data
+        run: bash bench/tpch/generate_tpch_data.sh 0.01
+
+      - name: Run C++ tests
+        working-directory: build
+        run: |
+          set -o pipefail
+          ctest -j 4 --no-tests=error --output-on-failure | tee ctest.log
+
+      - name: Check no test skipped except the known ones
+        run: bash scripts/ci_check_skips.sh build/ctest.log

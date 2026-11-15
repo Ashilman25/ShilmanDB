@@ -5,7 +5,7 @@ Benchmarks and experiment tools. Code is grouped by topic; each topic keeps its 
 ```
 bench/
 ├── CMakeLists.txt     builds every tool into build/bench/<name>
-├── tpch/              TPC-H benchmarks against SQLite
+├── tpch/              TPC-H benchmarks against SQLite, DuckDB and Postgres
 │   ├── load_tpch.cpp            the loader and benchmark binary
 │   ├── tpch_workload.hpp        schemas, indexes, the 8 queries, SameResult
 │   ├── tpch_streams.hpp         stream / lookup / mixed workload generators
@@ -13,10 +13,13 @@ bench/
 │   ├── generate_tpch_data.sh    builds dbgen and writes bench/tpch_data/
 │   ├── run_benchmarks.py        the main runner (SQLite + every config)
 │   ├── run_sqlite_benchmarks.py SQLite timings and the answer key
+│   ├── run_duckdb_benchmarks.py DuckDB timings (same queries, file reused while its marker matches)
+│   ├── run_postgres_benchmarks.py  Postgres timings (own server on port 5434, 8 indexes, database reused while its marker matches)
+│   ├── pg_baseline_server.sh    init / start / stop / status of that server (data in bench/results/tpch_postgres/)
+│   ├── baseline_common.py       helpers shared by the engine baseline runners
 │   ├── check_stream_results.py  checks workload answers against SQLite
-│   ├── plot_results.py          charts from a results folder
 │   ├── run_shilmandb_benchmarks.py  the older runner
-│   └── tests/
+│   └── tests/                   (tpch_tiny_tables.py: the 7-table .tbl fixture the runner tests share)
 ├── join/              join-order experiments
 │   ├── join_headroom.cpp        times every connected join order
 │   ├── analyze_join_headroom.py
@@ -28,6 +31,10 @@ bench/
 │   ├── engine/        the classical policies run inside the engine
 │   ├── v3_check/      small learned policies on sampled candidates
 │   ├── switch_check/  switching between policies as the workload changes
+│   └── tests/
+├── charts/            the README and docs charts: export from results/ to docs/data/, then PNGs to docs/images/
+│   ├── export_chart_data.py     reads result folders (never writes there), writes small CSVs to docs/data/
+│   ├── make_charts.py           reads only docs/data/, writes <name>-light.png and <name>-dark.png
 │   └── tests/
 ├── analyst/           AI-analyst check: local model writes SQL, the engine checks the answer (C++ bridge + Python)
 │   ├── an_common.py             shared paths, fixed values, crash-safe JSON-lines files, to_sqlite
@@ -85,7 +92,7 @@ Only folders changed; no file was renamed.
 | Old | New |
 |---|---|
 | `bench/load_tpch.cpp`, `tpch_workload.hpp`, `tpch_streams.hpp`, `page_owners.hpp`, `generate_tpch_data.sh` | `bench/tpch/` |
-| `bench/run_benchmarks.py`, `run_sqlite_benchmarks.py`, `check_stream_results.py`, `plot_results.py`, `run_shilmandb_benchmarks.py` | `bench/tpch/` |
+| `bench/run_benchmarks.py`, `run_sqlite_benchmarks.py`, `check_stream_results.py`, `run_shilmandb_benchmarks.py` | `bench/tpch/` |
 | `bench/join_headroom.cpp`, `generate_join_training_data.cpp`, `bench/headroom/analyze_join_headroom.py` | `bench/join/` |
 | `bench/eviction_*.{hpp,cpp}` | `bench/eviction/sim/` |
 | `bench/headroom/{run,analyze}_eviction_headroom.py`, `export_v2_weights.py` | `bench/eviction/headroom/` |

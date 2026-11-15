@@ -1,0 +1,243 @@
+"""Unit tests for bench/charts/make_charts.py."""
+from __future__ import annotations
+
+import importlib.util
+import sys
+from pathlib import Path
+
+import pytest
+
+SPEC_PATH = Path(__file__).resolve().parents[1] / "make_charts.py"
+spec = importlib.util.spec_from_file_location("make_charts", SPEC_PATH)
+assert spec and spec.loader
+mod = importlib.util.module_from_spec(spec)
+sys.modules["make_charts"] = mod
+spec.loader.exec_module(mod)
+
+CONFIGS = [("baseline", "shilmandb"), ("+index", "shilmandb"), ("+vectorized", "shilmandb"),
+           ("sqlite_disk", "sqlite"), ("sqlite_memory", "sqlite"), ("duckdb", "duckdb"),
+           ("duckdb_1thread", "duckdb"), ("postgres", "postgres"),
+           ("postgres_1worker", "postgres")]
+QUERIES = ["Q1", "Q3", "Q5", "Q6", "Q10", "Q12", "Q14", "Q19"]
+NAMES = ["latency", "vectorized", "eviction", "ceilings", "analyst"]
+SF1_SCALE, SF10_SCALE = 10.0, 100.0   # make_data's time scale per panel
+
+
+def baseline_ms(scale: float, qi: int, ci: int) -> float:
+    return scale * (1 + qi) * (1 + ci)
+
+
+# The smallest SF=1 time and the largest SF=10 time make_data writes.
+FASTEST_MS = baseline_ms(SF1_SCALE, 0, 0)
+SLOWEST_MS = baseline_ms(SF10_SCALE, len(QUERIES) - 1, len(CONFIGS) - 1)
+
+
+def write_baseline(path: Path, scale: float) -> None:
+    lines = ["query,engine,config,median_ms,status,max_abs_diff,max_rel_diff"]
+    for qi, q in enumerate(QUERIES):
+        for ci, (config, engine) in enumerate(CONFIGS):
+            status = "SKIP" if engine == "sqlite" else "PASS"
+            ms = f"{baseline_ms(scale, qi, ci):.3f}"
+            diffs = ","
+            if q == "Q1" and config == "duckdb":
+                status, diffs = "DRIFT", "1e-09,2e-12"
+            if q == "Q3" and config == "postgres":
+                status, ms = "FAIL", ""
+            lines.append(f"{q},{engine},{config},{ms},{status},{diffs}")
+    path.write_text("\n".join(lines) + "\n")
+
+
+# A full docs/data folder with every chart's input.
+def make_data(root: Path, with_sf10: bool = True) -> Path:
+    d = root / "data"
+    d.mkdir()
+    write_baseline(d / "baseline_sf1.csv", SF1_SCALE)
+    if with_sf10:
+        write_baseline(d / "baseline_sf10.csv", SF10_SCALE)
+    ev = ["sf,kind,pool_fraction,policy,misses,vs_belady"]
+    for kind in ("index_stream", "index_mixed"):
+        for frac in ("0.0142", "0.05", "0.1", "0.25", "0.5", "1.0"):
+            for pol, m in (("lru", 2.0e6), ("arc_visit", 1.9e6), ("lirs_visit", 1.5e6),
+                           ("belady", 1.0e6)):
+                ev.append(f"1.0,{kind},{frac},{pol},{m * (1.1 - float(frac))},1.2")
+        ev.append(f"1.0,{kind},0.0142,v2,2.1e6,1.1")
+    (d / "eviction_misses.csv").write_text("\n".join(ev) + "\n")
+    ce = ["part,sf,item,method,ratio"]
+    for q, r in (("Q3", 1.01), ("Q5", 1.0), ("Q10", 1.02)):
+        ce += [f"join,1.0,{q},classical,{r}", f"join,1.0,{q},learned,{r}"]
+    for item, b, v in (("stream 10%", 1.13, 1.2), ("mixed 25%", 1.48, 1.62)):
+        ce += [f"eviction,0.01,{item},best_classical,{b}", f"eviction,0.01,{item},v2,{v}"]
+    (d / "ceilings.csv").write_text("\n".join(ce) + "\n")
+    (d / "analyst_bars.csv").write_text(
+        "bar,count,total,rate,wilson_low,wilson_high,needs\n"
+        '"catch (bar 1): wrong shown answers warned or refused",20,35,0.571,0.409,0.720,at least 0.50\n'
+        '"keep, refusals (bar 2): right shown answers refused",0,227,0.000,0.000,0.017,at most 0.10\n'
+        '"keep, warnings (bar 3): right shown answers warned or refused",18,227,0.079,0.051,0.122,at most 0.25\n'
+    )
+    return d
+
+
+def test_make_charts_writes_light_and_dark(tmp_path: Path) -> None:
+    data = make_data(tmp_path)
+    out = tmp_path / "images"
+    mod.main(["--data", str(data), "--out", str(out)])
+    for name in NAMES:
+        for theme in ("light", "dark"):
+            png = out / f"{name}-{theme}.png"
+            assert png.exists(), png
+            assert png.stat().st_size > 0
+
+
+def test_latency_chart_without_sf10(tmp_path: Path) -> None:
+    data = make_data(tmp_path, with_sf10=False)
+    out = tmp_path / "images"
+    written = mod.chart_latency(data, out)
+    assert sorted(p.name for p in written) == ["latency-dark.png", "latency-light.png"]
+    assert all(p.stat().st_size > 0 for p in written)
+
+
+def test_charts_skip_when_baseline_missing(tmp_path: Path) -> None:
+    data = make_data(tmp_path)
+    (data / "baseline_sf1.csv").unlink()
+    (data / "baseline_sf10.csv").unlink()
+    out = tmp_path / "images"
+    mod.main(["--data", str(data), "--out", str(out)])
+    names = sorted(p.name for p in out.iterdir())
+    assert names == sorted(f"{n}-{t}.png" for n in NAMES[2:] for t in ("light", "dark"))
+
+
+def test_fail_row_with_a_time_is_never_drawn(tmp_path: Path) -> None:
+    path = tmp_path / "baseline_sf1.csv"
+    path.write_text(
+        "query,engine,config,median_ms,status,max_abs_diff,max_rel_diff\n"
+        "Q1,shilmandb,+index,10.0,PASS,,\n"
+        "Q1,shilmandb,+vectorized,6.0,FAIL,,\n"
+        "Q3,shilmandb,+index,20.0,PASS,,\n"
+        "Q3,shilmandb,+vectorized,10.0,DRIFT,1e-9,1e-12\n"
+        "Q5,shilmandb,+index,,FAIL,,\n"
+    )
+    rows = mod.read_csv(path)
+    by_cell = {(r["query"], r["config"]): r for r in rows}
+    assert mod.drawable_ms(by_cell[("Q1", "+vectorized")], "1") is None   # FAIL with a time
+    assert mod.drawable_ms(by_cell[("Q5", "+index")], "1") is None        # FAIL, empty time
+    assert mod.drawable_ms(None, "1") is None
+    assert mod.drawable_ms(by_cell[("Q3", "+vectorized")], "1") == 10.0   # DRIFT is drawn
+    assert mod.vectorized_ratios(rows, "1") == [("Q3", 0.5)]
+
+
+def test_needs_text_accepts_only_at_least_and_at_most() -> None:
+    assert mod.needs_text("at least 0.50") == ("≥", 0.5)
+    assert mod.needs_text("at most 0.10") == ("≤", 0.1)
+    with pytest.raises(ValueError):
+        mod.needs_text("exactly 0.10")
+    with pytest.raises(ValueError):
+        mod.needs_text("below 0.25")
+
+
+def test_only_checked_times_are_drawn() -> None:
+    def row(engine: str, config: str, status: str, ms: str = "10.0") -> dict:
+        return {"query": "Q1", "engine": engine, "config": config, "median_ms": ms, "status": status}
+
+    assert mod.drawable_ms(row("shilmandb", "+index", "PASS"), "1") == 10.0
+    assert mod.drawable_ms(row("duckdb", "duckdb", "DRIFT"), "1") == 10.0
+    assert mod.drawable_ms(row("sqlite", "sqlite_disk", "SKIP"), "1") == 10.0   # the reference itself
+    assert mod.drawable_ms(row("duckdb", "duckdb", "SKIP"), "1") is None
+    assert mod.drawable_ms(row("shilmandb", "+vectorized", "SKIP"), "1") is None
+    assert mod.drawable_ms(row("postgres", "postgres", ""), "1") is None
+    assert mod.drawable_ms(row("shilmandb", "+index", "WEIRD"), "1") is None
+    assert mod.drawable_ms(row("sqlite", "sqlite_disk", ""), "1") is None
+    assert mod.drawable_ms(row("sqlite", "sqlite_memory", "FAIL"), "1") is None
+    unchecked = [row("shilmandb", "+index", "PASS"), row("shilmandb", "+vectorized", "SKIP", "5.0")]
+    assert mod.vectorized_ratios(unchecked, "1") == []
+
+
+def test_sqlite_skip_is_drawn_only_where_sqlite_is_the_reference() -> None:
+    row = {"query": "Q1", "engine": "sqlite", "config": "sqlite_disk", "median_ms": "10.0", "status": "SKIP"}
+    assert mod.drawable_ms(row, "1") == 10.0
+    assert mod.drawable_ms(row, "0.1") == 10.0
+    assert mod.drawable_ms(row, "10") is None   # DuckDB and Postgres are the references there
+    assert mod.drawable_ms(dict(row, status="PASS"), "10") == 10.0
+
+
+def test_latency_chart_skips_sf10_sqlite_skip(tmp_path: Path, monkeypatch) -> None:
+    data = make_data(tmp_path)
+    drawn = []
+    real = mod.drawable_ms
+
+    def spy(row, sf):
+        ms = real(row, sf)
+        if row and row["engine"] == "sqlite" and ms is not None:
+            drawn.append(sf)
+        return ms
+
+    monkeypatch.setattr(mod, "drawable_ms", spy)
+    mod.chart_latency(data, tmp_path / "images")
+    assert drawn and set(drawn) == {"1"}
+
+
+# The latency chart's figures (light, dark), captured instead of saved.
+def latency_figures(tmp_path: Path, monkeypatch) -> list:
+    figs = []
+    monkeypatch.setattr(mod, "save", lambda fig, out, name, theme: figs.append(fig) or out / name)
+    mod.chart_latency(make_data(tmp_path), tmp_path / "images")
+    for fig in figs:
+        fig.canvas.draw()
+    return figs
+
+
+# Half a marker's drawn width in points, its edge included.
+def half_width_pts(line) -> float:
+    from matplotlib.markers import MarkerStyle
+    style = MarkerStyle(line.get_marker())
+    unit = style.get_path().transformed(style.get_transform()).get_extents().width
+    return (unit * line.get_markersize() + line.get_markeredgewidth()) / 2
+
+
+def x_to_pts(ax, x: float) -> float:
+    return ax.transData.transform((x, 1.0))[0] * 72 / ax.figure.dpi
+
+
+def test_latency_markers_in_a_query_do_not_overlap(tmp_path: Path, monkeypatch) -> None:
+    for fig in latency_figures(tmp_path, monkeypatch):
+        for ax in fig.axes:
+            points = []   # (query slot, x in points, half width in points)
+            for line in ax.get_lines():
+                if line.get_linestyle() != "None" or line.get_markerfacecolor() == "none":
+                    continue
+                for x in line.get_xdata():
+                    points.append((round(x), x_to_pts(ax, x), half_width_pts(line)))
+            assert points
+            points.sort()
+            for a, b in zip(points, points[1:]):
+                if a[0] == b[0]:
+                    assert b[1] - a[1] >= a[2] + b[2] - 1e-6, (a, b)
+
+
+def test_latency_drift_ring_clears_its_marker(tmp_path: Path, monkeypatch) -> None:
+    for fig in latency_figures(tmp_path, monkeypatch):
+        ax = fig.axes[0]
+        lines = ax.get_lines()
+        rings = [ln for ln in lines if ln.get_markerfacecolor() == "none" and ln.get_linestyle() == "None"]
+        widest = max(half_width_pts(ln) - ln.get_markeredgewidth() / 2 for ln in lines if ln not in rings and ln.get_linestyle() == "None")
+        assert rings
+        for ring in rings:
+            inner = (ring.get_markersize() - ring.get_markeredgewidth()) / 2
+            assert inner >= widest
+
+
+def test_latency_panels_share_one_time_axis(tmp_path: Path, monkeypatch) -> None:
+    for fig in latency_figures(tmp_path, monkeypatch):
+        top, bottom = [ax for ax in fig.axes if ax.get_lines()]
+        assert top.get_ylim() == bottom.get_ylim()
+        lo, hi = top.get_ylim()
+        assert lo <= FASTEST_MS and hi >= SLOWEST_MS
+
+
+def test_latency_neighbouring_drift_rings_do_not_overlap(tmp_path: Path, monkeypatch) -> None:
+    for fig in latency_figures(tmp_path, monkeypatch):
+        for ax in fig.axes:
+            lines = [ln for ln in ax.get_lines() if ln.get_linestyle() == "None"]
+            slots = sorted({x_to_pts(ax, x) for ln in lines if ln.get_markerfacecolor() != "none" for x in ln.get_xdata()})
+            step = min(b - a for a, b in zip(slots, slots[1:]))
+            for ring in (ln for ln in lines if ln.get_markerfacecolor() == "none"):
+                assert ring.get_markersize() + ring.get_markeredgewidth() <= step, (ring.get_markersize(), step)

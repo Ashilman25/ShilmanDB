@@ -500,6 +500,7 @@ def test_output_inside_ai_refused(tmp_path, capsys):
 
 
 # rem, trajectories, train and replay end to end on a tiny world, in child processes.
+@pytest.mark.skipif(importlib.util.find_spec("lightgbm") is None, reason="lightgbm is not installed")
 def test_tiny_end_to_end(tmp_path):
     started = time.monotonic()
     world = write_world(tmp_path)

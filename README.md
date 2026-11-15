@@ -1,248 +1,223 @@
 # ShilmanDB
 
-A relational database engine built from scratch in C++17, featuring two learned ML components: a neural network join order optimizer and a learned buffer pool eviction policy. Targets analytical workloads (TPC-H) and benchmarks against SQLite.
+[![CI](https://github.com/Ashilman25/ShilmanDB/actions/workflows/ci.yml/badge.svg)](https://github.com/Ashilman25/ShilmanDB/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-ShilmanDB is an educational and research project exploring how machine learning can enhance traditional database internals. It is not a production database -- it is a ground-up implementation of every layer of a relational engine, from raw page I/O to SQL parsing, with ML integration at two key decision points.
+A from-scratch C++17 analytics database engine, in progress, measured against SQLite, DuckDB and Postgres on TPC-H.
 
-## Quick Start
+Numbers on this page are marked by how we know them: *measured* (we ran it), *from docs* (copied from a spec, such as TPC-H's) or *inferred* (worked out from other numbers).
 
-```bash
-# Clone and build (Debug, no ML)
-bash scripts/build.sh
+## Status
 
-# Run tests
-cd build && ctest --output-on-failure && cd ..
+**Today** ShilmanDB is a single-threaded row store. It runs 8 of the 22 TPC-H queries (8 *measured*; TPC-H has 22, *from docs*), and it has been measured on one Mac at SF=1 against SQLite, DuckDB and Postgres, and at SF=10 against DuckDB and Postgres. Every layer is written here, from page I/O up: a buffer pool, B+tree indexes, a hand-written SQL parser, a cost-based planner, and an executor that runs one row at a time, with a vectorized path that runs scans, filters, projections and aggregates a batch of rows at a time.
 
-# Generate TPC-H data (one-time)
-bash bench/tpch/generate_tpch_data.sh
+**What it is becoming (in progress; none of this is built yet):**
 
-# Run a query (via the TPC-H benchmark loader)
-./build/bench/load_tpch --sf 0.01 --db-file /tmp/tpch.db \
-    --data-dir bench/tpch_data/sf0.01/
-```
+- A columnar, parallel engine.
+- One engine with two ways in: an app with a SQL runner and an AI analyst whose answers the database checks, and the Postgres protocol, so Postgres tools can connect to it.
+- Running on your own data, from CSV files and from your own Postgres.
 
-To use the learned ML components:
+**The production bar** it is aimed at: no size limit (data bigger than memory still works), faster than Postgres on the same machine at SF=10 and SF=100, all 22 TPC-H queries, crash safety, and many users at once. A **scale ladder** measures it: SF=10, then SF=100 (about 100 GB of text, *from docs*, more than this Mac's 64 GiB of memory, *measured*), then SF=1000 on a Linux server.
 
-```bash
-# Build with LibTorch
-bash scripts/build.sh Release ON
+The bar and the ladder are goals, not stops. A step that misses them still finishes, and the gap is reported as it is. As I put it when I set them: *"if it doesnt hit the production bar that wont be a stop just get the best we can but yes the production bars are the goals"*.
 
-# Run with both learned components
-./build/bench/load_tpch --sf 0.01 --db-file /tmp/tpch.db \
-    --data-dir bench/tpch_data/sf0.01/ \
-    --use-learned-join --join-model-path ml/join_optimizer/models/join_order_model.pt \
-    --use-learned-eviction --eviction-model-path ml/eviction_policy/models/eviction_model.pt
-```
+The speed goal past Postgres is DuckDB's class. DuckDB is a team's years of work, so that is the hardest bar this project has set, and today's engine is far from it (next section).
 
-## Architecture
+## Where it stands
 
-```
-                          SQL string
-                              |
-                              v
-                     +----------------+
-                     |     Lexer      |   Tokenizes input
-                     +----------------+
-                              |
-                              v
-                     +----------------+
-                     |     Parser     |   Recursive descent -> AST
-                     +----------------+
-                              |
-                              v
-                     +----------------+     +-------------------------+
-                     |    Planner     |<--->| Learned Join Optimizer  |
-                     +----------------+     | (MLP, TorchScript)      |
-                              |             +-------------------------+
-                              v
-                     +----------------+
-                     |   Executor     |   Volcano-style iterator tree
-                     |  (9 operators) |   SeqScan, HashJoin, Sort, ...
-                     +----------------+
-                              |
-                              v
-                     +----------------+     +-------------------------+
-                     | Buffer Pool    |<--->| Learned Eviction Policy |
-                     |   Manager      |     | (EmbedPool, TorchScript)|
-                     +----------------+     +-------------------------+
-                              |
-                              v
-                     +----------------+
-                     |  Disk Manager  |   8 KB page I/O
-                     +----------------+
-                              |
-                              v
-                         [db file]
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/latency-dark.png">
+  <img src="docs/images/latency-light.png" alt="Median query time for the 8 TPC-H queries on a log scale, at SF=1 and SF=10, for ShilmanDB, SQLite, DuckDB and Postgres. DuckDB is fastest on every query, then Postgres; ShilmanDB and SQLite are slowest, with ShilmanDB mostly ahead of SQLite on disk at SF=1.">
+</picture>
 
-**Layers (bottom-up):**
+The 8 queries are ShilmanDB's versions of TPC-H Q1, Q3, Q5, Q6, Q10, Q12, Q14 and Q19, close to the official texts but not word for word. They ran on an Apple M5 Max on 2026-11-14: 1 warmup and 5 timed runs, median, query time only (not the load). Every time and ratio in this section is *measured*. A ratio is ShilmanDB's time ÷ the other engine's, so above 1 means ShilmanDB is slower.
 
-| Layer | Directory | Purpose |
-|-------|-----------|---------|
-| Storage | `src/storage/` | DiskManager (page I/O), SlottedPage (variable-length tuples), TableHeap (heap file) |
-| Buffer | `src/buffer/` | BufferPoolManager with pin-count tracking, pluggable eviction policy |
-| Index | `src/index/` | B+tree with point lookup and range scan |
-| Catalog | `src/catalog/` | Table schemas, indexes, per-column statistics for cost estimation |
-| Types | `src/types/` | Value (tagged union), Tuple, type coercion system |
-| Parser | `src/parser/` | Hand-written lexer + recursive descent parser producing AST |
-| Planner | `src/planner/` | AST to physical plan tree with join ordering (exhaustive or learned) |
-| Executor | `src/executor/` | Volcano-style operators: SeqScan, IndexScan, Filter, HashJoin, NestedLoopJoin, Sort, Aggregate, Projection, Limit |
-| Engine | `src/engine/` | Database facade: `ExecuteSQL()`, `LoadTable()` |
+The headline compares ShilmanDB's headline config, `+vectorized` (8 indexes; fastest on 6 of 8 queries at SF=1 and 7 of 8 at SF=10), with `postgres` (the same 8 indexes, memory settings for a 64 GB machine, parallel workers on) and `duckdb` (its defaults, all cores, no indexes):
 
-For detailed architecture documentation, see [docs/architecture.md](docs/architecture.md).
+| `+vectorized` ÷ | SF=1, range | SF=1, geometric mean | SF=10, range | SF=10, geometric mean |
+|---|---:|---:|---:|---:|
+| `postgres` | 2.29-14.5 | 4.15 | 2.20-23.6 † | 3.75 † |
+| `duckdb` | 24.1-385 | 99.1 | 66.4-1,836 † | 233 † |
+| `sqlite_disk` | 0.30-0.98 | 0.50 | did not run | |
+| `sqlite_memory` | 0.34-1.37 | 0.73 | did not run | |
 
-## ML Components
+† Includes Q1 at SF=10, a DRIFT result (below).
 
-### Learned Join Order Optimizer
+In plain words:
 
-An MLP that predicts the optimal join order for multi-table queries, replacing exhaustive search over all permutations.
+- **SQLite:** at SF=1 ShilmanDB is faster than SQLite on disk on all 8 queries, and faster than SQLite in memory on 5 of 8.
+- **Postgres:** ShilmanDB is slower on every query, at both sizes, so the goal of beating Postgres is not met yet. Single process against single process (`postgres_1worker`), it is faster only on Q1 at both sizes and on Q12 at SF=10.
+- **DuckDB:** ShilmanDB is about 99× slower at SF=1 and 233× at SF=10 (geometric means). Even DuckDB on one thread is 7.59-104× faster at SF=1.
+- **Q19** is the worst query against both: it joins `lineitem` and `part`, then tests a three-branch `OR` on every joined row.
+- **SF=10:** all three ShilmanDB configs ran, and every answer was checked against DuckDB and Postgres. † Q1 is a *DRIFT* result: its sums are off by up to 0.25 (2.24e-13 relative) because ShilmanDB adds decimals as doubles. Every other answer matches.
 
-- **Architecture:** 48 -> 256 -> 128 -> 64 -> 6 (Wide MLP, 54K params)
-- **Training:** ListMLE ranking loss on 6,561 TPC-H-derived samples with perturbation-based data augmentation
-- **Accuracy:** 94.1% exact-match, mean cost regret 0.019, prefix-2 accuracy 96.3%
-- **Safety:** 1.5x cost fallback -- if the learned order costs more than 1.5x the exhaustive-search optimum, the heuristic order is used instead
+**Why the gap to DuckDB** (*inferred* from how the engines are built, not profiled): DuckDB stores columns, compressed, and reads only the columns a query uses; its loops use the CPU's vector instructions; and it uses every core. ShilmanDB reads whole rows, on one thread, through a buffer pool. The steps meant to close it:
 
-### Learned Buffer Pool Eviction Policy
+- **14a:** a columnar file format, with exact decimal storage.
+- **14b:** a parallel vectorized executor, target SF=10.
+- **14c:** out-of-core execution (joins, aggregates and sorts that spill to disk), target SF=100.
 
-An embedding-based model that predicts page reuse distances to make smarter eviction decisions than LRU.
+**Main limits today:**
 
-- **Architecture:** EmbedPool -- `nn.Embedding(4096, 16)` + frequency features -> MLP -> predicted log(reuse_distance) (66K params)
-- **Training:** Zipfian access trace (500K accesses, 4096-page vocabulary)
-- **Hit rate:** +3.64% improvement over LRU (Belady optimal ceiling is +7.39%, model captures ~49% of the theoretical gap)
-- **Inference:** Single batched forward pass over all eviction candidates
+- No NULLs. Aggregates over no rows return 0.
+- `LEFT JOIN` runs as an inner join, without an error.
+- No functions (`extract`, `substring`, casts) and no subqueries, `DISTINCT` or `WITH`.
 
-Both models are exported as TorchScript (`.pt`) files and loaded at runtime via LibTorch. All ML code is behind `#ifdef SHILMANDB_HAS_LIBTORCH` -- the engine compiles and runs without ML dependencies.
+Every table at SF=1 and SF=10, every config of all four engines, the indexes and settings each engine got, the answer check and how to rerun it all: [docs/benchmarks.md](docs/benchmarks.md).
 
-## Benchmarks
+## Roadmap
 
-Benchmarked on TPC-H queries Q1, Q3, Q5, Q6 at scale factor 0.01, comparing four ShilmanDB configurations against SQLite (disk and in-memory modes).
+Three tracks, in plain words. Step labels (such as 14a) are the names the code history uses.
 
-| Query | ShilmanDB (LRU) | SQLite (disk) | Ratio |
-|-------|-----------------|---------------|-------|
-| Q1 (aggregation) | 1,173 ms | 28 ms | ~42x |
-| Q3 (3-table join) | 1,432 ms | 5.1 ms | ~281x |
-| Q5 (5-table join) | 1,518 ms | 8.8 ms | ~172x |
-| Q6 (scan + filter) | 1,149 ms | 4.6 ms | ~250x |
+- **Docs** (now): this README, the baseline above, CI and the GitHub page.
+- **App:** next, a first slice of the app: a SQL runner and the AI analyst on the built-in TPC-H data (6e-1). Later the app on your own CSV and Postgres data (6e-2), a second measured check of the analyst (6d-2), and packaging as GitHub Releases and a Homebrew tap (6e-3).
+- **Engine:** first the columnar core: the file format (14a), the parallel vectorized executor (14b), out-of-core execution (14c), then the switch-over once TPC-H answers match on it (14d). Then NULLs and a real `LEFT JOIN` (8b), Postgres's SQL and all 22 TPC-H queries (step 12), writes and keys (8c), importing from Postgres and CSV (10a), the Postgres wire server (9a-9d), crash safety and many users (8d, 13a-13b), and Linux, Docker and SF=1000 (10d).
 
-The performance gap is expected. ShilmanDB is an educational row-store with no query optimizer (beyond join ordering), no columnar storage, no vectorized execution, and no page compression. SQLite has decades of optimization. The value is in the architecture and ML integration, not raw throughput.
+Every engine step keeps TPC-H answers matching the reference and measures its speed changes. From 14b on, each one also reports its ratios to DuckDB and Postgres.
 
-**Learned component impact at SF=0.01:**
-- Learned join optimizer: ~5% improvement on Q5 (5-table join), where join ordering matters most
-- Learned eviction: marginal latency impact (small dataset fits mostly in buffer pool)
-- All 16/16 correctness verifications PASS (every config x every query matches SQLite results)
+## Research results
 
-For detailed benchmark analysis, see [docs/benchmarking_results.md](docs/benchmarking_results.md).
+ShilmanDB has two learned components, a join order model and an eviction policy for the buffer pool. Measured against strong classical answers, both lost or tied. Numbers in this section are *measured* unless marked otherwise; details, dates and charts are in [docs/research.md](docs/research.md).
 
-Charts: `bench/results/query_latency.png`, `bench/results/join_order_accuracy.png`, `bench/results/hit_rate.png`
+- **The learned join optimizer ties the classical one at best.** On Q5 it once picked an order 1.8× faster than the classical planner's, but that was luck: it found that order only when the query already started with `customer` and `orders`, the way TPC-H writes it. After the classical cost formula learned to see filters, the classical planner picks that order itself. Over every connected join order of the six join queries at SF=1.0, both planners land at 1.00-1.02× of the fastest.
+- **Learned eviction V2 saves no misses on TPC-H** and makes queries 3.5-6.9× slower at SF=0.01. Each eviction decision takes 16.6-17.4 µs at a 128-frame pool (about as long as 30 page reads from the file cache, *inferred*), and about 17-183 µs across pools of 128 to 2,048 frames (*from docs*).
+- **The best classical eviction policy** misses 1.07-1.50× what Belady (the best possible, which needs to know the future) would, on the four pool-size and workload cells that matter at SF=1.0. That is the room a learned policy would have to win in.
+- **Both learned components stay in the code, off by default.** They build only with LibTorch (`-DSHILMANDB_ENABLE_ML=ON`) and run only when asked for.
 
-## Build Instructions
+**The AI-analyst check: GO.** A local model (`gemma4-26b`, run on the Mac through MLX) turns plain-English questions into SQL, and ShilmanDB runs it. The check then tested each answer, by asking the question a second way and with evidence only the database has (such as the rows each step of the plan kept), and warned or refused when something looked wrong. The app that would show this to users is in progress. On 300 test questions, written by separate AI writers that never saw the checks, with the bars fixed before any model answered a test question:
 
-### Prerequisites
+- 20 of 35 silent wrong answers were warned (0.571; the bar was at least 0.50).
+- 0 of 227 right answers were refused, and 18 of 227 were warned (0.079).
 
-- macOS ARM (Apple Silicon) -- primary target
-- C++17 compiler (Apple Clang or GCC)
-- CMake 3.20+
-- Ninja build system
-- Python 3.10+ with venv (for ML training and benchmarking scripts)
+Said honestly, the GO is mostly "ask twice": the check that asks the question a second way and compares the answers makes 15 of the 20 catches. Without it, the other checks catch 9 of 35, which would fail the catch bar. The engine's own checks (engine traps, empty input, fan-out, grain) catch 5 of 35 on their own, but only 2 that the second phrasing and the terms check both missed. The margin is thin: at 17 of 35 the bar fails.
 
-For ML builds additionally:
-- LibTorch 2.11.0 (run `bash scripts/setup_libtorch.sh`)
-- libomp (`brew install libomp`)
+## How it's built
 
-### Build
+SQL string → lexer → parser (AST) → planner (physical plan) → executor (iterator tree) → buffer pool → disk manager → file on disk.
+
+| Layer | Directory | What it does |
+|---|---|---|
+| Storage | `src/storage/` | 8 KB page I/O, slotted pages, heap files |
+| Buffer | `src/buffer/` | buffer pool with pin counts; LRU (default), CLOCK, LRU-2, ARC, LIRS and the learned policies |
+| Index | `src/index/` | B+tree with point lookups and range scans |
+| Catalog | `src/catalog/` | schemas, indexes and per-column statistics |
+| Parser | `src/parser/` | hand-written lexer and recursive-descent parser |
+| Planner | `src/planner/` | join order search, filtered row estimates, scan costs |
+| Executor | `src/executor/` | row-at-a-time operators, plus a vectorized path |
+| Engine | `src/engine/` | the `Database` class: `ExecuteSQL()`, `LoadTable()` |
+
+More in [docs/architecture.md](docs/architecture.md).
+
+## Build, test, run one query
+
+You need macOS on Apple Silicon (the main target), CMake 3.24 or newer, Ninja, a C++17 compiler, git, and Python 3.12 or newer for the Python tests (the pinned `scipy` needs it; I use 3.14). The first configure downloads googletest, and the data step clones TPC-H's `dbgen`, so both need the network.
+
+**Debug build and the C++ tests.** Generate the small TPC-H data before running `ctest`: the tests that check TPC-H answers skip without it.
 
 ```bash
-# Debug build, no ML
-bash scripts/build.sh
+# Debug: asserts on, no ML, no bench tools
+cmake -S . -B build-debug -G Ninja -DCMAKE_BUILD_TYPE=Debug -DSHILMANDB_BUILD_BENCH=OFF
+cmake --build build-debug
 
-# Debug build, no ML (explicit)
-bash scripts/build.sh Debug OFF
+# TPC-H data at SF=0.01, into bench/tpch_data/sf0.01/ (builds dbgen in /tmp/tpch-dbgen the first time)
+bash bench/tpch/generate_tpch_data.sh 0.01
 
-# Release build with ML
-bash scripts/build.sh Release ON
+# Run ctest from inside the build folder
+cd build-debug && ctest -j 12 --output-on-failure && cd ..
+```
 
-# Manual CMake (full control)
-cmake -S . -B build -G Ninja \
-    -DCMAKE_BUILD_TYPE=Debug \
-    -DSHILMANDB_ENABLE_ML=OFF \
-    -DSHILMANDB_BUILD_BENCH=ON
+On a fresh copy of the repo, 929 of the 930 Debug tests pass and 1 skips (*measured*): `EvictionSimTest.V2ExportedWeightsMatchTorch`, which needs the exported V2 weights file, not checked in. The `SqliteComparisonTest` tests check each of the 8 queries' answers at SF=0.01 against fixed expected results.
+
+**Release build with the bench tools.** Use this one for any timing.
+
+```bash
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSHILMANDB_BUILD_BENCH=ON
 cmake --build build
+
+# The 4 NextBeforeInitAsserts tests check assert(), which Release compiles out
+cd build && ctest -j 12 --output-on-failure -E NextBeforeInitAsserts && cd ..
 ```
 
-### CMake Options
+On the fresh copy, 925 of the 926 pass and the same `V2ExportedWeightsMatchTorch` test skips (*measured*).
 
-| Option | Default | Description |
-|--------|---------|-------------|
-| `SHILMANDB_ENABLE_ML` | OFF | Link LibTorch for learned components. Requires `third_party/libtorch/` |
-| `SHILMANDB_BUILD_TESTS` | ON | Build GoogleTest suite |
-| `SHILMANDB_BUILD_BENCH` | OFF during dev | Build TPC-H benchmark loader |
+**Run the TPC-H queries.** `load_tpch` loads the data into a database file and builds the 8 indexes. Then it runs the 8 queries: one untimed warmup pass, then 5 timed runs of each. It has no flag for a single query; the query texts are in [bench/tpch/tpch_workload.hpp](bench/tpch/tpch_workload.hpp). It adds to an existing database file, so start from a fresh one.
 
-### LibTorch Setup (for ML builds)
+```bash
+rm -f /tmp/shilmandb_sf0.01.db
+./build/bench/load_tpch --sf 0.01 --db-file /tmp/shilmandb_sf0.01.db --data-dir bench/tpch_data/sf0.01/
+```
+
+It takes under a second at SF=0.01 (*measured*). For each run it prints the time, row count and buffer pool counts, and it ends with `=== 8/8 TPC-H queries passed ===`, which means every query ran without an error. It does not check answers; the tests above and the benchmark runner do.
+
+Options: `--warmup 0 --runs 1` runs each query once. `--execution-mode vectorized` uses the vectorized path. `--eviction-policy lirs` (also `clock`, `lru2`, `arc`) picks another eviction policy. `--results-dir <folder>` writes each query's result and timings as CSV files.
+
+**The Python tests** (the bench tools and their analysis scripts) run in a virtual environment at `.venv/`. Tests that need something not in `requirements.txt` (Postgres, LibTorch, a trained model) skip.
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+.venv/bin/python -m pytest bench -q -W error
+```
+
+On a fresh copy with only `requirements.txt` installed: 1,376 passed and 23 skipped, in 42 seconds (*measured*). Run it after the Release build: some tests drive the `build/bench/` tools and skip without them.
+
+The full benchmark against SQLite, DuckDB and Postgres is in [docs/benchmarks.md](docs/benchmarks.md#how-to-reproduce).
+
+## Training the learned models
+
+The learned flags (`--use-learned-join`, `--use-learned-eviction`) need trained models. They are not checked in or attached to releases, because a TorchScript model only loads with the LibTorch version it was saved with. Train them yourself:
+
+**1. Build with LibTorch.** The setup script downloads LibTorch 2.11.0 for macOS ARM into `third_party/libtorch/`. The ML build also needs `libomp`.
 
 ```bash
 bash scripts/setup_libtorch.sh
-# Also requires:
 brew install libomp
+sudo mkdir -p /opt/llvm-openmp/lib
 sudo ln -sf /opt/homebrew/opt/libomp/lib/libomp.dylib /opt/llvm-openmp/lib/libomp.dylib
+
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSHILMANDB_ENABLE_ML=ON -DSHILMANDB_BUILD_BENCH=ON
+cmake --build build
+
+# PyTorch in the venv must match LibTorch's version
+.venv/bin/pip install torch==2.11.0
 ```
 
-## Testing
+**2. The join order model** (`ml/join_optimizer/`). The data step runs `build/bench/generate_join_training_data` on every `bench/tpch_data/sf*/` folder that has data.
 
 ```bash
-# Run all tests
-cd build && ctest --output-on-failure
-
-# Run a single test
-cd build && ctest --output-on-failure -R disk_manager_test
-
-# Run tests matching a pattern
-cd build && ctest --output-on-failure -R buffer
-
-# Run a test binary directly (shows individual test case names)
-./build/test/storage/disk_manager_test
+bash bench/tpch/generate_tpch_data.sh 0.01 0.1 1.0
+.venv/bin/python ml/join_optimizer/generate_training_data.py --perturbations 80
+.venv/bin/python ml/join_optimizer/train_join_model.py --model-variant wide --lr 1e-3 --batch-size 64 \
+    --epochs 300 --lr-schedule cosine --patience 50
+.venv/bin/python ml/join_optimizer/export_model.py      # writes ml/join_optimizer/models/join_order_model.pt
+.venv/bin/python ml/join_optimizer/evaluate_join_model.py
 ```
 
-318 tests across 26 test files. All pass in Debug. Four assert-based tests fail in Release builds (NDEBUG strips `assert()` -- pre-existing, not a regression).
-
-## TPC-H Benchmarking
+**3. Eviction V2** (`ml/eviction_policy/`), trained on synthetic page-access traces:
 
 ```bash
-# Generate TPC-H data (one-time setup)
-bash bench/tpch/generate_tpch_data.sh
-
-# Run full benchmark suite (ShilmanDB + SQLite, all configs)
-python bench/tpch/run_benchmarks.py --sf 0.01 --runs 5
-
-# Generate charts from results
-.venv/bin/python bench/tpch/plot_results.py
+.venv/bin/python ml/eviction_policy/generate_multiscale_traces.py
+.venv/bin/python ml/eviction_policy/generate_feature_training_data.py
+.venv/bin/python ml/eviction_policy/train_eviction_model_v2.py
+.venv/bin/python ml/eviction_policy/export_model_v2.py   # writes ml/eviction_policy/models/eviction_model_v2.pt
+.venv/bin/python ml/eviction_policy/evaluate_eviction_model_v2.py
 ```
 
-## Project Structure
+**4. Run with them:**
 
+```bash
+rm -f /tmp/shilmandb_sf0.01.db
+./build/bench/load_tpch --sf 0.01 --db-file /tmp/shilmandb_sf0.01.db --data-dir bench/tpch_data/sf0.01/ \
+    --use-learned-join --join-model-path ml/join_optimizer/models/join_order_model.pt \
+    --use-learned-eviction --eviction-model-path ml/eviction_policy/models/eviction_model_v2.pt
 ```
-ShilmanDB/
-  src/
-    buffer/         Buffer pool manager, LRU and learned eviction policies
-    catalog/        Table metadata, schemas, statistics
-    common/         Config constants, exceptions, RID type
-    engine/         Database facade (ExecuteSQL, LoadTable)
-    executor/       Volcano-style query operators (9 executors)
-    index/          B+tree index with point lookup and range scan
-    parser/         Hand-written SQL lexer and recursive descent parser
-    planner/        Query planner, join order optimizer (heuristic + learned)
-    storage/        Disk manager, slotted pages, table heap
-    types/          Value (tagged union), Tuple, type system
-  test/             26 test files, 318 tests (GoogleTest)
-  bench/            TPC-H data generation, benchmark harness, result plotting
-  ml/
-    join_optimizer/ Training, evaluation, export for join order MLP
-    eviction_policy/ Training, evaluation, export for eviction model
-  scripts/          Build script, LibTorch setup, result comparison
-  docs/             Architecture and benchmark documentation
-  _docs/            Product spec and implementation plan
-  third_party/      LibTorch (gitignored)
-```
+
+## Contributing and history
+
+- [CONTRIBUTING.md](CONTRIBUTING.md): conventions, how to measure a speed change, and the checks every change must pass.
+- [CHANGELOG.md](CHANGELOG.md): what changed, by pull request.
+- [docs/benchmarks.md](docs/benchmarks.md), [docs/research.md](docs/research.md), [docs/architecture.md](docs/architecture.md): the detail behind this page.
 
 ## License
 
-MIT
+Apache-2.0. See [LICENSE](LICENSE).

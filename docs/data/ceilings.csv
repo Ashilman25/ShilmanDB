@@ -1,0 +1,21 @@
+part,sf,item,method,ratio
+join,1.0,Q3,classical,1.0104
+join,1.0,Q3,learned,1.0104
+join,1.0,Q5,classical,1
+join,1.0,Q5,learned,1
+join,1.0,Q10,classical,1.01948
+join,1.0,Q10,learned,1.01948
+join,1.0,Q12,classical,1
+join,1.0,Q12,learned,1
+join,1.0,Q14,classical,1
+join,1.0,Q14,learned,1
+join,1.0,Q19,classical,1
+join,1.0,Q19,learned,1
+eviction,0.01,stream 10%,best_classical,1.131501413
+eviction,0.01,stream 10%,v2,1.19669377
+eviction,0.01,stream 25%,best_classical,1.1353003
+eviction,0.01,stream 25%,v2,1.321069161
+eviction,0.01,mixed 10%,best_classical,1.233514368
+eviction,0.01,mixed 10%,v2,1.352419909
+eviction,0.01,mixed 25%,best_classical,1.475935373
+eviction,0.01,mixed 25%,v2,1.621280792
