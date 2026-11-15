@@ -236,16 +236,26 @@ def test_parse_latencies_old_format(tmp_path: Path) -> None:
 
 # pool_for_fraction / config_label
 def test_pool_for_fraction() -> None:
-    assert mod.DB_PAGES == {"0.01": 1448, "0.1": 14417, "1.0": 144032}
+    assert mod.DB_PAGES == {"0.01": 1448, "0.1": 14417, "1.0": 144032, "10": 1439816}
     assert mod.pool_for_fraction("0.01", 0.05) == 72
     assert mod.pool_for_fraction("1.0", 0.01) == 1440
     assert mod.pool_for_fraction("0.01", 0.001) == 16
     assert mod.pool_for_fraction("0.01", 1.0) == 1448
 
 
-def test_pool_for_fraction_sf10_needs_db_pages() -> None:
-    with pytest.raises(ValueError, match="DB_PAGES has no entry for SF=10 yet"):
-        mod.pool_for_fraction("10", 0.25)
+def test_pool_for_fraction_sf10() -> None:
+    assert mod.pool_for_fraction("10", 0.25) == 359954
+    assert mod.pool_for_fraction("10", 0.01) == 14398  # 14,398.16 rounds down
+    assert mod.pool_for_fraction("10", 0.001) == 1440  # 1,439.816 rounds up
+
+
+def test_every_known_sf_has_db_pages() -> None:
+    assert set(mod.KNOWN_SCALE_FACTORS) <= set(mod.DB_PAGES)
+
+
+def test_pool_for_fraction_unknown_sf_needs_db_pages() -> None:
+    with pytest.raises(ValueError, match="DB_PAGES has no entry for SF=100 yet"):
+        mod.pool_for_fraction("100", 0.25)
 
 
 def test_config_label() -> None:

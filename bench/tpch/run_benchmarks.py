@@ -74,6 +74,7 @@ DB_PAGES: Dict[str, int] = {
     "0.01": 1448,
     "0.1": 14417,
     "1.0": 144032,
+    "10": 1439816,
 }
 MIN_POOL_PAGES: int = 16
 
@@ -1361,7 +1362,7 @@ def stream_length_value(text: str) -> int:
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Phase 20.1 benchmark runner",
+    p = argparse.ArgumentParser(description="TPC-H benchmark runner",
                                 epilog="Exit 3: --duckdb or --postgres was asked for and its runner failed; every other output is still written.")
     p.add_argument("--binary", type=Path, default=DEFAULT_BINARY, help=f"Path to load_tpch binary (default: {DEFAULT_BINARY})")
     p.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR, help=f"TPC-H data dir (default: {DEFAULT_DATA_DIR})")
@@ -1417,7 +1418,7 @@ def main() -> int:
     output_dir: Path = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    section(f"Phase 20.1 benchmark runner | SFs={sfs} | configs={configs}")
+    section(f"TPC-H benchmark runner | SFs={sfs} | configs={configs}")
     print(f"  warmup={args.warmup}, runs={args.runs}, "
           f"pool_sweep={args.pool_sweep}, v1_eviction={args.v1_eviction}")
     if args.miss_penalty_us != [0] or args.direct_io or args.pool_fractions or args.policy_timing:
