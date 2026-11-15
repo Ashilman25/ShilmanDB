@@ -45,6 +45,12 @@ CONTENT_TYPES = {
 }
 JSON_TYPE = CONTENT_TYPES[".json"]
 
+# The page loads only its own files: no inline script or style, no other site, no framing.
+CSP = (
+    "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; "
+    "base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+)
+
 ERROR_PAGE = """<!doctype html>
 <html lang="en">
 <head><meta charset="utf-8"><title>ShilmanDB</title></head>
@@ -159,6 +165,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Content-Security-Policy", CSP)
         super().end_headers()
 
     # Every method goes through the same checks; only GET and POST have routes.

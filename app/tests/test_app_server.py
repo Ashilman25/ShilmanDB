@@ -40,7 +40,10 @@ SERVER_REPLIES = {**REPLIES, TYPED: bridge_ok([("n_name", "VARCHAR")], [[n] for 
 
 DEV_QUESTIONS = Path("bench/results/analyst_check/questions.jsonl")
 DEV_RUN = Path("bench/results/analyst_check/runs/dev_gemma4-26b.jsonl")
-SECURITY_HEADERS = {"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer"}
+CSP = ("default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; "
+       "base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
+SECURITY_HEADERS = {"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer",
+                    "Content-Security-Policy": CSP}
 
 
 # One HTTP response, read in full.

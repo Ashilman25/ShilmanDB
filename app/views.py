@@ -114,10 +114,16 @@ def csv_label(reply: dict) -> str:
     return f"Download CSV (up to {cap:,} rows)"
 
 
-# The plan's operators, root first, with each one's total time.
+# An engine time in words: whole ms with separators, or "under 1 ms".
+def ms_text(ms: float) -> str:
+    return f"{ms:,.0f} ms" if ms >= 1 else "under 1 ms"
+
+
+# The plan's operators, root first, with each one's total time as a number and as text.
 def plan_rows(profile: dict | None) -> list[dict]:
     operators = (profile or {}).get("operators", [])
-    return [{"name": op["name"], "depth": op["depth"], "rows": op["rows"], "ms": op["total_ms"]} for op in operators]
+    return [{"name": op["name"], "depth": op["depth"], "rows": op["rows"], "ms": op["total_ms"], "ms_text": ms_text(op["total_ms"])}
+            for op in operators]
 
 
 # The line above the result: rows, the claimed grain, and the engine's time.
@@ -125,8 +131,7 @@ def meta_line(row_count: int, grain: str | None, ms: float) -> str:
     rows = "1 row" if row_count == 1 else f"{row_count:,} rows"
     grain = (grain or "").strip().rstrip(".")
     lead = f"{rows}, {grain}." if grain else f"{rows}."
-    ran = f"Ran in {ms:,.0f} ms." if ms >= 1 else "Ran in under 1 ms."
-    return f"{lead} {ran}"
+    return f"{lead} Ran in {ms_text(ms)}."
 
 
 # A failed reply in plain words; never raises, whatever the reply holds.

@@ -228,8 +228,18 @@ def test_limits_read_from_sixd(monkeypatch):
 
 def test_plan_rows():
     op = {"name": "Sort", "depth": 0, "rows": 5, "total_ms": 83.0, "self_ms": 0.1}
-    assert plan_rows({"operators": [op]}) == [{"name": "Sort", "depth": 0, "rows": 5, "ms": 83.0}]
+    assert plan_rows({"operators": [op]}) == [{"name": "Sort", "depth": 0, "rows": 5, "ms": 83.0, "ms_text": "83 ms"}]
     assert len(plan_rows(_region_reply()["profile"])) == 2
+
+
+# Each operator's time is worded by the meta line's rule, so the page formats no decimals.
+def test_plan_rows_time_text():
+    def text(ms: float) -> str:
+        return plan_rows({"operators": [{"name": "Scan", "depth": 1, "rows": 9, "total_ms": ms}]})[0]["ms_text"]
+
+    assert [text(ms) for ms in (1234.4, 82.9, 1.0, 0.4, 0.0)] == ["1,234 ms", "83 ms", "1 ms", "under 1 ms", "under 1 ms"]
+    assert meta_line(2, None, 1234.4).endswith(f"Ran in {text(1234.4)}.")
+    assert meta_line(2, None, 0.4).endswith(f"Ran in {text(0.4)}.")
 
 
 def test_meta_line():
@@ -274,7 +284,7 @@ def test_answer_view_keys():
     assert view["chart"]["kind"] == "bars"
     assert view["csv_label"] == "Download CSV (up to 10,000 rows)"
     assert (view["sql"], view["grain"], view["question"]) == (REGION_SQL, "one row per region", "Revenue by region?")
-    assert view["plan"][0] == {"name": "Sort", "depth": 0, "rows": 5, "ms": 83.0}
+    assert view["plan"][0] == {"name": "Sort", "depth": 0, "rows": 5, "ms": 83.0, "ms_text": "83 ms"}
     assert view["ms"] == 83.130375
     assert view["meta"] == "5 rows, one row per region. Ran in 83 ms."
 

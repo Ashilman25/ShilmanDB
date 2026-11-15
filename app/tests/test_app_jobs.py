@@ -53,7 +53,7 @@ LATE_RESULT = bridge_ok([("late_lines", "INTEGER")], [[123]])
 ALL_REPLIES = {**REPLIES, TYPED: TYPED_RESULT, BAD_SQL: PARSE_ERROR, LATE_SQL: LATE_RESULT}
 
 HISTORY_KEYS = ["id", "kind", "dataset", "text", "verdict", "from_job"]
-NO_TIMING = {"first_s": None, "verdict_s": None, "engine_ms": None}
+NO_TIMING = {"first_s": None, "verdict_s": None, "engine_ms": None, "first_text": None, "verdict_text": None}
 STOPPED = {"kind": "stopped", "text": "Stopped before the second answer, so there's no verdict.", "sql": None}
 RATES = read_json(default_paths().measured)["rates"]
 
@@ -519,10 +519,18 @@ def test_timing_fields(runners):
     assert by_stage["queued"] == NO_TIMING and by_stage["writing"] == NO_TIMING
     first = by_stage["first"]
     assert first["first_s"] is not None and first["verdict_s"] is None and first["engine_ms"] == MS
+    assert first["first_text"] == f"{first['first_s']:.1f} s" and first["verdict_text"] is None
     final = done["timing"]
     assert final["first_s"] == first["first_s"] <= final["verdict_s"]
     assert final["engine_ms"] == MS
     assert all(round(v, 1) == v for v in (final["first_s"], final["verdict_s"]))
+    assert (final["first_text"], final["verdict_text"]) == (f"{final['first_s']:.1f} s", f"{final['verdict_s']:.1f} s")
+
+
+# The page shows seconds as the server words them: one decimal, then " s".
+def test_seconds_text():
+    assert [jobs.seconds_text(s) for s in (2.5, 5.3, 0.0, 12.0, 30.1)] == ["2.5 s", "5.3 s", "0.0 s", "12.0 s", "30.1 s"]
+    assert jobs.seconds_text(None) is None
 
 
 def test_cannot_and_failed_end_done(runners):
@@ -532,7 +540,7 @@ def test_cannot_and_failed_end_done(runners):
     assert done["verdict"] == {"kind": "cannot", "sql": None,
                                "text": "Can't answer this yet. Model's reason: The data has no weather records."}
     assert (done["first"], done["second"], done["checks"], done["terms"], done["error"]) == (None, None, [], [], None)
-    assert done["tested"] == check_views.tested_line(cannot.engine.lock, "ask", {})
+    assert done["tested"] is None
     assert done["timing"]["first_s"] is None and done["timing"]["engine_ms"] is None
 
     unreadable = runners(FakeModel({QUESTION: "Here is my answer, but not as JSON."}))
@@ -545,6 +553,29 @@ def test_cannot_and_failed_end_done(runners):
     assert done["stage"] == "done" and done["first"] is None
     assert done["verdict"] == {"kind": "failed", "sql": BAD_SQL, "text": (
         "No answer. The model's SQL failed 3 times. Last error: Parse error: Expected a condition after WHERE")}
+
+
+# The tested line stands only beside an answer the checks looked at: none for can't answer or failed,
+# kept for a refused answer (its Refused row is a check) and a clean one.
+def test_tested_line_only_where_checks_ran(runners):
+    cases = {
+        "cannot": FakeModel({QUESTION: json.dumps({"cannot_answer": "The data has no weather records."})}),
+        "failed": FakeModel({QUESTION: "Here is my answer, but not as JSON."}),
+        "refused": FakeModel(script(first_sql=LEFT_SQL)),
+        "clean": FakeModel(script()),
+    }
+    tested = {}
+    for kind, model in cases.items():
+        runner = runners(model)
+        runner.engine.lock, runner.engine.measured = Lock(True, None), {"rates": RATES}
+        done = finish(runner, runner.submit("ask", "tpch", QUESTION)["id"])
+        assert done["verdict"]["kind"] == kind
+        tested[kind] = done["tested"]
+
+    assert tested["cannot"] is None and tested["failed"] is None
+    for kind in ("refused", "clean"):
+        assert tested[kind] == check_views.tested_line(Lock(True, None), "ask", RATES), kind
+        assert tested[kind]["text"].startswith("Checked answers."), kind
 
 
 def test_sql_jobs_end_done_or_error(runners):

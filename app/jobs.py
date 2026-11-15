@@ -58,7 +58,7 @@ class Job:
     checks: list = field(default_factory=list)
     terms: list = field(default_factory=list)
     tested: dict | None = None
-    timing: dict = field(default_factory=lambda: {"first_s": None, "verdict_s": None, "engine_ms": None})
+    timing: dict = field(default_factory=lambda: {"first_s": None, "verdict_s": None, "engine_ms": None, "first_text": None, "verdict_text": None})
     error: dict | None = None
     replies: dict = field(default_factory=dict)  # "first" / "second": bridge replies whose rows are shown
     stop: bool = False
@@ -72,6 +72,11 @@ class Worker:
     queue: deque = field(default_factory=deque)
     busy: Job | None = None
     thread: threading.Thread | None = None
+
+
+# Seconds as the page shows them ("2.5 s"); None stays None.
+def seconds_text(seconds: float | None) -> str | None:
+    return None if seconds is None else f"{seconds:.1f} s"
 
 
 # Text with its em dashes made plain; None stays None.
@@ -343,14 +348,15 @@ class JobRunner:
                 "replies": {"first": result}
             }
 
+        # No check ran on an answer the model couldn't or didn't give, so no tested line stands beside it.
         primary = record["primary"]
         if stage == "cannot":
-            return {**ended, "verdict": _verdict([], "done", "cannot", primary["reason"])}
+            return {**ended, "tested": None, "verdict": _verdict([], "done", "cannot", primary["reason"])}
         
         if stage == "failed":
             last = primary["attempts"][-1]
             detail = NO_SQL_REPLY if last["reply"] is None else views.error_text(last["reply"])
-            return {**ended, "verdict": _verdict([], "done", "failed", detail, sql=last["sql"])}
+            return {**ended, "tested": None, "verdict": _verdict([], "done", "failed", detail, sql=last["sql"])}
 
         phase, asked = ("first" if stage == "first" else "done"), job.asked
         if ck.overall(results) == "refused":  # no numbers, only why, with the SQL one click away
@@ -382,10 +388,14 @@ class JobRunner:
 
         now = round(time.monotonic() - job.submitted, 1)
         first = job.replies.get("first")
+        first_s = now if job.stage == "first" else job.timing["first_s"]
+        verdict_s = now if job.stage in ENDED else None
         job.timing = {
-            "first_s": now if job.stage == "first" else job.timing["first_s"],
-            "verdict_s": now if job.stage in ENDED else None,
+            "first_s": first_s,
+            "verdict_s": verdict_s,
             "engine_ms": first.get("ms") if first else None,
+            "first_text": seconds_text(first_s),
+            "verdict_text": seconds_text(verdict_s),
         }
         self._publish(job)
         if job.stage in ENDED:
