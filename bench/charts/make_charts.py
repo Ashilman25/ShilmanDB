@@ -34,6 +34,13 @@ FONTS = ["Helvetica Neue", "Helvetica", "Arial", "DejaVu Sans"]
 DPI = 200
 MARKER_SIZE = 7.5
 
+# The latency chart puts up to 10 markers side by side per query, so its markers are smaller.
+LATENCY_MARKER = 6.5
+LATENCY_EDGE = 1.5
+LATENCY_SCALE = {"D": 0.83}   # a diamond is wider than a circle of the same size
+RING_SIZE = 8.5              # fits around any latency marker, and between neighbours
+RING_EDGE = 0.8
+
 QUERIES = ["Q1", "Q3", "Q5", "Q6", "Q10", "Q12", "Q14", "Q19"]
 ENGINE_SLOT = {"shilmandb": 0, "duckdb": 1, "postgres": 2, "sqlite": 3}
 # Config order on the chart, its label, and its marker (engines keep one hue each).
@@ -162,6 +169,10 @@ def ms_label(v: float, _pos=None) -> str:
     return f"{v:g} ms"
 
 
+def latency_marker_size(marker: str) -> float:
+    return LATENCY_MARKER * LATENCY_SCALE.get(marker, 1.0)
+
+
 # Chart 1: every engine config's median time per query, one log panel per scale factor.
 def chart_latency(data: Path, out: Path) -> Optional[List[Path]]:
     panels = baseline_panels(data)
@@ -170,9 +181,9 @@ def chart_latency(data: Path, out: Path) -> Optional[List[Path]]:
     machine = machine_name(data)
 
     def draw(theme: dict):
-        fig, axes = new_figure(theme, len(panels), 1, 10.5, 4.3 * len(panels) + 0.4)
+        fig, axes = new_figure(theme, len(panels), 1, 13.5, 4.3 * len(panels) + 0.4, sharey=True)
         present = [c for c in CONFIGS if any(r["config"] == c[0] for _, rows in panels for r in rows)]
-        width = 0.8 / max(len(present), 1)
+        width = 0.9 / max(len(present), 1)
         any_drift = False
         for ax, (sf, rows) in zip(axes[:, 0], panels):
             by_key = {(r["query"], r["config"]): r for r in rows}
@@ -187,7 +198,7 @@ def chart_latency(data: Path, out: Path) -> Optional[List[Path]]:
                     ms = drawable_ms(r, sf)
                     if ms is None:
                         continue   # unchecked, failed or not run: left empty
-                    x = qi - 0.4 + width * (ci + 0.5)
+                    x = qi - 0.45 + width * (ci + 0.5)
                     xs.append(x)
                     ys.append(ms)
                     if r["status"] == "DRIFT":
@@ -195,17 +206,17 @@ def chart_latency(data: Path, out: Path) -> Optional[List[Path]]:
                         drift_ys.append(ms)
                         
                 ax.plot(
-                    xs, ys, linestyle="none", marker=marker, markersize=MARKER_SIZE,
+                    xs, ys, linestyle="none", marker=marker, markersize=latency_marker_size(marker),
                     markerfacecolor=color, markeredgecolor=theme["surface"],
-                    markeredgewidth=2, zorder=3
+                    markeredgewidth=LATENCY_EDGE, zorder=3
                 )
                 
                 if drift_xs:
                     any_drift = True
                     ax.plot(
                         drift_xs, drift_ys, linestyle="none", marker="o",
-                        markersize=MARKER_SIZE + 6, markerfacecolor="none",
-                        markeredgecolor=theme["ink"], markeredgewidth=1.2, zorder=4
+                        markersize=RING_SIZE, markerfacecolor="none",
+                        markeredgecolor=theme["ink"], markeredgewidth=RING_EDGE, zorder=4
                     )
                     
             ax.set_yscale("log")
@@ -225,22 +236,22 @@ def chart_latency(data: Path, out: Path) -> Optional[List[Path]]:
         for config, label, marker in present:
             engine = next(r["engine"] for _, rows in panels for r in rows if r["config"] == config)
             handles.append(
-                Line2D([], [], linestyle="none", marker=marker, markersize=MARKER_SIZE,
+                Line2D([], [], linestyle="none", marker=marker, markersize=latency_marker_size(marker),
                        markerfacecolor=theme["slots"][ENGINE_SLOT.get(engine, 7)],
-                       markeredgecolor=theme["surface"], markeredgewidth=2,
+                       markeredgecolor=theme["surface"], markeredgewidth=LATENCY_EDGE,
                        label=label
                        )
                 )
         if any_drift:
             handles.append(
-                Line2D([], [], linestyle="none", marker="o", markersize=MARKER_SIZE + 4,
-                       markerfacecolor="none", markeredgecolor=theme["ink"],
+                Line2D([], [], linestyle="none", marker="o", markersize=RING_SIZE,
+                       markerfacecolor="none", markeredgecolor=theme["ink"], markeredgewidth=RING_EDGE,
                        label="ring: answer drifts in the last digits"
                        )
                 )
         legend = axes[0, 0].legend(handles=handles, loc="upper left", bbox_to_anchor=(1.01, 1.0), fontsize=9, handletextpad=0.4, labelspacing=0.7)
         style_legend(legend, theme)
-        fig.subplots_adjust(hspace=0.3)
+        fig.subplots_adjust(hspace=0.3, top=0.92)
         
         add_titles(
             fig, theme, "TPC-H query times: ShilmanDB against SQLite, DuckDB and Postgres",
