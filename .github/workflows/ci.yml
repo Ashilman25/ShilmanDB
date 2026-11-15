@@ -96,9 +96,9 @@ jobs:
           python -m venv .venv
           .venv/bin/pip install -r requirements.txt
 
-      # Tests that need Postgres, torch, faiss, LightGBM or MLX skip here
+      # The bench's tests and the app's; ones that need Postgres, torch, faiss, LightGBM or MLX skip here
       - name: Run Python tests
-        run: .venv/bin/python -m pytest bench -q -W error
+        run: .venv/bin/python -m pytest bench app -q -W error
 
   # The Debug job on Linux
   linux-debug:

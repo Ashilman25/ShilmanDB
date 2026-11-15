@@ -1,0 +1,2 @@
+region	region.tbl	r_regionkey:BIGINT,r_name:VARCHAR,r_comment:VARCHAR
+nation	nation.tbl	n_nationkey:BIGINT,n_name:VARCHAR,n_regionkey:BIGINT,n_comment:VARCHAR
