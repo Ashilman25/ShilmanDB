@@ -693,8 +693,8 @@ def _fake_shilmandb(calls: list):
 
 # Stands in for a runner subprocess: writes its latencies and info files, like the real one.
 def _fake_engine(calls: list, ok: bool = True):
-    def run(engine, scale_factors, data_dir, output_dir, timed_runs):
-        calls.append((engine, list(scale_factors), timed_runs))
+    def run(engine, scale_factors, data_dir, output_dir, timed_runs, warmup_runs):
+        calls.append((engine, list(scale_factors), timed_runs, warmup_runs))
         if not ok:
             return False
         lines = ["sf,query,config,run,latency_ms"]
@@ -710,14 +710,17 @@ def _fake_engine(calls: list, ok: bool = True):
 
 
 # Stands in for compare_results.py: answers by the --reference-name it was given.
+# An answer of "CRASH" prints nothing and writes a traceback to stderr.
 def _fake_compare(answers: dict, calls: list):
     def run(cmd):
         name = cmd[cmd.index("--reference-name") + 1]
         cfg, sf = cmd[cmd.index("--configs") + 1], cmd[cmd.index("--sf") + 1]
         calls.append((cfg, name))
         line = answers.get(name, "PASS")
+        if line == "CRASH":
+            return "", "Traceback (most recent call last):\nStopIteration\n"
         return "\n".join(f"  {line.split()[0]:<5} [{cfg}] {q} SF={sf}{line[len(line.split()[0]):]}"
-                         for q in mod.QUERIES) + "\n"
+                         for q in mod.QUERIES) + "\n", ""
     return run
 
 
@@ -768,7 +771,7 @@ def test_duckdb_flag_adds_rows(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
                                       "--runs", "3", "--output-dir", str(out)])
     assert mod.main() == 0
 
-    assert engines == [("duckdb", ["0.01"], 3)]
+    assert engines == [("duckdb", ["0.01"], 3, 1)]
     lat = _read_dicts(out / "latencies.csv")
     assert {r["config"] for r in lat} == {"baseline", "duckdb", "duckdb_1thread"}
     q1 = next(r for r in lat if r["config"] == "duckdb" and r["query"] == "Q1")
@@ -846,7 +849,7 @@ def test_failed_engine_shows_skip(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     _stub_main(monkeypatch, shilmandb, engines, compares, sqlite, engine_ok=False)
     monkeypatch.setattr(sys, "argv", ["run_benchmarks.py", "--sf", "0.01", "--configs", "baseline", "--postgres",
                                       "--output-dir", str(out)])
-    assert mod.main() == 0
+    assert mod.main() == 3                      # every output is still written
     assert {r["config"] for r in _read_dicts(out / "latencies.csv")} == {"baseline"}
     status = {(r["config"], r["status"]) for r in _read_dicts(out / "correctness.csv")}
     assert status == {("baseline", "PASS"), ("postgres", "SKIP"), ("postgres_1worker", "SKIP")}
@@ -941,7 +944,7 @@ def test_no_engine_files_when_every_engine_failed(tmp_path: Path, monkeypatch: p
     _stub_main(monkeypatch, shilmandb, engines, compares, sqlite, engine_ok=False)
     monkeypatch.setattr(sys, "argv", ["run_benchmarks.py", "--sf", "10", "--configs", "baseline", "--duckdb", "--postgres",
                                       "--output-dir", str(out)])
-    assert mod.main() == 0
+    assert mod.main() == 3
     assert len(engines) == 2
     assert compares == []                       # no reference left at SF=10, not a fall back to SQLite
     status = {(r["config"], r["status"]) for r in _read_dicts(out / "correctness.csv")}
@@ -976,3 +979,90 @@ def test_build_info_falls_back_to_newest_folder(tmp_path: Path) -> None:
     build = tmp_path / "build"
     _fake_cmake_build(build, {"4.0.0": ("16.0.0", 1_000), "4.2.0": ("17.0.0", 2_000)}, (4, 3, 1))
     assert mod.build_info(build) == ("/usr/bin/c++ (AppleClang 17.0.0)", "Release")
+
+
+# A crashed compare_results.py must not pass as SKIP
+def test_compare_output_returns_stdout_and_stderr(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
+    monkeypatch.setattr(mod.subprocess, "run",
+                        lambda cmd, **k: mod.subprocess.CompletedProcess(cmd, 1, stdout="out\n", stderr="Traceback: boom\n"))
+    assert mod.compare_output(["x"]) == ("out\n", "Traceback: boom\n")
+    assert "Traceback: boom" in capsys.readouterr().err
+
+    monkeypatch.setattr(mod.subprocess, "run",
+                        lambda cmd, **k: mod.subprocess.CompletedProcess(cmd, 1, stdout="out\n", stderr=""))
+    assert mod.compare_output(["x"]) == ("out\n", "")
+    assert capsys.readouterr().err == ""
+
+
+def test_crashed_compare_is_fail_in_both_files(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list = []
+    monkeypatch.setattr(mod, "compare_output", _fake_compare({"DuckDB": "CRASH", "Postgres": "PASS"}, calls))
+    path, checks = tmp_path / "correctness.csv", tmp_path / "reference_checks.csv"
+    mod.write_correctness_csv(path, ["10"], ["baseline"], tmp_path, queries=["Q1"], duckdb=True, postgres=True, checks_path=checks)
+    assert {r["config"]: r["status"] for r in _read_dicts(path)} == {"baseline": "FAIL"}
+    got = {r["reference"]: r["status"] for r in _read_dicts(checks)}
+    assert got == {"DuckDB": "FAIL", "Postgres": "PASS"}
+
+
+def test_missing_line_without_stderr_stays_skip(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(mod, "compare_output", lambda cmd: ("", ""))
+    path = tmp_path / "correctness.csv"
+    mod.write_correctness_csv(path, ["0.01"], ["baseline"], tmp_path, queries=["Q1"])
+    assert {r["config"]: r["status"] for r in _read_dicts(path)} == {"baseline": "SKIP"}
+
+
+# The real compare_results.py on an empty result file: it crashes, and that is FAIL, not SKIP.
+def test_real_compare_crash_is_fail(tmp_path: Path) -> None:
+    (tmp_path / "sqlite_results").mkdir()
+    (tmp_path / "sqlite_results" / "Q1_sf0.01.csv").write_text("a\n1\n")
+    (tmp_path / "shilmandb_results" / "baseline").mkdir(parents=True)
+    (tmp_path / "shilmandb_results" / "baseline" / "Q1_sf0.01.csv").write_text("")
+    path = tmp_path / "correctness.csv"
+    mod.write_correctness_csv(path, ["0.01"], ["baseline"], tmp_path, queries=["Q1", "Q3"])
+    assert {r["query"]: r["status"] for r in _read_dicts(path)} == {"Q1": "FAIL", "Q3": "FAIL"}
+
+
+def test_main_exit_3_when_an_engine_failed_and_0_otherwise(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    shilmandb, engines, compares, sqlite = [], [], [], []
+    _stub_main(monkeypatch, shilmandb, engines, compares, sqlite)
+
+    # A fresh folder per run, so the second run's outputs can't be left from the first.
+    def run_into(out: Path) -> int:
+        monkeypatch.setattr(sys, "argv", ["run_benchmarks.py", "--sf", "0.01", "--configs", "baseline", "--duckdb", "--postgres",
+                                          "--output-dir", str(out)])
+        return mod.main()
+
+    assert run_into(tmp_path / "ok") == 0
+
+    def one_fails(engine, *args):
+        return engine == "duckdb" and _fake_engine(engines)(engine, *args)
+
+    monkeypatch.setattr(mod, "run_engine_benchmarks", one_fails)
+    failed = tmp_path / "failed"
+    assert run_into(failed) == 3
+    assert (failed / "latencies.csv").exists() and (failed / "environment.csv").exists()
+
+
+def test_help_mentions_exit_3(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
+    monkeypatch.setattr(sys, "argv", ["run_benchmarks.py", "--help"])
+    with pytest.raises(SystemExit):
+        mod.parse_args()
+    assert "exit 3" in " ".join(capsys.readouterr().out.split())
+
+
+def test_engine_runner_gets_warmup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    commands: list = []
+    monkeypatch.setattr(mod.subprocess, "run", lambda cmd, **k: commands.append(cmd) or mod.subprocess.CompletedProcess(cmd, 0))
+    assert mod.run_engine_benchmarks("duckdb", ["0.01"], tmp_path, tmp_path, 3, 2) is True
+    cmd = commands[0]
+    assert cmd[cmd.index("--warmup") + 1] == "2"
+    assert cmd[cmd.index("--runs") + 1] == "3"
+
+
+def test_main_passes_warmup_to_engines(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    shilmandb, engines, compares, sqlite = [], [], [], []
+    _stub_main(monkeypatch, shilmandb, engines, compares, sqlite)
+    monkeypatch.setattr(sys, "argv", ["run_benchmarks.py", "--sf", "0.01", "--configs", "none", "--postgres",
+                                      "--warmup", "4", "--runs", "2", "--output-dir", str(tmp_path / "out")])
+    assert mod.main() == 0
+    assert engines == [("postgres", ["0.01"], 2, 4)]

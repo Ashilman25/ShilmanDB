@@ -230,3 +230,117 @@ def test_main_refuses_out_under_repo_results(tmp_path: Path) -> None:
     out = mod.RESULTS_DIR / "chart_export_refusal_test"
     assert mod.main(["--results-dir", str(results), "--out", str(out)]) != 0
     assert not out.exists()
+
+
+# A baseline folder from (config, time, status) cells; status None means no correctness row.
+def make_status_dir(root: Path, sf: str, cells, name: str = "baseline") -> Path:
+    d = root / name
+    d.mkdir(parents=True)
+    lat = [LAT_HEADER] + [f"{sf},Q1,{config},{ms},4,,\n" for config, ms, _ in cells]
+    (d / "latencies.csv").write_text("".join(lat))
+    cor = ["sf,query,config,status\n"] + [f"{sf},Q1,{config},{st}\n" for config, _, st in cells if st is not None]
+    (d / "correctness.csv").write_text("".join(cor))
+    return d
+
+
+def test_export_baseline_publishes_only_checked_times(tmp_path: Path) -> None:
+    src = make_status_dir(tmp_path, "1.0", [
+        ("baseline", "800.0", "PASS"),
+        ("+index", "700.0", "DRIFT"),
+        ("+vectorized", "600.0", "FAIL"),
+        ("duckdb", "40.0", "SKIP"),
+        ("postgres", "900.0", None),
+        ("+learned", "950.0", "WEIRD"),
+        ("sqlite_disk", "2000.0", "SKIP"),
+        ("sqlite_memory", "1900.0", "SKIP"),
+    ])
+    out = tmp_path / "out"
+    mod.export_baseline(src, "1", out)
+    rows = {r["config"]: r for r in read_rows(out / "baseline_sf1.csv")}
+    times = {c: r["median_ms"] for c, r in rows.items()}
+    assert times == {
+        "baseline": "800.0", "+index": "700.0", "+vectorized": "", "duckdb": "",
+        "postgres": "", "+learned": "", "sqlite_disk": "2000.0", "sqlite_memory": "1900.0"}
+    assert rows["postgres"]["status"] == ""        # no correctness row: status stays empty
+    assert rows["duckdb"]["status"] == "SKIP"
+    assert rows["+learned"]["status"] == "WEIRD"
+
+
+def test_export_baseline_sf10_skip_has_no_time(tmp_path: Path) -> None:
+    src = make_status_dir(tmp_path, "10.0", [
+        ("duckdb", "400.0", "SKIP"),
+        ("postgres", "9000.0", "PASS"),
+        ("+index", "8000.0", "DRIFT"),
+        ("sqlite_disk", "20000.0", "SKIP"),
+        ("sqlite_memory", "19000.0", "SKIP"),
+    ])
+    out = tmp_path / "out"
+    mod.export_baseline(src, "10", out)
+    rows = {r["config"]: r for r in read_rows(out / "baseline_sf10.csv")}
+    times = {c: r["median_ms"] for c, r in rows.items()}
+    # SQLite is not the reference at SF=10, so its SKIP was never checked.
+    assert times == {"duckdb": "", "postgres": "9000.0", "+index": "8000.0",
+                     "sqlite_disk": "", "sqlite_memory": ""}
+    assert rows["sqlite_disk"]["status"] == "SKIP"
+
+
+def test_publishable_sqlite_skip_only_where_sqlite_is_the_reference() -> None:
+    for sf in ("0.01", "0.1", "1", "1.0"):
+        assert mod.publishable("sqlite_disk", "SKIP", sf)
+    assert not mod.publishable("sqlite_disk", "SKIP", "10")
+    assert not mod.publishable("sqlite_memory", "SKIP", "10.0")
+    assert mod.publishable("sqlite_disk", "PASS", "10")
+    assert not mod.publishable("duckdb", "SKIP", "1")
+
+
+def test_export_baseline_refuses_missing_correctness(tmp_path: Path, capsys) -> None:
+    src = make_baseline_dir(tmp_path)
+    (src / "correctness.csv").unlink()
+    out = tmp_path / "out"
+    with pytest.raises(mod.StaleResultsError):
+        mod.export_baseline(src, "1", out)
+    assert not out.exists()
+    assert mod.main(["--results-dir", str(tmp_path / "nothing"), "--baseline-dir-sf1", str(src),
+                     "--out", str(out)]) == 2
+    assert not out.exists()
+    err = capsys.readouterr().err
+    assert str(src) in err and "correctness.csv" in err
+
+
+def test_export_baseline_refuses_stale_correctness(tmp_path: Path, capsys) -> None:
+    results = make_results_dir(tmp_path)
+    src = make_baseline_dir(tmp_path)
+    lat = src / "latencies.csv"
+    os.utime(src / "correctness.csv", (1_000_000, 1_000_000))
+    os.utime(lat, (2_000_000, 2_000_000))
+    out = tmp_path / "out"
+    with pytest.raises(mod.StaleResultsError):
+        mod.export_baseline(src, "1", out)
+    assert not out.exists()
+    # Refused before any export runs, the others included.
+    assert mod.main(["--results-dir", str(results), "--baseline-dir-sf10", str(src),
+                     "--out", str(out)]) == 2
+    assert not out.exists()
+    err = capsys.readouterr().err
+    assert str(src) in err and "older" in err
+    assert "cp -p" in err   # a plain cp -R makes a good folder look stale
+
+
+def test_export_baseline_accepts_newer_correctness(tmp_path: Path) -> None:
+    src = make_baseline_dir(tmp_path)
+    os.utime(src / "latencies.csv", (1_000_000, 1_000_000))
+    os.utime(src / "correctness.csv", (2_000_000, 2_000_000))
+    out = tmp_path / "out"
+    assert mod.main(["--results-dir", str(tmp_path / "nothing"), "--baseline-dir-sf1", str(src),
+                     "--out", str(out)]) == 0
+    assert (out / "baseline_sf1.csv").exists()
+
+
+@pytest.mark.parametrize("flag", ["--baseline-dir-sf1", "--baseline-dir-sf10", "--join-dir"])
+def test_main_refuses_out_under_input_dirs(tmp_path: Path, flag: str, capsys) -> None:
+    src = make_baseline_dir(tmp_path)
+    out = src / "charts"
+    assert mod.main(["--results-dir", str(tmp_path / "nothing"), flag, str(src),
+                     "--out", str(out)]) == 2
+    assert not out.exists()
+    assert "under" in capsys.readouterr().err

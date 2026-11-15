@@ -66,6 +66,31 @@ def engine_of(config: str) -> str:
     return "other"
 
 
+# A time is published only if its answer was checked: PASS, DRIFT, or SQLite's own SKIP.
+# SQLite is the reference only at SF <= 1; at SF=10 its SKIP was never checked.
+def publishable(config: str, status: str, sf: str) -> bool:
+    sqlite_reference = engine_of(config) == "sqlite" and float(sf) <= 1
+    return status in ("PASS", "DRIFT") or (status == "SKIP" and sqlite_reference)
+
+
+class StaleResultsError(ValueError):
+    """A baseline folder whose answer statuses don't belong to its times."""
+
+
+# Refuses a folder whose correctness.csv is missing or older than its latencies.csv.
+def check_statuses_current(results_dir: Path) -> None:
+    latencies, correctness = results_dir / "latencies.csv", results_dir / "correctness.csv"
+    if not correctness.exists():
+        raise StaleResultsError(f"{results_dir}: correctness.csv is missing, so no time can be checked")
+    
+    if correctness.stat().st_mtime < latencies.stat().st_mtime:
+        raise StaleResultsError(
+            f"{results_dir}: correctness.csv is older than latencies.csv "
+            "(left from an earlier run? copy result folders with cp -p, "
+            "which keeps file times)"
+        )
+
+
 def largest(values: Iterable[str]) -> str:
     filled = [v for v in values if v not in ("", None)]
     return max(filled, key=float) if filled else ""
@@ -73,6 +98,7 @@ def largest(values: Iterable[str]) -> str:
 
 # One row per query and config: time, answer status and the diffs behind that status.
 def export_baseline(results_dir: Path, sf: str, out: Path) -> Path:
+    check_statuses_current(results_dir)
     latencies = [r for r in read_csv(results_dir / "latencies.csv") if same_sf(r["sf"], sf)]
     status = {(r["query"], r["config"]): r["status"] for r in read_csv(results_dir / "correctness.csv") if same_sf(r["sf"], sf)}
     checks_path = results_dir / "reference_checks.csv"
@@ -87,12 +113,12 @@ def export_baseline(results_dir: Path, sf: str, out: Path) -> Path:
             "query": r["query"],
             "engine": engine_of(r["config"]),
             "config": r["config"],
-            "median_ms": "" if st == "FAIL" else r["median_latency_ms"],
+            "median_ms": r["median_latency_ms"] if publishable(r["config"], st, sf) else "",
             "status": st,
             "max_abs_diff": largest(c["max_abs_diff"] for c in matching),
             "max_rel_diff": largest(c["max_rel_diff"] for c in matching),
         })
-        
+
     path = out / f"baseline_sf{sf}.csv"
     write_csv(path, BASELINE_COLUMNS, rows)
     env = results_dir / "environment.csv"
@@ -205,10 +231,11 @@ def export_analyst(out: Path, results_dir: Path = RESULTS_DIR) -> Path:
     return path
 
 
-# The results folder that out falls inside (--results-dir or bench/results/), else None.
-def out_under_results(out: Path, results_dir: Path) -> Optional[Path]:
+# The input folder that out falls inside (results, bench/results/ or an extra), else None.
+def out_under_results(out: Path, results_dir: Path, extra: Sequence[Path] = ()) -> Optional[Path]:
     target = out.resolve()
-    for folder in (results_dir.resolve(), RESULTS_DIR.resolve()):
+    for folder in (results_dir, RESULTS_DIR, *extra):
+        folder = folder.resolve()
         if target == folder or folder in target.parents:
             return folder
     return None
@@ -224,11 +251,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parser.parse_args(argv)
 
     results = args.results_dir
-    bad = out_under_results(args.out, results)
+    inputs = [d for d in (args.baseline_dir_sf1, args.baseline_dir_sf10, args.join_dir) if d]
+    bad = out_under_results(args.out, results, inputs)
     if bad:
         print(f"error: --out {args.out} is under {bad}; I never write into result folders", file=sys.stderr)
         return 2
-    
+
+    # Stale or missing statuses stop everything before any file is written.
+    for folder in (args.baseline_dir_sf1, args.baseline_dir_sf10):
+        if folder and (folder / "latencies.csv").exists():
+            try:
+                check_statuses_current(folder)
+            except StaleResultsError as e:
+                print(f"error: {e}", file=sys.stderr)
+                return 2
+
     join_dir = args.join_dir or results / "headroom" / "join_output_after"
     jobs = [
         ("baseline SF=1", args.baseline_dir_sf1 and args.baseline_dir_sf1 / "latencies.csv", lambda: export_baseline(args.baseline_dir_sf1, "1", args.out)),

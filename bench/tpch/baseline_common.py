@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-#DubDB and Postgres TPC-H baseline runners
+# DuckDB and Postgres TPC-H baseline runners
 from __future__ import annotations
 
 import argparse
@@ -109,10 +109,11 @@ def tbl_row_counts(data_dir: Path) -> Dict[str, int]:
     return counts
 
 
-# One untimed warmup, then `runs` timed calls (execute + fetch).
+# `warmup` untimed calls, then `runs` timed calls (execute + fetch).
 # Returns the latencies in ms and the last call's rows.
-def time_query(run: Callable[[], list], runs: int) -> Tuple[List[float], list]:
-    run()
+def time_query(run: Callable[[], list], runs: int, warmup: int = 1) -> Tuple[List[float], list]:
+    for _ in range(warmup):
+        run()
     latencies = []
     rows: list = []
     for _ in range(runs):
@@ -153,6 +154,7 @@ def add_baseline_args(parser: argparse.ArgumentParser, configs: Dict[str, List[s
     parser.add_argument("--sf", action="extend", nargs="+", default=None, help="scale factors, space or comma separated: 0.01, 0.1, 1.0, 10, or 'all' (0.01, 0.1, 1.0; the default)")
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR, help="where results go (default: bench/results)")
     parser.add_argument("--runs", type=int, default=5, help="timed runs per query (default: 5)")
+    parser.add_argument("--warmup", type=int, default=1, help="untimed runs per query before the timed ones (default: 1)")
     parser.add_argument("--configs", action="extend", nargs="+", default=None, help=f"configs to run, space or comma separated (default: {','.join(configs)})")
 
 
@@ -184,10 +186,13 @@ def resolve_configs(names: Optional[List[str]], configs: Dict[str, List[str]]) -
     return list(dict.fromkeys(chosen))
 
 
-# The checked --runs, scale factors and configs; None after printing what's wrong.
+# The checked --runs, --warmup, scale factors and configs; None after printing what's wrong.
 def resolve_run_args(args: argparse.Namespace, configs: Dict[str, List[str]]) -> Optional[Tuple[List[str], List[str]]]:
     if args.runs < 1:
         print("Error: --runs must be at least 1.")
+        return None
+    if args.warmup < 0:
+        print("Error: --warmup can't be negative.")
         return None
     
     scale_factors = resolve_scale_factors(args.sf)
@@ -212,12 +217,12 @@ def ensure_loaded(label: str, sf_data_dir: Path, reload: bool, read_marker: Call
 
 
 # Time the 8 queries through execute(sql) and write each one's last rows to results_dir.
-def run_queries(engine: str, execute: Callable[[str], list], sf: str, config: str, runs: int, results_dir: Path) -> List[dict]:
+def run_queries(engine: str, execute: Callable[[str], list], sf: str, config: str, runs: int, results_dir: Path, warmup: int = 1) -> List[dict]:
     rows: List[dict] = []
     print(f"\n  --- Config: {config} (SF={sf}) ---")
     for tag in QUERY_ORDER:
         sql = query_text(engine, tag)
-        latencies, result = time_query(lambda: execute(sql), runs)
+        latencies, result = time_query(lambda: execute(sql), runs, warmup)
         print(f"  {tag}: median={statistics.median(latencies):.2f} ms "
               f"(min={min(latencies):.2f}, max={max(latencies):.2f})")
         

@@ -141,9 +141,17 @@ def machine_name(data: Path) -> str:
     return ""
 
 
-# A row's time if it may be drawn: never for a missing row, a FAIL or an empty time.
-def drawable_ms(row: Optional[Dict[str, str]]) -> Optional[float]:
-    if not row or row.get("status") == "FAIL" or not row.get("median_ms"):
+# Only checked answers are drawn: PASS, DRIFT, or SQLite's own SKIP where it is the reference.
+# SQLite is the reference only at SF <= 1; at SF=10 its SKIP was never checked.
+def checked(row: Dict[str, str], sf: str) -> bool:
+    status = row.get("status")
+    sqlite_reference = row.get("engine") == "sqlite" and float(sf) <= 1
+    return status in ("PASS", "DRIFT") or (status == "SKIP" and sqlite_reference)
+
+
+# A row's time if it may be drawn: never for a missing row, an unchecked answer or an empty time.
+def drawable_ms(row: Optional[Dict[str, str]], sf: str) -> Optional[float]:
+    if not row or not checked(row, sf) or not row.get("median_ms"):
         return None
     return float(row["median_ms"])
 
@@ -176,9 +184,9 @@ def chart_latency(data: Path, out: Path) -> Optional[List[Path]]:
                 
                 for qi, q in enumerate(queries):
                     r = by_key.get((q, config))
-                    ms = drawable_ms(r)
+                    ms = drawable_ms(r, sf)
                     if ms is None:
-                        continue   # FAIL or not run: left empty
+                        continue   # unchecked, failed or not run: left empty
                     x = qi - 0.4 + width * (ci + 0.5)
                     xs.append(x)
                     ys.append(ms)
@@ -244,12 +252,12 @@ def chart_latency(data: Path, out: Path) -> Optional[List[Path]]:
 
 
 # (query, +vectorized ÷ +index) for every query where both times can be drawn.
-def vectorized_ratios(rows: List[Dict[str, str]]) -> List[tuple]:
+def vectorized_ratios(rows: List[Dict[str, str]], sf: str) -> List[tuple]:
     by_key = {(r["query"], r["config"]): r for r in rows}
     ratios = []
     for q in QUERIES:
-        vec = drawable_ms(by_key.get((q, "+vectorized")))
-        idx = drawable_ms(by_key.get((q, "+index")))
+        vec = drawable_ms(by_key.get((q, "+vectorized")), sf)
+        idx = drawable_ms(by_key.get((q, "+index")), sf)
         
         if vec is not None and idx is not None:
             ratios.append((q, vec / idx))
@@ -260,7 +268,7 @@ def vectorized_ratios(rows: List[Dict[str, str]]) -> List[tuple]:
 def chart_vectorized(data: Path, out: Path) -> Optional[List[Path]]:
     panels = []
     for sf, rows in baseline_panels(data):
-        ratios = vectorized_ratios(rows)
+        ratios = vectorized_ratios(rows, sf)
         if ratios:
             panels.append((sf, ratios))
 

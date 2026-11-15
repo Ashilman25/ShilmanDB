@@ -44,7 +44,7 @@ jobs:
           set -o pipefail
           ctest -j 4 --no-tests=error --output-on-failure | tee ctest.log
 
-      - name: Check no TPC-H answer test skipped
+      - name: Check no test skipped except the known ones
         run: bash scripts/ci_check_skips.sh build/ctest.log
 
   # Release build with the bench tools (no ML), the C++ tests, then the Python tests
@@ -81,7 +81,7 @@ jobs:
           set -o pipefail
           ctest -j 4 --no-tests=error --output-on-failure -E NextBeforeInitAsserts | tee ctest.log
 
-      - name: Check no TPC-H answer test skipped
+      - name: Check no test skipped except the known ones
         run: bash scripts/ci_check_skips.sh build/ctest.log
 
       - uses: actions/setup-python@v6
@@ -135,5 +135,5 @@ jobs:
           set -o pipefail
           ctest -j 4 --no-tests=error --output-on-failure | tee ctest.log
 
-      - name: Check no TPC-H answer test skipped
+      - name: Check no test skipped except the known ones
         run: bash scripts/ci_check_skips.sh build/ctest.log

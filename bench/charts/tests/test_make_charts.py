@@ -108,11 +108,11 @@ def test_fail_row_with_a_time_is_never_drawn(tmp_path: Path) -> None:
     )
     rows = mod.read_csv(path)
     by_cell = {(r["query"], r["config"]): r for r in rows}
-    assert mod.drawable_ms(by_cell[("Q1", "+vectorized")]) is None   # FAIL with a time
-    assert mod.drawable_ms(by_cell[("Q5", "+index")]) is None        # FAIL, empty time
-    assert mod.drawable_ms(None) is None
-    assert mod.drawable_ms(by_cell[("Q3", "+vectorized")]) == 10.0   # DRIFT is drawn
-    assert mod.vectorized_ratios(rows) == [("Q3", 0.5)]
+    assert mod.drawable_ms(by_cell[("Q1", "+vectorized")], "1") is None   # FAIL with a time
+    assert mod.drawable_ms(by_cell[("Q5", "+index")], "1") is None        # FAIL, empty time
+    assert mod.drawable_ms(None, "1") is None
+    assert mod.drawable_ms(by_cell[("Q3", "+vectorized")], "1") == 10.0   # DRIFT is drawn
+    assert mod.vectorized_ratios(rows, "1") == [("Q3", 0.5)]
 
 
 def test_needs_text_accepts_only_at_least_and_at_most() -> None:
@@ -122,3 +122,44 @@ def test_needs_text_accepts_only_at_least_and_at_most() -> None:
         mod.needs_text("exactly 0.10")
     with pytest.raises(ValueError):
         mod.needs_text("below 0.25")
+
+
+def test_only_checked_times_are_drawn() -> None:
+    def row(engine: str, config: str, status: str, ms: str = "10.0") -> dict:
+        return {"query": "Q1", "engine": engine, "config": config, "median_ms": ms, "status": status}
+
+    assert mod.drawable_ms(row("shilmandb", "+index", "PASS"), "1") == 10.0
+    assert mod.drawable_ms(row("duckdb", "duckdb", "DRIFT"), "1") == 10.0
+    assert mod.drawable_ms(row("sqlite", "sqlite_disk", "SKIP"), "1") == 10.0   # the reference itself
+    assert mod.drawable_ms(row("duckdb", "duckdb", "SKIP"), "1") is None
+    assert mod.drawable_ms(row("shilmandb", "+vectorized", "SKIP"), "1") is None
+    assert mod.drawable_ms(row("postgres", "postgres", ""), "1") is None
+    assert mod.drawable_ms(row("shilmandb", "+index", "WEIRD"), "1") is None
+    assert mod.drawable_ms(row("sqlite", "sqlite_disk", ""), "1") is None
+    assert mod.drawable_ms(row("sqlite", "sqlite_memory", "FAIL"), "1") is None
+    unchecked = [row("shilmandb", "+index", "PASS"), row("shilmandb", "+vectorized", "SKIP", "5.0")]
+    assert mod.vectorized_ratios(unchecked, "1") == []
+
+
+def test_sqlite_skip_is_drawn_only_where_sqlite_is_the_reference() -> None:
+    row = {"query": "Q1", "engine": "sqlite", "config": "sqlite_disk", "median_ms": "10.0", "status": "SKIP"}
+    assert mod.drawable_ms(row, "1") == 10.0
+    assert mod.drawable_ms(row, "0.1") == 10.0
+    assert mod.drawable_ms(row, "10") is None   # DuckDB and Postgres are the references there
+    assert mod.drawable_ms(dict(row, status="PASS"), "10") == 10.0
+
+
+def test_latency_chart_skips_sf10_sqlite_skip(tmp_path: Path, monkeypatch) -> None:
+    data = make_data(tmp_path)
+    drawn = []
+    real = mod.drawable_ms
+
+    def spy(row, sf):
+        ms = real(row, sf)
+        if row and row["engine"] == "sqlite" and ms is not None:
+            drawn.append(sf)
+        return ms
+
+    monkeypatch.setattr(mod, "drawable_ms", spy)
+    mod.chart_latency(data, tmp_path / "images")
+    assert drawn and set(drawn) == {"1"}

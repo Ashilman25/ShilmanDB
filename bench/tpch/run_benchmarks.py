@@ -750,7 +750,7 @@ def engine_of(config: str) -> str:
 
 
 # Run bench/tpch/run_<engine>_benchmarks.py as a subprocess. False if it failed (it says why).
-def run_engine_benchmarks(engine: str, scale_factors: Sequence[str], data_dir: Path, output_dir: Path, timed_runs: int) -> bool:
+def run_engine_benchmarks(engine: str, scale_factors: Sequence[str], data_dir: Path, output_dir: Path, timed_runs: int, warmup_runs: int = 1) -> bool:
     subsection(f"{REFERENCE_NAMES[engine]} benchmarks (SFs: {', '.join(scale_factors)})")
     script = HERE / f"run_{engine}_benchmarks.py"
     cmd: List[str] = [
@@ -758,6 +758,7 @@ def run_engine_benchmarks(engine: str, scale_factors: Sequence[str], data_dir: P
         "--data-dir", str(data_dir),
         "--output-dir", str(output_dir),
         "--runs", str(timed_runs),
+        "--warmup", str(warmup_runs),
     ]
     for sf in scale_factors:
         cmd += ["--sf", sf]
@@ -1115,10 +1116,14 @@ def worst_status(statuses: Sequence[str]) -> str:
     return max(statuses, key=STATUS_ORDER.index, default="SKIP")
 
 
-# Run compare_results.py and return what it printed.
-def compare_output(cmd: List[str]) -> str:
+# Run compare_results.py; returns its stdout and stderr, and repeats any stderr on ours.
+# A normal run writes nothing to stderr, so anything there means it crashed.
+def compare_output(cmd: List[str]) -> Tuple[str, str]:
     print(f"  $ {' '.join(cmd)}", flush=True)
-    return subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True, check=False).stdout
+    proc = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True, check=False)
+    if proc.stderr.strip():
+        eprint(f"! compare_results.py wrote to stderr (exit {proc.returncode}):\n{proc.stderr.rstrip()}")
+    return proc.stdout, proc.stderr
 
 
 # {query: (status, max_abs, max_rel)} from compare_results.py's output; the diffs only for DRIFT.
@@ -1150,6 +1155,7 @@ def references_for(sf: str, duckdb: bool, postgres: bool, output_dir: Path = DEF
 # Check every config with scripts/compare_results.py against each of its references (never its own engine).
 # correctness.csv gets the worst status per query; checks_path, when given, gets every check.
 # SQLite configs, configs of a failed engine and configs left with no reference are SKIP.
+# A query with no line from a compare that crashed is FAIL, else SKIP.
 def write_correctness_csv(path: Path, sfs: Sequence[str], configs: Sequence[str], output_dir: Path,
                           queries: Sequence[str] = tuple(QUERIES), duckdb: bool = False, postgres: bool = False,
                           failed_engines: Sequence[str] = (), checks_path: Optional[Path] = None) -> None:
@@ -1186,9 +1192,11 @@ def write_correctness_csv(path: Path, sfs: Sequence[str], configs: Sequence[str]
                         "--sf", sf,
                         "--configs", cfg,
                     ] + (["--reference-config", ref_config] if ref_config else [])
-                    seen = parse_compare_output(compare_output(cmd))
+                    stdout, stderr = compare_output(cmd)
+                    seen = parse_compare_output(stdout)
+                    missing = "FAIL" if stderr.strip() else "SKIP"
                     for q in queries:
-                        status, max_abs, max_rel = seen.get(q, ("SKIP", "", ""))
+                        status, max_abs, max_rel = seen.get(q, (missing, "", ""))
                         statuses[q].append(status)
                         checks.append((sf, q, cfg, name, status, max_abs, max_rel))
             for q in queries:
@@ -1353,15 +1361,16 @@ def stream_length_value(text: str) -> int:
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Phase 20.1 benchmark runner")
+    p = argparse.ArgumentParser(description="Phase 20.1 benchmark runner",
+                                epilog="Exit 3: --duckdb or --postgres was asked for and its runner failed; every other output is still written.")
     p.add_argument("--binary", type=Path, default=DEFAULT_BINARY, help=f"Path to load_tpch binary (default: {DEFAULT_BINARY})")
     p.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR, help=f"TPC-H data dir (default: {DEFAULT_DATA_DIR})")
     p.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR, help=f"Output dir (default: {DEFAULT_OUTPUT_DIR})")
     p.add_argument("--sf", action="append", choices=KNOWN_SCALE_FACTORS + ["all"], help="Scale factor(s). Repeat flag or use 'all'. Default: 'all'.")
     p.add_argument("--configs", default="all", help=("Comma-separated configs. Accepts 'all', 'none' (no ShilmanDB or SQLite config) or a subset of: " + ",".join(ALL_CONFIG_NAMES)))
-    p.add_argument("--duckdb", action="store_true", help="Also run DuckDB (duckdb, duckdb_1thread) through run_duckdb_benchmarks.py")
-    p.add_argument("--postgres", action="store_true", help="Also run Postgres (postgres, postgres_1worker) through run_postgres_benchmarks.py; needs the server on port 5434")
-    p.add_argument("--warmup", type=int, default=1, help="Warmup runs per query (default 1)")
+    p.add_argument("--duckdb", action="store_true", help="Also run DuckDB (duckdb, duckdb_1thread) through run_duckdb_benchmarks.py; exit 3 if it fails")
+    p.add_argument("--postgres", action="store_true", help="Also run Postgres (postgres, postgres_1worker) through run_postgres_benchmarks.py; needs the server on port 5434; exit 3 if it fails")
+    p.add_argument("--warmup", type=int, default=1, help="Warmup runs per query, DuckDB and Postgres included (default 1)")
     p.add_argument("--runs", type=int, default=5, help="Timed runs per query (default 5)")
     p.add_argument("--pool-sweep", action="store_true", help=f"Also run baseline pool-size sweep at SF={POOL_SWEEP_SF}")
     p.add_argument("--v1-eviction", action="store_true", help="Also run +learned with V1 eviction model per SF")
@@ -1453,7 +1462,7 @@ def main() -> int:
         print("  (skip: DuckDB and Postgres only run with the single workload)")
     for engine in tried_engines:
         engine_configs += ENGINE_CONFIGS[engine]
-        if not run_engine_benchmarks(engine, sfs, args.data_dir, output_dir, args.runs):
+        if not run_engine_benchmarks(engine, sfs, args.data_dir, output_dir, args.runs, args.warmup):
             eprint(f"! {engine} benchmarks failed - continuing without its rows")
             failed_engines.append(engine)
             continue
@@ -1577,6 +1586,9 @@ def main() -> int:
         print(f"  workload_queries -> {output_dir / 'workload_queries.csv'}")
         if not args.skip_correctness:
             print(f"  stream_correctness -> {output_dir / 'stream_correctness.csv'}")
+    if failed_engines:
+        eprint(f"! failed: {', '.join(failed_engines)} (exit 3)")
+        return 3
     return 0
 
 

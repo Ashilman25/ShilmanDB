@@ -158,3 +158,22 @@ def test_missing_marker_rebuilds(tmp_path: Path) -> None:
 
     assert mod.ensure_database(db_path, data, reload=False) is not None
     assert mod.ensure_database(db_path, data, reload=False) is None
+
+
+def test_duckdb_honors_warmup(tmp_path: Path, monkeypatch) -> None:
+    data_dir = tmp_path / "data"
+    write_tiny_tbl_files(data_dir / "sf0.01")
+    seen = []
+    real = mod.common.time_query
+
+    def spy(run, runs, warmup=1):
+        seen.append((runs, warmup))
+        return real(run, runs, warmup)
+
+    monkeypatch.setattr(mod.common, "time_query", spy)
+    assert run_main(data_dir, tmp_path / "out", tmp_path / "db", "--configs", "duckdb", "--warmup", "3") == 0
+    assert seen == [(1, 3)] * len(mod.common.QUERY_ORDER)
+
+    seen.clear()
+    assert run_main(data_dir, tmp_path / "out2", tmp_path / "db", "--configs", "duckdb") == 0
+    assert seen == [(1, 1)] * len(mod.common.QUERY_ORDER)

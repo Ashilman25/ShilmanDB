@@ -53,8 +53,18 @@ def _load_common() -> ModuleType:
 
 common = _load_common()
 
-CONFIGS: Dict[str, List[str]] = {"postgres": [], "postgres_1worker": ["SET max_parallel_workers_per_gather = 0"]}
+# The settings each config changes on purpose, and the SET statements that change them.
+CONFIG_SETTINGS: Dict[str, Dict[str, str]] = {"postgres": {}, "postgres_1worker": {"max_parallel_workers_per_gather": "0"}}
+CONFIGS: Dict[str, List[str]] = {config: [f"SET {name} = {value}" for name, value in sets.items()] for config, sets in CONFIG_SETTINGS.items()}
 MARKER_TABLE = "_baseline_load"
+SESSION_FIX = ("A database or role setting (ALTER DATABASE / ALTER ROLE ... SET) overrides postgresql.conf; "
+               "reset it. No latency or info file was written; per-query result files from "
+               "configs that already ran may have been updated.")
+
+
+# A benchmark session whose settings differ from the baseline; the message lists them.
+class SettingsMismatch(Exception):
+    pass
 
 
 def db_name(sf: str) -> str:
@@ -75,9 +85,15 @@ def show_settings(conn: psycopg.Connection) -> Dict[str, str]:
     return {name: conn.execute(f"SHOW {name}").fetchone()[0] for name in PG_SETTINGS}
 
 
-# One line per setting that differs from the baseline.
-def settings_mismatches(shown: Dict[str, str]) -> List[str]:
-    return [f"{name}: got {shown.get(name)}, want {want}" for name, want in PG_SETTINGS.items() if shown.get(name) != want]
+# One line per setting that differs from want (the baseline by default).
+def settings_mismatches(shown: Dict[str, str], want: Optional[Dict[str, str]] = None) -> List[str]:
+    want = PG_SETTINGS if want is None else want
+    return [f"{name}: got {shown.get(name)}, want {value}" for name, value in want.items() if shown.get(name) != value]
+
+
+# The refusal text: where, one line per wrong setting, then how to fix it.
+def mismatch_report(where: str, bad: List[str], fix: str) -> str:
+    return "\n".join([f"{where} doesn't have the baseline settings:", *(f"  {line}" for line in bad), fix])
 
 
 # The settings as postgresql.conf lines, for the server script to append.
@@ -181,16 +197,20 @@ def ensure_database(name: str, port: int, sf_data_dir: Path, reload: bool) -> Op
     )
 
 
-# Run the 8 queries under one config.
-# Returns the latency rows and the settings it ran with.
-def run_config(name: str, port: int, sf: str, config: str, runs: int, output_dir: Path) -> Tuple[List[dict], Dict[str, str]]:
+# Run the 8 queries under one config, after checking the session's own settings.
+# Returns the latency rows and the settings it ran with; raises SettingsMismatch first.
+def run_config(name: str, port: int, sf: str, config: str, runs: int, output_dir: Path, warmup: int = 1) -> Tuple[List[dict], Dict[str, str]]:
     conn = connect(name, port)
     try:
         for statement in CONFIGS[config]:
             conn.execute(statement)
-        workers = conn.execute("SHOW max_parallel_workers_per_gather").fetchone()[0]
-        settings = {f"max_parallel_workers_per_gather_{config}": workers}
-        rows = common.run_queries("postgres", lambda sql: conn.execute(sql).fetchall(), sf, config, runs, Path(output_dir) / "postgres_results" / config)
+        shown = show_settings(conn)
+        bad = settings_mismatches(shown, {**PG_SETTINGS, **CONFIG_SETTINGS[config]})
+        if bad:
+            raise SettingsMismatch(mismatch_report(f"Database {name} (config {config})", bad, SESSION_FIX))
+        
+        settings = {f"max_parallel_workers_per_gather_{config}": shown["max_parallel_workers_per_gather"]}
+        rows = common.run_queries("postgres", lambda sql: conn.execute(sql).fetchall(), sf, config, runs, Path(output_dir) / "postgres_results" / config, warmup)
     finally:
         conn.close()
     return rows, settings
@@ -223,10 +243,7 @@ def check_server(port: int) -> Optional[Tuple[str, Dict[str, str]]]:
         shown = show_settings(conn)
         bad = settings_mismatches(shown)
         if bad:
-            print(f"Postgres on port {port} doesn't have the baseline settings:")
-            for line in bad:
-                print(f"  {line}")
-            print(f"Fix {PG_DATA}/postgresql.conf (see --print-conf) and restart the server.")
+            print(mismatch_report(f"Postgres on port {port}", bad, f"Fix {PG_DATA}/postgresql.conf (see --print-conf) and restart the server."))
             return None
         version = conn.execute("SELECT version()").fetchone()[0]
         
@@ -256,14 +273,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     version, shown = server
     print("Postgres TPC-H Benchmark")
     print(f"  Server: {version} (port {args.port})")
-    print(f"  Scale factors: {scale_factors}  Configs: {configs}  Runs per query: {args.runs}")
+    print(f"  Scale factors: {scale_factors}  Configs: {configs}  Warmup: {args.warmup}  Runs per query: {args.runs}")
 
     info: Dict[str, str] = {"postgres_version": version, **shown}
-    return common.run_all(
-        "postgres", args.data_dir, args.output_dir, scale_factors, configs, info,
-        ensure=lambda sf, sf_data_dir: ensure_database(db_name(sf), args.port, sf_data_dir, args.reload),
-        run=lambda sf, config: run_config(db_name(sf), args.port, sf, config, args.runs, args.output_dir),
-    )
+    try:
+        return common.run_all(
+            "postgres", args.data_dir, args.output_dir, scale_factors, configs, info,
+            ensure=lambda sf, sf_data_dir: ensure_database(db_name(sf), args.port, sf_data_dir, args.reload),
+            run=lambda sf, config: run_config(db_name(sf), args.port, sf, config, args.runs, args.output_dir, args.warmup),
+        )
+    except SettingsMismatch as e:
+        print(e)
+        return 2
 
 
 if __name__ == "__main__":

@@ -308,3 +308,106 @@ def test_postgres_end_to_end(tmp_path: Path, monkeypatch) -> None:
             admin.execute(f"DROP DATABASE IF EXISTS {test_db}")
         finally:
             admin.close()
+
+
+# A stand-in connection: SHOW reads `settings`, SET changes them, everything else is logged.
+class FakeSession:
+    def __init__(self, settings: dict) -> None:
+        self.settings = dict(settings)
+        self.queries: list = []
+
+    def execute(self, sql: str):
+        words = sql.split()
+        if words[0] == "SHOW":
+            value = self.settings.get(words[1])
+            return FakeResult([(value,)])
+        if words[0] == "SET":
+            self.settings[words[1]] = words[3]
+            return FakeResult([])
+        if sql == "SELECT version()":
+            return FakeResult([("PostgreSQL 17.0 (fake)",)])
+        self.queries.append(sql)
+        return FakeResult([])
+
+    def close(self) -> None:
+        pass
+
+
+class FakeResult:
+    def __init__(self, rows: list) -> None:
+        self.rows = rows
+
+    def fetchone(self):
+        return self.rows[0]
+
+    def fetchall(self) -> list:
+        return self.rows
+
+
+def run_fake_config(monkeypatch, tmp_path: Path, config: str, settings: dict, **kwargs):
+    session = FakeSession(settings)
+    monkeypatch.setattr(mod, "connect", lambda dbname, port: session)
+    result = mod.run_config("tpch_sf0_01", 5434, "0.01", config, 1, tmp_path / "out", **kwargs)
+    return session, result
+
+
+def test_session_settings_match_runs_queries(monkeypatch, tmp_path: Path) -> None:
+    for config in mod.CONFIGS:
+        session, (rows, settings) = run_fake_config(monkeypatch, tmp_path, config, mod.PG_SETTINGS)
+        assert len(session.queries) == 2 * len(mod.common.QUERY_ORDER)     # 1 warmup + 1 timed each
+        assert len(rows) == len(mod.common.QUERY_ORDER)
+    assert settings == {"max_parallel_workers_per_gather_postgres_1worker": "0"}
+
+
+@pytest.mark.parametrize("config, session_settings, line", [
+    ("postgres", {"work_mem": "4MB"}, "work_mem: got 4MB, want 256MB"),
+    ("postgres", {"max_parallel_workers_per_gather": "0"}, "max_parallel_workers_per_gather: got 0, want 2"),
+    ("postgres_1worker", {"jit": "off"}, "jit: got off, want on"),
+])
+def test_session_settings_mismatch_refuses_before_timing(monkeypatch, tmp_path: Path, config, session_settings, line) -> None:
+    session = FakeSession({**mod.PG_SETTINGS, **session_settings})
+    monkeypatch.setattr(mod, "connect", lambda dbname, port: session)
+    with pytest.raises(mod.SettingsMismatch) as e:
+        mod.run_config("tpch_sf0_01", 5434, "0.01", config, 1, tmp_path / "out")
+    assert line in str(e.value)
+    assert "tpch_sf0_01" in str(e.value)
+    assert session.queries == []
+    assert not (tmp_path / "out").exists()
+
+
+def test_1worker_needs_its_own_override(monkeypatch, tmp_path: Path) -> None:
+    class IgnoresSet(FakeSession):
+        def execute(self, sql: str):
+            return FakeResult([]) if sql.startswith("SET") else super().execute(sql)
+
+    session = IgnoresSet(mod.PG_SETTINGS)
+    monkeypatch.setattr(mod, "connect", lambda dbname, port: session)
+    with pytest.raises(mod.SettingsMismatch) as e:
+        mod.run_config("tpch_sf0_01", 5434, "0.01", "postgres_1worker", 1, tmp_path / "out")
+    assert "max_parallel_workers_per_gather: got 2, want 0" in str(e.value)
+    assert session.queries == []
+
+
+def test_benchmark_database_settings_checked_by_main(monkeypatch, tmp_path: Path, capsys) -> None:
+    sessions = {"postgres": FakeSession(mod.PG_SETTINGS), "tpch_sf0_01": FakeSession({**mod.PG_SETTINGS, "work_mem": "4MB"})}
+    monkeypatch.setattr(mod, "connect", lambda dbname, port: sessions[dbname])
+    monkeypatch.setattr(mod, "ensure_database", lambda *a, **k: None)
+    (tmp_path / "data" / "sf0.01").mkdir(parents=True)
+    out = tmp_path / "out"
+    code = mod.main(["--sf", "0.01", "--data-dir", str(tmp_path / "data"), "--output-dir", str(out)])
+    assert code == 2
+    text = capsys.readouterr().out
+    assert "work_mem: got 4MB, want 256MB" in text
+    assert sessions["tpch_sf0_01"].queries == []
+    assert not (out / "postgres_latencies.csv").exists()
+
+
+def test_postgres_honors_warmup(monkeypatch, tmp_path: Path) -> None:
+    session, (rows, _) = run_fake_config(monkeypatch, tmp_path, "postgres", mod.PG_SETTINGS, warmup=3)
+    assert len(session.queries) == 4 * len(mod.common.QUERY_ORDER)
+    assert len(rows) == len(mod.common.QUERY_ORDER)
+
+
+def test_warmup_flag_default() -> None:
+    assert mod.parse_args([]).warmup == 1
+    assert mod.parse_args(["--warmup", "0"]).warmup == 0

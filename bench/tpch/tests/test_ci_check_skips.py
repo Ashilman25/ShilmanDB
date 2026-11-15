@@ -1,4 +1,4 @@
-"""Tests for scripts/ci_check_skips.sh, the CI check that TPC-H answer tests really ran."""
+"""Tests for scripts/ci_check_skips.sh, the CI check that no test skipped except two known ones."""
 from __future__ import annotations
 
 import subprocess
@@ -38,15 +38,32 @@ def run(tmp_path: Path, text: str) -> subprocess.CompletedProcess:
     return subprocess.run(["bash", str(SCRIPT), str(log)], capture_output=True, text=True)
 
 
+ALLOWED = ("DiskManagerTest.DirectIORoundTrip", "EvictionSimTest.V2ExportedWeightsMatchTorch")
+
+
 def test_tpch_skip_fails_and_names_it(tmp_path):
     result = run(tmp_path, ctest_log("SqliteComparisonTest.Q1"))
     assert result.returncode == 1
     assert "SqliteComparisonTest.Q1" in result.stdout + result.stderr
 
 
-def test_other_skip_passes(tmp_path):
-    result = run(tmp_path, ctest_log("DiskManagerTest.DirectIO"))
+def test_unknown_skip_fails(tmp_path):
+    result = run(tmp_path, ctest_log("NewDataSuiteTest.NeedsFiles"))
+    assert result.returncode == 1
+    assert "NewDataSuiteTest.NeedsFiles" in result.stdout + result.stderr
+
+
+def test_only_the_allowed_skips_pass(tmp_path):
+    result = run(tmp_path, ctest_log(*ALLOWED))
     assert result.returncode == 0
+    result = run(tmp_path, ctest_log(ALLOWED[1]))
+    assert result.returncode == 0
+
+
+def test_allowed_names_match_exactly(tmp_path):
+    # A longer name that starts with an allowed one is not allowed
+    result = run(tmp_path, ctest_log("DiskManagerTest.DirectIORoundTripTwice"))
+    assert result.returncode == 1
 
 
 def test_no_skips_passes(tmp_path):
@@ -62,30 +79,30 @@ def test_no_skips_passes(tmp_path):
     "JoinOrderParityTest.Q5",
     "VectorizedTpchParityTest.Q19",
 ])
-def test_each_tpch_suite_is_caught(tmp_path, name):
-    result = run(tmp_path, ctest_log("DiskManagerTest.DirectIO", name))
+def test_allowed_plus_tpch_names_only_tpch(tmp_path, name):
+    result = run(tmp_path, ctest_log(*ALLOWED, name))
     assert result.returncode == 1
     out = result.stdout + result.stderr
     assert name in out
-    assert "DiskManagerTest.DirectIO" not in out
+    assert not any(allowed in out for allowed in ALLOWED)
 
 
-def test_only_tpch_names_are_printed_all_of_them(tmp_path):
-    result = run(tmp_path, ctest_log("TpchStreamsTest.A", "ValueTest.B", "JoinOrderParityTest.C"))
+def test_every_unallowed_skip_is_printed(tmp_path):
+    result = run(tmp_path, ctest_log("TpchStreamsTest.A", ALLOWED[0], "ValueTest.B"))
     assert result.returncode == 1
     out = result.stdout + result.stderr
-    assert "TpchStreamsTest.A" in out and "JoinOrderParityTest.C" in out
-    assert "ValueTest.B" not in out
+    assert "TpchStreamsTest.A" in out and "ValueTest.B" in out
+    assert ALLOWED[0] not in out
 
 
-def test_tpch_name_outside_the_section_is_ignored(tmp_path):
-    # The progress lines name SqliteComparisonTest.Q1, but nothing TPC-H was skipped
-    result = run(tmp_path, ctest_log("DiskManagerTest.DirectIORoundTrip"))
+def test_name_outside_the_section_is_ignored(tmp_path):
+    # The progress lines name SqliteComparisonTest.Q1 and a skipped DirectIO test, but only the section counts
+    result = run(tmp_path, ctest_log())
     assert result.returncode == 0
 
 
 def test_section_ends_before_failed_list(tmp_path):
-    text = ctest_log("DiskManagerTest.DirectIO") + "\nThe following tests FAILED:\n\t 12 - SqliteComparisonTest.Q1 (Failed)\n"
+    text = ctest_log(ALLOWED[0]) + "\nThe following tests FAILED:\n\t 12 - SqliteComparisonTest.Q1 (Failed)\n"
     result = run(tmp_path, text)
     assert result.returncode == 0
 

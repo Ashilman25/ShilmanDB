@@ -131,7 +131,7 @@ def ensure_database(db_path: Path, sf_data_dir: Path, reload: bool) -> Optional[
 
 # Run the 8 queries under one config.
 # Returns the latency rows and the settings it ran with.
-def run_config(db_path: Path, sf: str, config: str, runs: int, output_dir: Path) -> Tuple[List[dict], Dict[str, str]]:
+def run_config(db_path: Path, sf: str, config: str, runs: int, output_dir: Path, warmup: int = 1) -> Tuple[List[dict], Dict[str, str]]:
     con = duckdb.connect(str(db_path), read_only=True)
     try:
         for statement in CONFIGS[config]:
@@ -141,7 +141,7 @@ def run_config(db_path: Path, sf: str, config: str, runs: int, output_dir: Path)
             f"threads_{config}": str(con.execute("SELECT current_setting('threads')").fetchone()[0]),
             f"memory_limit_{config}": str(con.execute("SELECT current_setting('memory_limit')").fetchone()[0]),
         }
-        rows = common.run_queries("duckdb", lambda sql: con.execute(sql).fetchall(), sf, config, runs, Path(output_dir) / "duckdb_results" / config)
+        rows = common.run_queries("duckdb", lambda sql: con.execute(sql).fetchall(), sf, config, runs, Path(output_dir) / "duckdb_results" / config, warmup)
     finally:
         con.close()
     return rows, settings
@@ -184,13 +184,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     warn_if_unpinned()
     print("DuckDB TPC-H Benchmark")
     print(f"  DuckDB version: {duckdb.__version__}")
-    print(f"  Scale factors: {scale_factors}  Configs: {configs}  Runs per query: {args.runs}")
+    print(f"  Scale factors: {scale_factors}  Configs: {configs}  Warmup: {args.warmup}  Runs per query: {args.runs}")
 
     info: Dict[str, str] = {"duckdb_version": duckdb.__version__}
     return common.run_all(
         "duckdb", args.data_dir, args.output_dir, scale_factors, configs, info,
         ensure=lambda sf, sf_data_dir: ensure_database(db_path_for(args.db_dir, sf), sf_data_dir, args.reload),
-        run=lambda sf, config: run_config(db_path_for(args.db_dir, sf), sf, config, args.runs, args.output_dir),
+        run=lambda sf, config: run_config(db_path_for(args.db_dir, sf), sf, config, args.runs, args.output_dir, args.warmup),
     )
 
 

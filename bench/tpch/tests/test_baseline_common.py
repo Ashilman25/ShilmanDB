@@ -154,3 +154,44 @@ def test_ensure_loaded_reuses_matching_marker(tmp_path: Path, capsys) -> None:
     assert "  Reusing db x (row counts match)\n" in capsys.readouterr().out
     assert common.ensure_loaded("db x", data, True, lambda: marker, lambda expected: 1.0) == 1.0
     assert "  Loaded 7 rows in 1.00 s\n" in capsys.readouterr().out
+
+
+def test_time_query_honors_warmup() -> None:
+    calls = []
+
+    def run() -> list:
+        calls.append(1)
+        return [(len(calls),)]
+
+    latencies, rows = common.time_query(run, 2, warmup=3)
+    assert len(calls) == 5 and len(latencies) == 2 and rows == [(5,)]
+
+    calls.clear()
+    latencies, _ = common.time_query(run, 2, warmup=0)
+    assert len(calls) == 2 and len(latencies) == 2
+
+
+def test_warmup_flag_defaults_to_1_and_rejects_negative(capsys) -> None:
+    import argparse
+    parser = argparse.ArgumentParser()
+    common.add_baseline_args(parser, {"a": []})
+    assert parser.parse_args([]).warmup == 1
+    assert parser.parse_args(["--warmup", "0"]).warmup == 0
+    assert common.resolve_run_args(parser.parse_args(["--warmup", "-1"]), {"a": []}) is None
+    assert "--warmup" in capsys.readouterr().out
+
+
+def test_run_queries_passes_warmup(tmp_path: Path, monkeypatch) -> None:
+    seen = []
+
+    def fake_time_query(run, runs, warmup=1):
+        seen.append((runs, warmup))
+        return [1.0] * runs, []
+
+    monkeypatch.setattr(common, "time_query", fake_time_query)
+    common.run_queries("duckdb", lambda sql: [], "0.01", "duckdb", 2, tmp_path, warmup=4)
+    assert seen == [(2, 4)] * len(common.QUERY_ORDER)
+
+
+def test_header_names_duckdb() -> None:
+    assert (TPCH_DIR / "baseline_common.py").read_text().splitlines()[1] == "# DuckDB and Postgres TPC-H baseline runners"
