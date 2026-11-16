@@ -21,7 +21,7 @@ From the repo root:
 | `--recorded-pace` | With `--recorded-model`, each reply takes as long as it did when it was recorded. |
 | `--no-cache` | Don't use the prompt cache, even when its gate is open. |
 
-At launch the two datasets start loading first (each starts an engine bridge, on its own thread), then the model starts loading on the model worker's thread. Only then does the app print its link (`ShilmanDB app: http://127.0.0.1:<port>/?token=...`) and open it in the browser; with the real model it also prints `Prompt cache: on` or `Prompt cache: off (<reason>)` under the link. The token in the link becomes a cookie on the first visit, so open the printed link, not a bare address. The status bar shows each dataset and the model as loading, ready, missing or failed, and the tables, their rows and the SQL runner work as soon as a dataset is ready.
+At launch the two datasets start loading first (each starts an engine bridge, on its own thread), then the model starts loading on the model worker's thread. Only then does the app print its link (`ShilmanDB app: http://127.0.0.1:<port>/?token=...`) and open it in the browser; with the real model it also prints `Prompt cache: on` or `Prompt cache: off (<reason>)` under the link. That line is printed while the model is still loading, so it shows the gate (below) only; if the model then fails to load or caches nothing, the status bar turns to off and the line doesn't change. The status bar is the one to trust. The token in the link becomes a cookie on the first visit, so open the printed link, not a bare address. The status bar shows each dataset and the model as loading, ready, missing or failed, and the tables, their rows and the SQL runner work as soon as a dataset is ready.
 
 ## The screen
 
@@ -38,7 +38,7 @@ The page is laid out as a database tool. Nothing here changes how an answer is c
 
 Under 1100px wide the inspector moves under the grid; under 760px the sidebar moves above the tabs and the page scrolls as a whole.
 
-Press Ctrl-C to quit. The server, the workers and the bridges close in that order; from the first step on, a table preview is refused ("The app is quitting."). A query still running holds the quit until it returns, and each busy bridge gets up to 10 s to exit (*from docs*: `CLOSE_WAIT_S` in `bench/analyst/bridge_client.py`). A second Ctrl-C ends the app at once, without those waits, and can leave a bridge's `analyst_bridge_*.db` file in the temp folder.
+Press Ctrl-C to quit. The server, the workers and the bridges close in that order; from the first step on, a table preview is refused ("The app is quitting."). A query still running doesn't hold the quit until it returns: the workers get up to 5 s in all to finish their current step (*from docs*: `SHUTDOWN_S` in `app/jobs.py`), then each busy bridge gets up to 10 s to exit before it's killed (*from docs*: `CLOSE_WAIT_S` in `bench/analyst/bridge_client.py`). So a quit with one query running takes at most about 15 s (*inferred* from the two limits). A second Ctrl-C ends the app at once, without those waits, and can leave a bridge's `analyst_bridge_*.db` file in the temp folder.
 
 ## What it needs
 
@@ -47,7 +47,7 @@ Press Ctrl-C to quit. The server, the workers and the bridges close in that orde
   cmake --build build --target analyst_bridge
   ```
   (`build/` is the Release + bench build in `CLAUDE.md`.)
-- **The analyst check's dataset files** under `bench/results/analyst_check/`: each dataset's `tables.tsv`, `.tbl` files, `description.md` and `manifest.json`, plus `subset_rules.md`. They're gitignored. A missing dataset shows as Data missing, with what to run under the input. The full steps are in the analyst check's handbook, `docs/playbooks/ai-analyst-check-playbook.md`, which is a local file that isn't in the repo; in a clone, `.venv/bin/python bench/analyst/run_analyst_check.py --dry-run` prints the same commands in order. In short:
+- **The analyst check's dataset files** under `bench/results/analyst_check/`: each dataset's `tables.tsv`, `.tbl` files, `description.md` and `manifest.json`, plus `subset_rules.md`. They're gitignored. A missing dataset shows as Data missing, with what to run under the input. The full steps are in the analyst check's handbook, `docs/playbooks/ai-analyst-check-playbook.md`, which is a local file that isn't in the repo. In a clone, run the three commands below, in order. (The analyst check's driver, `run_analyst_check.py`, refuses these steps once its `freeze.json` exists, and its default steps add a fourth, `key`, that the app doesn't need.)
   ```bash
   .venv/bin/python bench/analyst/prepare_datasets.py
   .venv/bin/python bench/analyst/describe_datasets.py
@@ -96,7 +96,7 @@ While the lock holds, each answer carries a line with the test's rates, and the 
 
 Every analyst prompt for a dataset starts with the same long text: the dataset's description, the rules and the examples, before the question. The cache keeps the model's state after that shared start, one per dataset (4,096 tokens for TPC-H, 2,048 for the reviews, *measured* 2026-11-15). It's filled in pieces of the same size, on the same boundaries, as mlx_lm's own generation would fill them (*from docs*: `CHUNK` = 2,048 in `app/prompt_cache.py`), and each question gets a fresh copy, so the model does the same arithmetic either way. That's the argument; the replay is the proof.
 
-**The gate.** The cache is used only with the real model, only without `--no-cache`, and only when `bench/results/app/cache_proof.json` matches this setup. Only that file, written by a full cached replay, feeds the gate (and the lock's MLX reason); `uncached_check.json` is information only. With the real model, the status bar shows `Prompt cache on`, or `Prompt cache off: <reason>` in plain text, and the launch line says the same; `/api/status` has it in every mode. The reasons (300 is `rates.test_questions` in `measured.json`, *from docs*):
+**The gate.** The cache is used only with the real model, only without `--no-cache`, and only when `bench/results/app/cache_proof.json` matches this setup. Only that file, written by a full cached replay, feeds the gate (and the lock's MLX reason); `uncached_check.json` is information only. With the real model, the status bar shows `Prompt cache on`, or `Prompt cache off: <reason>` in plain text; `/api/status` has it in every mode. The launch line is printed while the model is still loading, so it usually misses `the model didn't load` and `no dataset's prompt start was cached` below; the status bar shows them. The reasons (300 is `rates.test_questions` in `measured.json`, *from docs*):
 
 | Reason | Meaning |
 |---|---|
@@ -132,7 +132,8 @@ Exit codes (*from docs*: `app/replay_check.py`): 0 every question identical, 1 o
 | Run | Result |
 |---|---|
 | Replay smoke, `--limit 2` | identical 4 of 4 in 16.1 s (*measured* 2026-11-15) |
-| Full replay | about 11-15 min (*inferred* 2026-11-15 from the 4-question smoke) |
+| Full replay, estimate | about 11-15 min (*inferred* 2026-11-15 from the 4-question smoke) |
+| Full replay, as run | identical 300 of 300, no differences (*measured* 2026-11-15); about 23 min (*inferred* from file times, so the estimate was low); first answer median 1.50 s, p90 2.13 s; verdict median 3.32 s, p90 5.21 s (*measured*, the proof's `timings`) |
 
 **Timings on TPC-H through the app** (*measured* 2026-11-15):
 

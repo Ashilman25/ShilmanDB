@@ -96,7 +96,7 @@ So at SF=1.0 the best classical policy misses 1.07-1.50× what Belady would. Cha
 
 ## The AI-analyst check
 
-**What it is.** A local language model (`gemma4-26b`, run on the Mac through MLX) turns a plain-English question into SQL, and ShilmanDB runs it. In the check, the database then tested each answer with evidence only it has, such as the rows each step of the plan kept. The check recorded that evidence next to each answer and labeled the answer warned or refused when something looked wrong. The app that would show this to a user is still in progress. The question was whether these checks catch enough wrong answers without crying wolf on right ones. The bars were fixed before any model answered a test question.
+**What it is.** A local language model (`gemma4-26b`, run on the Mac through MLX) turns a plain-English question into SQL, and ShilmanDB runs it. In the check, the database then tested each answer with evidence only it has, such as the rows each step of the plan kept. The check recorded that evidence next to each answer and labeled the answer warned or refused when something looked wrong. The question was whether these checks catch enough wrong answers without crying wolf on right ones. The bars were fixed before any model answered a test question. A first slice of the app (built 2026-11-15 to 2026-11-16) now shows this to a user: it runs the tested setup (the same model, prompts and checks) and quotes the rates below only while that setup still holds. A replay of the 300 test questions through the app, with its prompt cache on, gave the same model output on all 300 (*measured*).
 
 **The checks:**
 
