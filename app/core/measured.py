@@ -6,8 +6,8 @@ from dataclasses import dataclass
 from importlib import metadata
 from pathlib import Path
 
-from app import sixd
-from app.datasets import AppPaths
+from app.core import analyst_check
+from app.core.datasets import AppPaths
 
 # The analyst check's code the answers depend on, next to its scripts.
 FILES_CODE = [
@@ -61,7 +61,7 @@ def tree_sha1(root: Path) -> str:
 # sha1 as the check's freeze hashes it; None when the file can't be read.
 def _sha1_or_none(path: Path) -> str | None:
     try:
-        return sixd.an.sha1_file(path)
+        return analyst_check.an.sha1_file(path)
     except OSError:
         return None
 

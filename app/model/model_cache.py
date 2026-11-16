@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import time
 
-from app import sixd
-from app.prompt_cache import CHUNK, cache_len, dummy_prompts, encode, match, shared_prefix_len
+from app.core import analyst_check
+from app.model.prompt_cache import CHUNK, cache_len, dummy_prompts, encode, match, shared_prefix_len
 
 # MLX is imported inside the functions only, so importing this module never loads it.
 
@@ -50,7 +50,7 @@ def fresh_copy(kept: list) -> list:
 # A prompt that starts with a kept prefix skips those tokens; any other goes to the plain model.
 class CachedModel:
     def __init__(self, config_id: str, contexts: dict[str, object]):
-        self._mm = sixd.load_model_mlx()
+        self._mm = analyst_check.load_model_mlx()
         self.plain = self._mm.MlxModel(config_id)
         self.config_id = self.plain.config_id
         self.config = self.plain.config

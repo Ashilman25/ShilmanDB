@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from app import sixd
+from app.core import analyst_check
 
 # mlx_lm 0.32.2's prefill_step_size: generate_step feeds the prompt in pieces this long.
 CHUNK = 2048
@@ -26,7 +26,7 @@ def cache_len(shared: int, chunk: int = CHUNK) -> int:
 
 # Two base prompts for one dataset that differ only in the question.
 def dummy_prompts(context) -> tuple[str, str]:
-    first, second = (sixd.pr.build_sql_prompt(context.description, context.rules, context.examples, q) for q in DUMMY_QUESTIONS)
+    first, second = (analyst_check.pr.build_sql_prompt(context.description, context.rules, context.examples, q) for q in DUMMY_QUESTIONS)
     return first, second
 
 

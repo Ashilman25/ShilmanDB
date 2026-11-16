@@ -3,10 +3,10 @@ from __future__ import annotations
 from collections.abc import Iterable
 from dataclasses import replace
 
-from app import sixd
-from app.datasets import MODEL_ID
+from app.core import analyst_check
+from app.core.datasets import MODEL_ID
 
-ck = sixd.ck
+ck = analyst_check.ck
 
 WORDS = {"pass": "Pass", "note": "Note", "warn": "Warning", "refuse": "Refused"}
 SECOND_WORDS = {"pass": "Same", "warn": "Differs"}
@@ -21,7 +21,7 @@ OUTCOMES = ("shown", "cannot", "failed", "not_run", "ran")
 VERDICT_ORDER = ("second_phrasing", *(name for name in ck.CHECKS if name != "second_phrasing"))
 ROW_ORDER = tuple(name for name in VERDICT_ORDER if name != "terms")
 
-TRIES = sixd.an.MAX_RETRIES + 1
+TRIES = analyst_check.an.MAX_RETRIES + 1
 
 # The analyst check's three bars, fixed before the test: flag at least half the wrong answers,
 # refuse at most 10% of the right ones, and warn on or refuse at most 25% of them.
@@ -269,7 +269,7 @@ def _second_detail(evidence: dict) -> str | None:
         parts.append(f"First answer {_rows(first)}, second answer {_rows(second)}.")
         
     if evidence.get("truncated"):
-        parts.append(f"A result was cut at {sixd.an.ROW_CAP:,} rows, so only the rows kept were compared.")
+        parts.append(f"A result was cut at {analyst_check.an.ROW_CAP:,} rows, so only the rows kept were compared.")
     return " ".join(parts) or None
 
 
@@ -474,7 +474,7 @@ def term_rows(results, spec: dict, question: str, asked: dict | None = None) -> 
         cued = entry.get("cued")
         
         if cued is None and term:  # evidence without cues: read them from the question
-            cued = [r["name"] for r in sixd.dd.cued_readings(term, question)]
+            cued = [r["name"] for r in analyst_check.dd.cued_readings(term, question)]
         default = next((r["name"] for r in readings if r.get("default")), None)
 
         rows.append({

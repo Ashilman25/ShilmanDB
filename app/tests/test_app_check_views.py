@@ -1,4 +1,4 @@
-"""Tests for app/check_views.py and app/copy_rules.py."""
+"""Tests for app/server/check_views.py and app/server/copy_rules.py."""
 from __future__ import annotations
 
 import ast
@@ -7,10 +7,10 @@ from types import SimpleNamespace
 
 import pytest
 
+from app.core import analyst_check
 # tested_line and tested_panel are reached through cv: pytest collects any test* name in a test module.
-from app import check_views as cv
-from app import sixd
-from app.check_views import (
+from app.server import check_views as cv
+from app.server.check_views import (
     KINDS,
     OUTCOMES,
     PHASES,
@@ -21,12 +21,15 @@ from app.check_views import (
     trap_reason,
     verdict,
 )
-from app.copy_rules import plain, problems
+from app.server.copy_rules import plain, problems
 
-CheckResult = sixd.ck.CheckResult
+CheckResult = analyst_check.ck.CheckResult
 APP_DIR = Path(__file__).resolve().parents[1]
-ANALYZER = sixd.ANALYST_DIR / "analyze_analyst_check.py"
-SPECS = {name: sixd.dd.load_spec(name) for name in ("tpch", "reviews")}
+# Every Python file in the app outside its tests (and the page's node_modules).
+APP_MODULES = sorted(p for p in APP_DIR.rglob("*.py")
+                     if p.relative_to(APP_DIR).parts[0] != "tests" and "node_modules" not in p.parts)
+ANALYZER = analyst_check.ANALYST_DIR / "analyze_analyst_check.py"
+SPECS = {name: analyst_check.dd.load_spec(name) for name in ("tpch", "reviews")}
 TPCH = SPECS["tpch"]
 QUESTION = "What was revenue by region in 1995?"
 
@@ -133,7 +136,7 @@ def _answer(second: dict | None = None, second_level: str = "note", **over: Chec
         "exact": _r("exact", "pass", {}),
     }
     base.update(over)
-    return [base[name] for name in sixd.ck.CHECKS]
+    return [base[name] for name in analyst_check.ck.CHECKS]
 
 
 # The results a typed SQL run gets: no second answer, no terms.
@@ -175,14 +178,14 @@ def test_plain_turns_dashes_into_commas():
     assert problems(plain(f"x {dash} y {bar} z")) == []
 
 
-# Every server module: its strings reach the page or the terminal.
-@pytest.mark.parametrize("path", sorted(APP_DIR.glob("*.py")), ids=lambda p: p.name)
+# Every app module: its strings reach the page or the terminal.
+@pytest.mark.parametrize("path", APP_MODULES, ids=lambda p: p.relative_to(APP_DIR).as_posix())
 def test_app_modules_pass_copy_rules(path):
     assert problems(path.read_text(encoding="utf-8")) == []
 
 
 def test_own_files_pass_copy_rules():
-    for path in (APP_DIR / "check_views.py", APP_DIR / "copy_rules.py", Path(__file__)):
+    for path in (APP_DIR / "server/check_views.py", APP_DIR / "server/copy_rules.py", Path(__file__)):
         assert problems(path.read_text(encoding="utf-8")) == [], path.name
 
 
@@ -343,7 +346,7 @@ def test_reask_cues_every_cued_reading():
             for reading in term["readings"]:
                 if not reading.get("cues"):
                     continue
-                cued = sixd.dd.cued_readings(term, reask_question("Q?", term["term"], reading["name"]))
+                cued = analyst_check.dd.cued_readings(term, reask_question("Q?", term["term"], reading["name"]))
                 assert reading in cued, (term["term"], reading["name"])
 
 

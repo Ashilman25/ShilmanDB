@@ -3,9 +3,9 @@ from __future__ import annotations
 from pathlib import Path
 from time import sleep
 
-from app import sixd
+from app.core import analyst_check
 
-an = sixd.an
+an = analyst_check.an
 
 
 # Every model reply a run record holds: the primary attempts, the rephrase, then its attempts.

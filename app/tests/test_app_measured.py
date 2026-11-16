@@ -1,4 +1,4 @@
-"""Tests for app/measured.py and the committed app/measured.json."""
+"""Tests for app/core/measured.py and the committed app/core/measured.json."""
 from __future__ import annotations
 
 import ast
@@ -11,10 +11,11 @@ from pathlib import Path
 
 import pytest
 
+from app.core import analyst_check, measured
+from app.core.analyst_check import REPO_ROOT
+from app.core.datasets import AppPaths, default_paths
 # tested_line is reached through check_views: pytest collects any test* name in a test module.
-from app import check_views, measured, sixd
-from app.datasets import AppPaths, default_paths
-from app.sixd import REPO_ROOT
+from app.server import check_views
 
 FREEZE = REPO_ROOT / "bench/results/analyst_check/freeze.json"
 HEX40 = re.compile(r"[0-9a-f]{40}")
@@ -120,8 +121,8 @@ def test_file_hashes_keys_and_missing(tmp_path):
     assert list(hashes) == ([f"code/{n}" for n in measured.FILES_CODE] + [f"results/{n}" for n in measured.FILES_RESULTS]
                             + [f"code/{n}" for n in measured.FILES_WATCHED])
     assert hashes["results/subset_rules.md"] is None
-    assert hashes["code/analyst_bridge.cpp"] == sixd.an.sha1_file(paths.code / "analyst_bridge.cpp")
-    assert hashes["results/datasets/tpch/description.md"] == sixd.an.sha1_file(paths.results / "datasets/tpch/description.md")
+    assert hashes["code/analyst_bridge.cpp"] == analyst_check.an.sha1_file(paths.code / "analyst_bridge.cpp")
+    assert hashes["results/datasets/tpch/description.md"] == analyst_check.an.sha1_file(paths.results / "datasets/tpch/description.md")
 
 
 def test_lock_holds_when_all_match(tmp_path):
@@ -335,6 +336,6 @@ def test_file_hashes_match_measured_here():
 
 
 def test_measured_model_matches_model_mlx():
-    configs = sixd.fz.read_model_configs(REPO_ROOT / "bench/analyst/model_mlx.py")
+    configs = analyst_check.fz.read_model_configs(REPO_ROOT / "bench/analyst/model_mlx.py")
     model = {k: v for k, v in _record()["model"].items() if k != "id"}
     assert configs["gemma4-26b"] == model

@@ -9,10 +9,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qsl, unquote, urlsplit
 
-from app import check_views, views
-from app.copy_rules import plain
-from app.datasets import DATASETS, LABELS
-from app.jobs import ENDED, Refusal, _check_dataset
+from app.core.datasets import DATASETS, LABELS
+from app.server import check_views, views
+from app.server.copy_rules import plain
+from app.server.jobs import ENDED, Refusal, _check_dataset
 
 HOST = "127.0.0.1"
 MAX_BODY = 1024 * 1024  # bytes in a POST body

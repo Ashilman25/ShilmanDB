@@ -7,12 +7,12 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from app import sixd
-from app.datasets import DATASETS, LABELS, MODEL_ID, AppPaths, Dataset, build_hint, load_dataset, missing_files
-from app.measured import CacheGate, Lock, cache_code_sha1, cache_gate, check_lock, library_versions, mlx_versions, read_json
-from app.model_cache import CachedModel
-from app.recorded_model import RecordedModel, recorded_model_id
-from app.schema import dataset_schema
+from app.core import analyst_check
+from app.core.datasets import DATASETS, LABELS, MODEL_ID, AppPaths, Dataset, build_hint, load_dataset, missing_files
+from app.core.measured import CacheGate, Lock, cache_code_sha1, cache_gate, check_lock, library_versions, mlx_versions, read_json
+from app.core.schema import dataset_schema
+from app.model.model_cache import CachedModel
+from app.model.recorded_model import RecordedModel, recorded_model_id
 
 MODEL_MODES = ("mlx", "recorded", "none")
 MEASURED_KEYS = ("files", "engine_src_sha1", "model", "rates")
@@ -72,7 +72,7 @@ class EngineOptions:
 # The real bridge on paths.bridge, its stderr appended to a log per dataset.
 def default_bridge_factory(paths: AppPaths) -> Callable:
     def make(name: str, tables_tsv: Path):
-        return sixd.bc.Bridge(tables_tsv, command=[str(paths.bridge)], log_path=paths.app_results / f"bridge_{name}.log")
+        return analyst_check.bc.Bridge(tables_tsv, command=[str(paths.bridge)], log_path=paths.app_results / f"bridge_{name}.log")
     return make
 
 
@@ -98,7 +98,7 @@ def default_model_factory(options: EngineOptions, paths: AppPaths | None = None,
     if options.model_mode == "mlx" and cache_on:
         return lambda: CachedModel(MODEL_ID, _contexts(paths))
     if options.model_mode == "mlx":
-        return lambda: sixd.load_model_mlx().MlxModel(MODEL_ID)
+        return lambda: analyst_check.load_model_mlx().MlxModel(MODEL_ID)
     if options.model_mode == "recorded":
         return lambda: RecordedModel(options.recorded_run, pace=options.pace)
     return None
@@ -107,7 +107,7 @@ def default_model_factory(options: EngineOptions, paths: AppPaths | None = None,
 # The tested model's settings from model_mlx.py; None when the file can't be read.
 def _model_config(paths: AppPaths) -> dict | None:
     try:
-        return sixd.fz.read_model_configs(paths.code / "model_mlx.py").get(MODEL_ID)
+        return analyst_check.fz.read_model_configs(paths.code / "model_mlx.py").get(MODEL_ID)
     except (OSError, ValueError, SyntaxError):
         return None
 
@@ -182,7 +182,7 @@ class Engine:
         # The gate runs even with --no-cache, so the flag never changes which records count as readable.
         try:
             lock = check_lock(self.paths, record, model_config, proof, versions)
-            cache = cache_gate(self.paths, record, proof, library_versions(), cache_code_sha1(self.paths.app_dir), model_config)
+            cache = cache_gate(self.paths, record, proof, library_versions(), cache_code_sha1(self.paths.cache_code_dir), model_config)
         except (KeyError, TypeError, AttributeError, ValueError):
             return unusable
         return record, other_model or lock, no_cache or cache

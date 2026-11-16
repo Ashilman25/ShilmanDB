@@ -12,10 +12,10 @@ from pathlib import Path
 import pytest
 
 from app.__main__ import EXAMPLES, STATIC_DIR
-from app.datasets import default_paths
-from app.engine import Engine, EngineOptions
-from app.jobs import ENDED, JobRunner
-from app.server import make_server
+from app.core.datasets import default_paths
+from app.core.engine import Engine, EngineOptions
+from app.server.jobs import ENDED, JobRunner
+from app.server.server import make_server
 from app.tests.test_app_flows import LEFT_SQL, QUESTION
 from app.tests.test_app_server import TOKEN, Client
 

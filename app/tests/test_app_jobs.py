@@ -1,4 +1,4 @@
-"""Tests for app/jobs.py."""
+"""Tests for app/server/jobs.py."""
 from __future__ import annotations
 
 import copy
@@ -10,12 +10,13 @@ from pathlib import Path
 
 import pytest
 
+from app.core import analyst_check
+from app.core.datasets import LABELS, default_paths
+from app.core.engine import Engine, EngineOptions
+from app.core.measured import Lock, read_json
 # check_views is reached as a module: pytest collects any test* name imported into a test module.
-from app import check_views, copy_rules, jobs, sixd, views
-from app.datasets import LABELS, default_paths
-from app.engine import Engine, EngineOptions
-from app.jobs import HISTORY_CAP, LONG_POLL_S, MODEL_WORKER, SNAPSHOT_KEYS, SQL_WORKER, JobRunner, Refusal
-from app.measured import Lock, read_json
+from app.server import check_views, copy_rules, jobs, views
+from app.server.jobs import HISTORY_CAP, LONG_POLL_S, MODEL_WORKER, SNAPSHOT_KEYS, SQL_WORKER, JobRunner, Refusal
 from app.tests.fakes import MS, FakeBridge, FakeModel, bridge_error, bridge_ok, reply
 from app.tests.test_app_flows import (
     COLUMNS,
@@ -36,7 +37,7 @@ from app.tests.test_app_flows import (
     script,
 )
 
-pr = sixd.pr
+pr = analyst_check.pr
 
 WAIT_S = 10.0
 ENDED = ("done", "stopped", "error")

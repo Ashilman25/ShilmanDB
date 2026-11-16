@@ -2,11 +2,11 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 
-from app import sixd
-from app.analyst import Event, apply_guard
-from app.datasets import Dataset
+from app.answers.analyst import Event, apply_guard
+from app.core import analyst_check
+from app.core.datasets import Dataset
 
-ck = sixd.ck
+ck = analyst_check.ck
 
 # Checks that need a question or a second answer, which typed SQL doesn't have.
 NOT_FOR_SQL = ("second_phrasing", "terms")

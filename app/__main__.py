@@ -11,16 +11,16 @@ import webbrowser
 from collections.abc import Callable
 from pathlib import Path
 
-from app.datasets import AppPaths, default_paths
-from app.engine import Engine, EngineOptions
-from app.jobs import JobRunner
-from app.server import HOST, make_server
+from app.core.datasets import AppPaths, default_paths
+from app.core.engine import Engine, EngineOptions
+from app.server.jobs import JobRunner
+from app.server.server import HOST, make_server
 
 DEFAULT_PORT = 8765
 PORT_TRIES = 20
 APP_DIR = Path(__file__).resolve().parent
-STATIC_DIR = APP_DIR / "static"
-EXAMPLES = APP_DIR / "examples.json"
+STATIC_DIR = APP_DIR / "web/static"
+EXAMPLES = APP_DIR / "server/examples.json"
 QUIT_SIGNALS = (signal.SIGINT, signal.SIGTERM)
 
 

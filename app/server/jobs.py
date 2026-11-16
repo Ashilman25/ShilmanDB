@@ -6,13 +6,14 @@ import traceback
 from collections import deque
 from dataclasses import dataclass, field, replace
 
-from app import check_views, sixd, views
-from app.analyst import Event, analyst_events
-from app.copy_rules import plain
-from app.datasets import DATASETS, LABELS, Dataset
-from app.sql_runner import pre_run_traps, sql_events
+from app.answers.analyst import Event, analyst_events
+from app.answers.sql_runner import pre_run_traps, sql_events
+from app.core import analyst_check
+from app.core.datasets import DATASETS, LABELS, Dataset
+from app.server import check_views, views
+from app.server.copy_rules import plain
 
-ck = sixd.ck
+ck = analyst_check.ck
 
 HISTORY_CAP = 100
 LONG_POLL_S = 20.0

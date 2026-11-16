@@ -4,9 +4,9 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-from app import sixd
+from app.core import analyst_check
 
-DATASETS = sixd.an.DATASETS
+DATASETS = analyst_check.an.DATASETS
 LABELS = {"tpch": "TPC-H, SF 0.1", "reviews": "Reviews"}
 MODEL_ID = "gemma4-26b"
 
@@ -27,11 +27,11 @@ class AppPaths:
 
     # Folder holding one dataset's files; raises ValueError for a name I don't use.
     def dataset_dir(self, name: str) -> Path:
-        return self.results / "datasets" / sixd.an.check_dataset(name)
+        return self.results / "datasets" / analyst_check.an.check_dataset(name)
 
     # The JSON spec a dataset's description is written from.
     def spec(self, name: str) -> Path:
-        return self.code / "datasets" / f"{sixd.an.check_dataset(name)}.json"
+        return self.code / "datasets" / f"{analyst_check.an.check_dataset(name)}.json"
 
     # The tested model's answers on one split.
     def run_file(self, split: str) -> Path:
@@ -47,7 +47,12 @@ class AppPaths:
 
     @property
     def measured(self) -> Path:
-        return self.app_dir / "measured.json"
+        return self.app_dir / "core/measured.json"
+
+    # The folder holding the two cache files the cache gate hashes (measured.CACHE_CODE).
+    @property
+    def cache_code_dir(self) -> Path:
+        return self.app_dir / "model"
 
     @property
     def cache_proof(self) -> Path:
@@ -56,7 +61,7 @@ class AppPaths:
 
 # The paths in this repo: the analyst check's files where it left them, the app's output beside them.
 def default_paths() -> AppPaths:
-    root = sixd.REPO_ROOT
+    root = analyst_check.REPO_ROOT
     return AppPaths(
         results=root / "bench/results/analyst_check",
         code=root / "bench/analyst",
@@ -118,8 +123,8 @@ def load_dataset(paths: AppPaths, name: str) -> Dataset:
         raise MissingFiles(missing)
 
     d = paths.dataset_dir(name)
-    examples = sixd.rp._load_examples(paths.examples, [name])[name]
-    context = sixd.rp.Context(
+    examples = analyst_check.rp._load_examples(paths.examples, [name])[name]
+    context = analyst_check.rp.Context(
         (d / "description.md").read_text(encoding="utf-8"),
         paths.rules.read_text(encoding="utf-8"),
         examples,
@@ -129,7 +134,7 @@ def load_dataset(paths: AppPaths, name: str) -> Dataset:
 
 # A path as the hint shows it: from the repo root when it's inside the repo.
 def _shown(path: Path) -> str:
-    return str(path.relative_to(sixd.REPO_ROOT)) if path.is_relative_to(sixd.REPO_ROOT) else str(path)
+    return str(path.relative_to(analyst_check.REPO_ROOT)) if path.is_relative_to(analyst_check.REPO_ROOT) else str(path)
 
 
 # What to run for whatever the dataset is missing, one instruction per line; empty if nothing is.

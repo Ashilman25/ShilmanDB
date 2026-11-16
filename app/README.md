@@ -31,14 +31,14 @@ The page is laid out as a database tool. Nothing here changes how an answer is c
 - **Sidebar, Tables:** a filter ("Filter tables and columns") over a tree of both databases. Each table shows its row count and opens to its columns and their types; a key column says "key". Click a table to open its rows; click a column to open its table with that column picked. The tree takes the arrow keys and Enter. The tables come from `/api/schema`, which reads each dataset's manifest, spec and `description.md` once and never runs SQL.
 - **Sidebar, History:** this session's runs, newest first, each with its kind (SQL, Edited SQL or Ask), its text, its database when it isn't the Query tab's and, when it has one, the word for how it ended (Warning, Refused, Not run). Click one to reopen it in the Query tab.
 - **Tabs:** Query first, then up to 8 tables (*from docs*: `MAX_TABLE_TABS` in `app/web/src/state.ts`; a ninth closes the oldest). The arrow keys move between tabs; Delete, the close mark or a middle-click closes a table's tab.
-- **A table's tab:** its name, database and size, **Query this table** (runs `SELECT * FROM <table> LIMIT 100` in the Query tab; off, with the reason beside it, while a run is under way or the database isn't ready), and its first 1,000 rows in the grid, 200 at a time (*from docs*: `PREVIEW_ROWS` in `app/server.py`, `PREVIEW_PAGE` in `app/web/src/tabletab.ts`), from `/api/preview` (straight through the dataset's bridge, never a job, so it isn't in History). The **Columns** inspector on the right shows each column's type, key or reference, description and listed values: the same notes the analyst is given. Click a column's header to pick it there.
+- **A table's tab:** its name, database and size, **Query this table** (runs `SELECT * FROM <table> LIMIT 100` in the Query tab; off, with the reason beside it, while a run is under way or the database isn't ready), and its first 1,000 rows in the grid, 200 at a time (*from docs*: `PREVIEW_ROWS` in `app/server/server.py`, `PREVIEW_PAGE` in `app/web/src/tabletab.ts`), from `/api/preview` (straight through the dataset's bridge, never a job, so it isn't in History). The **Columns** inspector on the right shows each column's type, key or reference, description and listed values: the same notes the analyst is given. Click a column's header to pick it there.
 - **The Query tab:** the Ask / SQL switch, the database, and Run or Ask (Stop while running; Cmd+Enter). The SQL editor is a plain text box with line numbers and its keywords, strings and numbers colored; as you type a name it offers the database's tables and columns (Up / Down, Tab or Enter to take one, Escape to close), and the line under it drags (or takes the arrow keys) to set its height. The answer fills the results grid under the editor, with a Table / Chart switch when bars apply (each bar with its value, the axis labeled at 0 and its top); a single value shows once, as a large figure. The header shows a question and the meta lines; typed SQL isn't repeated there. The **Checks** inspector on the right holds the verdict, the checks, the terms, the SQL and the tested line; a run that failed, wasn't run, was refused, couldn't be answered or was stopped leads with the same words as its banner. Empty, it lists example questions (Ask) or a first query per table (SQL); with `--no-model` it's always the SQL list.
 - **The grid** (tables and results alike): row numbers and the header stay put while it scrolls; each header shows the column's type under its name. Click a cell, or move with the arrow keys, to pick it; Cmd+C copies its value (a number without its thousands separators), and the status bar shows its column and value.
 - **Status bar:** each dataset's engine, the model and, with the real model, the prompt cache on the left; on the right, the picked cell or the shown result's rows and time.
 
 Under 1100px wide the inspector moves under the grid; under 760px the sidebar moves above the tabs and the page scrolls as a whole.
 
-Press Ctrl-C to quit. The server, the workers and the bridges close in that order; from the first step on, a table preview is refused ("The app is quitting."). A query still running doesn't hold the quit until it returns: the workers get up to 5 s in all to finish their current step (*from docs*: `SHUTDOWN_S` in `app/jobs.py`), then each busy bridge gets up to 10 s to exit before it's killed (*from docs*: `CLOSE_WAIT_S` in `bench/analyst/bridge_client.py`). So a quit with one query running takes at most about 15 s (*inferred* from the two limits). A second Ctrl-C ends the app at once, without those waits, and can leave a bridge's `analyst_bridge_*.db` file in the temp folder.
+Press Ctrl-C to quit. The server, the workers and the bridges close in that order; from the first step on, a table preview is refused ("The app is quitting."). A query still running doesn't hold the quit until it returns: the workers get up to 5 s in all to finish their current step (*from docs*: `SHUTDOWN_S` in `app/server/jobs.py`), then each busy bridge gets up to 10 s to exit before it's killed (*from docs*: `CLOSE_WAIT_S` in `bench/analyst/bridge_client.py`). So a quit with one query running takes at most about 15 s (*inferred* from the two limits). A second Ctrl-C ends the app at once, without those waits, and can leave a bridge's `analyst_bridge_*.db` file in the temp folder.
 
 ## What it needs
 
@@ -68,7 +68,7 @@ The model loads in about 3.2 s (*measured* 2026-11-14), or 5.0 s with both promp
   ```
   No test loads MLX. The end-to-end tests (`app/tests/test_app_end_to_end.py`) use the real bridge and skip when it isn't built.
 
-The page is TypeScript in `app/web/src/`, compiled to `app/static/js/`. The compiled files are committed, so running and testing need no Node. To rebuild after an edit:
+The page is TypeScript in `app/web/src/`, compiled to `app/web/static/js/`. The compiled files are committed, so running and testing need no Node. To rebuild after an edit:
 
 ```bash
 npm ci --prefix app/web
@@ -77,7 +77,7 @@ npm run --prefix app/web build
 
 ## The tested line and the measured lock
 
-`app/measured.json` records what the analyst check tested: the sha1 of every file the answers depend on (the check's code and dataset files, plus the pipeline, bridge client and bridge source the app runs), the sha1 of the engine's `src/` tree, the model settings, and the rates. The rates come from `docs/research.md`; the app reads them from the file and never retypes them (*from docs*: `rates` in `app/measured.json`, e.g. `test_questions` = 300).
+`app/core/measured.json` records what the analyst check tested: the sha1 of every file the answers depend on (the check's code and dataset files, plus the pipeline, bridge client and bridge source the app runs), the sha1 of the engine's `src/` tree, the model settings, and the rates. The rates come from `docs/research.md`; the app reads them from the file and never retypes them (*from docs*: `rates` in `app/core/measured.json`, e.g. `test_questions` = 300).
 
 At launch the app checks all of this once. The lock breaks, and the status says why, when:
 
@@ -94,9 +94,9 @@ While the lock holds, each answer carries a line with the test's rates, and the 
 
 ## The prompt cache and the replay
 
-Every analyst prompt for a dataset starts with the same long text: the dataset's description, the rules and the examples, before the question. The cache keeps the model's state after that shared start, one per dataset (4,096 tokens for TPC-H, 2,048 for the reviews, *measured* 2026-11-15). It's filled in pieces of the same size, on the same boundaries, as mlx_lm's own generation would fill them (*from docs*: `CHUNK` = 2,048 in `app/prompt_cache.py`), and each question gets a fresh copy, so the model does the same arithmetic either way. That's the argument; the replay is the proof.
+Every analyst prompt for a dataset starts with the same long text: the dataset's description, the rules and the examples, before the question. The cache keeps the model's state after that shared start, one per dataset (4,096 tokens for TPC-H, 2,048 for the reviews, *measured* 2026-11-15). It's filled in pieces of the same size, on the same boundaries, as mlx_lm's own generation would fill them (*from docs*: `CHUNK` = 2,048 in `app/model/prompt_cache.py`), and each question gets a fresh copy, so the model does the same arithmetic either way. That's the argument; the replay is the proof.
 
-**The gate.** The cache is used only with the real model, only without `--no-cache`, and only when `bench/results/app/cache_proof.json` matches this setup. Only that file, written by a full cached replay, feeds the gate (and the lock's MLX reason); `uncached_check.json` is information only. With the real model, the status bar shows `Prompt cache on`, or `Prompt cache off: <reason>` in plain text; `/api/status` has it in every mode. The launch line is printed while the model is still loading, so it usually misses `the model didn't load` and `no dataset's prompt start was cached` below; the status bar shows them. The reasons (300 is `rates.test_questions` in `measured.json`, *from docs*):
+**The gate.** The cache is used only with the real model, only without `--no-cache`, and only when `bench/results/app/cache_proof.json` matches this setup. Only that file, written by a full cached replay, feeds the gate (and the lock's MLX reason); `uncached_check.json` is information only. With the real model, the status bar shows `Prompt cache on`, or `Prompt cache off: <reason>` in plain text; `/api/status` has it in every mode. The launch line is printed while the model is still loading, so it usually misses `the model didn't load` and `no dataset's prompt start was cached` below; the status bar shows them. The proof holds a sha1 of the two cache files' bytes, so any change to `app/model/model_cache.py` or `app/model/prompt_cache.py`, even an import line, closes the gate until the replay is rerun. The reasons (300 is `rates.test_questions` in `measured.json`, *from docs*):
 
 | Reason | Meaning |
 |---|---|
@@ -107,8 +107,8 @@ Every analyst prompt for a dataset starts with the same long text: the dataset's
 | `the replay hasn't been run` | No proof file. |
 | `the replay found differences` | A replayed answer differed. |
 | `the replay didn't cover all 300 test questions` | A partial proof. |
-| `a model library changed since the replay` | The installed mlx, mlx-lm, mlx-metal, transformers, tokenizers or jinja2 differs from the proof's (*from docs*: `MODEL_LIBRARIES` in `app/measured.py`). |
-| `the app's cache code changed since the replay` | `model_cache.py` or `prompt_cache.py` changed. |
+| `a model library changed since the replay` | The installed mlx, mlx-lm, mlx-metal, transformers, tokenizers or jinja2 differs from the proof's (*from docs*: `MODEL_LIBRARIES` in `app/core/measured.py`). |
+| `the app's cache code changed since the replay` | Any byte of `app/model/model_cache.py` or `app/model/prompt_cache.py` changed. |
 | `a tested file changed since the replay` | A locked file or the model settings changed. |
 | `the engine changed since the replay` | `src/` changed. |
 | `the model didn't load` | The gate is open, but the model failed to load. |
@@ -127,7 +127,7 @@ Every analyst prompt for a dataset starts with the same long text: the dataset's
 | `--out DIR` | Where the proof goes (default `bench/results/app/`). |
 | `--uncached-only` | Run the plain model with no cache and write `uncached_check.json` instead. |
 
-Exit codes (*from docs*: `app/replay_check.py`): 0 every question identical, 1 one differs, 2 it can't start (it lists why: a freeze that doesn't verify, a missing test run, questions or dataset file, or `--limit` without `--out`) or something it vouches for changed during the pass, 130 stopped by Ctrl-C (nothing written). It hashes what the proof vouches for (the library versions, the cache code, the locked files and `src/`) before the pass, writes those hashes into the proof, and checks them and the freeze again after the pass. If anything changed it writes nothing and prints one line naming it, for example `Not writing the proof: app/prompt_cache.py changed during the replay.` When a cached answer differs it reruns that question uncached, so the proof says whether the cache or MLX itself is to blame. It prints a timing table: the replay, the saved run on the same questions, and the saved run on all of them.
+Exit codes (*from docs*: `app/replay_check.py`): 0 every question identical, 1 one differs, 2 it can't start (it lists why: a freeze that doesn't verify, a missing test run, questions or dataset file, or `--limit` without `--out`) or something it vouches for changed during the pass, 130 stopped by Ctrl-C (nothing written). It hashes what the proof vouches for (the library versions, the cache code, the locked files and `src/`) before the pass, writes those hashes into the proof, and checks them and the freeze again after the pass. If anything changed it writes nothing and prints one line naming it, for example `Not writing the proof: app/model/prompt_cache.py changed during the replay.` When a cached answer differs it reruns that question uncached, so the proof says whether the cache or MLX itself is to blame. It prints a timing table: the replay, the saved run on the same questions, and the saved run on all of them.
 
 | Run | Result |
 |---|---|
@@ -156,27 +156,38 @@ It finds each reply by the prompt's sha1, so only the run's own questions get an
 
 ## Files
 
+Where things are:
+
+- `core/`: the analyst check's modules, paths and datasets, the engine (bridges, model, lock, cache gate), the schema, and the tested record.
+- `model/`: the prompt cache and the recorded model.
+- `answers/`: the analyst's two answers and typed SQL.
+- `server/`: the HTTP server and its job queue (they use the same views), the result and check views, the copy rules and the example questions.
+- `web/`: the page: TypeScript in `src/`, what the server sends in `static/`.
+
+`__main__.py` and `replay_check.py` stay at the top, so the commands are `python -m app` and `python -m app.replay_check`.
+
 | File | What it holds |
 |---|---|
 | `__main__.py` | The command: flags, port, startup and shutdown. |
-| `server.py` | The HTTP server: token cookie, Host and Origin checks, the JSON API (with the schema and a table's preview rows), the long poll. |
-| `jobs.py` | The two workers (model and SQL) and each job's snapshot. |
-| `engine.py` | The bridges, the model, the lock and the cache gate. |
-| `datasets.py` | Paths, loading a dataset, and the hint for missing files. |
-| `schema.py` | Each dataset's tables and columns for the sidebar and the Columns inspector, read from its manifest, spec and `description.md`. |
-| `analyst.py` | The analyst check's pipeline split into a first and a second answer. |
-| `sql_runner.py` | Typed SQL: the engine-trap check, then the run. |
-| `views.py` | Results ready to draw: rows, chart, plan, meta line, error text. |
-| `check_views.py` | Check rows, verdicts, terms, the tested line and panel. |
-| `copy_rules.py` | The characters no shown text may hold, and the em dash fix for model text. |
-| `measured.py` / `measured.json` | The lock and the cache gate, and the tested record. |
-| `model_cache.py` / `prompt_cache.py` | The prompt cache. Only `model_cache.py` imports MLX. |
 | `replay_check.py` | The replay and its proof. |
-| `recorded_model.py` | Replies from a saved run. |
-| `sixd.py` | Loads the analyst check's modules from `bench/analyst/`. |
-| `examples.json` | Example questions on the page. |
-| `web/` | The page's TypeScript and its build. |
-| `static/` | What the server sends: `index.html`, `app.css`, the compiled `js/`. |
+| `core/analyst_check.py` | Loads the analyst check's modules from `bench/analyst/`. |
+| `core/datasets.py` | Paths, loading a dataset, and the hint for missing files. |
+| `core/engine.py` | The bridges, the model, the lock and the cache gate. |
+| `core/schema.py` | Each dataset's tables and columns for the sidebar and the Columns inspector, read from its manifest, spec and `description.md`. |
+| `core/measured.py` / `core/measured.json` | The lock and the cache gate, and the tested record. |
+| `model/model_cache.py` / `model/prompt_cache.py` | The prompt cache. Only `model_cache.py` imports MLX. |
+| `model/recorded_model.py` | Replies from a saved run. |
+| `answers/analyst.py` | The analyst check's pipeline split into a first and a second answer. |
+| `answers/sql_runner.py` | Typed SQL: the engine-trap check, then the run. |
+| `server/server.py` | The HTTP server: token cookie, Host and Origin checks, the JSON API (with the schema and a table's preview rows), the long poll. |
+| `server/jobs.py` | The two workers (model and SQL) and each job's snapshot. |
+| `server/views.py` | Results ready to draw: rows, chart, plan, meta line, error text. |
+| `server/check_views.py` | Check rows, verdicts, terms, the tested line and panel. |
+| `server/copy_rules.py` | The characters no shown text may hold, and the em dash fix for model text. |
+| `server/examples.json` | Example questions on the page. |
+| `web/src/` | The page's TypeScript. |
+| `web/static/` | What the server sends: `index.html`, `app.css`, the compiled `js/`. |
+| `web/package.json` / `web/tsconfig.json` | The pinned TypeScript and the build into `static/js/`. |
 | `tests/` | The tests, with a two-table TPC-H fixture and a two-question run file. |
 
 `bench/results/app/` (gitignored) is the app's output: `bridge_<dataset>.log` (the bridges' stderr), `cache_proof.json`, `uncached_check.json`, and `replay_bridge_<dataset>.log`.

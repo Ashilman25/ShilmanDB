@@ -1,5 +1,5 @@
-// The server's replies as the page reads them. Field names match app/jobs.py, app/views.py
-// and app/server.py, and a Python test holds Snapshot and AnswerView to the server's keys.
+// The server's replies as the page reads them. Field names match jobs.py, views.py and
+// server.py in app/server/, and a Python test holds Snapshot and AnswerView to the server's keys.
 
 export type Stage = "queued" | "writing" | "first" | "done" | "stopped" | "error";
 export type JobKind = "ask" | "reask" | "sql" | "edit";

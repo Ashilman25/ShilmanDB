@@ -4,10 +4,10 @@ import re
 from collections.abc import Iterator
 from dataclasses import dataclass
 
-from app import sixd
-from app.datasets import Dataset
+from app.core import analyst_check
+from app.core.datasets import Dataset
 
-an, ck, pr, rp, sf = sixd.an, sixd.ck, sixd.pr, sixd.rp, sixd.sf
+an, ck, pr, rp, sf = analyst_check.an, analyst_check.ck, analyst_check.pr, analyst_check.rp, analyst_check.sf
 
 PENDING = {"final": "pending"}
 GUARD_MESSAGES = {False: "the SQL couldn't be read and mentions an outer join", True: "the SQL mentions an outer join"}

@@ -1,7 +1,7 @@
 {
   "name": "shilmandb-app-page",
   "private": true,
-  "description": "The app's page, compiled to app/static/js.",
+  "description": "The app's page, compiled to app/web/static/js.",
   "type": "module",
   "scripts": {
     "build": "tsc -p .",

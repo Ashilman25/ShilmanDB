@@ -11,13 +11,14 @@ from pathlib import Path
 
 import pytest
 
-from app import measured, replay_check, sixd
-from app.datasets import MODEL_ID, default_paths
-from app.recorded_model import RecordedModel
+from app import replay_check
+from app.core import analyst_check, measured
+from app.core.datasets import MODEL_ID, default_paths
+from app.model.recorded_model import RecordedModel
 from app.replay_check import compare_record, timings
 from app.tests.fakes import FakeBridge
 
-an, fz = sixd.an, sixd.fz
+an, fz = analyst_check.an, analyst_check.fz
 
 # The questions the fixture run file answers.
 QUESTION = "How many nations does each region hold?"
@@ -203,7 +204,7 @@ def test_replay_proof_with_recorded_model(replay, capsys, tmp_path):
     assert (proof["identical"], proof["total"]) == (2, 2)
     assert proof["differences"] == [] and proof["uncached_differences"] == []
     assert proof["versions"] == measured.mlx_versions()
-    assert proof["cache_code_sha1"] == measured.cache_code_sha1(paths.app_dir)
+    assert proof["cache_code_sha1"] == measured.cache_code_sha1(paths.cache_code_dir)
     assert proof["files"] == measured.file_hashes(paths)
     assert proof["engine_src_sha1"] == measured.tree_sha1(paths.src)
     assert proof["model"] == fz.read_model_configs(paths.code / "model_mlx.py")[MODEL_ID]
@@ -343,13 +344,13 @@ def test_replay_saved_records_untouched(replay, capsys, tmp_path):
 @pytest.fixture
 def editable(replay, tmp_path):
     paths = replay[0]
-    app_dir, src = tmp_path / "app_copy", tmp_path / "src_copy"
-    app_dir.mkdir()
+    copy = replace(paths, app_dir=tmp_path / "app_copy", src=tmp_path / "src_copy")
+    copy.cache_code_dir.mkdir(parents=True)
     for name in measured.CACHE_CODE:
-        shutil.copy(paths.app_dir / name, app_dir / name)
-    (src / "storage").mkdir(parents=True)
-    (src / "storage/page.hpp").write_text("#pragma once\n", encoding="utf-8")
-    return (replace(paths, app_dir=app_dir, src=src), *replay[1:])
+        shutil.copy(paths.cache_code_dir / name, copy.cache_code_dir / name)
+    (copy.src / "storage").mkdir(parents=True)
+    (copy.src / "storage/page.hpp").write_text("#pragma once\n", encoding="utf-8")
+    return (copy, *replay[1:])
 
 
 # A recorded model that runs change once, on its first reply.
@@ -368,7 +369,7 @@ def _changing_model(run: Path, change):
 
 # Each thing the proof vouches for, changed mid-pass, and the line naming it.
 @pytest.mark.parametrize("what, line", [
-    ("cache code", "app/prompt_cache.py changed during the replay."),
+    ("cache code", "app/model/prompt_cache.py changed during the replay."),
     ("engine", "the engine source changed during the replay."),
     ("locked file", "checks.py changed during the replay."),
     ("library", "a model library changed during the replay."),
@@ -383,7 +384,7 @@ def test_replay_change_mid_pass_writes_nothing(editable, capsys, tmp_path, monke
     def change():
         state["changed"] = True
         if what == "cache code":
-            with open(paths.app_dir / "prompt_cache.py", "a", encoding="utf-8") as f:
+            with open(paths.cache_code_dir / "prompt_cache.py", "a", encoding="utf-8") as f:
                 f.write("# edited\n")
         elif what == "engine":
             (paths.src / "storage/page.hpp").write_text("#pragma once // edited\n", encoding="utf-8")

@@ -5,7 +5,7 @@ import io
 import itertools
 import math
 
-from app import sixd
+from app.core import analyst_check
 
 DISPLAY_ROWS = 500
 CELL_CHARS = 200
@@ -113,7 +113,7 @@ def csv_text(reply: dict) -> str:
 
 # The download link's text, saying when the engine cut the result at its row cap.
 def csv_label(reply: dict) -> str:
-    cap = sixd.an.ROW_CAP
+    cap = analyst_check.an.ROW_CAP
     if reply.get("truncated"):
         return f"Download CSV (first {cap:,} of {reply['row_count']:,} rows)"
     return f"Download CSV (up to {cap:,} rows)"
@@ -154,11 +154,11 @@ def error_text(reply: dict) -> str:
                 return str(message)
             return f"{lead}: {message}"
         case "timeout":
-            return f"Stopped after {sixd.an.TIMEOUT_S:g} s. The engine restarted (about 2 s)."
+            return f"Stopped after {analyst_check.an.TIMEOUT_S:g} s. The engine restarted (about 2 s)."
         case "crash":
             return "The engine stopped on this query and restarted."
         case "memory":
-            return f"The query used more than {sixd.an.MAX_RSS_MB:,} MB, so the engine restarted."
+            return f"The query used more than {analyst_check.an.MAX_RSS_MB:,} MB, so the engine restarted."
         case _:
             return f"Engine error: {message}"
 

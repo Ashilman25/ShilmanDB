@@ -1,4 +1,4 @@
-"""Tests for the page: app/static/ and the TypeScript it's built from in app/web/.
+"""Tests for the page: app/web/static/ and the TypeScript it's built from in app/web/src/.
 
 They read files, and run the one compiled module that touches no page (sqltext.js) in Node when Node is
 installed; the build itself (tsc) runs in CI, never here."""
@@ -13,14 +13,15 @@ from pathlib import Path
 
 import pytest
 
-from app import copy_rules, jobs, views
+from app.server import copy_rules, jobs, views
 from app.tests.test_app_views import REGION_SQL, _region_reply
 
 APP_DIR = Path(__file__).resolve().parents[1]
-STATIC = APP_DIR / "static"
 WEB = APP_DIR / "web"
+STATIC = WEB / "static"
 INDEX, CSS = STATIC / "index.html", STATIC / "app.css"
 SOURCES, COMPILED = WEB / "src", STATIC / "js"
+TSCONFIG = WEB / "tsconfig.json"
 
 HTML_SINKS = ("innerHTML", "outerHTML", "insertAdjacentHTML", "document.write")
 ADDRESSES = ("http://", "https://")
@@ -289,6 +290,12 @@ def test_typescript_pinned():
     lock = json.loads(_read(WEB / "package-lock.json"))
     assert lock["packages"][""]["devDependencies"] == {"typescript": "7.0.2"}
     assert lock["packages"]["node_modules/typescript"]["version"] == "7.0.2"
+
+
+# tsc writes into outDir, from app/web/; CI checks COMPILED, so the two must agree.
+def test_tsconfig_builds_into_compiled():
+    out_dir = json.loads(_read(TSCONFIG))["compilerOptions"]["outDir"]
+    assert (WEB / out_dir).resolve() == COMPILED.resolve()
 
 
 def test_dark_is_default():

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 
-from app.datasets import AppPaths, missing_files
+from app.core.datasets import AppPaths, missing_files
 
 # description.md's table heading, a column's bullet, and the Values line under that bullet.
 # Any other section heading ends the tables.

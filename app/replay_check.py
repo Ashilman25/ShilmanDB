@@ -9,12 +9,12 @@ import time
 from itertools import zip_longest
 from pathlib import Path
 
-from app import sixd
-from app.datasets import DATASETS, MODEL_ID, AppPaths, default_paths, load_dataset
-from app.measured import CACHE_CODE, cache_code_sha1, file_hashes, library_versions, mlx_versions, tree_sha1
-from app.model_cache import CachedModel
+from app.core import analyst_check
+from app.core.datasets import DATASETS, MODEL_ID, AppPaths, default_paths, load_dataset
+from app.core.measured import CACHE_CODE, cache_code_sha1, file_hashes, library_versions, mlx_versions, tree_sha1
+from app.model.model_cache import CachedModel
 
-an, rp, fz = sixd.an, sixd.rp, sixd.fz
+an, rp, fz = analyst_check.an, analyst_check.rp, analyst_check.fz
 
 ATTEMPT_FIELDS = ("raw", "kind", "sql")
 PROOF = "cache_proof.json"
@@ -168,9 +168,9 @@ def _datasets(paths: AppPaths, names) -> dict:
 def _snapshot(paths: AppPaths) -> dict:
     return {
         "versions": mlx_versions(), "library_versions": library_versions(),
-        "cache_code_sha1": cache_code_sha1(paths.app_dir), "files": file_hashes(paths),
+        "cache_code_sha1": cache_code_sha1(paths.cache_code_dir), "files": file_hashes(paths),
         "engine_src_sha1": tree_sha1(paths.src),
-        "cache_files": {name: sixd.an.sha1_file(paths.app_dir / name) if (paths.app_dir / name).is_file() else None for name in CACHE_CODE},
+        "cache_files": {name: analyst_check.an.sha1_file(paths.cache_code_dir / name) if (paths.cache_code_dir / name).is_file() else None for name in CACHE_CODE},
     }
 
 
@@ -181,7 +181,7 @@ def _changed(before: dict, after: dict) -> str | None:
     
     for name in CACHE_CODE:
         if before["cache_files"][name] != after["cache_files"][name]:
-            return f"app/{name} changed during the replay"
+            return f"app/model/{name} changed during the replay"
         
     if before["cache_code_sha1"] != after["cache_code_sha1"]:
         return "the app's cache code changed during the replay"
@@ -213,14 +213,14 @@ def _timing_lines(rows: list[tuple[str, dict]]) -> list[str]:
 def _default_bridge_factory(paths: AppPaths, out: Path):
     def make(ds: str, tables_tsv: Path):
         out.mkdir(parents=True, exist_ok=True)
-        return sixd.bc.Bridge(tables_tsv, command=[str(paths.bridge)], log_path=out / f"replay_bridge_{ds}.log")
+        return analyst_check.bc.Bridge(tables_tsv, command=[str(paths.bridge)], log_path=out / f"replay_bridge_{ds}.log")
     return make
 
 
 # The prompt cache model, or the plain MlxModel with --uncached-only.
 def _default_model_factory(uncached_only: bool):
     if uncached_only:
-        return lambda contexts: sixd.load_model_mlx().MlxModel(MODEL_ID)
+        return lambda contexts: analyst_check.load_model_mlx().MlxModel(MODEL_ID)
     return lambda contexts: CachedModel(MODEL_ID, contexts)
 
 

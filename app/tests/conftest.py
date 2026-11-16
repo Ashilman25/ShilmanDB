@@ -12,7 +12,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if sys.path[:1] != [str(REPO_ROOT)]:
     sys.path.insert(0, str(REPO_ROOT))
 
-from app.datasets import AppPaths, default_paths  # noqa: E402
+from app.core.datasets import AppPaths, default_paths  # noqa: E402
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 

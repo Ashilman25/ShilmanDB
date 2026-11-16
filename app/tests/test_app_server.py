@@ -1,4 +1,4 @@
-"""Tests for app/server.py and app/__main__.py."""
+"""Tests for app/server/server.py and app/__main__.py."""
 from __future__ import annotations
 
 import contextlib
@@ -18,26 +18,27 @@ from urllib.parse import quote
 
 import pytest
 
-# check_views is reached as a module: pytest collects any test* name imported into a test module.
 from app import __main__ as app_main
-from app import check_views, copy_rules, schema, sixd
 from app.__main__ import main, pick_port
-from app.datasets import DATASETS, default_paths, load_dataset, missing_files
-from app.engine import Engine, EngineOptions
-from app.jobs import SNAPSHOT_KEYS, JobRunner
-from app.measured import Lock, read_json
-from app.server import MAX_BODY, make_server
+from app.core import analyst_check, schema
+from app.core.datasets import DATASETS, default_paths, load_dataset, missing_files
+from app.core.engine import Engine, EngineOptions
+from app.core.measured import Lock, read_json
+# check_views is reached as a module: pytest collects any test* name imported into a test module.
+from app.server import check_views, copy_rules
+from app.server.jobs import SNAPSHOT_KEYS, JobRunner
+from app.server.server import MAX_BODY, make_server
 from app.tests.fakes import FakeBridge, FakeModel, bridge_error, bridge_ok
 from app.tests.test_app_flows import LEFT_SQL, QUESTION, REPLIES, script
 
-an, pr = sixd.an, sixd.pr
+an, pr = analyst_check.an, analyst_check.pr
 
 WAIT_S = 10.0
 CLIENT_TIMEOUT_S = 30.0  # above the server's 20 s long poll, so only a real hang times out
 TOKEN = "0123456789abcdef0123456789abcdef"
 APP_DIR = Path(__file__).resolve().parents[1]
-EXAMPLES = json.loads((APP_DIR / "examples.json").read_text(encoding="utf-8"))
-RATES = read_json(APP_DIR / "measured.json")["rates"]
+EXAMPLES = json.loads((APP_DIR / "server/examples.json").read_text(encoding="utf-8"))
+RATES = read_json(APP_DIR / "core/measured.json")["rates"]
 ENDED = ("done", "stopped", "error")
 
 TYPED = "SELECT n_name FROM nation WHERE n_regionkey = 1"
@@ -188,7 +189,7 @@ def start(paths):
             assert engine.wait_bridges(WAIT_S)
         runner = JobRunner(engine)
         runner.start()
-        server = make_server(runner, engine, TOKEN, 0, static_dir or APP_DIR / "static", EXAMPLES)
+        server = make_server(runner, engine, TOKEN, 0, static_dir or APP_DIR / "web/static", EXAMPLES)
         # A short poll interval, so shutdown at the end doesn't wait the default half second.
         thread = threading.Thread(target=server.serve_forever, args=(0.01,), name="test-http", daemon=True)
         thread.start()
@@ -633,7 +634,7 @@ def test_status_has_examples_and_panel(start):
 def test_server_strings_pass_copy_rules(start):
     c = start().client
     pages = [c.get("/").body.decode(), c.get("/", cookie=False).body.decode(),
-             (APP_DIR / "static" / "index.html").read_text(encoding="utf-8")]
+             (APP_DIR / "web/static/index.html").read_text(encoding="utf-8")]
     for text in pages:
         assert copy_rules.problems(text) == []
 
@@ -848,7 +849,7 @@ def test_preview_refused_once_quitting(start, paths):
 # Quitting starts when the server shuts down, the first thing the app closes.
 def test_server_shutdown_begins_quitting(kept_bridges):
     engine, _ = kept_bridges()
-    server = make_server(JobRunner(engine), engine, TOKEN, 0, APP_DIR / "static", EXAMPLES)
+    server = make_server(JobRunner(engine), engine, TOKEN, 0, APP_DIR / "web/static", EXAMPLES)
     thread = threading.Thread(target=server.serve_forever, args=(0.01,), name="test-http", daemon=True)
     thread.start()
     try:
@@ -1015,7 +1016,7 @@ def test_main_quits_with_a_query_in_flight(main_paths, capsys, monkeypatch):
     real_engine, real_runner = app_main.Engine, app_main.JobRunner
 
     def factory(name, tables_tsv):
-        bridges.append(sixd.bc.Bridge(tables_tsv, command=[sys.executable, "-c", SLOW_BRIDGE]))
+        bridges.append(analyst_check.bc.Bridge(tables_tsv, command=[sys.executable, "-c", SLOW_BRIDGE]))
         return bridges[-1]
 
     def runner(engine):

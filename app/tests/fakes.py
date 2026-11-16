@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import threading
 
-from app.datasets import MODEL_ID
+from app.core.datasets import MODEL_ID
 
 SECONDS = 1.5          # model seconds per reply
 MS = 250.0             # bridge ms per query

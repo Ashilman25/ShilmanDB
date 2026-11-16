@@ -1,4 +1,4 @@
-"""Tests for app/engine.py and app/recorded_model.py."""
+"""Tests for app/core/engine.py and app/model/recorded_model.py."""
 from __future__ import annotations
 
 import json
@@ -14,21 +14,22 @@ from pathlib import Path
 
 import pytest
 
-from app import engine as engine_mod
-from app import measured, recorded_model, sixd
-from app.datasets import DATASETS, LABELS, MODEL_ID, Dataset, build_hint, default_paths, load_dataset, missing_files
-from app.engine import Engine, EngineOptions, LockedBridge, default_bridge_factory
-from app.recorded_model import RecordedModel
+from app.core import analyst_check, measured
+from app.core import engine as engine_mod
+from app.core.datasets import DATASETS, LABELS, MODEL_ID, Dataset, build_hint, default_paths, load_dataset, missing_files
+from app.core.engine import Engine, EngineOptions, LockedBridge, default_bridge_factory
+from app.model import recorded_model
+from app.model.recorded_model import RecordedModel
 from app.tests.fakes import FakeBridge, FakeModel, bridge_ok
 
-an, pr = sixd.an, sixd.pr
+an, pr = analyst_check.an, analyst_check.pr
 
 # The questions the fixture run file answers.
 QUESTION = "How many nations does each region hold?"
 REPHRASED = "For every region, count its nations."
 CANNOT_QUESTION = "Which nation has the most customers?"
 
-FAKE_BRIDGE = sixd.REPO_ROOT / "bench/analyst/tests/fake_bridge.py"
+FAKE_BRIDGE = analyst_check.REPO_ROOT / "bench/analyst/tests/fake_bridge.py"
 LOADED = re.compile(r"Loaded in \d+\.\d s\.")
 NO_MEASURED = "measured.json is missing or can't be read"
 MODEL = {"path": "org/some-model-4bit", "revision": "abc123", "thinking": False, "max_tokens": 1024}
@@ -52,12 +53,13 @@ def paths(fixture_paths, tmp_path):
     return replace(fixture_paths, app_dir=tmp_path / "app", src=tmp_path / "src")
 
 
-# Tmp trees holding every locked file, a model_mlx.py with the tested config and a matching measured.json.
+# Tmp trees holding every locked file, the cache code, a model_mlx.py with the tested config and a matching measured.json.
 @pytest.fixture
 def tested(tmp_path):
     p = replace(default_paths(), code=tmp_path / "code", results=tmp_path / "results", src=tmp_path / "src",
                 app_dir=tmp_path / "app", app_results=tmp_path / "app_results")
-    for folder, names in ((p.code, measured.FILES_CODE + measured.FILES_WATCHED), (p.results, measured.FILES_RESULTS)):
+    for folder, names in ((p.code, measured.FILES_CODE + measured.FILES_WATCHED), (p.results, measured.FILES_RESULTS),
+                          (p.cache_code_dir, measured.CACHE_CODE)):
         for name in names:
             _write(folder / name, f"contents of {name}\n")
     _write(p.code / "model_mlx.py", f"MODEL_CONFIGS = {{{MODEL_ID!r}: {MODEL!r}}}\n")
@@ -74,7 +76,7 @@ def _proof(p) -> dict:
     return {"identical": 300, "total": 300, "differences": [], "uncached_differences": [], "versions": dict(VERSIONS),
             "library_versions": dict(LIBRARIES),
             "files": measured.file_hashes(p), "engine_src_sha1": measured.tree_sha1(p.src),
-            "cache_code_sha1": measured.cache_code_sha1(p.app_dir)}
+            "cache_code_sha1": measured.cache_code_sha1(p.cache_code_dir)}
 
 
 # Builds engines and closes every one at the end of the test.
@@ -104,7 +106,7 @@ class Bridges:
         return self.made[name]
 
 
-# A FakeBridge whose start fails the way 6d's does.
+# A FakeBridge whose start fails the way the analyst check's bridge does.
 class FailingStart(FakeBridge):
     def start(self) -> dict:
         raise RuntimeError(START_ERROR)
@@ -360,7 +362,7 @@ def test_engine_missing_dataset_status(paths, engines):
     assert tpch["label"] == LABELS["tpch"] and tpch["state"] == "ready" and LOADED.fullmatch(tpch["detail"])
     assert list(bridges.made) == ["tpch"] and bridges.made["tpch"].started
     assert bridges.tsvs == {"tpch": paths.dataset_dir("tpch") / "tables.tsv"}
-    assert paths.app_results.is_dir()  # 6d's bridge appends to a log there
+    assert paths.app_results.is_dir()  # the analyst check's bridge appends to a log there
 
     assert isinstance(engine.dataset("tpch"), Dataset) and engine.dataset("tpch").name == "tpch"
     bridge = engine.bridge("tpch")
@@ -498,7 +500,7 @@ def test_engine_close_stops_real_bridge_mid_load(paths, engines):
 
     # A bridge process that never sends its ready line and exits once its stdin closes.
     def factory(name, tables_tsv):
-        made.append(sixd.bc.Bridge(tables_tsv, command=[sys.executable, "-c", "import sys; sys.stdin.read()"]))
+        made.append(analyst_check.bc.Bridge(tables_tsv, command=[sys.executable, "-c", "import sys; sys.stdin.read()"]))
         return made[-1]
 
     assert _children() == []
@@ -522,7 +524,7 @@ def test_engine_close_removes_real_bridge_db_file(paths, engines):
     made = []
 
     def factory(name, tables_tsv):
-        made.append(sixd.bc.Bridge(tables_tsv, command=[sys.executable, str(FAKE_BRIDGE)]))
+        made.append(analyst_check.bc.Bridge(tables_tsv, command=[sys.executable, str(FAKE_BRIDGE)]))
         return made[-1]
 
     engine = engines(paths, bridge_factory=factory)
@@ -541,7 +543,7 @@ def test_default_bridge_factory(paths):
     tsv = paths.dataset_dir("tpch") / "tables.tsv"
     bridge = default_bridge_factory(paths)("tpch", tsv)
     try:
-        assert isinstance(bridge, sixd.bc.Bridge)
+        assert isinstance(bridge, analyst_check.bc.Bridge)
         assert bridge.command == [str(paths.bridge)]
         assert bridge.log_path == paths.app_results / "bridge_tpch.log"
         assert bridge.tables_tsv == tsv
@@ -771,7 +773,7 @@ def test_engine_unusable_measured_json(tested, engines, key):
     assert engine.cache == measured.CacheGate(False, NO_MEASURED)
 
 
-# Records how the engine built its model, standing in for CachedModel and 6d's MlxModel.
+# Records how the engine built its model, standing in for CachedModel and the analyst check's MlxModel.
 class MadeModel:
     def __init__(self, kind: str, config_id: str, contexts=None):
         self.kind, self.config_id, self.contexts = kind, config_id, contexts
@@ -785,7 +787,7 @@ def swap(paths, monkeypatch):
     monkeypatch.setattr(engine_mod, "check_lock", lambda *a: measured.Lock(True, None))
     monkeypatch.setattr(engine_mod, "CachedModel", lambda config_id, contexts: made.append(MadeModel("cached", config_id, contexts)) or made[-1])
     stub = type("model_mlx", (), {"MlxModel": staticmethod(lambda config_id: made.append(MadeModel("plain", config_id)) or made[-1])})
-    monkeypatch.setattr(sixd, "load_model_mlx", lambda: stub)
+    monkeypatch.setattr(analyst_check, "load_model_mlx", lambda: stub)
 
     def gate(on: bool):
         monkeypatch.setattr(engine_mod, "cache_gate", lambda *a: measured.CacheGate(on, "forced"))

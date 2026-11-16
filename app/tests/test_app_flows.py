@@ -1,4 +1,4 @@
-"""Tests for app/analyst.py and app/sql_runner.py."""
+"""Tests for app/answers/analyst.py and app/answers/sql_runner.py."""
 from __future__ import annotations
 
 import json
@@ -7,14 +7,15 @@ from pathlib import Path
 
 import pytest
 
+from app.answers.analyst import PENDING, analyst_events, has_outer_join_words
+from app.answers.sql_runner import sql_events
+from app.core import analyst_check
+from app.core.datasets import load_dataset
 # check_views is reached as a module: pytest collects any test* name imported into a test module.
-from app import check_views, sixd
-from app.analyst import PENDING, analyst_events, has_outer_join_words
-from app.datasets import load_dataset
-from app.sql_runner import sql_events
+from app.server import check_views
 from app.tests.fakes import FakeBridge, FakeModel, bridge_error, bridge_ok, reply
 
-an, ck, pr, rp = sixd.an, sixd.ck, sixd.pr, sixd.rp
+an, ck, pr, rp = analyst_check.an, analyst_check.ck, analyst_check.pr, analyst_check.rp
 
 QUESTION = "How many nations does each region hold?"
 REPHRASED = "For every region, count its nations."
@@ -103,7 +104,7 @@ def test_events_in_order(ds):
     assert check(events[-1].checks, "second_phrasing").level == "pass"
     assert bridge.sent == [SQL, SQL]
     for e in events:
-        json.dumps(e.record)  # records stay plain JSON, as 6d's run files
+        json.dumps(e.record)  # records stay plain JSON, as the analyst check's run files
 
 
 def test_first_has_pending_second(ds):
@@ -142,7 +143,7 @@ def test_refused_first_skips_second(ds):
     assert traps.level == "refuse" and traps.evidence["left_join"] is True
     assert ck.overall(done.checks) == "refused"
     assert not rephrase_asked(model)
-    assert bridge.sent == [LEFT_SQL]  # 6d's path: the SQL runs, then the answer is withheld
+    assert bridge.sent == [LEFT_SQL]  # the analyst check's path: the SQL runs, then the answer is withheld
 
 
 def test_cannot_and_failed_end(ds):
@@ -177,7 +178,7 @@ def test_record_matches_run_question(ds, monkeypatch):
 
 
 def test_guard_hides_unreadable_outer_join(ds):
-    assert not sixd.sf.facts(OUTER_SQL, ds.manifest).ok
+    assert not analyst_check.sf.facts(OUTER_SQL, ds.manifest).ok
     events, model, _ = run(ds, script(first_sql=OUTER_SQL))
     done = events[-1]
     traps = check(done.checks, "engine_traps")
@@ -262,7 +263,7 @@ def test_sql_left_join_never_sent(wide_ds):
 
     # sql_facts can't read this one, so the outer-join guard stops it.
     right = "SELECT c_name FROM customer c RIGHT JOIN orders o ON c.c_custkey = o.o_custkey"
-    assert not sixd.sf.facts(right, wide_ds.manifest).ok
+    assert not analyst_check.sf.facts(right, wide_ds.manifest).ok
     events = list(sql_events(right, wide_ds, bridge))
     assert [e.stage for e in events] == ["not_run"]
     assert [(c.name, c.level, c.evidence) for c in events[0].checks] == [
@@ -272,7 +273,7 @@ def test_sql_left_join_never_sent(wide_ds):
 
 def test_guard_withholds_readable_right_join(ds):
     right = SQL.replace(" JOIN ", " RIGHT JOIN ")
-    assert sixd.sf.facts(right, ds.manifest).ok  # RIGHT reads as nation's alias
+    assert analyst_check.sf.facts(right, ds.manifest).ok  # RIGHT reads as nation's alias
     events, model, bridge = run(ds, script(first_sql=right), {right: BY_REGION})
     done = events[-1]
     traps = check(done.checks, "engine_traps")
@@ -282,14 +283,14 @@ def test_guard_withholds_readable_right_join(ds):
     assert traps.message == "the SQL mentions an outer join"
     assert done.record["rephrase"]["final"] == "skipped"
     assert not rephrase_asked(model)
-    assert bridge.sent == [right]  # 6d's path: the SQL runs, then the answer is withheld
+    assert bridge.sent == [right]  # the analyst check's path: the SQL runs, then the answer is withheld
 
 
 def test_sql_readable_outer_joins_never_sent(wide_ds):
     bridge = FakeBridge({}, default=BY_REGION)
     for word in ("RIGHT", "FULL"):
         sql = f"SELECT c_name FROM customer {word} JOIN orders ON c_custkey = o_custkey"
-        assert sixd.sf.facts(sql, wide_ds.manifest).ok, sql
+        assert analyst_check.sf.facts(sql, wide_ds.manifest).ok, sql
         events = list(sql_events(sql, wide_ds, bridge))
 
         assert [e.stage for e in events] == ["not_run"], sql

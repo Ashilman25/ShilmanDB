@@ -1,11 +1,11 @@
-"""Tests for app/views.py."""
+"""Tests for app/server/views.py."""
 from __future__ import annotations
 
 import csv
 import io
 
-from app import sixd
-from app.views import (
+from app.core import analyst_check
+from app.server.views import (
     CELL_CHARS,
     DISPLAY_ROWS,
     answer_view,
@@ -225,10 +225,10 @@ def test_csv_label_up_to_cap():
     assert csv_label(_region_reply()) == "Download CSV (up to 10,000 rows)"
 
 
-def test_limits_read_from_sixd(monkeypatch):
-    monkeypatch.setattr(sixd.an, "ROW_CAP", 2500)
-    monkeypatch.setattr(sixd.an, "TIMEOUT_S", 45.0)
-    monkeypatch.setattr(sixd.an, "MAX_RSS_MB", 8192)
+def test_limits_read_from_analyst_check(monkeypatch):
+    monkeypatch.setattr(analyst_check.an, "ROW_CAP", 2500)
+    monkeypatch.setattr(analyst_check.an, "TIMEOUT_S", 45.0)
+    monkeypatch.setattr(analyst_check.an, "MAX_RSS_MB", 8192)
 
     assert csv_label(_reply([DECIMAL], [[1.0]], row_count=12345, truncated=True)) == "Download CSV (first 2,500 of 12,345 rows)"
     assert error_text(_failure("timeout", "over 45 s")) == "Stopped after 45 s. The engine restarted (about 2 s)."

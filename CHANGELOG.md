@@ -15,7 +15,8 @@ Every number below is a result of the project's own runs (*measured*), recorded 
 - A screen laid out like a database tool: a schema sidebar with row counts, columns, types and keys; a tab per table with a data grid and column notes; a Query tab with SQL highlighting and completion, a results grid and chart, and a Checks inspector; a status bar.
 - The analyst check's rates are shown only while the tested setup holds (its files, the model settings and today's engine); re-asked questions say they aren't part of the test, and typed or edited SQL shows no rates.
 - A prompt cache, on only while a replay proves it changes nothing: the replay matched all 300 test answers, and the median wait fell from 2.51 to 1.50 s for the first answer and from 5.29 to 3.32 s for the verdict (*measured*).
-- 381 tests for the app, run in CI with the bench tests (`pytest bench app`); no test loads the model.
+- 388 tests for the app, run in CI with the bench tests (`pytest bench app`); no test loads the model.
+- The app's files are organized into folders (`core/`, `model/`, `answers/`, `server/`, `web/`); the commands are unchanged.
 
 ## [0.1.0] - 2026-11-15
 

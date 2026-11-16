@@ -1,4 +1,4 @@
-"""Tests for app/prompt_cache.py and app/model_cache.py, with stand-ins for MLX."""
+"""Tests for app/model/prompt_cache.py and app/model/model_cache.py, with stand-ins for MLX."""
 from __future__ import annotations
 
 import contextlib
@@ -7,11 +7,12 @@ import types
 
 import pytest
 
-from app import model_cache, prompt_cache, sixd
-from app.datasets import MODEL_ID, load_dataset
-from app.prompt_cache import CHUNK, cache_len, dummy_prompts, encode, match, shared_prefix_len, starts_with
+from app.core import analyst_check
+from app.core.datasets import MODEL_ID, load_dataset
+from app.model import model_cache, prompt_cache
+from app.model.prompt_cache import CHUNK, cache_len, dummy_prompts, encode, match, shared_prefix_len, starts_with
 
-pr = sixd.pr
+pr = analyst_check.pr
 BOS = "<bos>"
 
 
@@ -92,13 +93,13 @@ def test_match_needs_a_longer_prompt_and_an_equal_prefix():
     assert match([1, 2, 3], {"a": [1], "b": [1, 2]}) == ("a", 1)  # tried in order
 
 
-# --- CachedModel, with a stand-in for 6d's MlxModel and for MLX itself ---
+# --- CachedModel, with a stand-in for the analyst check's MlxModel and for MLX itself ---
 
 MODEL_CONFIG = {"path": "org/model", "revision": "abc", "thinking": False, "max_tokens": 1024}
 PLAIN_SECONDS = 0.25
 
 
-# Stands in for 6d's MlxModel: same attributes, a reply that names the prompt.
+# Stands in for the analyst check's MlxModel: same attributes, a reply that names the prompt.
 class FakeMlxModel:
     made: list = []
 
@@ -117,7 +118,7 @@ class FakeMlxModel:
 
 # Contexts whose dummy prompts share long_text plus the prompt's fixed parts.
 def _context(long_text: str):
-    return sixd.rp.Context(long_text, "rules", [])
+    return analyst_check.rp.Context(long_text, "rules", [])
 
 
 # The tokens CachedModel works with for one prompt.
@@ -128,9 +129,9 @@ def _tokens(prompt: str) -> list[int]:
 
 @pytest.fixture
 def mlx_stub(monkeypatch):
-    real = sixd.load_model_mlx()
+    real = analyst_check.load_model_mlx()
     stub = types.SimpleNamespace(MlxModel=FakeMlxModel, render_chat=real.render_chat, reply_prefix=real.reply_prefix)
-    monkeypatch.setattr(sixd, "load_model_mlx", lambda: stub)
+    monkeypatch.setattr(analyst_check, "load_model_mlx", lambda: stub)
     FakeMlxModel.made = []
 
     calls = {"fill": [], "copy": [], "generate": []}

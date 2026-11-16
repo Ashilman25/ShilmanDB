@@ -107,12 +107,12 @@ jobs:
           cache: npm
           cache-dependency-path: app/web/package-lock.json
 
-      # The committed JS in app/static/js must be exactly what the TypeScript builds to
+      # The committed JS in app/web/static/js must be exactly what the TypeScript builds to
       - name: Build the app's page and check the committed JS
         run: |
           npm ci --prefix app/web
           npm run --prefix app/web build
-          git diff --exit-code -- app/static/js && test -z "$(git status --porcelain -- app/static/js)"
+          git diff --exit-code -- app/web/static/js && test -z "$(git status --porcelain -- app/web/static/js)"
 
   # The Debug job on Linux
   linux-debug:

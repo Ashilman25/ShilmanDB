@@ -5,7 +5,7 @@
     "lib": ["ES2022", "DOM"],
     "moduleResolution": "bundler",
     "rootDir": "src",
-    "outDir": "../static/js",
+    "outDir": "static/js",
     "strict": true,
     "noUncheckedIndexedAccess": true,
     "noImplicitReturns": true,
