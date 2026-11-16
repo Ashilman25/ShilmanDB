@@ -97,7 +97,7 @@ A first slice of the app runs on the Mac today: a SQL runner and the AI analyst 
 
 The test's rates belong to the setup that was tested: that model, those files and today's engine. The app shows them only while all of that still matches. A question re-asked with a different reading of a term says it isn't part of the test, and SQL you type or edit shows no rates at all. When the columnar core changes the engine, the rates hide until the test is rerun on it.
 
-A prompt cache keeps the model's state after the long start every prompt shares. A replay of the 300 test questions with the cache gave the same output on all 300, so the cache could be turned on: the median wait for the first answer went from 2.51 to 1.50 s, and for the verdict from 5.29 to 3.32 s (*measured*). The cache is on only while that replay's proof matches the cache code, the analyst check's tested files, the model settings, the model's libraries and the engine; after a change to any of them it stays off until the replay runs again.
+A prompt cache keeps the model's state after the long start every prompt shares. A replay of the 300 test questions with the cache gave the same output on all 300, so the cache could be turned on: the median wait for the first answer went from 2.51 to 1.50-1.62 s, and for the verdict from 5.29 to 3.32-3.52 s, over two replays (*measured*). The cache is on only while that replay's proof matches the cache code, the analyst check's tested files, the model settings, the model's libraries and the engine; after a change to any of them it stays off until the replay runs again.
 
 ```bash
 cmake --build build --target analyst_bridge   # the engine bridge, from the Release build below

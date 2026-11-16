@@ -134,6 +134,7 @@ Exit codes (*from docs*: `app/replay_check.py`): 0 every question identical, 1 o
 | Replay smoke, `--limit 2` | identical 4 of 4 in 16.1 s (*measured* 2026-11-15) |
 | Full replay, estimate | about 11-15 min (*inferred* 2026-11-15 from the 4-question smoke) |
 | Full replay, as run | identical 300 of 300, no differences (*measured* 2026-11-15); about 23 min (*inferred* from file times, so the estimate was low); first answer median 1.50 s, p90 2.13 s; verdict median 3.32 s, p90 5.21 s (*measured*, the proof's `timings`) |
+| Full replay, rerun after the files moved into folders | identical 300 of 300, no differences (*measured* 2026-11-16); first answer median 1.62 s, p90 2.25 s; verdict median 3.52 s, p90 5.29 s (*measured*, the proof's `timings`) |
 
 **Timings on TPC-H through the app** (*measured* 2026-11-15):
 
