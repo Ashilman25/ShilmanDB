@@ -1,9 +1,9 @@
 // Calls to the app's server. Every reply is checked against its type before the page sees it.
 import { UNREACHABLE, UNREADABLE } from "./copy.js";
 import {
-  errorMessage, readHistory, readRowsPage, readSnapshot, readStatus, readStopReply, ShapeError, type Read,
+  errorMessage, readHistory, readPreview, readRowsPage, readSchema, readSnapshot, readStatus, readStopReply, ShapeError, type Read,
 } from "./read.js";
-import type { AnswerName, HistoryEntry, RowsPage, Snapshot, Status, StopReply } from "./types.js";
+import type { AnswerName, HistoryEntry, Preview, RowsPage, Schema, Snapshot, Status, StopReply } from "./types.js";
 
 // A call the server refused, or one that never reached it (status 0).
 export class ApiError extends Error {
@@ -54,6 +54,17 @@ function jobPath(id: string): string {
 
 export function getStatus(): Promise<Status> {
   return call("/api/status", readStatus);
+}
+
+// Both datasets' tables and columns, read from their files.
+export function getSchema(): Promise<Schema> {
+  return call("/api/schema", readSchema);
+}
+
+// The first rows of one table, read straight from its engine (never a job).
+export function getPreview(dataset: string, table: string): Promise<Preview> {
+  const query = new URLSearchParams({ dataset, table });
+  return call(`/api/preview?${query.toString()}`, readPreview);
 }
 
 export function getHistory(): Promise<HistoryEntry[]> {

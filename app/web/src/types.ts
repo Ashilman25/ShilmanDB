@@ -175,3 +175,42 @@ export interface RowsPage {
 export interface StopReply {
   stopped: boolean;
 }
+
+// One column of a table as /api/schema gives it: key, references and values are filled only when it has them.
+export interface SchemaColumn {
+  name: string;
+  type: string;
+  description: string;
+  key: boolean;
+  references: string | null;
+  values: string[] | null;
+}
+
+export interface SchemaTable {
+  name: string;
+  rows: number;
+  primary_key: string[];
+  columns: SchemaColumn[];
+}
+
+export interface DatasetSchema {
+  label: string;
+  state: LoadState;
+  detail: string;
+  about: string;
+  tables: SchemaTable[];
+}
+
+export interface Schema {
+  datasets: Record<string, DatasetSchema>;
+}
+
+// The first rows of one table, formatted for the grid, with the table's full row count.
+export interface Preview {
+  dataset: string;
+  table: string;
+  columns: Column[];
+  rows: string[][];
+  total: number;
+  ms: number;
+}

@@ -10,13 +10,16 @@ from pathlib import Path
 from urllib.parse import parse_qsl, unquote, urlsplit
 
 from app import check_views, views
-from app.jobs import ENDED, Refusal
+from app.copy_rules import plain
+from app.datasets import DATASETS, LABELS
+from app.jobs import ENDED, Refusal, _check_dataset
 
 HOST = "127.0.0.1"
 MAX_BODY = 1024 * 1024  # bytes in a POST body
 QUESTION_CHARS, SQL_CHARS = 2_000, 20_000
 REASK_KINDS = ("ask", "reask")
 ANSWERS = ("first", "second")
+PREVIEW_ROWS = 1_000  # rows a table's preview reads
 
 NO_TOKEN = "Open the link the app printed."
 WRONG_HOST = "This address isn't the app's. Open the link the app printed."
@@ -35,6 +38,9 @@ NOT_FOUND, WRONG_METHOD = "Not found.", "Method not allowed."
 BROKEN = "The app hit an error. The terminal it runs in has the details."
 BAD_REQUEST = "The request wasn't valid HTTP."
 BAD_CHARACTER = "The text has a character the app can't send. Retype it and try again."
+NO_TABLE_NAMED = 'The request needs "dataset" and "table".'
+UNKNOWN_DATASET = f"Unknown dataset. Use {' or '.join(DATASETS)}."
+QUITTING = "The app is quitting."
 
 CONTENT_TYPES = {
     ".html": "text/html; charset=utf-8",
@@ -66,6 +72,8 @@ ROUTES = (
     ("GET", re.compile(r"/static/(?P<path>.+)"), "_static"),
     ("GET", re.compile(r"/api/status"), "_status"),
     ("GET", re.compile(r"/api/history"), "_history"),
+    ("GET", re.compile(r"/api/schema"), "_schema"),
+    ("GET", re.compile(r"/api/preview"), "_preview"),
     ("POST", re.compile(r"/api/ask"), "_ask"),
     ("POST", re.compile(r"/api/reask"), "_reask"),
     ("POST", re.compile(r"/api/sql"), "_sql"),
@@ -150,6 +158,11 @@ class AppServer(ThreadingHTTPServer):
         self.cookie_name = f"shilmandb_token_{port}"
         self.hosts = (f"127.0.0.1:{port}", f"localhost:{port}")
         self.origins = tuple(f"http://{host}" for host in self.hosts)
+
+    # Quitting begins here, the first thing the app closes: a preview still waiting for a bridge is refused.
+    def shutdown(self) -> None:
+        self.engine.begin_quit()
+        super().shutdown()
 
 
 # The server for the page and its API, bound to 127.0.0.1; port 0 picks a free one.
@@ -333,6 +346,39 @@ class Handler(BaseHTTPRequestHandler):
     # This session's jobs, newest first.
     def _history(self, query: dict) -> None:
         self._json({"history": self.server.runner.history()})
+
+    # Both datasets' tables and columns, from their files.
+    def _schema(self, query: dict) -> None:
+        self._json(self.server.engine.schema())
+
+    # The first rows of one table the dataset's manifest names, straight through its bridge: never a job,
+    # so it stays out of History and never waits behind the analyst. Only the manifest's own name reaches SQL.
+    # Once quitting has begun it's refused, even after waiting for the bridge.
+    def _preview(self, query: dict) -> None:
+        name, table = query.get("dataset"), query.get("table")
+        if not name or not table:
+            raise HttpError(400, NO_TABLE_NAMED)
+        if name not in DATASETS:
+            raise HttpError(404, UNKNOWN_DATASET)
+
+        engine = self.server.engine
+        _check_dataset(name, engine.status()["datasets"][name])
+        entry = next((t for t in engine.dataset(name).manifest["tables"] if t["name"] == table), None)
+        if entry is None:
+            raise HttpError(404, f"That table isn't in {LABELS[name]}.")
+
+        reply = engine.preview_query(name, f"SELECT * FROM {entry['name']} LIMIT {PREVIEW_ROWS}")
+        if reply is None:
+            raise HttpError(503, QUITTING)  # the status and words a job submit gives while quitting
+        if reply.get("ok") is not True:
+            raise HttpError(502, plain(views.error_text(reply)))
+        
+        self._json({
+            "dataset": name, "table": entry["name"],
+            "columns": [{"name": c["name"], "type": c["type"]} for c in reply["columns"]],
+            "rows": views.display_rows(reply, 0, PREVIEW_ROWS),
+            "total": entry["rows"], "ms": reply["ms"],
+        })
 
     # A typed question for the analyst.
     def _ask(self, query: dict) -> None:

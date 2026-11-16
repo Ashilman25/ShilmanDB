@@ -1,8 +1,10 @@
-// The input row: the Ask / SQL switch, the question line or the SQL editor, the action button,
-// and the messages under it. The two text fields are in index.html, so typing is never lost to a redraw
-// and the editor's attributes (no spellcheck, no autocorrect) are there before any script runs.
-import { choice } from "./controls.js";
-import { byId, h, redraw } from "./dom.js";
+// The Query tab's editor: the bar (the Ask / SQL switch, the database it uses, the action button and its key),
+// the question line or the SQL editor, and the messages under them. The two text fields are in index.html, so
+// typing is never lost to a redraw and the editor's attributes (no spellcheck, no autocorrect) are there before
+// any script runs. The database select is made once for the same reason.
+import { choice, chevron } from "./controls.js";
+import { byId, fill, h, redraw } from "./dom.js";
+import { makeSqlEditor } from "./sqledit.js";
 import { askBlock, datasetLabel, isRunning, runBlock, } from "./state.js";
 const MODES = [{ value: "ask", text: "Ask" }, { value: "sql", text: "SQL" }];
 function inputById(id) {
@@ -28,7 +30,10 @@ function actionButton(state, actions) {
     const blocked = state.mode === "ask" ? askBlock(state) : runBlock(state);
     return h("button", {
         class: "btn",
-        attrs: { type: "button", disabled: blocked !== null || state.submitting, "aria-describedby": blocked ? "why-off" : null, "data-focus": "action" },
+        attrs: {
+            type: "button", disabled: blocked !== null || state.submitting, "aria-describedby": blocked ? "why-off" : "run-key",
+            "data-focus": "action",
+        },
         onClick: () => actions.submit(),
     }, state.mode === "ask" ? "Ask" : "Run");
 }
@@ -49,9 +54,20 @@ export function makeInput(actions) {
     const question = inputById("question");
     const sql = textareaById("sql");
     const modeSlot = byId("mode");
+    const dbSlot = byId("db");
     const actionSlot = byId("action");
     const under = byId("under");
+    const editor = makeSqlEditor(sql, byId("sql-box"), byId("code-lines"), byId("splitter"), byId("query-pane"));
+    const database = h("select", {
+        class: "db-select",
+        attrs: { "aria-label": "Database", "data-focus": "database" },
+        onChange: (event) => { if (event.target instanceof HTMLSelectElement)
+            actions.setDataset(event.target.value); },
+    });
+    // The select with the tree's chevron as its arrow, so it's drawn like the switch beside it.
+    const select = h("span", { class: "select-wrap" }, database, chevron());
     let drawn = "";
+    let choices = "";
     question.addEventListener("keydown", (event) => {
         if (event.key === "Enter" && !event.isComposing && !event.shiftKey) {
             event.preventDefault();
@@ -59,20 +75,34 @@ export function makeInput(actions) {
         }
     });
     sql.addEventListener("keydown", (event) => {
+        if (editor.onKey(event))
+            return; // the names list took the key
         if (event.key === "Enter" && (event.metaKey || event.ctrlKey) && !event.isComposing) {
             event.preventDefault();
             actions.submit();
         }
     });
+    // The select's options, rebuilt only when the datasets or their labels change.
+    function drawDatabases(state) {
+        const names = Object.keys(state.status?.datasets ?? state.schema?.datasets ?? {});
+        const next = JSON.stringify(names.map((name) => [name, datasetLabel(state, name)]));
+        if (next !== choices) {
+            choices = next;
+            fill(database, names.map((name) => h("option", { attrs: { value: name } }, datasetLabel(state, name))));
+        }
+        database.value = state.dataset;
+        fill(dbSlot, names.length ? select : null);
+    }
     return {
         draw(state) {
             const label = datasetLabel(state);
             redraw(modeSlot, choice("mode", "Ask a question or write SQL", MODES, state.mode, (mode) => actions.setMode(mode), true));
+            drawDatabases(state);
             question.hidden = state.mode !== "ask";
-            sql.hidden = state.mode !== "sql";
+            editor.draw(state, state.mode === "sql");
             question.placeholder = `Ask a question about ${label}. Enter asks.`;
             sql.placeholder = `Write SQL for ${label}. Cmd+Enter runs.`;
-            redraw(actionSlot, actionButton(state, actions));
+            redraw(actionSlot, isRunning(state.job) ? null : h("span", { class: "key-hint", attrs: { id: "run-key" } }, "Cmd+Enter"), actionButton(state, actions));
             // Redrawn only when its words change, so a screen reader hears an alert once, not on every status poll.
             const notes = messages(state);
             const text = notes.map((note) => note?.textContent ?? "").join("\n");
@@ -83,7 +113,10 @@ export function makeInput(actions) {
         question: () => question.value,
         sql: () => sql.value,
         setQuestion: (text) => { question.value = text; },
-        setSql: (text) => { sql.value = text; },
+        setSql: (text) => {
+            sql.value = text;
+            editor.render();
+        },
         focusQuestion: () => question.focus(),
         focusSql: () => sql.focus(),
     };

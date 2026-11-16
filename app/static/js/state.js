@@ -1,7 +1,14 @@
 // What the page holds between redraws, the actions the panels can call, and the rules
 // derived from them (is the shown job running, why Ask or Run is off).
-import { CONNECTING } from "./copy.js";
+import { BUSY, CONNECTING } from "./copy.js";
+export const QUERY_TAB = "query";
+export const MAX_TABLE_TABS = 8;
+// The table each database opens with.
+export const START_TABLES = { tpch: "orders", reviews: "reviews" };
 export const SECOND_ROW = "second_phrasing";
+export function tableKey(dataset, table) {
+    return `${dataset}.${table}`;
+}
 export function isRunning(job) {
     return job !== null && (job.stage === "queued" || job.stage === "writing" || job.stage === "first");
 }
@@ -16,13 +23,20 @@ export function showsSecond(job) {
     return job.second !== null && secondRow(job)?.word === "Differs";
 }
 export function datasetLabel(state, name = state.dataset) {
-    return state.status?.datasets[name]?.label ?? name;
+    return state.status?.datasets[name]?.label ?? state.schema?.datasets[name]?.label ?? name;
 }
-// Why typed SQL can't run on the current dataset, or null when it can.
-export function runBlock(state) {
+// A table's schema entry, once /api/schema is in.
+export function schemaTable(state, dataset, table) {
+    return state.schema?.datasets[dataset]?.tables.find((entry) => entry.name === table);
+}
+export function activeTable(state) {
+    return state.tabs.find((tab) => tab.key === state.active);
+}
+// Why typed SQL can't run on a dataset (the Query tab's, unless named), or null when it can.
+export function runBlock(state, dataset = state.dataset) {
     if (state.statusError)
         return state.statusError;
-    const info = state.status?.datasets[state.dataset];
+    const info = state.status?.datasets[dataset];
     if (!info)
         return CONNECTING;
     if (info.state === "loading")
@@ -47,4 +61,10 @@ export function askBlock(state) {
 // Whether a new question or SQL run can start from the page right now.
 export function canStart(state) {
     return !isRunning(state.job) && !state.submitting;
+}
+// Why Query this table can't run now, or null when it can: a run already under way, or the Run button's reason.
+export function queryBlock(state, dataset) {
+    if (!canStart(state))
+        return BUSY;
+    return runBlock(state, dataset);
 }

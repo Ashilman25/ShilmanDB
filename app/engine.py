@@ -12,6 +12,7 @@ from app.datasets import DATASETS, LABELS, MODEL_ID, AppPaths, Dataset, build_hi
 from app.measured import CacheGate, Lock, cache_code_sha1, cache_gate, check_lock, library_versions, mlx_versions, read_json
 from app.model_cache import CachedModel
 from app.recorded_model import RecordedModel, recorded_model_id
+from app.schema import dataset_schema
 
 MODEL_MODES = ("mlx", "recorded", "none")
 MEASURED_KEYS = ("files", "engine_src_sha1", "model", "rates")
@@ -32,6 +33,14 @@ class LockedBridge:
 
     def query(self, sql: str) -> dict:
         with self._lock:
+            self.queries += 1
+            return self._bridge.query(sql)
+
+    # The same, unless stop() says no once the bridge is free: then nothing is sent and the answer is None.
+    def query_unless(self, sql: str, stop: Callable[[], bool]) -> dict | None:
+        with self._lock:
+            if stop():
+                return None
             self.queries += 1
             return self._bridge.query(sql)
 
@@ -146,6 +155,9 @@ class Engine:
         self._made: list[tuple[str, object]] = []  # (dataset, bridge) for every bridge built, started or not
         self._threads: list[threading.Thread] = []
         self._closed = False
+        self._quitting = False  # set as quitting begins, before anything is closed
+        self._schema_lock = threading.Lock()
+        self._schemas: dict[str, dict] = {}  # each dataset's tables, read from its files once
 
         # Each hashes the locked files and walks src/, so once per launch.
         self.measured, self.lock, self.cache = self._check_measured()
@@ -260,6 +272,20 @@ class Engine:
         with self._state_lock:
             return self._bridges[name]
 
+    # Marks the start of quitting, so no preview reaches a bridge about to close. close() marks it too.
+    def begin_quit(self) -> None:
+        with self._state_lock:
+            self._quitting = True
+
+    @property
+    def quitting(self) -> bool:
+        with self._state_lock:
+            return self._quitting
+
+    # A table preview's query, sent once the bridge is free; None when quitting began before then.
+    def preview_query(self, name: str, sql: str) -> dict | None:
+        return self.bridge(name).query_unless(sql, lambda: self.quitting)
+
     # The prompt cache as the status shows it: on only for the live model with the gate on,
     # once it has loaded with a cached prefix (or while it loads). Called with the state lock held.
     def _cache_state(self) -> CacheGate:
@@ -296,11 +322,21 @@ class Engine:
                 },
             }
 
+    # Both datasets' tables and columns, read from their files once, each with its state as the status has it.
+    def schema(self) -> dict:
+        states = self.status()["datasets"]
+        with self._schema_lock:
+            for name in DATASETS:
+                if name not in self._schemas:
+                    self._schemas[name] = dataset_schema(self.paths, name)
+            read = dict(self._schemas)
+        return {"datasets": {name: {**states[name], **read[name]} for name in DATASETS}}
+
     # Closes every bridge built so far, even one still loading (its start then fails),
     # then waits for the start threads. Safe to call twice.
     def close(self) -> None:
         with self._state_lock:
-            self._closed = True
+            self._closed = self._quitting = True
             made, self._made = self._made, []
         for name, bridge in made:
             _close_bridge(name, bridge)

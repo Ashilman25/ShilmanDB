@@ -14,19 +14,20 @@ import threading
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
+from urllib.parse import quote
 
 import pytest
 
 # check_views is reached as a module: pytest collects any test* name imported into a test module.
 from app import __main__ as app_main
-from app import check_views, copy_rules, sixd
+from app import check_views, copy_rules, schema, sixd
 from app.__main__ import main, pick_port
 from app.datasets import DATASETS, default_paths, load_dataset, missing_files
 from app.engine import Engine, EngineOptions
 from app.jobs import SNAPSHOT_KEYS, JobRunner
 from app.measured import Lock, read_json
 from app.server import MAX_BODY, make_server
-from app.tests.fakes import FakeBridge, FakeModel, bridge_ok
+from app.tests.fakes import FakeBridge, FakeModel, bridge_error, bridge_ok
 from app.tests.test_app_flows import LEFT_SQL, QUESTION, REPLIES, script
 
 an, pr = sixd.an, sixd.pr
@@ -149,6 +150,9 @@ class StubEngine:
                 "lock": {"holds": self.lock.holds, "reason": self.lock.reason}, "cache": {"on": False, "reason": "off"}}
 
     def load_model(self) -> None:
+        pass
+
+    def begin_quit(self) -> None:
         pass
 
     def close(self) -> None:
@@ -632,6 +636,248 @@ def test_server_strings_pass_copy_rules(start):
              (APP_DIR / "static" / "index.html").read_text(encoding="utf-8")]
     for text in pages:
         assert copy_rules.problems(text) == []
+
+
+PREVIEW_SQL = "SELECT * FROM nation LIMIT 1000"
+NATION_ROWS = bridge_ok([("n_nationkey", "BIGINT"), ("n_name", "VARCHAR"), ("n_regionkey", "BIGINT"), ("n_comment", "VARCHAR")],
+                        [[0, "ALGERIA", 0, " haggle. carefully final"], [24, "UNITED STATES", 1, "y final packages"]])
+TPCH_SPEC = json.loads((APP_DIR.parent / "bench/analyst/datasets/tpch.json").read_text(encoding="utf-8"))
+
+
+# An engine on fake bridges, each kept by dataset so a test can read the SQL it was sent.
+@pytest.fixture
+def kept_bridges(paths):
+    def make(replies: dict | None = None):
+        made = {}
+
+        def factory(name, tables_tsv):
+            made[name] = FakeBridge(dict(replies or {}))
+            return made[name]
+
+        engine = Engine(paths, EngineOptions("none"), bridge_factory=factory)
+        engine.start_bridges()
+        assert engine.wait_bridges(WAIT_S)
+        return engine, made
+    return make
+
+
+# One column's entry in /api/schema, by table and column name.
+def _schema_column(dataset: dict, table: str, column: str) -> dict:
+    found = next(t for t in dataset["tables"] if t["name"] == table)
+    return next(c for c in found["columns"] if c["name"] == column)
+
+
+def test_schema_has_tables_columns_keys_and_values(start, kept_bridges):
+    engine, made = kept_bridges()
+    c = start(engine=engine).client
+    reply = c.get("/api/schema")
+    assert reply.status == 200
+    schema = reply.json()["datasets"]
+    assert list(schema) == list(DATASETS)
+
+    tpch = schema["tpch"]
+    status = engine.status()["datasets"]["tpch"]
+    assert {k: tpch[k] for k in ("label", "state", "detail")} == status
+    assert tpch["about"] == TPCH_SPEC["about"]
+    assert [(t["name"], t["rows"], t["primary_key"]) for t in tpch["tables"]] == [
+        ("region", 5, ["r_regionkey"]), ("nation", 25, ["n_nationkey"])]
+    assert [c["name"] for c in tpch["tables"][1]["columns"]] == ["n_nationkey", "n_name", "n_regionkey", "n_comment"]
+
+    assert _schema_column(tpch, "region", "r_regionkey") == {
+        "name": "r_regionkey", "type": "BIGINT", "description": "Region number, 0 to 4.", "key": True}
+    assert _schema_column(tpch, "nation", "n_regionkey") == {
+        "name": "n_regionkey", "type": "BIGINT", "description": TPCH_SPEC["columns"]["n_regionkey"],
+        "references": "region.r_regionkey"}
+    assert _schema_column(tpch, "region", "r_name")["values"] == ["AFRICA", "AMERICA", "ASIA", "EUROPE", "MIDDLE EAST"]
+    # values hold commas and keep leading spaces, as description.md quotes them
+    comments = _schema_column(tpch, "region", "r_comment")["values"]
+    assert len(comments) == 5 and "hs use ironic, even requests. s" in comments
+    nation_comments = _schema_column(tpch, "nation", "n_comment")["values"]
+    assert len(nation_comments) == 25 and nation_comments[0] == " haggle. carefully final deposits detect slyly agai"
+    assert "values" not in _schema_column(tpch, "nation", "n_regionkey")
+    assert "key" not in _schema_column(tpch, "nation", "n_name")
+
+    # the fixture has no reviews files: its state and the build hint, and no tables
+    reviews = schema["reviews"]
+    assert reviews == {**engine.status()["datasets"]["reviews"], "about": "", "tables": []}
+    assert reviews["state"] == "missing" and reviews["detail"].startswith("Missing: ")
+    assert made["tpch"].sent == []  # read from the files, never through the engine
+
+
+def test_schema_files_are_read_once(start, kept_bridges, paths):
+    engine, _ = kept_bridges()
+    c = start(engine=engine).client
+    first = c.get("/api/schema").json()
+    (paths.dataset_dir("tpch") / "description.md").unlink()
+    (paths.dataset_dir("tpch") / "manifest.json").write_text("{}", encoding="utf-8")
+    assert c.get("/api/schema").json() == first
+
+
+def test_schema_of_a_loading_dataset(start, paths):
+    gate = threading.Event()
+
+    def blocked(name, tables_tsv):
+        gate.wait(WAIT_S)
+        return FakeBridge({})
+
+    engine = Engine(paths, EngineOptions("none"), bridge_factory=blocked)
+    engine.start_bridges()
+    try:
+        c = start(engine=engine).client
+        tpch = c.get("/api/schema").json()["datasets"]["tpch"]
+        assert (tpch["state"], [t["name"] for t in tpch["tables"]]) == ("loading", ["region", "nation"])
+        loading = c.get("/api/preview?dataset=tpch&table=nation")
+        assert (loading.status, loading.error()) == (409, "TPC-H, SF 0.1 isn't loaded yet.")
+    finally:
+        gate.set()
+
+
+def test_parse_values_reads_sql_literals():
+    assert schema.parse_values("'A', 'B'") == ["A", "B"]
+    assert schema.parse_values("'it''s', ' x, y '") == ["it's", " x, y "]
+    assert schema.parse_values("'Cell Phones & Accessories'") == ["Cell Phones & Accessories"]
+    for broken in ("", "A, B", "'A' 'B'", "'A',", "'A', ", "'open"):
+        assert schema.parse_values(broken) is None, broken
+
+
+# Both real datasets, when they're here: every table in manifest order, each column's spec entry,
+# the keys and references from the spec, and values parsed from description.md.
+def test_schema_of_the_real_datasets():
+    paths = default_paths()
+    if any(missing_files(paths, name) for name in DATASETS):
+        pytest.skip("6d's dataset files aren't here")
+    for name in DATASETS:
+        ds = load_dataset(paths, name)
+        read = schema.dataset_schema(paths, name)
+        assert read["about"] == ds.spec["about"]
+        assert [t["name"] for t in read["tables"]] == [t["name"] for t in ds.manifest["tables"]]
+        for table in read["tables"]:
+            key = ds.spec["primary_keys"][table["name"]]
+            assert table["primary_key"] == key
+            assert [c["name"] for c in table["columns"] if c.get("key")] == [c for c in key]
+            assert all(c["description"] == ds.spec["columns"][c["name"]] for c in table["columns"])
+        refs = {f"{fk['table']}.{c}": f"{fk['ref_table']}.{r}" for fk in ds.spec["foreign_keys"] for c, r in zip(fk["columns"], fk["ref_columns"])}
+        found = {f"{t['name']}.{c['name']}": c["references"] for t in read["tables"] for c in t["columns"] if "references" in c}
+        assert found == refs
+    reviews = schema.dataset_schema(paths, "reviews")
+    assert "Cell Phones & Accessories" in _schema_column(reviews, "products", "p_main_category")["values"]
+    tpch = schema.dataset_schema(paths, "tpch")
+    assert _schema_column(tpch, "lineitem", "l_shipmode")["values"] == ["AIR", "FOB", "MAIL", "RAIL", "REG AIR", "SHIP", "TRUCK"]
+    assert _schema_column(tpch, "orders", "o_orderpriority")["values"][3] == "4-NOT SPECIFIED"
+
+
+def test_preview_rows_and_total(start, kept_bridges):
+    engine, made = kept_bridges({PREVIEW_SQL: NATION_ROWS})
+    c = start(engine=engine).client
+    reply = c.get("/api/preview?dataset=tpch&table=nation")
+    assert reply.status == 200
+    assert reply.json() == {
+        "dataset": "tpch", "table": "nation",
+        "columns": [{"name": "n_nationkey", "type": "BIGINT"}, {"name": "n_name", "type": "VARCHAR"},
+                    {"name": "n_regionkey", "type": "BIGINT"}, {"name": "n_comment", "type": "VARCHAR"}],
+        "rows": [["0", "ALGERIA", "0", " haggle. carefully final"], ["24", "UNITED STATES", "1", "y final packages"]],
+        "total": 25, "ms": 250.0,
+    }
+    assert made["tpch"].sent == [PREVIEW_SQL]
+    assert c.get("/api/history").json() == {"history": []}  # a preview is never a job
+
+
+def test_preview_refusals(start, kept_bridges):
+    engine, made = kept_bridges({PREVIEW_SQL: NATION_ROWS})
+    c = start(engine=engine).client
+    for table in ("lineitem", "NATION", "nation; DROP TABLE nation", "nation LIMIT 1", ""):
+        refused = c.get(f"/api/preview?dataset=tpch&table={quote(table)}")
+        assert (refused.status, refused.error()) == ((400, 'The request needs "dataset" and "table".') if not table
+                                                     else (404, "That table isn't in TPC-H, SF 0.1.")), table
+    unknown = c.get("/api/preview?dataset=nope&table=nation")
+    assert (unknown.status, unknown.error()) == (404, "Unknown dataset. Use tpch or reviews.")
+    assert c.get("/api/preview?table=nation").status == 400
+    missing = c.get("/api/preview?dataset=reviews&table=reviews")
+    assert missing.status == 409 and missing.error().startswith("Reviews isn't available: Missing: ")
+    assert made["tpch"].sent == []  # no name outside the manifest ever reaches the engine
+    assert c.post("/api/preview?dataset=tpch&table=nation").status == 405
+    assert c.get("/api/preview?dataset=tpch&table=nation", cookie=False).status == 403
+
+
+def test_preview_engine_error(start, kept_bridges):
+    engine, _ = kept_bridges({PREVIEW_SQL: bridge_error("run", "Table not found: nation")})
+    c = start(engine=engine).client
+    failed = c.get("/api/preview?dataset=tpch&table=nation")
+    assert (failed.status, failed.error()) == (502, "Run error: Table not found: nation")
+
+
+# Once quitting has begun a preview is refused with a plain sentence, even one already waiting for the
+# bridge behind a long query, so nothing more reaches a bridge that's about to close.
+def test_preview_refused_once_quitting(start, paths):
+    gate, holding, made = threading.Event(), threading.Event(), {}
+
+    class SlowBridge(FakeBridge):
+        def query(self, sql: str) -> dict:
+            if sql == "SLOW":
+                holding.set()
+                gate.wait(WAIT_S)
+            return super().query(sql)
+
+    def factory(name, tables_tsv):
+        made[name] = SlowBridge({PREVIEW_SQL: NATION_ROWS, "SLOW": NATION_ROWS})
+        return made[name]
+
+    engine = Engine(paths, EngineOptions("none"), bridge_factory=factory)
+    engine.start_bridges()
+    assert engine.wait_bridges(WAIT_S)
+    c = start(engine=engine).client
+    assert c.get("/api/preview?dataset=tpch&table=nation").status == 200
+
+    slow = threading.Thread(target=engine.bridge("tpch").query, args=("SLOW",))
+    slow.start()
+    assert holding.wait(WAIT_S)
+    replies = []
+    waiting = threading.Thread(target=lambda: replies.append(c.get("/api/preview?dataset=tpch&table=nation")))
+    waiting.start()
+    time.sleep(0.2)  # the preview waits for the bridge now; it's refused either way
+    engine.begin_quit()
+    gate.set()
+    waiting.join(WAIT_S)
+    slow.join(WAIT_S)
+    assert (replies[0].status, replies[0].error()) == (503, "The app is quitting.")  # as a job submit says it
+    late = c.get("/api/preview?dataset=tpch&table=nation")
+    assert (late.status, late.error()) == (503, "The app is quitting.")
+    assert made["tpch"].sent == [PREVIEW_SQL, "SLOW"]
+
+
+# Quitting starts when the server shuts down, the first thing the app closes.
+def test_server_shutdown_begins_quitting(kept_bridges):
+    engine, _ = kept_bridges()
+    server = make_server(JobRunner(engine), engine, TOKEN, 0, APP_DIR / "static", EXAMPLES)
+    thread = threading.Thread(target=server.serve_forever, args=(0.01,), name="test-http", daemon=True)
+    thread.start()
+    try:
+        assert engine.quitting is False
+        server.shutdown()
+        assert engine.quitting is True
+    finally:
+        server.server_close()
+        thread.join(WAIT_S)
+        engine.close()
+
+
+# A dataset with no tables gets an empty list of its own, never one shared with another dataset's entry.
+def test_no_tables_is_never_shared(paths):
+    one, two = schema.dataset_schema(paths, "reviews"), schema.dataset_schema(paths, "reviews")
+    assert one == two == {"about": "", "tables": []}
+    assert one["tables"] is not two["tables"]
+
+
+# A Values line counts only inside the Tables section: one under a bullet in a later section is never filed.
+def test_values_stop_where_the_tables_end():
+    text = "\n".join([
+        "## Tables", "", "### region (5 rows)", "",
+        "- `r_name` VARCHAR - Region name.", "  Values: 'AFRICA', 'ASIA'", "",
+        "## Missing values", "",
+        "- `r_name` is never empty.", "  Values: 'NONE'", "",
+        "## Glossary", "", "- `r_name` names a region.", "  Values: 'X'",
+    ])
+    assert schema.listed_values(text) == {("region", "r_name"): ["AFRICA", "ASIA"]}
 
 
 # Whether a question uses a glossary term, as the terms check decides.

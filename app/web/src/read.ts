@@ -1,9 +1,9 @@
 // Turns the server's JSON into the page's types, checking every field on the way in,
 // so a reply that drifted from the server's shape fails loudly instead of drawing wrong.
 import type {
-  Alternative, AnswerView, Asked, BarPoint, CacheStatus, Chart, CheckRow, Column, DatasetStatus, HistoryEntry,
-  JobError, JobKind, LoadState, LockStatus, ModelState, ModelStatus, PlanRow, RowsPage, Snapshot, Stage, Status,
-  StopReply, TermRow, Tested, Timing, Verdict, VerdictKind,
+  Alternative, AnswerView, Asked, BarPoint, CacheStatus, Chart, CheckRow, Column, DatasetSchema, DatasetStatus,
+  HistoryEntry, JobError, JobKind, LoadState, LockStatus, ModelState, ModelStatus, PlanRow, Preview, RowsPage, Schema,
+  SchemaColumn, SchemaTable, Snapshot, Stage, Status, StopReply, TermRow, Tested, Timing, Verdict, VerdictKind,
 } from "./types.js";
 
 // A reply that doesn't have the shape the page expects.
@@ -38,6 +38,11 @@ const number: Read<number> = (v, at) => (typeof v === "number" && Number.isFinit
 
 function maybe<T>(read: Read<T>): Read<T | null> {
   return (v, at) => (v === null ? null : read(v, at));
+}
+
+// A field the server leaves out when it has nothing to say; absent reads as the fallback.
+function absent<T>(read: Read<T>, fallback: T): Read<T> {
+  return (v, at) => (v === undefined ? fallback : read(v, at));
 }
 
 function list<T>(read: Read<T>): Read<T[]> {
@@ -224,6 +229,41 @@ export const readRowsPage: Read<RowsPage> = (v, at) => {
 };
 
 export const readStopReply: Read<StopReply> = (v, at) => ({ stopped: fields(v, at)("stopped", flag) });
+
+const schemaColumn: Read<SchemaColumn> = (v, at) => {
+  const f = fields(v, at);
+  return {
+    name: f("name", text),
+    type: f("type", text),
+    description: f("description", text),
+    key: f("key", absent(flag, false)),
+    references: f("references", absent<string | null>(text, null)),
+    values: f("values", absent<string[] | null>(list(text), null)),
+  };
+};
+
+const schemaTable: Read<SchemaTable> = (v, at) => {
+  const f = fields(v, at);
+  return { name: f("name", text), rows: f("rows", number), primary_key: f("primary_key", list(text)), columns: f("columns", list(schemaColumn)) };
+};
+
+const datasetSchema: Read<DatasetSchema> = (v, at) => {
+  const f = fields(v, at);
+  return {
+    label: f("label", text), state: f("state", oneOf(LOAD_STATES)), detail: f("detail", text),
+    about: f("about", text), tables: f("tables", list(schemaTable)),
+  };
+};
+
+export const readSchema: Read<Schema> = (v, at) => ({ datasets: fields(v, at)("datasets", table(datasetSchema)) });
+
+export const readPreview: Read<Preview> = (v, at) => {
+  const f = fields(v, at);
+  return {
+    dataset: f("dataset", text), table: f("table", text), columns: f("columns", list(column)),
+    rows: f("rows", cells), total: f("total", number), ms: f("ms", number),
+  };
+};
 
 // The message of an error reply ({"error": "..."}), or null when the body isn't one.
 export function errorMessage(body: unknown): string | null {

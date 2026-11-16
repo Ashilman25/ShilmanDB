@@ -21,13 +21,28 @@ From the repo root:
 | `--recorded-pace` | With `--recorded-model`, each reply takes as long as it did when it was recorded. |
 | `--no-cache` | Don't use the prompt cache, even when its gate is open. |
 
-At launch the two datasets start loading first (each starts an engine bridge, on its own thread), then the model starts loading on the model worker's thread. Only then does the app print its link (`ShilmanDB app: http://127.0.0.1:<port>/?token=...`) and open it in the browser; with the real model it also prints `Prompt cache: on` or `Prompt cache: off (<reason>)` under the link. The token in the link becomes a cookie on the first visit, so open the printed link, not a bare address. The page shows each dataset and the model as loading, ready, missing or failed, and the SQL runner works as soon as a dataset is ready.
+At launch the two datasets start loading first (each starts an engine bridge, on its own thread), then the model starts loading on the model worker's thread. Only then does the app print its link (`ShilmanDB app: http://127.0.0.1:<port>/?token=...`) and open it in the browser; with the real model it also prints `Prompt cache: on` or `Prompt cache: off (<reason>)` under the link. The token in the link becomes a cookie on the first visit, so open the printed link, not a bare address. The status bar shows each dataset and the model as loading, ready, missing or failed, and the tables, their rows and the SQL runner work as soon as a dataset is ready.
 
-Press Ctrl-C to quit. The server, the workers and the bridges close in that order. A query still running holds the quit until it returns, and each busy bridge gets up to 10 s to exit (*from docs*: `CLOSE_WAIT_S` in `bench/analyst/bridge_client.py`). A second Ctrl-C ends the app at once, without those waits, and can leave a bridge's `analyst_bridge_*.db` file in the temp folder.
+## The screen
+
+The page is laid out as a database tool. Nothing here changes how an answer is checked; it's where things are drawn.
+
+- **Top bar:** the name, "How the checks were tested" (opens a sheet under the link with the test's numbers, one row each; Close or Escape shuts it) and the Dark / Light switch.
+- **Sidebar, Tables:** a filter ("Filter tables and columns") over a tree of both databases. Each table shows its row count and opens to its columns and their types; a key column says "key". Click a table to open its rows; click a column to open its table with that column picked. The tree takes the arrow keys and Enter. The tables come from `/api/schema`, which reads each dataset's manifest, spec and `description.md` once and never runs SQL.
+- **Sidebar, History:** this session's runs, newest first, each with its kind (SQL, Edited SQL or Ask), its text, its database when it isn't the Query tab's and, when it has one, the word for how it ended (Warning, Refused, Not run). Click one to reopen it in the Query tab.
+- **Tabs:** Query first, then up to 8 tables (*from docs*: `MAX_TABLE_TABS` in `app/web/src/state.ts`; a ninth closes the oldest). The arrow keys move between tabs; Delete, the close mark or a middle-click closes a table's tab.
+- **A table's tab:** its name, database and size, **Query this table** (runs `SELECT * FROM <table> LIMIT 100` in the Query tab; off, with the reason beside it, while a run is under way or the database isn't ready), and its first 1,000 rows in the grid, 200 at a time (*from docs*: `PREVIEW_ROWS` in `app/server.py`, `PREVIEW_PAGE` in `app/web/src/tabletab.ts`), from `/api/preview` (straight through the dataset's bridge, never a job, so it isn't in History). The **Columns** inspector on the right shows each column's type, key or reference, description and listed values: the same notes the analyst is given. Click a column's header to pick it there.
+- **The Query tab:** the Ask / SQL switch, the database, and Run or Ask (Stop while running; Cmd+Enter). The SQL editor is a plain text box with line numbers and its keywords, strings and numbers colored; as you type a name it offers the database's tables and columns (Up / Down, Tab or Enter to take one, Escape to close), and the line under it drags (or takes the arrow keys) to set its height. The answer fills the results grid under the editor, with a Table / Chart switch when bars apply (each bar with its value, the axis labeled at 0 and its top); a single value shows once, as a large figure. The header shows a question and the meta lines; typed SQL isn't repeated there. The **Checks** inspector on the right holds the verdict, the checks, the terms, the SQL and the tested line; a run that failed, wasn't run, was refused, couldn't be answered or was stopped leads with the same words as its banner. Empty, it lists example questions (Ask) or a first query per table (SQL); with `--no-model` it's always the SQL list.
+- **The grid** (tables and results alike): row numbers and the header stay put while it scrolls; each header shows the column's type under its name. Click a cell, or move with the arrow keys, to pick it; Cmd+C copies its value (a number without its thousands separators), and the status bar shows its column and value.
+- **Status bar:** each dataset's engine, the model and, with the real model, the prompt cache on the left; on the right, the picked cell or the shown result's rows and time.
+
+Under 1100px wide the inspector moves under the grid; under 760px the sidebar moves above the tabs and the page scrolls as a whole.
+
+Press Ctrl-C to quit. The server, the workers and the bridges close in that order; from the first step on, a table preview is refused ("The app is quitting."). A query still running holds the quit until it returns, and each busy bridge gets up to 10 s to exit (*from docs*: `CLOSE_WAIT_S` in `bench/analyst/bridge_client.py`). A second Ctrl-C ends the app at once, without those waits, and can leave a bridge's `analyst_bridge_*.db` file in the temp folder.
 
 ## What it needs
 
-- **The engine bridge**, `build/bench/analyst_bridge`. If it's missing the page says so (Engine missing in the top bar) and shows the build command under the input:
+- **The engine bridge**, `build/bench/analyst_bridge`. If it's missing the page says so (Engine missing in the status bar) and shows the build command under the input:
   ```bash
   cmake --build build --target analyst_bridge
   ```
@@ -81,7 +96,7 @@ While the lock holds, each answer carries a line with the test's rates, and the 
 
 Every analyst prompt for a dataset starts with the same long text: the dataset's description, the rules and the examples, before the question. The cache keeps the model's state after that shared start, one per dataset (4,096 tokens for TPC-H, 2,048 for the reviews, *measured* 2026-11-15). It's filled in pieces of the same size, on the same boundaries, as mlx_lm's own generation would fill them (*from docs*: `CHUNK` = 2,048 in `app/prompt_cache.py`), and each question gets a fresh copy, so the model does the same arithmetic either way. That's the argument; the replay is the proof.
 
-**The gate.** The cache is used only with the real model, only without `--no-cache`, and only when `bench/results/app/cache_proof.json` matches this setup. Only that file, written by a full cached replay, feeds the gate (and the lock's MLX reason); `uncached_check.json` is information only. With the real model, the top bar shows `Prompt cache on`, or `Prompt cache off: <reason>` in plain text, and the launch line says the same; `/api/status` has it in every mode. The reasons (300 is `rates.test_questions` in `measured.json`, *from docs*):
+**The gate.** The cache is used only with the real model, only without `--no-cache`, and only when `bench/results/app/cache_proof.json` matches this setup. Only that file, written by a full cached replay, feeds the gate (and the lock's MLX reason); `uncached_check.json` is information only. With the real model, the status bar shows `Prompt cache on`, or `Prompt cache off: <reason>` in plain text, and the launch line says the same; `/api/status` has it in every mode. The reasons (300 is `rates.test_questions` in `measured.json`, *from docs*):
 
 | Reason | Meaning |
 |---|---|
@@ -143,10 +158,11 @@ It finds each reply by the prompt's sha1, so only the run's own questions get an
 | File | What it holds |
 |---|---|
 | `__main__.py` | The command: flags, port, startup and shutdown. |
-| `server.py` | The HTTP server: token cookie, Host and Origin checks, the JSON API, the long poll. |
+| `server.py` | The HTTP server: token cookie, Host and Origin checks, the JSON API (with the schema and a table's preview rows), the long poll. |
 | `jobs.py` | The two workers (model and SQL) and each job's snapshot. |
 | `engine.py` | The bridges, the model, the lock and the cache gate. |
 | `datasets.py` | Paths, loading a dataset, and the hint for missing files. |
+| `schema.py` | Each dataset's tables and columns for the sidebar and the Columns inspector, read from its manifest, spec and `description.md`. |
 | `analyst.py` | The analyst check's pipeline split into a first and a second answer. |
 | `sql_runner.py` | Typed SQL: the engine-trap check, then the run. |
 | `views.py` | Results ready to draw: rows, chart, plan, meta line, error text. |

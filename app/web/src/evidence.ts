@@ -1,21 +1,35 @@
-// The evidence panel: the verdict line, the checks, the terms, the SQL and its plan, then the tested line.
+// The Checks inspector: the verdict line, the checks, the terms, the SQL and its plan, then the tested line.
 // From the first answer on its layout holds still: a question's verdict line keeps two lines, the Running
-// row keeps the room its final text usually takes (four lines beside the result, three under it), turns
-// into Same or Differs where it stands, and the verdict line settles last.
-import { skeleton, word } from "./controls.js";
-import { EMPTY_EVIDENCE, NOT_TESTED, rowsText } from "./copy.js";
-import { byId, h, redraw, type Child } from "./dom.js";
+// row keeps the room its final text usually takes, turns into Same or Differs where it stands, and the
+// verdict line settles last.
+import { leadText, skeleton, word } from "./controls.js";
+import { EMPTY_EVIDENCE, NOT_TESTED, rowsText, STOPPED_QUEUED } from "./copy.js";
+import { h, redraw, type Child } from "./dom.js";
+import { failedSentence } from "./result.js";
 import { askBlock, isSql, secondRow, SECOND_ROW, showsSecond, type Actions, type State } from "./state.js";
 import type { CheckRow, PlanRow, Snapshot, TermRow, VerdictKind } from "./types.js";
 
-// Verdicts whose banner is the whole result; the banner carries them, so the panel doesn't repeat them.
+// Verdicts whose banner is the whole result: no numbers came back to judge.
 const BANNER_IS_RESULT: readonly VerdictKind[] = ["refused", "cannot", "failed", "not_run"];
 
-// The verdict line, unless the result's banner already says it. A question's line keeps
-// two lines in every stage, so a two-line warning lands without moving the rows.
-function verdictLine(job: Snapshot, from: Snapshot | null): HTMLElement | null {
+// The words a run that ended without a judged answer leads with, as its result banner says them:
+// failed, not run, refused, can't answer, or stopped. Null for a run that has a verdict to wait for.
+function endedWords(job: Snapshot): { kind: VerdictKind | "error"; text: string } | null {
+  if (job.stage === "error") return { kind: "error", text: failedSentence(job) };
   const verdict = job.verdict;
-  if (!verdict || BANNER_IS_RESULT.includes(verdict.kind)) return null;
+  if (verdict && BANNER_IS_RESULT.includes(verdict.kind)) return verdict;
+  if (job.stage === "stopped") return { kind: "error", text: verdict?.text ?? STOPPED_QUEUED };
+  return null;
+}
+
+// The verdict line. A run that ended without numbers to judge leads with its banner's words, so a Pass
+// under it never reads as approval. A question's line keeps two lines in every stage, so a two-line
+// warning lands without moving the rows.
+function verdictLine(job: Snapshot, from: Snapshot | null): HTMLElement | null {
+  const ended = endedWords(job);
+  if (ended) return h("p", { class: isSql(job) ? "verdict ended" : "verdict ended reserve" }, leadText(ended.kind, ended.text));
+  const verdict = job.verdict;
+  if (!verdict) return null;
   const pending = verdict.kind === "pending";
   const settled = !pending && from !== null && from.verdict?.kind === "pending";
   const classes = ["verdict", isSql(job) ? "" : "reserve", pending ? "pending" : "", settled ? "settle" : ""];
@@ -83,11 +97,11 @@ function sqlSection(job: Snapshot, state: State, actions: Actions): Child[] {
 }
 
 function placeholder(): Child[] {
-  return [h("h2", {}, "Checks"), h("div", { class: "ledger" },
+  return [h("div", { class: "ledger" },
     [0, 1, 2].map(() => h("div", { class: "entry" }, skeleton([100]), h("div", { class: "entry-body" }, skeleton([85])))))];
 }
 
-// What the panel holds for the shown job; nothing at all when no check, SQL or tested line applies.
+// What the inspector holds for the shown job; the hint when no check, SQL or tested line applies.
 function panel(state: State, actions: Actions): Child[] {
   const job = state.job;
   if (!job) return [h("p", { class: "hint" }, EMPTY_EVIDENCE)];
@@ -98,19 +112,18 @@ function panel(state: State, actions: Actions): Child[] {
   const ended = job.stage === "stopped" || job.stage === "error";
   const live = ended ? null : finished && !state.submitting;
   const line = verdictLine(job, from);
-  return [
-    line || job.checks.length ? h("h2", {}, "Checks") : null,
+  const parts: Child[] = [
     line,
     job.checks.length ? h("div", { class: "ledger" }, job.checks.map((row) => checkRow(row, from))) : null,
     job.terms.length ? [h("h2", {}, "Terms"), h("div", { class: "ledger" }, job.terms.map((term) => termRow(term, live, actions)))] : null,
     sqlSection(job, state, actions),
     job.tested ? h("p", { class: "tested" }, job.tested.text) : null,
   ];
+  return parts.flat().some(Boolean) ? parts : [h("p", { class: "hint" }, EMPTY_EVIDENCE)];
 }
 
-// Draws the panel. An empty one steps aside: the columns get the "alone" class here, not
-// from a CSS :has() rule, so the result takes the room at once.
 export function drawEvidence(root: HTMLElement, state: State, actions: Actions): void {
-  redraw(root, panel(state, actions));
-  byId("cols").classList.toggle("alone", root.children.length === 0);
+  redraw(root,
+    h("div", { class: "ins-head" }, h("h2", {}, "Checks")),
+    h("div", { class: "ins-body", attrs: { "data-scroll": "checks" } }, panel(state, actions)));
 }

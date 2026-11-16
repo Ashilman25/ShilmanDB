@@ -25,6 +25,10 @@ const number = (v, at) => (typeof v === "number" && Number.isFinite(v) ? v : fai
 function maybe(read) {
     return (v, at) => (v === null ? null : read(v, at));
 }
+// A field the server leaves out when it has nothing to say; absent reads as the fallback.
+function absent(read, fallback) {
+    return (v, at) => (v === undefined ? fallback : read(v, at));
+}
 function list(read) {
     return (v, at) => {
         if (!Array.isArray(v))
@@ -189,6 +193,36 @@ export const readRowsPage = (v, at) => {
     return { offset: f("offset", number), rows: f("rows", cells) };
 };
 export const readStopReply = (v, at) => ({ stopped: fields(v, at)("stopped", flag) });
+const schemaColumn = (v, at) => {
+    const f = fields(v, at);
+    return {
+        name: f("name", text),
+        type: f("type", text),
+        description: f("description", text),
+        key: f("key", absent(flag, false)),
+        references: f("references", absent(text, null)),
+        values: f("values", absent(list(text), null)),
+    };
+};
+const schemaTable = (v, at) => {
+    const f = fields(v, at);
+    return { name: f("name", text), rows: f("rows", number), primary_key: f("primary_key", list(text)), columns: f("columns", list(schemaColumn)) };
+};
+const datasetSchema = (v, at) => {
+    const f = fields(v, at);
+    return {
+        label: f("label", text), state: f("state", oneOf(LOAD_STATES)), detail: f("detail", text),
+        about: f("about", text), tables: f("tables", list(schemaTable)),
+    };
+};
+export const readSchema = (v, at) => ({ datasets: fields(v, at)("datasets", table(datasetSchema)) });
+export const readPreview = (v, at) => {
+    const f = fields(v, at);
+    return {
+        dataset: f("dataset", text), table: f("table", text), columns: f("columns", list(column)),
+        rows: f("rows", cells), total: f("total", number), ms: f("ms", number),
+    };
+};
 // The message of an error reply ({"error": "..."}), or null when the body isn't one.
 export function errorMessage(body) {
     return isFields(body) && typeof body["error"] === "string" ? body["error"] : null;
