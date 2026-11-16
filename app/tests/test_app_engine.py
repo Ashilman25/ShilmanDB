@@ -684,3 +684,74 @@ def test_engine_unusable_measured_json(tested, engines, key):
     assert engine.measured == {}
     assert engine.lock == measured.Lock(False, NO_MEASURED)
     assert engine.cache == measured.CacheGate(False, NO_MEASURED)
+
+
+# Records how the engine built its model, standing in for CachedModel and 6d's MlxModel.
+class MadeModel:
+    def __init__(self, kind: str, config_id: str, contexts=None):
+        self.kind, self.config_id, self.contexts = kind, config_id, contexts
+
+
+# measured.json in place, with the lock and the gate forced to the given state.
+@pytest.fixture
+def swap(paths, monkeypatch):
+    _write(paths.measured, json.dumps({"files": {}, "engine_src_sha1": "", "model": {}, "rates": {}}))
+    made = []
+    monkeypatch.setattr(engine_mod, "check_lock", lambda *a: measured.Lock(True, None))
+    monkeypatch.setattr(engine_mod, "CachedModel", lambda config_id, contexts: made.append(MadeModel("cached", config_id, contexts)) or made[-1])
+    stub = type("model_mlx", (), {"MlxModel": staticmethod(lambda config_id: made.append(MadeModel("plain", config_id)) or made[-1])})
+    monkeypatch.setattr(sixd, "load_model_mlx", lambda: stub)
+
+    def gate(on: bool):
+        monkeypatch.setattr(engine_mod, "cache_gate", lambda *a: measured.CacheGate(on, "forced"))
+
+    return paths, made, gate
+
+
+def test_engine_gate_on_builds_cached_model(swap, engines):
+    paths, made, gate = swap
+    gate(True)
+    engine = engines(paths, EngineOptions("mlx"))
+    assert engine.cache.on and made == []
+
+    engine.load_model()
+    assert [m.kind for m in made] == ["cached"] and engine.model is made[0]
+    assert made[0].config_id == MODEL_ID
+    assert made[0].contexts == {"tpch": load_dataset(paths, "tpch").context}  # reviews is missing in the fixture
+    assert engine.status()["model"]["state"] == "ready"
+    assert "mlx" not in sys.modules and "mlx_lm" not in sys.modules
+
+
+def test_engine_gate_off_or_no_cache_builds_plain_model(swap, engines):
+    paths, made, gate = swap
+    gate(False)
+    engine = engines(paths, EngineOptions("mlx"))
+    engine.load_model()
+    gate(True)
+    flagged = engines(paths, EngineOptions("mlx", use_cache=False))
+    flagged.load_model()
+
+    assert not engine.cache.on and not flagged.cache.on
+    assert [(m.kind, m.config_id) for m in made] == [("plain", MODEL_ID), ("plain", MODEL_ID)]
+    assert "mlx" not in sys.modules and "mlx_lm" not in sys.modules
+
+
+def test_engine_cached_model_skips_a_dataset_that_fails_to_load(swap, engines, monkeypatch):
+    paths, made, gate = swap
+    gate(True)
+
+    def broken(p, name):
+        raise ValueError("bad manifest")
+
+    monkeypatch.setattr(engine_mod, "load_dataset", broken)
+    engine = engines(paths, EngineOptions("mlx"))
+    engine.load_model()
+    assert made[0].kind == "cached" and made[0].contexts == {}
+
+
+def test_engine_recorded_mode_ignores_the_gate(swap, engines):
+    paths, made, gate = swap
+    gate(True)
+    engine = engines(paths, EngineOptions("recorded", recorded_run=paths.run_file("dev")))
+    engine.load_model()
+    assert isinstance(engine.model, RecordedModel) and made == []

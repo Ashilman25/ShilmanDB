@@ -10,6 +10,7 @@ from pathlib import Path
 from app import sixd
 from app.datasets import DATASETS, LABELS, MODEL_ID, AppPaths, Dataset, build_hint, load_dataset, missing_files
 from app.measured import CacheGate, Lock, cache_code_sha1, cache_gate, check_lock, mlx_versions, read_json
+from app.model_cache import CachedModel
 from app.recorded_model import RecordedModel
 
 MODEL_MODES = ("mlx", "recorded", "none")
@@ -61,8 +62,25 @@ def default_bridge_factory(paths: AppPaths) -> Callable:
     return make
 
 
+# Each dataset's prompt context, for the datasets whose files are all there.
+# One that fails to load is left out, so its prompts run uncached.
+def _contexts(paths: AppPaths) -> dict[str, object]:
+    contexts = {}
+    for name in DATASETS:
+        if missing_files(paths, name):
+            continue
+        try:
+            contexts[name] = load_dataset(paths, name).context
+        except Exception:
+            continue
+    return contexts
+
+
 # What builds the model for a mode; None when there is no model.
-def default_model_factory(options: EngineOptions) -> Callable | None:
+# In mlx mode the prompt cache is used only when the cache gate is on.
+def default_model_factory(options: EngineOptions, paths: AppPaths | None = None, cache_on: bool = False) -> Callable | None:
+    if options.model_mode == "mlx" and cache_on:
+        return lambda: CachedModel(MODEL_ID, _contexts(paths))
     if options.model_mode == "mlx":
         return lambda: sixd.load_model_mlx().MlxModel(MODEL_ID)
     if options.model_mode == "recorded":
@@ -104,7 +122,6 @@ class Engine:
         self.model = None
         self._check_binary = bridge_factory is None
         self._bridge_factory = bridge_factory or default_bridge_factory(paths)
-        self._model_factory = model_factory or default_model_factory(options)
 
         self._state_lock = threading.Lock()
         self._datasets = {name: {"state": "loading", "detail": ""} for name in DATASETS}
@@ -117,6 +134,7 @@ class Engine:
 
         # Each hashes the locked files and walks src/, so once per launch.
         self.measured, self.lock, self.cache = self._check_measured()
+        self._model_factory = model_factory or default_model_factory(options, paths, self.cache.on)
 
     # The tested record, the lock and the cache gate; both closed when measured.json is missing,
     # unreadable, or shaped so the checks can't read it.
