@@ -121,6 +121,12 @@ function paint(...names) {
 function message(error) {
     return error instanceof ApiError ? error.message : UNREACHABLE;
 }
+// A call that never reached the server: recheck the status, whose error path says Not connected
+// and retries. Nothing starts when a status call is already in flight or waiting.
+function noticeGone(error) {
+    if (error instanceof ApiError && error.status === 0 && !statusBusy)
+        void loadStatus();
+}
 function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -228,6 +234,7 @@ async function follow(id, first) {
                 paint("ask", "rail", "result", "evidence");
                 return;
             }
+            noticeGone(error);
             const problem = message(error);
             if (problem !== state.jobError) {
                 state.jobError = problem;
@@ -266,6 +273,7 @@ async function start(send) {
         void follow(job.id, job);
     }
     catch (error) {
+        noticeGone(error);
         state.submitting = false;
         state.submitError = message(error);
         paint("ask", "rail", "evidence");
@@ -291,6 +299,7 @@ async function stop() {
         await api.stopJob(job.id);
     }
     catch (error) {
+        noticeGone(error);
         state.stopping = false;
         state.submitError = message(error);
         paint("ask");
@@ -316,6 +325,7 @@ async function showMore(answer) {
         state.extra[answer] = [...state.extra[answer], ...page.rows];
     }
     catch (error) {
+        noticeGone(error);
         if (ticket !== switches || state.job?.id !== job.id)
             return;
         state.moreError = { answer, message: message(error) };
@@ -340,8 +350,8 @@ async function loadHistory() {
         state.history = await api.getHistory();
         paint("rail");
     }
-    catch {
-        // the status line already says when the app can't be reached
+    catch (error) {
+        noticeGone(error); // the status line then says the app can't be reached
     }
 }
 function stillLoading() {
@@ -353,6 +363,7 @@ function stillLoading() {
 // The last status reply, error and dataset drawn, so a poll that brings nothing new paints nothing.
 let statusDrawn = null;
 let statusSeen = false;
+let statusBusy = false; // a status call is in flight or waiting to retry
 // Started with --no-model, Ask can't work: on the first reply, an untouched page with no job opens in SQL.
 function sqlWhenModelOff() {
     if (statusSeen || !state.status)
@@ -368,6 +379,7 @@ function sqlWhenModelOff() {
 }
 // Reads what's loaded; polls about once a second only while something is still loading.
 async function loadStatus() {
+    statusBusy = true;
     try {
         state.status = await api.getStatus();
         state.statusError = null;
@@ -381,10 +393,14 @@ async function loadStatus() {
     if (seen !== statusDrawn) {
         statusDrawn = seen;
         paint("top", "tested", "rail", "ask", "evidence");
+        if (!state.job)
+            paint("result"); // the empty hint follows the model's state
     }
     sqlWhenModelOff();
     if (state.statusError || stillLoading())
         setTimeout(() => void loadStatus(), state.statusError ? RETRY_MS : STATUS_POLL_MS);
+    else
+        statusBusy = false;
 }
 function jobFromHash() {
     const found = /^#job=([^&]+)$/.exec(window.location.hash);

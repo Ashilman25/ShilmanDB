@@ -24,6 +24,8 @@ RATES = {"test_questions": 300, "model_right": 252, "shown_right": 227, "shown_w
          "without_terms": 17, "topn_caught": 6, "topn_wrong": 13, "median_s": 5.3, "p90_s": 7.6}
 MODEL = {"path": "org/some-model-4bit", "revision": "abc123", "thinking": False, "max_tokens": 1024}
 VERSIONS = {"mlx": "0.30.0", "mlx_lm": "0.32.2"}
+LIBRARIES = {"mlx": "0.30.0", "mlx-lm": "0.32.2", "mlx-metal": "0.30.0", "transformers": "5.22.1",
+             "tokenizers": "0.23.3", "jinja2": "3.1.6"}
 CACHE_SHA1 = "c" * 40
 MLX_REASON = "this machine's MLX no longer reproduces the test's answers"
 
@@ -52,7 +54,7 @@ def _setup(tmp_path: Path) -> tuple[AppPaths, dict]:
 # A replay proof that matches the setup, with any fields changed.
 def _proof(paths: AppPaths, **changes) -> dict:
     proof = {"identical": 300, "total": 300, "differences": [], "uncached_differences": [],
-             "versions": dict(VERSIONS), "files": measured.file_hashes(paths),
+             "versions": dict(VERSIONS), "library_versions": dict(LIBRARIES), "files": measured.file_hashes(paths),
              "engine_src_sha1": measured.tree_sha1(paths.src), "cache_code_sha1": CACHE_SHA1,
              "timings": {}, "written_at": "2026-11-15T00:00:00+00:00"}
     return {**proof, **changes}
@@ -64,8 +66,8 @@ def _lock(paths: AppPaths, record: dict, model_config=MODEL, proof=None, version
 
 
 # The cache gate over the setup, with the tested model config unless given.
-def _gate(paths: AppPaths, record: dict, proof, versions=VERSIONS, cache=CACHE_SHA1, model_config=MODEL):
-    return measured.cache_gate(paths, record, proof, versions, cache, model_config)
+def _gate(paths: AppPaths, record: dict, proof, libraries=LIBRARIES, cache=CACHE_SHA1, model_config=MODEL):
+    return measured.cache_gate(paths, record, proof, libraries, cache, model_config)
 
 
 # The committed measured.json.
@@ -198,8 +200,12 @@ def test_cache_gate_each_reason(tmp_path):
     assert _gate(paths, record, _proof(paths, uncached_differences=["q7"])) == off("the replay found differences")
     assert _gate(paths, record, _proof(paths, identical=2, total=2)) == off("the replay didn't cover all 300 test questions")
     assert _gate(paths, record, _proof(paths, identical=299)) == off("the replay didn't cover all 300 test questions")
-    assert _gate(paths, record, _proof(paths), versions={"mlx": "0.31.0", "mlx_lm": "0.32.2"}) == off("mlx changed since the replay")
-    assert _gate(paths, record, _proof(paths), versions={}) == off("mlx changed since the replay")
+    library = off("a model library changed since the replay")
+    for name in measured.MODEL_LIBRARIES:
+        assert _gate(paths, record, _proof(paths), libraries={**LIBRARIES, name: "9.9.9"}) == library
+        assert _gate(paths, record, _proof(paths), libraries={**LIBRARIES, name: None}) == library
+    assert _gate(paths, record, _proof(paths), libraries={}) == library
+    assert _gate(paths, record, _proof(paths, library_versions=None)) == library  # a proof from before the wider set
     assert _gate(paths, record, _proof(paths), cache="d" * 40) == off("the app's cache code changed since the replay")
     assert _gate(paths, record, _proof(paths), model_config={**MODEL, "thinking": True}) == off("a tested file changed since the replay")
 
@@ -267,6 +273,23 @@ def test_mlx_versions(monkeypatch):
     assert measured.mlx_versions() == {}
     installed.clear()
     assert measured.mlx_versions() == {}
+
+
+def test_library_versions(monkeypatch):
+    installed = dict(LIBRARIES)
+
+    def version(name: str) -> str:
+        if name not in installed:
+            raise measured.metadata.PackageNotFoundError(name)
+        return installed[name]
+
+    monkeypatch.setattr(measured.metadata, "version", version)
+    assert measured.MODEL_LIBRARIES == ("mlx", "mlx-lm", "mlx-metal", "transformers", "tokenizers", "jinja2")
+    assert measured.library_versions() == LIBRARIES
+    del installed["jinja2"]
+    assert measured.library_versions() == {**LIBRARIES, "jinja2": None}
+    installed.clear()
+    assert measured.library_versions() == dict.fromkeys(measured.MODEL_LIBRARIES)
 
 
 def test_measured_imports_no_mlx():

@@ -28,22 +28,24 @@ NATIONS_SQL = ("SELECT r_name, COUNT(*) AS nations FROM nation JOIN region ON n_
 BAD_SQL = "SELECT nope FROM nation"
 
 
-# The bridge processes this test process started that are still running.
-def bridge_children() -> str:
+# The bridge processes this test process started that are still running, one "pid command" line each.
+def bridge_children() -> set[str]:
     found = subprocess.run(["pgrep", "-fl", "-P", str(os.getpid()), "analyst_bridge"], capture_output=True, text=True)
-    return found.stdout.strip()
+    return set(found.stdout.split("\n")) - {""}
 
 
-# Bridge db files this test process left in the temp folder.
-def leftover_db_files() -> list[Path]:
-    return sorted(Path(tempfile.gettempdir()).glob(f"analyst_bridge_{os.getpid()}_*.db"))
+# Bridge db files this test process has in the temp folder.
+def leftover_db_files() -> set[Path]:
+    return set(Path(tempfile.gettempdir()).glob(f"analyst_bridge_{os.getpid()}_*.db"))
 
 
 # Starts the app the way python -m app does, on a free port with the given model, and returns
-# its client and engine. At the end it shuts down in the app's order: server, runner, engine.
+# its client and engine. At the end it shuts down in the app's order: server, runner, engine,
+# then checks it left no bridge or db file beyond those already there when it began.
 @pytest.fixture
 def start(fixture_paths):
     made = []
+    children_before, db_files_before = bridge_children(), leftover_db_files()
 
     def make(options: EngineOptions) -> tuple[Client, Engine]:
         engine = Engine(fixture_paths, options)
@@ -63,15 +65,17 @@ def start(fixture_paths):
     yield make
     for engine, runner, server, thread in made:
         try:
-            if server is not None:
-                server.shutdown()
-                server.server_close()
-                thread.join(WAIT_S)
-            runner.shutdown()
+            try:
+                if server is not None:
+                    server.shutdown()
+                    server.server_close()
+                    thread.join(WAIT_S)
+            finally:
+                runner.shutdown()
         finally:
             engine.close()
-    assert bridge_children() == ""
-    assert leftover_db_files() == []
+    assert bridge_children() - children_before == set()
+    assert leftover_db_files() - db_files_before == set()
 
 
 # Typed SQL on TPC-H through the API, waited on over the long poll.
@@ -126,6 +130,7 @@ def test_real_engine_error(start):
 
 
 # Pace makes each recorded reply take its 1.5 s, so every stage lasts long enough for the poll to see it.
+# That 1.5 s per stage is the margin against a loopback poll, which takes a few ms.
 @needs_bridge
 def test_recorded_question_round_trip(start, fixture_paths):
     client, _ = start(EngineOptions("recorded", recorded_run=fixture_paths.run_file("dev"), pace=True))

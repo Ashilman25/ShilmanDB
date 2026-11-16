@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import threading
 import time
+import traceback
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from app import check_views, sixd, views
 from app.analyst import Event, analyst_events
@@ -25,6 +26,8 @@ SNAPSHOT_KEYS = ("id", "version", "kind", "dataset", "text", "asked", "stage", "
 ENDED = ("done", "stopped", "error")
 
 STOPPED_TEXT = "Stopped before the second answer, so there's no verdict."
+SQL_STOPPED_TEXT = "Stopped. The query finished, but the result was dropped."
+SECOND_COUNTS = ("primary_row_count", "rephrase_row_count")
 NO_SQL_REPLY = "The last reply couldn't be read as SQL."
 MODEL_REFUSALS = {"loading": "The model is still loading.", "off": "The analyst is off (started with --no-model)."}
 
@@ -122,6 +125,11 @@ def _second_answer(rephrase: dict, ds: Dataset) -> tuple[dict | None, dict | Non
     if pre_run_traps(rephrase["sql"], ds).level == "refuse":
         return None, None
     return _view(reply, rephrase["sql"], question=rephrase["text"]), reply
+
+
+# The results with the second answer's row counts taken out, for a second answer that isn't shown.
+def _without_second_counts(results: list) -> list:
+    return [replace(r, evidence={k: v for k, v in r.evidence.items() if k not in SECOND_COUNTS}) if r.name == "second_phrasing" else r for r in results]
 
 
 # Raises a Refusal unless the model is ready to answer.
@@ -288,6 +296,7 @@ class JobRunner:
                 events.close()
                 
         except Exception as e:
+            traceback.print_exc()
             with self._cond:
                 if not self._stop_at_first(job):  # a stopped second answer's failure doesn't matter
                     self._apply(job, {
@@ -308,7 +317,7 @@ class JobRunner:
 
             event = next(events, None)
             with self._cond:
-                if self._stop_at_first(job):
+                if self._stop_at_first(job) or self._stop_sql(job, event):
                     return
                 
             if event is None:
@@ -378,6 +387,8 @@ class JobRunner:
             second, second_reply = _second_answer(record["rephrase"], job.ds)
             if second is not None:
                 updates.update(second=second, replies={"first": reply, "second": second_reply})
+            else:  # a withheld second answer's row count isn't shown either
+                updates.update(checks=_rows(_without_second_counts(results), phase, kind))
         return updates
 
     # Sets the fields, then the timing, then publishes; an ended job may push the oldest out of history.
@@ -408,7 +419,18 @@ class JobRunner:
             return False
         
         verdict = {"kind": "stopped", "text": STOPPED_TEXT, "sql": None}
-        self._apply(job, {"stage": "stopped", "verdict": verdict, "checks": _without_second(job.checks)})
+        self._apply(job, {"stage": "stopped", "verdict": verdict, "tested": None, "checks": _without_second(job.checks)})
+        return True
+
+    # Ends a typed SQL job as stopped when a stop came while its query ran: the result is dropped.
+    # True when it did. Called with the lock held.
+    def _stop_sql(self, job: Job, event: Event | None) -> bool:
+        if job.kind in MODEL_KINDS or not job.stop or event is None:
+            return False
+
+        verdict = {"kind": "stopped", "text": SQL_STOPPED_TEXT, "sql": None}
+        self._apply(job, {"stage": "stopped", "verdict": verdict, "tested": None, "first": None, "second": None,
+                          "checks": [], "terms": [], "replies": {}})
         return True
 
     # Takes a queued job out of its queue as stopped. Called with the lock held.

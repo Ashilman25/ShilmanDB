@@ -33,6 +33,8 @@ NOT_A_QUESTION = "Only a finished question can be asked again."
 UNKNOWN_READING = "Unknown reading."
 NOT_FOUND, WRONG_METHOD = "Not found.", "Method not allowed."
 BROKEN = "The app hit an error. The terminal it runs in has the details."
+BAD_REQUEST = "The request wasn't valid HTTP."
+BAD_CHARACTER = "The text has a character the app can't send. Retype it and try again."
 
 CONTENT_TYPES = {
     ".html": "text/html; charset=utf-8",
@@ -115,13 +117,18 @@ def _field(body: dict, name: str, required: bool = True) -> str | None:
     return value
 
 
-# Typed text without its outer whitespace; 400 when that leaves nothing or more than the limit.
+# Typed text without its outer whitespace; 400 when that leaves nothing or more than the limit,
+# or when it holds a character UTF-8 can't encode (a lone surrogate).
 def _typed(text: str, empty: str, limit: int, too_long: str) -> str:
     text = text.strip()
     if not text:
         raise HttpError(400, empty)
     if len(text) > limit:
         raise HttpError(400, too_long)
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        raise HttpError(400, BAD_CHARACTER) from None
     return text
 
 
@@ -177,9 +184,17 @@ class Handler(BaseHTTPRequestHandler):
     # Runs the checks and the route, and turns any refusal into its status and message.
     def _handle(self) -> None:
         self._sent = False
-        url = urlsplit(self.path)
-        api = url.path.startswith("/api/")
+        api = self.path.startswith("/api/")
         try:
+            # HTTP/0.9 has no headers to check; it's answered as HTTP/1.0 so the status line is sent.
+            if self.request_version == "HTTP/0.9":
+                self.request_version, self.close_connection = "HTTP/1.0", True
+                raise HttpError(400, BAD_REQUEST)
+            try:
+                url = urlsplit(self.path)
+            except ValueError:
+                raise HttpError(400, BAD_REQUEST) from None
+
             # Read first, so a refused write doesn't leave its body unread and reset the connection.
             self._raw = self._read_body() if self.command == "POST" else b""
             if self._one("Host") not in self.server.hosts:
@@ -195,13 +210,20 @@ class Handler(BaseHTTPRequestHandler):
             handler, params = self._route(url.path)
             handler(query, **params)
         except (HttpError, Refusal) as e:
-            self._fail(e.status, e.message, api)
+            self._quiet_fail(e.status, e.message, api)
         except (ConnectionError, TimeoutError):
             pass  # the browser went away, or stalled mid-request
         except Exception:
             traceback.print_exc()
             if not self._sent:
-                self._fail(500, BROKEN, api)
+                self._quiet_fail(500, BROKEN, api)
+
+    # An error answer; a browser that went away meanwhile is let go without a traceback.
+    def _quiet_fail(self, status: int, message: str, api: bool) -> None:
+        try:
+            self._fail(status, message, api)
+        except (ConnectionError, TimeoutError):
+            pass
 
     # A header that must appear exactly once; None when it's missing or repeated.
     def _one(self, name: str) -> str | None:
@@ -280,11 +302,16 @@ class Handler(BaseHTTPRequestHandler):
         cookie = f"{self.server.cookie_name}={token}; HttpOnly; SameSite=Strict; Path=/"
         self._send(303, b"", CONTENT_TYPES[".html"], (("Location", "/"), ("Set-Cookie", cookie)))
 
-    # A file under the static folder; anything outside it, or not a file, is a 404.
+    # A file under the static folder; anything outside it, not a file, or a name the file system
+    # refuses (too long, say) is a 404.
     def _file(self, relative: str) -> None:
         root = self.server.static_dir
-        target = None if "\0" in relative else (root / relative).resolve()
-        if target is None or not target.is_relative_to(root) or not target.is_file():
+        try:
+            target = None if "\0" in relative else (root / relative).resolve()
+            found = target is not None and target.is_relative_to(root) and target.is_file()
+        except (OSError, ValueError):
+            found = False
+        if not found:
             raise HttpError(404, NOT_FOUND)
         
         content_type = CONTENT_TYPES.get(target.suffix, "application/octet-stream")

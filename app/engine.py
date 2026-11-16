@@ -9,14 +9,18 @@ from pathlib import Path
 
 from app import sixd
 from app.datasets import DATASETS, LABELS, MODEL_ID, AppPaths, Dataset, build_hint, load_dataset, missing_files
-from app.measured import CacheGate, Lock, cache_code_sha1, cache_gate, check_lock, mlx_versions, read_json
+from app.measured import CacheGate, Lock, cache_code_sha1, cache_gate, check_lock, library_versions, mlx_versions, read_json
 from app.model_cache import CachedModel
-from app.recorded_model import RecordedModel
+from app.recorded_model import RecordedModel, recorded_model_id
 
 MODEL_MODES = ("mlx", "recorded", "none")
 MEASURED_KEYS = ("files", "engine_src_sha1", "model", "rates")
 NO_MEASURED = "measured.json is missing or can't be read"
 NO_CACHE = "cache turned off with --no-cache"
+MODEL_OFF = "the model is off"
+RECORDED = "answers come from a recorded run"
+MODEL_FAILED = "the model didn't load"
+NOTHING_CACHED = "no dataset's prompt start was cached"
 
 
 # One bridge shared by both workers: one query at a time, counted.
@@ -35,7 +39,8 @@ class LockedBridge:
     def restarts(self) -> int:
         return self._bridge.restarts
 
-    # Skips the query lock, so quitting never waits behind a slow query.
+    # Skips the query lock, so quitting doesn't wait for the query to finish. The bridge's
+    # own close can still give its process up to 10 s to exit.
     def close(self) -> None:
         self._bridge.close()
 
@@ -77,8 +82,10 @@ def _contexts(paths: AppPaths) -> dict[str, object]:
 
 
 # What builds the model for a mode; None when there is no model.
-# In mlx mode the prompt cache is used only when the cache gate is on.
+# In mlx mode the prompt cache is used only when the cache gate is on, which needs paths.
 def default_model_factory(options: EngineOptions, paths: AppPaths | None = None, cache_on: bool = False) -> Callable | None:
+    if options.model_mode == "mlx" and cache_on and paths is None:
+        raise ValueError("the cached model needs paths")
     if options.model_mode == "mlx" and cache_on:
         return lambda: CachedModel(MODEL_ID, _contexts(paths))
     if options.model_mode == "mlx":
@@ -99,6 +106,14 @@ def _model_config(paths: AppPaths) -> dict | None:
 # An exception's message, or its type when it has none.
 def _message(e: Exception) -> str:
     return str(e) or type(e).__name__
+
+
+# The model a recorded run was made with; None when it names none or can't be read.
+def _recorded_id(options: EngineOptions) -> str | None:
+    try:
+        return recorded_model_id(options.recorded_run)
+    except Exception:
+        return None
 
 
 # Wall seconds since start, as the status shows them.
@@ -145,16 +160,20 @@ class Engine:
         if record is None or any(key not in record for key in MEASURED_KEYS):
             return unusable
 
+        # The rates are the tested model's, so a recorded run of another model doesn't get them.
+        recorded = _recorded_id(self.options) if self.options.model_mode == "recorded" else MODEL_ID
+        other_model = None if recorded == MODEL_ID else Lock(False, f"{RECORDED} of {recorded or 'an unnamed model'}")
+
         model_config = _model_config(self.paths)
         proof = read_json(self.paths.cache_proof)
         versions = mlx_versions()
         # The gate runs even with --no-cache, so the flag never changes which records count as readable.
         try:
             lock = check_lock(self.paths, record, model_config, proof, versions)
-            cache = cache_gate(self.paths, record, proof, versions, cache_code_sha1(self.paths.app_dir), model_config)
+            cache = cache_gate(self.paths, record, proof, library_versions(), cache_code_sha1(self.paths.app_dir), model_config)
         except (KeyError, TypeError, AttributeError, ValueError):
             return unusable
-        return record, lock, no_cache or cache
+        return record, other_model or lock, no_cache or cache
 
     # Starts both datasets' bridges, one thread each, and returns at once.
     # The list is kept only once every thread runs, so a waiter never joins one that hasn't started.
@@ -241,9 +260,25 @@ class Engine:
         with self._state_lock:
             return self._bridges[name]
 
+    # The prompt cache as the status shows it: on only for the live model with the gate on,
+    # once it has loaded with a cached prefix (or while it loads). Called with the state lock held.
+    def _cache_state(self) -> CacheGate:
+        if self.options.model_mode == "none":
+            return CacheGate(False, MODEL_OFF)
+        if self.options.model_mode == "recorded":
+            return CacheGate(False, RECORDED)
+        if not self.cache.on:
+            return self.cache
+        if self._model_state["state"] == "failed":
+            return CacheGate(False, MODEL_FAILED)
+        if self._model_state["state"] == "ready" and not any(getattr(self.model, "cached_tokens", {}).values()):
+            return CacheGate(False, NOTHING_CACHED)
+        return self.cache
+
     # What's loaded, the model, the lock and the cache, as fresh dicts.
     def status(self) -> dict:
         with self._state_lock:
+            cache = self._cache_state()
             return {
                 "datasets": {name: {"label": LABELS[name], **self._datasets[name]} for name in DATASETS},
                 "model": {
@@ -256,8 +291,8 @@ class Engine:
                     "reason": self.lock.reason
                 },
                 "cache": {
-                    "on": self.cache.on,
-                    "reason": self.cache.reason
+                    "on": cache.on,
+                    "reason": cache.reason
                 },
             }
 

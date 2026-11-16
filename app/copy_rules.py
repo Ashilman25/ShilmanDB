@@ -5,8 +5,13 @@ import re
 # An em dash or horizontal bar with the spaces around it; a run of them counts as one.
 DASHES = re.compile(r"\s*(?:[\u2014\u2015]\s*)+")
 
-# Forbidden ranges, narrowest first, so a tick in the emoji block is named a tick.
+# Forbidden ranges, checked in order, so a tick in the emoji block is named a tick.
 FORBIDDEN = (
+    (0x00AB, 0x00AB, "chevron"),
+    (0x00BB, 0x00BB, "chevron"),
+    (0x2022, 0x2022, "bullet"),
+    (0x2039, 0x203A, "chevron"),
+    (0x2139, 0x2139, "info sign"),
     (0x2713, 0x2718, "tick or cross"),
     (0x2014, 0x2014, "em dash"),
     (0x2015, 0x2015, "horizontal bar"),

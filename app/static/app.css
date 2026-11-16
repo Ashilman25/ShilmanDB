@@ -203,11 +203,13 @@ a { color: var(--accent); text-underline-offset: 2px; }
   transition: background-color 150ms var(--ease), color 150ms var(--ease);
 }
 .seg input:hover + span { color: var(--ink); background: var(--hover); }
+.seg:not(.strong) input:hover + span { background: var(--panel); }
 .seg input:active + span { background: var(--press); }
-.seg input:checked + span { background: var(--panel); color: var(--ink); }
+/* Picked: ink at 600 inside a 1px muted ring (at least 5.8:1 on paper and panel); hover never gets the ring. */
+.seg input:checked + span { background: var(--panel); color: var(--ink); font-weight: 600; box-shadow: inset 0 0 0 1px var(--muted); }
 .seg input:focus-visible + span { outline: 2px solid var(--accent); outline-offset: -2px; }
 .seg.strong span { font-size: 14px; line-height: 1.45; }
-.seg.strong input:checked + span { background: var(--btnbg); color: var(--btnfg); font-weight: 600; }
+.seg.strong input:checked + span { background: var(--btnbg); color: var(--btnfg); font-weight: 600; box-shadow: none; }
 
 /* The top bar and the tested panel under it. */
 

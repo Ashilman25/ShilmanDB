@@ -11,7 +11,7 @@ from pathlib import Path
 
 from app import sixd
 from app.datasets import DATASETS, MODEL_ID, AppPaths, default_paths, load_dataset
-from app.measured import cache_code_sha1, file_hashes, mlx_versions, tree_sha1
+from app.measured import CACHE_CODE, cache_code_sha1, file_hashes, library_versions, mlx_versions, tree_sha1
 from app.model_cache import CachedModel
 
 an, rp, fz = sixd.an, sixd.rp, sixd.fz
@@ -164,6 +164,36 @@ def _datasets(paths: AppPaths, names) -> dict:
     return loaded
 
 
+# What the proof vouches for, taken before the pass and checked again after it.
+def _snapshot(paths: AppPaths) -> dict:
+    return {
+        "versions": mlx_versions(), "library_versions": library_versions(),
+        "cache_code_sha1": cache_code_sha1(paths.app_dir), "files": file_hashes(paths),
+        "engine_src_sha1": tree_sha1(paths.src),
+        "cache_files": {name: sixd.an.sha1_file(paths.app_dir / name) if (paths.app_dir / name).is_file() else None for name in CACHE_CODE},
+    }
+
+
+# What changed between two snapshots, as a plain phrase; None when nothing did.
+def _changed(before: dict, after: dict) -> str | None:
+    if before["versions"] != after["versions"] or before["library_versions"] != after["library_versions"]:
+        return "a model library changed during the replay"
+    
+    for name in CACHE_CODE:
+        if before["cache_files"][name] != after["cache_files"][name]:
+            return f"app/{name} changed during the replay"
+        
+    if before["cache_code_sha1"] != after["cache_code_sha1"]:
+        return "the app's cache code changed during the replay"
+    for key, sha1 in before["files"].items():
+        if after["files"].get(key) != sha1:
+            return f"{key.partition('/')[2]} changed during the replay"
+        
+    if before["engine_src_sha1"] != after["engine_src_sha1"]:
+        return "the engine source changed during the replay"
+    return None
+
+
 # Seconds as the table shows them.
 def _s(value: float | None) -> str:
     return "n/a" if value is None else f"{value:.2f} s"
@@ -231,12 +261,17 @@ def main(argv: list[str] | None = None, paths: AppPaths | None = None, model_fac
     paths = paths or default_paths()
     ap = argparse.ArgumentParser(description="Replay the tested model's saved test answers and check each reply is the same.")
     ap.add_argument("--limit", type=_positive_int, default=None, help="replay only the first N questions per dataset")
-    ap.add_argument("--out", type=Path, default=paths.app_results, help=f"where the proof goes (default {paths.app_results})")
+    ap.add_argument("--out", type=Path, default=None, help=f"where the proof goes (default {paths.app_results})")
     ap.add_argument("--uncached-only", action="store_true", help="run the plain model with no cache and write uncached_check.json instead")
     args = ap.parse_args(argv)
+    if args.limit is not None and args.out is None:
+        print("A limited run needs --out <folder>, so it can't replace the full proof.")
+        return 2
+    args.out = args.out or paths.app_results
 
     try:
         model_config = _check_freeze(paths)
+        snapshot = _snapshot(paths)
         saved = _saved_by_dataset(paths, args.limit)
         questions = _questions(paths, saved)
         loaded = _datasets(paths, saved)
@@ -247,24 +282,39 @@ def main(argv: list[str] | None = None, paths: AppPaths | None = None, model_fac
         return 2
 
     try:
-        return _run(args, paths, model_config, saved, questions, loaded, model_factory, bridge_factory)
+        return _run(args, paths, model_config, snapshot, saved, questions, loaded, model_factory, bridge_factory)
     except KeyboardInterrupt:
         print("Stopped by Ctrl-C; nothing was written.", file=sys.stderr)
         return 130
 
 
+# Why the proof can't be written after the pass: the freeze or the snapshot changed; None when neither did.
+def _drift(paths: AppPaths, snapshot: dict) -> str | None:
+    try:
+        _check_freeze(paths)
+    except Refused as e:
+        return f"the freeze no longer matches: {'; '.join(e.problems)}"
+    return _changed(snapshot, _snapshot(paths))
+
+
 # Load the model, replay every question, then write the proof in one go.
-def _run(args, paths, model_config, saved, questions, loaded, model_factory, bridge_factory) -> int:
+# The proof holds what was hashed before the pass, and isn't written if any of it changed.
+def _run(args, paths, model_config, snapshot, saved, questions, loaded, model_factory, bridge_factory) -> int:
     factory = model_factory or _default_model_factory(args.uncached_only)
     start = time.perf_counter()
     model = factory({ds: loaded[ds].context for ds in saved})
     print(f"Model {MODEL_ID} loaded in {time.perf_counter() - start:.1f} s.", flush=True)
     cached_tokens = dict(getattr(model, "cached_tokens", {}))
     for ds in saved:
-        print(f"{ds}: {cached_tokens.get(ds, 0)} cached tokens", flush=True)
+        print(f"{ds}: {cached_tokens.get(ds, 0):,} cached tokens", flush=True)
 
     bridges = bridge_factory or _default_bridge_factory(paths, args.out)
     replayed, differences, uncached = _replay(paths, saved, questions, loaded, model, bridges, args.uncached_only)
+    name = UNCACHED_CHECK if args.uncached_only else PROOF
+    drift = _drift(paths, snapshot)
+    if drift is not None:
+        print(f"Not writing {name if args.uncached_only else 'the proof'}: {drift}.")
+        return 2
 
     total = len(replayed)
     identical = total - len(differences)
@@ -277,11 +327,12 @@ def _run(args, paths, model_config, saved, questions, loaded, model_factory, bri
     
     proof = {
         "identical": identical, "total": total, "differences": differences, "uncached_differences": uncached,
-        "versions": mlx_versions(), "cache_code_sha1": cache_code_sha1(paths.app_dir), "files": file_hashes(paths),
-        "engine_src_sha1": tree_sha1(paths.src), "model": model_config, "cached_tokens": cached_tokens,
+        "versions": snapshot["versions"], "library_versions": snapshot["library_versions"],
+        "cache_code_sha1": snapshot["cache_code_sha1"], "files": snapshot["files"],
+        "engine_src_sha1": snapshot["engine_src_sha1"], "model": model_config, "cached_tokens": cached_tokens,
         "limit": args.limit, "timings": times,
     }
-    path = args.out / (UNCACHED_CHECK if args.uncached_only else PROOF)
+    path = args.out / name
     an.write_text_atomic(path, json.dumps(proof, indent=2) + "\n")
 
     print(f"identical {identical} of {total}")

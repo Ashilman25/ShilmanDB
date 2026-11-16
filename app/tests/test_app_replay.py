@@ -6,6 +6,7 @@ import json
 import re
 import shutil
 import sqlite3
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -256,7 +257,7 @@ def test_replay_differing_question_reruns_uncached(replay, capsys, tmp_path):
     assert proof["uncached_differences"] == []  # the plain model matched, so the cache did it
     assert proof["cached_tokens"] == {"tpch": 4096}
     assert "t001 primary attempt 1 raw differs" in " ".join(lines)
-    assert any("tpch" in line and "4096" in line for line in lines)
+    assert "tpch: 4,096 cached tokens" in lines
     assert "identical 1 of 2" in lines
 
 
@@ -336,3 +337,86 @@ def test_replay_saved_records_untouched(replay, capsys, tmp_path):
     saved = copy.deepcopy(an.read_jsonl(run))
     _run(replay, ["--out", str(tmp_path)], capsys)
     assert run.read_bytes() == before and an.read_jsonl(run) == saved
+
+
+# The replay fixture with the app's cache code and the engine source in tmp trees a test can edit.
+@pytest.fixture
+def editable(replay, tmp_path):
+    paths = replay[0]
+    app_dir, src = tmp_path / "app_copy", tmp_path / "src_copy"
+    app_dir.mkdir()
+    for name in measured.CACHE_CODE:
+        shutil.copy(paths.app_dir / name, app_dir / name)
+    (src / "storage").mkdir(parents=True)
+    (src / "storage/page.hpp").write_text("#pragma once\n", encoding="utf-8")
+    return (replace(paths, app_dir=app_dir, src=src), *replay[1:])
+
+
+# A recorded model that runs change once, on its first reply.
+def _changing_model(run: Path, change):
+    class Changing(RecordedModel):
+        changed = False
+
+        def generate(self, prompt: str):
+            if not Changing.changed:
+                Changing.changed = True
+                change()
+            return super().generate(prompt)
+
+    return lambda contexts: Changing(run)
+
+
+# Each thing the proof vouches for, changed mid-pass, and the line naming it.
+@pytest.mark.parametrize("what, line", [
+    ("cache code", "app/prompt_cache.py changed during the replay."),
+    ("engine", "the engine source changed during the replay."),
+    ("locked file", "checks.py changed during the replay."),
+    ("library", "a model library changed during the replay."),
+    ("freeze", "the freeze no longer matches: checks.py changed."),
+])
+@pytest.mark.parametrize("uncached_only", [False, True])
+def test_replay_change_mid_pass_writes_nothing(editable, capsys, tmp_path, monkeypatch, what, line, uncached_only):
+    paths = editable[0]
+    hashes, libraries, verify = measured.file_hashes, measured.library_versions(), fz.verify
+    state = {"changed": False}
+
+    def change():
+        state["changed"] = True
+        if what == "cache code":
+            with open(paths.app_dir / "prompt_cache.py", "a", encoding="utf-8") as f:
+                f.write("# edited\n")
+        elif what == "engine":
+            (paths.src / "storage/page.hpp").write_text("#pragma once // edited\n", encoding="utf-8")
+
+    def file_hashes(p):
+        found = hashes(p)
+        return {**found, "code/checks.py": "0" * 40} if what == "locked file" and state["changed"] else found
+
+    monkeypatch.setattr(replay_check, "file_hashes", file_hashes)
+    monkeypatch.setattr(replay_check, "library_versions",
+                        lambda: {**libraries, "jinja2": "9.9.9"} if what == "library" and state["changed"] else dict(libraries))
+    monkeypatch.setattr(fz, "verify", lambda *a: ["checks.py changed"] if what == "freeze" and state["changed"] else [])
+
+    out = tmp_path / "out"
+    argv = ["--out", str(out)] + (["--uncached-only"] if uncached_only else [])
+    code, lines, _ = _run(editable, argv, capsys, model_factory=_changing_model(paths.run_file("test"), change))
+    name = "uncached_check.json" if uncached_only else "the proof"
+    assert code == 2
+    assert lines[-1] == f"Not writing {name}: {line}"
+    assert not (out / "cache_proof.json").exists() and not (out / "uncached_check.json").exists()
+
+
+def test_replay_proof_records_the_libraries(editable, capsys, tmp_path, monkeypatch):
+    monkeypatch.setattr(replay_check, "library_versions", lambda: {"mlx": "1", "jinja2": None})
+    code, _, _ = _run(editable, ["--out", str(tmp_path)], capsys)
+    proof = json.loads((tmp_path / "cache_proof.json").read_text(encoding="utf-8"))
+    assert code == 0 and proof["library_versions"] == {"mlx": "1", "jinja2": None}
+    assert proof["versions"] == measured.mlx_versions()
+
+
+def test_replay_limit_needs_out(replay, capsys):
+    paths, _, _, bridges, models = replay
+    code, lines, err = _run(replay, ["--limit", "1"], capsys)
+    assert code == 2
+    assert "A limited run needs --out <folder>, so it can't replace the full proof." in lines + err.splitlines()
+    assert models == [] and bridges == [] and not paths.app_results.exists()

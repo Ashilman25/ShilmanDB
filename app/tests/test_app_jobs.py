@@ -292,6 +292,7 @@ def test_stop_between_first_and_second(runners):
     assert stopped["first"]["rows"] == [[r, "5"] for r in REGIONS]
     assert stopped["second"] is None
     assert stopped["verdict"] == STOPPED
+    assert stopped["tested"] is None  # no tested line beside an answer without its second answer
     assert "second_phrasing" not in row_names(stopped) and "engine_traps" in row_names(stopped)
     assert runner.rows(job_id, "second", 0, 10) is None and runner.csv(job_id, "second") is None
     assert runner.rows(job_id, "first", 0, 1) == [["AFRICA", "5"]]
@@ -326,7 +327,7 @@ def test_stop_while_writing_takes_effect_at_first(runners):
     assert stopped["second"] is None
     assert stopped["verdict"] == STOPPED
     assert "second_phrasing" not in row_names(stopped) and "engine_traps" in row_names(stopped)
-    assert stopped["tested"] is not None
+    assert stopped["tested"] is None
     assert stopped["timing"]["first_s"] is not None and stopped["timing"]["verdict_s"] is not None
     assert not any(pr.REPHRASE in p for p in model.prompts)
     assert runner.fakes["tpch"].sent == [SQL]
@@ -347,6 +348,39 @@ def test_stop_while_writing_ends_as_a_final_answer_says(runners):
         gate.set()
     done = finish(runner, job_id)
     assert done["stage"] == "done" and done["verdict"]["kind"] == "cannot"
+
+
+# A FakeBridge whose queries wait for the test, so a SQL job can be stopped while it runs.
+class HeldBridge(FakeBridge):
+    def __init__(self, replies: dict):
+        super().__init__(replies)
+        self.running, self.release = threading.Event(), threading.Event()
+
+    def query(self, sql: str) -> dict:
+        self.running.set()
+        if not self.release.wait(WAIT_S):
+            raise TimeoutError("the test never released the query")
+        return super().query(sql)
+
+
+def test_stop_while_sql_runs_drops_the_result(runners):
+    runner = runners(bridge=HeldBridge)
+    bridge = runner.fakes["tpch"]
+    job_id = runner.submit("sql", "tpch", TYPED)["id"]
+    try:
+        assert bridge.running.wait(WAIT_S)
+        assert runner.stop(job_id) is True
+    finally:
+        bridge.release.set()
+    stopped = finish(runner, job_id)
+
+    assert stopped["stage"] == "stopped"
+    assert stopped["verdict"] == {"kind": "stopped", "text": "Stopped. The query finished, but the result was dropped.", "sql": None}
+    assert (stopped["first"], stopped["second"], stopped["checks"], stopped["tested"]) == (None, None, [], None)
+    assert runner.rows(job_id, "first", 0, 10) is None and runner.csv(job_id, "first") is None
+    assert bridge.sent == [TYPED]  # it ran (the engine can't cancel), then the result was dropped
+    assert runner.stop(job_id) is False
+    assert copy_rules.problems(stopped["verdict"]["text"]) == []
 
 
 def test_stop_while_queued(runners):
@@ -466,10 +500,12 @@ def test_dataset_not_ready_refused(runners):
     refused(broken, "sql", 409, f"{LABELS['tpch']} isn't available: the bridge didn't start")
 
 
-def test_job_exception_becomes_error_state(runners):
+def test_job_exception_becomes_error_state(runners, capsys):
     model = FakeModel({**script(), BOOM: RuntimeError("boom")})
     runner = runners(model)
     failed = finish(runner, runner.submit("ask", "tpch", BOOM)["id"])
+    err = capsys.readouterr().err
+    assert "Traceback" in err and "RuntimeError: boom" in err  # the terminal gets the trace
 
     assert failed["stage"] == "error" and "boom" in failed["error"]["message"]
     assert (failed["verdict"], failed["first"], failed["tested"]) == (None, None, None)
@@ -630,7 +666,14 @@ def test_second_answer_with_an_engine_trap_is_not_shown(runners):
     assert done["second"] is None and done["first"] is not None
     assert runner.rows(job_id, "second", 0, 10) is None and runner.csv(job_id, "second") is None
     assert done["checks"][0]["word"] == "Same"  # the analyst check's own row, unchanged
+    assert done["checks"][0]["detail"] == f'Asked as: "{REPHRASED}"'  # no count from the trapped SQL
     assert runner.fakes["tpch"].sent == [SQL, LEFT_SQL]
+
+
+def test_second_answer_shown_keeps_its_row_counts(runners):
+    done = finish(runner := runners(FakeModel(script())), runner.submit("ask", "tpch", QUESTION)["id"])
+    assert done["second"] is not None
+    assert done["checks"][0]["detail"] == f'Asked as: "{REPHRASED}" First answer 5 rows, second answer 5 rows.'
 
 
 def test_model_prose_loses_em_dashes(runners):

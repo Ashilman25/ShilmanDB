@@ -2,7 +2,7 @@
 // then the chart and the table. Skeleton lines hold the place while the answer is on its way.
 import { chartFor } from "./chart.js";
 import { banner, JOB_FAILED_LEAD, skeleton, SQL_FAILED_LEAD, word } from "./controls.js";
-import { aheadText, ASK_RECOVERY, EMPTY_RESULT, SQL_RECOVERY, STOPPED_QUEUED } from "./copy.js";
+import { aheadText, ASK_RECOVERY, EMPTY_RESULT, EMPTY_RESULT_SQL, SQL_RECOVERY, STOPPED_QUEUED } from "./copy.js";
 import { fill, h, redraw, redrawFrom } from "./dom.js";
 import { isSql, showsSecond } from "./state.js";
 import { answerTable, forgetRows } from "./table.js";
@@ -95,7 +95,8 @@ export function drawResult(root, state, actions) {
     const job = state.job;
     root.setAttribute("aria-busy", String(job !== null && (job.stage === "queued" || job.stage === "writing")));
     if (!job) {
-        redraw(root, state.jobError ? banner("error", state.jobError) : h("p", { class: "hint" }, EMPTY_RESULT));
+        const hint = state.status?.model.state === "off" ? EMPTY_RESULT_SQL : EMPTY_RESULT;
+        redraw(root, state.jobError ? banner("error", state.jobError) : h("p", { class: "hint" }, hint));
         return;
     }
     const first = job.first;

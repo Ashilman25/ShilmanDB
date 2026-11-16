@@ -82,17 +82,31 @@ def _options(args: argparse.Namespace) -> EngineOptions:
     return EngineOptions("mlx", use_cache=use_cache)
 
 
-# Ctrl-C and SIGTERM set quit instead of raising; returns what puts the old handlers back.
-# Signal handlers can only be set on the main thread, so elsewhere this does nothing.
-def _on_signals(quit_event: threading.Event) -> Callable[[], None]:
+# Ctrl-C and SIGTERM set quit instead of raising, and put the default handlers back, so a second
+# press ends the app at once. Returns what puts the old handlers back. Main thread only.
+def _on_signals(quit_event: threading.Event, install=signal.signal) -> Callable[[], None]:
     if threading.current_thread() is not threading.main_thread():
         return lambda: None
-    previous = {sig: signal.signal(sig, lambda *_: quit_event.set()) for sig in QUIT_SIGNALS}
+
+    def on_quit(*_) -> None:
+        quit_event.set()
+        for sig in QUIT_SIGNALS:
+            install(sig, signal.SIG_DFL)
+
+    previous = {sig: install(sig, on_quit) for sig in QUIT_SIGNALS}
 
     def restore() -> None:
         for sig, handler in previous.items():
-            signal.signal(sig, handler)
+            install(sig, handler)
     return restore
+
+
+# The launch line about the prompt cache; None unless the live model is in use.
+def cache_line(status: dict) -> str | None:
+    if status["model"]["mode"] != "mlx":
+        return None
+    cache = status["cache"]
+    return "Prompt cache: on" if cache["on"] else f"Prompt cache: off ({cache['reason']})"
 
 
 # Starts the app, prints its link and serves until a signal (or stop, in tests); then closes
@@ -123,6 +137,9 @@ def main(argv: list[str] | None = None, stop: threading.Event | None = None, pat
 
         url = f"http://{HOST}:{server.server_port}/?token={token}"
         print(f"ShilmanDB app: {url}", flush=True)
+        line = cache_line(engine.status())
+        if line is not None:
+            print(line, flush=True)
         print("Press Ctrl-C to quit.", flush=True)
         if not args.no_browser:
             webbrowser.open(url)

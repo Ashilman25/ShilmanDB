@@ -4,8 +4,12 @@ from __future__ import annotations
 import contextlib
 import http.client
 import json
+import os
 import re
+import signal
 import socket
+import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass, replace
@@ -14,6 +18,7 @@ from pathlib import Path
 import pytest
 
 # check_views is reached as a module: pytest collects any test* name imported into a test module.
+from app import __main__ as app_main
 from app import check_views, copy_rules, sixd
 from app.__main__ import main, pick_port
 from app.datasets import DATASETS, default_paths, load_dataset, missing_files
@@ -352,6 +357,53 @@ def test_static_module_served_and_contained(start, tmp_path):
     assert c.get("/static/js/x.js", cookie=False).status == 403
 
 
+# The raw bytes the server answers to bytes sent on a fresh socket, read until it closes.
+def raw(port: int, data: bytes) -> bytes:
+    with socket.create_connection(("127.0.0.1", port), timeout=CLIENT_TIMEOUT_S) as s:
+        s.sendall(data)
+        chunks = []
+        while chunk := s.recv(65536):
+            chunks.append(chunk)
+    return b"".join(chunks)
+
+
+# Request lines no browser sends: HTTP/0.9, and a URL that won't split. Each gets a plain 400, no traceback.
+@pytest.mark.parametrize("line", [b"GET /\r\n", b"GET /api/status\r\n", b"GET http://[ HTTP/1.0\r\n\r\n",
+                                  b"GET http://[::1/api/status HTTP/1.0\r\n\r\n"])
+def test_malformed_request_lines_get_400(start, capsys, line):
+    app = start()
+    answer = raw(app.port, line)
+    assert answer.startswith(b"HTTP/1.0 400 "), answer[:80]
+    assert b"Traceback" not in answer and "Traceback" not in capsys.readouterr().err
+    assert app.client.get("/api/status").status == 200  # the server carries on
+
+
+# A static name too long for the file system: Python 3.13's is_file raises instead of saying no.
+def test_static_name_too_long_is_404(start, capsys, monkeypatch):
+    real = Path.is_file
+
+    def is_file(self):
+        if len(self.name) > 255:
+            raise OSError(63, "File name too long")
+        return real(self)
+
+    monkeypatch.setattr(Path, "is_file", is_file)
+    c = start().client
+    for path in ("/static/" + "a" * 300, "/static/js/" + "b" * 300 + ".js"):
+        found = c.get(path)
+        assert (found.status, found.body.count(b"Not found.")) == (404, 1), path
+    assert "Traceback" not in capsys.readouterr().err
+
+
+def test_lone_surrogate_text_refused(start):
+    c = start().client
+    message = "The text has a character the app can't send. Retype it and try again."
+    for route, field in (("/api/sql", "sql"), ("/api/ask", "question")):
+        body = ('{"dataset": "tpch", "%s": "SELECT \\ud800 FROM nation"}' % field).encode()
+        refused = c.post(route, body, headers={"Content-Type": "application/json"})
+        assert (refused.status, refused.error()) == (400, message), route
+
+
 def test_ask_round_trip(start):
     app = start(FakeModel(script()))
     c = app.client
@@ -641,6 +693,144 @@ def wait_for_url(capsys, thread) -> str:
         seen += capsys.readouterr().out
         time.sleep(0.01)
     return seen.splitlines()[0]
+
+
+# Everything main prints up to its quit hint, read from captured stdout as it arrives.
+def wait_for_launch(capsys, thread) -> list[str]:
+    seen = ""
+    deadline = time.monotonic() + WAIT_S
+    while "Press Ctrl-C to quit." not in seen:
+        assert time.monotonic() < deadline and thread.is_alive(), f"no quit hint yet: {seen!r}"
+        seen += capsys.readouterr().out
+        time.sleep(0.01)
+    return seen.splitlines()
+
+
+# Runs main on a thread with a stop event; returns the thread, the event and where its exit code lands.
+def run_main(argv: list[str], paths) -> tuple[threading.Thread, threading.Event, dict]:
+    stop, result = threading.Event(), {}
+    thread = threading.Thread(target=lambda: result.update(code=main(argv, stop=stop, paths=paths)), name="test-main", daemon=True)
+    thread.start()
+    return thread, stop, result
+
+
+@pytest.mark.parametrize("flags, line", [
+    ([], "Prompt cache: off (measured.json is missing or can't be read)"),
+    (["--no-cache"], "Prompt cache: off (cache turned off with --no-cache)"),
+    (["--no-model"], None),
+    (["--recorded-model", "RUN"], None),
+])
+def test_main_prints_the_cache_state(main_paths, capsys, monkeypatch, flags, line):
+    real = app_main.Engine
+    monkeypatch.setattr(app_main, "Engine", lambda paths, options: real(paths, options, model_factory=lambda: FakeModel({})))
+    flags = [str(main_paths.run_file("dev")) if f == "RUN" else f for f in flags]
+    thread, stop, result = run_main(["--no-browser", "--port", str(free_port()), *flags], main_paths)
+    try:
+        lines = wait_for_launch(capsys, thread)
+    finally:
+        stop.set()
+        thread.join(WAIT_S)
+    assert result == {"code": 0}
+    assert lines[0].startswith("ShilmanDB app: http://127.0.0.1:")
+    assert lines[1:] == ([line] if line else []) + ["Press Ctrl-C to quit."]
+
+
+def test_cache_line():
+    assert app_main.cache_line({"model": {"mode": "mlx"}, "cache": {"on": True, "reason": "the replay matched 300 of 300"}}) == "Prompt cache: on"
+    assert app_main.cache_line({"model": {"mode": "mlx"}, "cache": {"on": False, "reason": "the replay hasn't been run"}}) == \
+        "Prompt cache: off (the replay hasn't been run)"
+    for mode in ("none", "recorded"):
+        assert app_main.cache_line({"model": {"mode": mode}, "cache": {"on": False, "reason": "x"}}) is None
+
+
+# A bridge process that touches its db file, then answers each query after SLOW_QUERY_S.
+SLOW_QUERY_S = 1.0
+SLOW_BRIDGE = f"""
+import json, sys, time
+from pathlib import Path
+args = sys.argv[1:]
+Path(args[args.index("--db-file") + 1]).touch()
+print(json.dumps({{"ready": True, "tables": 0, "load_ms": 0, "rows": {{}}}}), flush=True)
+for raw in sys.stdin:
+    rid = raw.partition("\\t")[0]
+    time.sleep({SLOW_QUERY_S})
+    print(json.dumps({{"id": rid, "ok": True, "columns": [{{"name": "n", "type": "INTEGER"}}], "rows": [[1]],
+                      "row_count": 1, "truncated": False, "profile": {{}}, "ms": 1000}}), flush=True)
+"""
+
+
+# This process's child processes, by pid.
+def _children() -> list[str]:
+    return subprocess.run(["pgrep", "-P", str(os.getpid())], capture_output=True, text=True).stdout.split()
+
+
+def test_main_quits_with_a_query_in_flight(main_paths, capsys, monkeypatch):
+    bridges, runners = [], []
+    real_engine, real_runner = app_main.Engine, app_main.JobRunner
+
+    def factory(name, tables_tsv):
+        bridges.append(sixd.bc.Bridge(tables_tsv, command=[sys.executable, "-c", SLOW_BRIDGE]))
+        return bridges[-1]
+
+    def runner(engine):
+        runners.append(real_runner(engine))
+        return runners[-1]
+
+    monkeypatch.setattr(app_main, "Engine", lambda paths, options: real_engine(paths, options, bridge_factory=factory))
+    monkeypatch.setattr(app_main, "JobRunner", runner)
+    before = set(_children())
+    port = free_port()
+    thread, stop, result = run_main(["--no-browser", "--no-model", "--port", str(port)], main_paths)
+    try:
+        token = re.search(r"token=([0-9a-f]{32})", wait_for_url(capsys, thread)).group(1)
+        client = Client(port, token)
+        deadline = time.monotonic() + WAIT_S
+        while client.get("/api/status").json()["datasets"]["tpch"]["state"] != "ready":
+            assert time.monotonic() < deadline, "the bridge never got ready"
+            time.sleep(0.01)
+        db_files = [b.db_file for b in bridges]
+        assert all(f.exists() for f in db_files)
+
+        job = client.post("/api/sql", {"dataset": "tpch", "sql": TYPED}).json()
+        while client.get(f"/api/jobs/{job['id']}").json()["stage"] != "writing":
+            assert time.monotonic() < deadline, "the query never started"
+            time.sleep(0.005)
+    finally:
+        began = time.monotonic()
+        stop.set()
+        thread.join(WAIT_S)
+
+    assert not thread.is_alive() and result == {"code": 0}
+    assert time.monotonic() - began < SLOW_QUERY_S + 5.0  # the query's end, the closes and a margin
+    assert runners[0].wait(job["id"], -1, 0)["stage"] in ENDED
+    assert set(_children()) - before == set()  # every bridge closed
+    assert not any(f.exists() for f in db_files)
+
+
+# Records signal.signal calls without touching the process's real handlers.
+class FakeSignals:
+    def __init__(self):
+        self.handlers = {sig: f"previous {sig}" for sig in app_main.QUIT_SIGNALS}
+        self.calls: list[tuple] = []
+
+    def __call__(self, sig, handler):
+        self.calls.append((sig, handler))
+        previous, self.handlers[sig] = self.handlers[sig], handler
+        return previous
+
+
+def test_first_quit_signal_sets_quit_and_restores_the_defaults():
+    quit_event, fake = threading.Event(), FakeSignals()
+    restore = app_main._on_signals(quit_event, install=fake)
+    handler = fake.handlers[signal.SIGINT]
+    assert callable(handler) and fake.handlers[signal.SIGTERM] is handler and not quit_event.is_set()
+
+    handler(signal.SIGINT, None)
+    assert quit_event.is_set()
+    assert fake.handlers == {sig: signal.SIG_DFL for sig in app_main.QUIT_SIGNALS}  # a second press ends the app at once
+
+    restore()
+    assert fake.handlers == {sig: f"previous {sig}" for sig in app_main.QUIT_SIGNALS}
 
 
 def test_main_no_model_starts_and_stops(main_paths, capsys):

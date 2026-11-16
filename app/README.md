@@ -21,18 +21,18 @@ From the repo root:
 | `--recorded-pace` | With `--recorded-model`, each reply takes as long as it did when it was recorded. |
 | `--no-cache` | Don't use the prompt cache, even when its gate is open. |
 
-At launch the app prints its link (`ShilmanDB app: http://127.0.0.1:<port>/?token=...`) and opens it in the browser. The token in the link becomes a cookie on the first visit, so open the printed link, not a bare address. Then the two datasets load (each starts an engine bridge), and the model loads on its own thread. The page shows each one as loading, ready, missing or failed, and the SQL runner works as soon as a dataset is ready.
+At launch the two datasets start loading first (each starts an engine bridge, on its own thread), then the model starts loading on the model worker's thread. Only then does the app print its link (`ShilmanDB app: http://127.0.0.1:<port>/?token=...`) and open it in the browser; with the real model it also prints `Prompt cache: on` or `Prompt cache: off (<reason>)` under the link. The token in the link becomes a cookie on the first visit, so open the printed link, not a bare address. The page shows each dataset and the model as loading, ready, missing or failed, and the SQL runner works as soon as a dataset is ready.
 
-Press Ctrl-C to quit. The server, the workers and the bridges close in that order.
+Press Ctrl-C to quit. The server, the workers and the bridges close in that order. A query still running holds the quit until it returns, and each busy bridge gets up to 10 s to exit (*from docs*: `CLOSE_WAIT_S` in `bench/analyst/bridge_client.py`). A second Ctrl-C ends the app at once, without those waits, and can leave a bridge's `analyst_bridge_*.db` file in the temp folder.
 
 ## What it needs
 
-- **The engine bridge**, `build/bench/analyst_bridge`. If it's missing the app says so and prints the build command:
+- **The engine bridge**, `build/bench/analyst_bridge`. If it's missing the page says so (Engine missing in the top bar) and shows the build command under the input:
   ```bash
   cmake --build build --target analyst_bridge
   ```
   (`build/` is the Release + bench build in `CLAUDE.md`.)
-- **The analyst check's dataset files** under `bench/results/analyst_check/`: each dataset's `tables.tsv`, `.tbl` files, `description.md` and `manifest.json`, plus `subset_rules.md`. They're gitignored. A missing dataset shows as missing, with what to run; `docs/playbooks/ai-analyst-check-playbook.md` has the full steps. In short:
+- **The analyst check's dataset files** under `bench/results/analyst_check/`: each dataset's `tables.tsv`, `.tbl` files, `description.md` and `manifest.json`, plus `subset_rules.md`. They're gitignored. A missing dataset shows as Data missing, with what to run under the input. The full steps are in the analyst check's handbook, `docs/playbooks/ai-analyst-check-playbook.md`, which is a local file that isn't in the repo; in a clone, `.venv/bin/python bench/analyst/run_analyst_check.py --dry-run` prints the same commands in order. In short:
   ```bash
   .venv/bin/python bench/analyst/prepare_datasets.py
   .venv/bin/python bench/analyst/describe_datasets.py
@@ -71,7 +71,8 @@ At launch the app checks all of this once. The lock breaks, and the status says 
 | `<file> is missing` / `<file> changed` | A locked file is gone or differs from the tested one. |
 | `the model settings changed` | The model's entry in `model_mlx.py` isn't the tested one. |
 | `the engine changed since the test` | Anything under `src/` changed. |
-| `this machine's MLX no longer reproduces the test's answers` | A replay on this exact MLX found the plain, uncached model gives different answers. |
+| `this machine's MLX no longer reproduces the test's answers` | A full cached replay on this exact mlx and mlx_lm reran a differing question uncached, and the plain model differed too. |
+| `answers come from a recorded run of <model>` | `--recorded-model` with a run file whose records name a model other than the tested `gemma4-26b`. A recorded run of `gemma4-26b` keeps the tested line. |
 | `measured.json is missing or can't be read` | No record to check against. |
 
 While the lock holds, each answer carries a line with the test's rates, and the page has a "How the checks were tested" panel. While it's broken, the rates hide: the line says the setup differs from the tested one and why, and the panel gets no rates. The analyst still answers and still runs every check. Only the claim about how often the checks catch mistakes goes away.
@@ -80,17 +81,23 @@ While the lock holds, each answer carries a line with the test's rates, and the 
 
 Every analyst prompt for a dataset starts with the same long text: the dataset's description, the rules and the examples, before the question. The cache keeps the model's state after that shared start, one per dataset (4,096 tokens for TPC-H, 2,048 for the reviews, *measured* 2026-11-15). It's filled in pieces of the same size, on the same boundaries, as mlx_lm's own generation would fill them (*from docs*: `CHUNK` = 2,048 in `app/prompt_cache.py`), and each question gets a fresh copy, so the model does the same arithmetic either way. That's the argument; the replay is the proof.
 
-**The gate.** The cache is used only with the real model, only without `--no-cache`, and only when `bench/results/app/cache_proof.json` matches this setup. The status shows the reason (300 is `rates.test_questions` in `measured.json`, *from docs*):
+**The gate.** The cache is used only with the real model, only without `--no-cache`, and only when `bench/results/app/cache_proof.json` matches this setup. Only that file, written by a full cached replay, feeds the gate (and the lock's MLX reason); `uncached_check.json` is information only. With the real model, the top bar shows `Prompt cache on`, or `Prompt cache off: <reason>` in plain text, and the launch line says the same; `/api/status` has it in every mode. The reasons (300 is `rates.test_questions` in `measured.json`, *from docs*):
 
 | Reason | Meaning |
 |---|---|
+| `the model is off` | Started with `--no-model`. |
+| `answers come from a recorded run` | Started with `--recorded-model`. |
+| `cache turned off with --no-cache` | The flag. |
+| `measured.json is missing or can't be read` | No record to check the proof against. |
 | `the replay hasn't been run` | No proof file. |
 | `the replay found differences` | A replayed answer differed. |
-| `the replay didn't cover all 300 test questions` | A partial replay (`--limit`). |
-| `mlx changed since the replay` | mlx or mlx_lm versions differ. |
+| `the replay didn't cover all 300 test questions` | A partial proof. |
+| `a model library changed since the replay` | The installed mlx, mlx-lm, mlx-metal, transformers, tokenizers or jinja2 differs from the proof's (*from docs*: `MODEL_LIBRARIES` in `app/measured.py`). |
 | `the app's cache code changed since the replay` | `model_cache.py` or `prompt_cache.py` changed. |
 | `a tested file changed since the replay` | A locked file or the model settings changed. |
 | `the engine changed since the replay` | `src/` changed. |
+| `the model didn't load` | The gate is open, but the model failed to load. |
+| `no dataset's prompt start was cached` | The gate is open, but no dataset loaded, so nothing was cached. |
 | `the replay matched 300 of 300` | On. |
 
 **The replay** reruns the analyst check's 300 saved test answers (*from docs*: `measured.json`) with the cached model and compares what the model wrote, reply by reply (never times or engine replies). Run it in `.venv-ai`:
@@ -101,16 +108,16 @@ Every analyst prompt for a dataset starts with the same long text: the dataset's
 
 | Flag | What it does |
 |---|---|
-| `--limit N` | Replay only the first N questions per dataset. |
+| `--limit N` | Replay only the first N questions per dataset. Needs `--out`, so a partial run can't replace the full proof. |
 | `--out DIR` | Where the proof goes (default `bench/results/app/`). |
 | `--uncached-only` | Run the plain model with no cache and write `uncached_check.json` instead. |
 
-Exit codes (*from docs*: `app/replay_check.py`): 0 every question identical, 1 one differs, 2 it can't start (it lists why: a freeze that doesn't verify, a missing test run, questions or dataset file), 130 stopped by Ctrl-C (nothing written). When a cached answer differs it reruns that question uncached, so the proof says whether the cache or MLX itself is to blame. It prints a timing table: the replay, the saved run on the same questions, and the saved run on all of them.
+Exit codes (*from docs*: `app/replay_check.py`): 0 every question identical, 1 one differs, 2 it can't start (it lists why: a freeze that doesn't verify, a missing test run, questions or dataset file, or `--limit` without `--out`) or something it vouches for changed during the pass, 130 stopped by Ctrl-C (nothing written). It hashes what the proof vouches for (the library versions, the cache code, the locked files and `src/`) before the pass, writes those hashes into the proof, and checks them and the freeze again after the pass. If anything changed it writes nothing and prints one line naming it, for example `Not writing the proof: app/prompt_cache.py changed during the replay.` When a cached answer differs it reruns that question uncached, so the proof says whether the cache or MLX itself is to blame. It prints a timing table: the replay, the saved run on the same questions, and the saved run on all of them.
 
 | Run | Result |
 |---|---|
 | Replay smoke, `--limit 2` | identical 4 of 4 in 16.1 s (*measured* 2026-11-15) |
-| Full replay | 15-20 min (*inferred*; not run yet) |
+| Full replay | about 11-15 min (*inferred* 2026-11-15 from the 4-question smoke) |
 
 **Timings on TPC-H through the app** (*measured* 2026-11-15):
 
@@ -161,7 +168,10 @@ It finds each reply by the prompt's sha1, so only the run's own questions get an
 
 - **A rebuilt dataset description must match the tested one byte for byte.** `description.md`, `manifest.json` and `subset_rules.md` are locked, so any difference breaks the lock and the rates hide.
 - **When the columnar core changes `src/`, the rates hide** until the analyst check's test is rerun on the new engine and `measured.json` is updated. That's on purpose: the rates were measured on today's engine.
-- **A `--limit` replay with the default `--out` replaces a full proof with a partial one,** so the gate turns the cache off. That's safe, but rerun the full replay to turn it back on. Use `--out` somewhere else for a quick check.
+- **A `--limit` replay needs `--out`.** Without it the replay refuses (exit 2) and writes nothing, so a quick check can't replace the full proof.
+- **Rebuild `analyst_bridge` after switching branches** (`cmake --build build --target analyst_bridge`). The lock fingerprints `src/`, not the binary, so a bridge built from another branch's engine would keep the tested rates showing.
+- **Edit nothing the proof vouches for while the replay runs.** A change to the cache code, a locked file, `src/` or a model library during the pass means no proof is written.
+- **Stop on a running query takes effect when it returns.** The engine can't cancel, so the query finishes and its result is dropped ("Stopped. The query finished, but the result was dropped.").
 - **The model must load and answer on one thread** (MLX's generation stream is per thread). The model worker does both, so don't call the model from anywhere else.
 - **The token cookie is named for the port,** so two launches on two ports don't clash.
 - **The engine reports an unknown column as a run error, not a plan error** (`Run error: Column not found: nope`), since the planner leaves names it can't bind for the executor.

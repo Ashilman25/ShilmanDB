@@ -18,6 +18,7 @@ export function aheadText(n: number): string {
 export const EMPTY_HISTORY = "Ask a question or run SQL. Your runs this session show here.";
 export const EMPTY_RESULT = "Ask a question in plain English, or switch to SQL and run a query. "
   + "The answer shows here, with the checks beside it.";
+export const EMPTY_RESULT_SQL = "Type a SQL query and run it. The result shows here, with the checks beside it.";
 export const EMPTY_EVIDENCE = "Checks show here once an answer is back.";
 export const NO_ROWS = "No rows.";
 export const STOPPED_QUEUED = "Stopped before it started.";

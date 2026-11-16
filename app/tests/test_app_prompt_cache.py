@@ -305,6 +305,14 @@ def test_fill_cache_prefills_like_generate_step(fake_mx):
                        "exit stream gen", "exit wired ['gen']"]
 
 
+# A prefix that isn't whole chunks would end mid-piece, off generate_step's boundaries.
+@pytest.mark.parametrize("length", [1, CHUNK - 1, CHUNK + 1, 2 * CHUNK + 7])
+def test_fill_cache_refuses_a_partial_chunk(length):
+    with pytest.raises(ValueError, match="whole number of"):
+        model_cache.fill_cache(None, list(range(length)))
+    assert "mlx" not in sys.modules and "mlx_lm" not in sys.modules  # refused before MLX is imported
+
+
 def test_fresh_copy_makes_new_arrays(fake_mx):
     kept = [FakeKVCache(), FakeKVCache()]
     copies = model_cache.fresh_copy(kept)

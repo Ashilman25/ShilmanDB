@@ -156,7 +156,7 @@ def test_copy_rules_catch_each():
     assert problems("plain text") == []
     assert problems("Can't answer this yet. 5.3 s - fine, 20 of 35 (57%); a/b <= c") == []
     for code in (0x2705, 0x2014, 0x25B8, 0x2192, 0x2713, 0x2015, 0x1F600, 0x2190, 0x21FF, 0x25A0, 0x2718,
-                 0x23F3, 0x27F6, 0x2934, 0x2B50, 0x2E3A):
+                 0x23F3, 0x27F6, 0x2934, 0x2B50, 0x2E3A, 0x00AB, 0x00BB, 0x2039, 0x203A, 0x2022, 0x2139):
         found = problems("ok " + chr(code) + " ok")
         assert len(found) == 1, hex(code)
         assert found[0].startswith(f"U+{code:04X} at 3"), found
@@ -173,6 +173,12 @@ def test_plain_turns_dashes_into_commas():
     keep = "a - b " + chr(0x2013) + " c"
     assert plain(keep) == keep  # hyphens and en dashes stay
     assert problems(plain(f"x {dash} y {bar} z")) == []
+
+
+# Every server module: its strings reach the page or the terminal.
+@pytest.mark.parametrize("path", sorted(APP_DIR.glob("*.py")), ids=lambda p: p.name)
+def test_app_modules_pass_copy_rules(path):
+    assert problems(path.read_text(encoding="utf-8")) == []
 
 
 def test_own_files_pass_copy_rules():

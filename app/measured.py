@@ -24,6 +24,8 @@ FILES_WATCHED = ["run_pipeline.py", "bridge_client.py", "analyst_bridge.cpp"]
 
 SKIPPED = {"__pycache__", ".DS_Store"}
 CACHE_CODE = ("model_cache.py", "prompt_cache.py")
+# What runs, renders and tokenizes the prompt; the cache gate needs the replay's versions of each.
+MODEL_LIBRARIES = ("mlx", "mlx-lm", "mlx-metal", "transformers", "tokenizers", "jinja2")
 
 
 # Whether the tested rates apply, and if not, why.
@@ -91,6 +93,17 @@ def mlx_versions() -> dict[str, str]:
         return {}
 
 
+# Each model library's installed version, by package name; None when it isn't installed.
+def library_versions() -> dict[str, str | None]:
+    found = {}
+    for name in MODEL_LIBRARIES:
+        try:
+            found[name] = metadata.version(name)
+        except metadata.PackageNotFoundError:
+            found[name] = None
+    return found
+
+
 # sha1 over model_cache.py's bytes, then prompt_cache.py's; a missing file adds nothing.
 def cache_code_sha1(app_dir: Path) -> str:
     digest = hashlib.sha1()
@@ -127,7 +140,7 @@ def check_lock(paths: AppPaths, measured: dict, model_config: dict | None, proof
 
 
 # Whether the cache may be on: a replay matched every test question on this setup.
-def cache_gate(paths: AppPaths, measured: dict, proof: dict | None, versions: dict, cache_code_sha1: str, model_config: dict | None) -> CacheGate:
+def cache_gate(paths: AppPaths, measured: dict, proof: dict | None, libraries: dict, cache_code_sha1: str, model_config: dict | None) -> CacheGate:
     if proof is None:
         return CacheGate(False, "the replay hasn't been run")
     if proof.get("differences") or proof.get("uncached_differences"):
@@ -136,8 +149,8 @@ def cache_gate(paths: AppPaths, measured: dict, proof: dict | None, versions: di
     questions = measured["rates"]["test_questions"]
     if proof.get("total") != questions or proof.get("identical") != proof.get("total"):
         return CacheGate(False, f"the replay didn't cover all {questions} test questions")
-    if proof.get("versions") != versions:
-        return CacheGate(False, "mlx changed since the replay")
+    if proof.get("library_versions") != libraries:
+        return CacheGate(False, "a model library changed since the replay")
     if proof.get("cache_code_sha1") != cache_code_sha1:
         return CacheGate(False, "the app's cache code changed since the replay")
     if proof.get("files") != file_hashes(paths) or model_config != _tested_model(measured):

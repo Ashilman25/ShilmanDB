@@ -337,3 +337,53 @@ def test_dense_bar_rows():
     assert re.search(r"const DENSE_FROM = 13;", chart)
     labels = _rule(_read(CSS), ".dense .row-labels span")
     assert "height: 16px" in labels and "line-height: 16px" in labels
+
+
+# In mlx mode the top bar shows the prompt cache: on, or off with its reason as visible text.
+def test_top_bar_draws_the_cache_state():
+    for path in (SOURCES / "topbar.ts", COMPILED / "topbar.js"):
+        code = _read(path)
+        assert re.search(r'mode [!=]== "mlx"', code) and "status.cache" in code, path.name
+        assert '"Prompt cache on"' in code and "`Prompt cache off: ${" in code, path.name
+
+
+# A dataset whose files are missing or failed to load is named as data; Engine is the bridge binary's.
+def test_top_bar_names_data_problems():
+    for path in (SOURCES / "topbar.ts", COMPILED / "topbar.js"):
+        code = _read(path)
+        assert '"Data missing"' in code and '"Data failed"' in code and '"Engine missing"' in code, path.name
+        assert '"Missing:"' in code, path.name  # the server's prefix for missing dataset files
+
+
+# Started with --no-model, the empty result points to the SQL runner, not to asking.
+def test_empty_hint_follows_the_model():
+    copy = _read(SOURCES / "copy.ts")
+    sql_hint = re.search(r'export const EMPTY_RESULT_SQL = "([^"]+)"', copy)
+    assert sql_hint and "plain English" not in sql_hint.group(1) and "SQL" in sql_hint.group(1)
+    for path in (SOURCES / "result.ts", COMPILED / "result.js"):
+        assert re.search(r'model\.state === "off" \? EMPTY_RESULT_SQL : EMPTY_RESULT', _read(path)), path.name
+
+
+# A call that never reaches the server rechecks the status, so the top bar says Not connected.
+def test_lost_server_rechecks_the_status():
+    for path in (SOURCES / "main.ts", COMPILED / "main.js"):
+        code = _read(path)
+        found = re.search(r"function noticeGone\(error[^)]*\)[^{]*\{(.*?)\n\}", code, re.DOTALL)
+        assert found and "status === 0" in found.group(1) and "loadStatus()" in found.group(1), path.name
+        assert code.count("noticeGone(error)") >= 5, path.name  # follow, start, stop, show more, history
+
+
+# The picked option of a normal switch: ink at 600 and an inset 1px muted ring, at least 3:1 on the
+# paper and the panel in both themes. Hover fills with the checked panel tone, never past it.
+def test_picked_switch_has_a_3_to_1_cue():
+    css = _read(CSS)
+    checked = _rule(css, ".seg input:checked + span")
+    assert "font-weight: 600" in checked and "box-shadow: inset 0 0 0 1px var(--muted)" in checked
+    assert "background: var(--panel)" in checked and "color: var(--ink)" in checked
+    assert "background: var(--panel)" in _rule(css, ".seg:not(.strong) input:hover + span")
+    strong = _rule(css, ".seg.strong input:checked + span")
+    assert "box-shadow: none" in strong and "background: var(--btnbg)" in strong
+    for block in (":root", ':root[data-theme="light"]'):
+        tokens = _tokens(_rule(css, block))
+        for ground in ("--paper", "--panel"):
+            assert _contrast(tokens["--muted"], tokens[ground]) >= 3.0, (block, ground)

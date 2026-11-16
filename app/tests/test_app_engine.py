@@ -33,6 +33,8 @@ LOADED = re.compile(r"Loaded in \d+\.\d s\.")
 NO_MEASURED = "measured.json is missing or can't be read"
 MODEL = {"path": "org/some-model-4bit", "revision": "abc123", "thinking": False, "max_tokens": 1024}
 VERSIONS = {"mlx": "0.30.0", "mlx_lm": "0.32.2"}
+LIBRARIES = {"mlx": "0.30.0", "mlx-lm": "0.32.2", "mlx-metal": "0.30.0", "transformers": "5.22.1",
+             "tokenizers": "0.23.3", "jinja2": "3.1.6"}
 WAIT_S = 10.0
 START_ERROR = "analyst_bridge failed to load tables.tsv (exit code 1); see bridge_tpch.log"
 
@@ -70,6 +72,7 @@ def tested(tmp_path):
 # A replay proof matching the tested setup.
 def _proof(p) -> dict:
     return {"identical": 300, "total": 300, "differences": [], "uncached_differences": [], "versions": dict(VERSIONS),
+            "library_versions": dict(LIBRARIES),
             "files": measured.file_hashes(p), "engine_src_sha1": measured.tree_sha1(p.src),
             "cache_code_sha1": measured.cache_code_sha1(p.app_dir)}
 
@@ -208,7 +211,7 @@ def test_recorded_model_replays_by_prompt_sha1(paths):
     first = shown["primary"]["attempts"][0]
     second = shown["rephrase"]["attempts"][0]
 
-    assert model.config_id == MODEL_ID
+    assert model.config_id == MODEL_ID  # from the records' model field
     assert model.generate(pr.build_sql_prompt(ctx.description, ctx.rules, ctx.examples, QUESTION)) == (first["raw"], first["seconds"])
     assert model.generate(pr.build_rephrase_prompt(QUESTION)) == (shown["rephrase"]["raw"], shown["rephrase"]["seconds"])
     assert model.generate(pr.build_sql_prompt(ctx.description, ctx.rules, ctx.examples, REPHRASED)) == (second["raw"], second["seconds"])
@@ -256,6 +259,16 @@ def test_recorded_model_pace_sleeps_recorded_seconds(tmp_path, monkeypatch):
     with pytest.raises(KeyError):
         RecordedModel(path, pace=True).generate("unknown")
     assert slept == [1.25]
+
+
+def test_recorded_model_id_from_the_records(tmp_path):
+    rephrase = {"prompt_sha1": None, "attempts": []}
+    other = _run_file(tmp_path, [{"primary": {"attempts": []}, "rephrase": rephrase},
+                                 {"model": "qwen36-35b", "primary": {"attempts": []}, "rephrase": rephrase}])
+    assert recorded_model.recorded_model_id(other) == "qwen36-35b"
+    assert RecordedModel(other).config_id == "qwen36-35b"
+    unnamed = _run_file(tmp_path, [{"primary": {"attempts": []}, "rephrase": rephrase}])
+    assert recorded_model.recorded_model_id(unnamed) is None and RecordedModel(unnamed).config_id is None
 
 
 def test_recorded_model_missing_file(tmp_path):
@@ -591,32 +604,104 @@ def test_engine_lock_and_cache_in_status(tested, engines):
     p, record = tested
     record["files"]["results/subset_rules.md"] = "0" * 40
     _write(p.measured, json.dumps(record))
-    engine = engines(p)
+    engine = engines(p, EngineOptions("mlx"))
 
     assert engine.status()["lock"] == {"holds": False, "reason": "subset_rules.md changed"}
     assert engine.status()["cache"] == {"on": False, "reason": "the replay hasn't been run"}
     assert engine.measured == record
 
 
-def test_engine_lock_holds_and_cache_on(tested, engines, monkeypatch):
+# The tested setup with a matching replay proof, the installed versions pinned to the proof's.
+@pytest.fixture
+def proven(tested, monkeypatch):
     p, record = tested
     monkeypatch.setattr(engine_mod, "mlx_versions", lambda: dict(VERSIONS))
+    monkeypatch.setattr(engine_mod, "library_versions", lambda: dict(LIBRARIES))
     _write(p.cache_proof, json.dumps(_proof(p)))
-    engine = engines(p)
+    return p, record
+
+
+# A FakeModel carrying the cached prefix lengths a CachedModel reports.
+def _cached_fake(tokens: dict) -> FakeModel:
+    fake = FakeModel({})
+    fake.cached_tokens = dict(tokens)
+    return fake
+
+
+def test_engine_lock_holds_and_cache_on(proven, engines):
+    p, _ = proven
+    engine = engines(p, EngineOptions("mlx"), model_factory=lambda: _cached_fake({"tpch": 4096}))
 
     assert engine.status()["lock"] == {"holds": True, "reason": None}
+    assert engine.status()["cache"] == {"on": True, "reason": "the replay matched 300 of 300"}  # while loading
+    engine.load_model()
     assert engine.status()["cache"] == {"on": True, "reason": "the replay matched 300 of 300"}
     assert engine.lock == measured.Lock(True, None) and engine.cache.on
 
 
-def test_engine_no_cache_flag(tested, engines, monkeypatch):
-    p, _ = tested
-    monkeypatch.setattr(engine_mod, "mlx_versions", lambda: dict(VERSIONS))
-    _write(p.cache_proof, json.dumps(_proof(p)))
-    engine = engines(p, EngineOptions("none", use_cache=False))
+# Only the live model with the gate on reports the cache on; every other mode says why it's off.
+@pytest.mark.parametrize("options, reason", [
+    (EngineOptions("none"), "the model is off"),
+    (EngineOptions("none", use_cache=False), "the model is off"),
+    (EngineOptions("mlx", use_cache=False), "cache turned off with --no-cache"),
+])
+def test_engine_cache_off_per_mode(proven, engines, options, reason):
+    p, _ = proven
+    engine = engines(p, options, model_factory=lambda: _cached_fake({"tpch": 4096}))
+    engine.load_model()
+    assert engine.cache.on is options.use_cache  # the gate itself
+    assert engine.status()["cache"] == {"on": False, "reason": reason}
 
-    assert engine.status()["lock"]["holds"] is True
-    assert engine.status()["cache"] == {"on": False, "reason": "cache turned off with --no-cache"}
+
+def test_engine_cache_off_in_recorded_mode(proven, engines, tmp_path):
+    p, _ = proven
+    run = _run_file(tmp_path, [{"model": MODEL_ID, "primary": {"attempts": []}, "rephrase": {"prompt_sha1": None, "attempts": []}}])
+    engine = engines(p, EngineOptions("recorded", recorded_run=run))
+    engine.load_model()
+    assert engine.cache.on
+    assert engine.status()["cache"] == {"on": False, "reason": "answers come from a recorded run"}
+    assert engine.status()["lock"] == {"holds": True, "reason": None}
+
+
+def test_engine_cache_off_when_the_gate_is(tested, engines):
+    p, _ = tested
+    engine = engines(p, EngineOptions("mlx"), model_factory=lambda: _cached_fake({"tpch": 4096}))
+    engine.load_model()
+    assert engine.status()["cache"] == {"on": False, "reason": "the replay hasn't been run"}
+
+
+def test_engine_cache_off_when_the_model_failed_or_cached_nothing(proven, engines):
+    p, _ = proven
+
+    def broken():
+        raise RuntimeError("no weights")
+
+    failed = engines(p, EngineOptions("mlx"), model_factory=broken)
+    failed.load_model()
+    assert failed.status()["cache"] == {"on": False, "reason": "the model didn't load"}
+
+    for model in (_cached_fake({}), _cached_fake({"tpch": 0}), FakeModel({})):
+        empty = engines(p, EngineOptions("mlx"), model_factory=lambda model=model: model)
+        empty.load_model()
+        assert empty.status()["cache"] == {"on": False, "reason": "no dataset's prompt start was cached"}
+
+
+def test_engine_recorded_run_of_another_model_breaks_the_lock(proven, engines, tmp_path):
+    p, _ = proven
+    record = {"model": "qwen36-35b", "primary": {"attempts": []}, "rephrase": {"prompt_sha1": None, "attempts": []}}
+    engine = engines(p, EngineOptions("recorded", recorded_run=_run_file(tmp_path, [record])))
+    assert engine.lock == measured.Lock(False, "answers come from a recorded run of qwen36-35b")
+    assert engine.status()["lock"] == {"holds": False, "reason": "answers come from a recorded run of qwen36-35b"}
+    engine.load_model()
+    assert engine.model.config_id == "qwen36-35b"
+
+
+def test_engine_recorded_run_of_the_tested_model_keeps_the_lock(proven, engines, fixture_paths):
+    p, _ = proven
+    engine = engines(p, EngineOptions("recorded", recorded_run=fixture_paths.run_file("dev")))
+    assert engine.lock == measured.Lock(True, None)
+    engine.load_model()
+    assert engine.model.config_id == MODEL_ID
 
 
 # A model_mlx.py that won't parse, has no MODEL_CONFIGS, or holds other settings; its hash is re-recorded,
@@ -651,7 +736,7 @@ def test_engine_lock_computed_once(tested, engines, monkeypatch):
 
 
 def test_engine_missing_measured_json(paths, engines):
-    engine = engines(paths)
+    engine = engines(paths, EngineOptions("mlx"))
     assert not paths.measured.exists()
     assert engine.measured == {}
     assert engine.status()["lock"] == {"holds": False, "reason": NO_MEASURED}
@@ -747,6 +832,13 @@ def test_engine_cached_model_skips_a_dataset_that_fails_to_load(swap, engines, m
     engine = engines(paths, EngineOptions("mlx"))
     engine.load_model()
     assert made[0].kind == "cached" and made[0].contexts == {}
+
+
+def test_default_model_factory_needs_paths_for_the_cache():
+    with pytest.raises(ValueError, match="needs paths"):
+        engine_mod.default_model_factory(EngineOptions("mlx"), None, cache_on=True)
+    assert engine_mod.default_model_factory(EngineOptions("mlx"), None, cache_on=False) is not None
+    assert engine_mod.default_model_factory(EngineOptions("none"), None, cache_on=True) is None
 
 
 def test_engine_recorded_mode_ignores_the_gate(swap, engines):

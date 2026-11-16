@@ -4,7 +4,22 @@ import { choice } from "./controls.js";
 import { CONNECTING, RATES_HIDDEN, SETUP_DIFFERS, TESTED_LINK } from "./copy.js";
 import { h, redraw } from "./dom.js";
 const QUIET_STATES = ["loading", "ready", "off"];
-// What's loaded, in words: the current dataset's engine, then the model.
+// The current dataset's state in words. Missing files or a failed load are the data's problem;
+// a missing dataset with only the build hint means the engine bridge isn't built.
+function datasetWords(info) {
+    if (info.state === "missing")
+        return info.detail.startsWith("Missing:") ? "Data missing" : "Engine missing";
+    if (info.state === "failed")
+        return "Data failed";
+    return `Engine ${info.state}`;
+}
+// The prompt cache, for the live model only: on, or off with the reason in plain sight.
+function cacheWords(status) {
+    if (status.model.mode !== "mlx")
+        return null;
+    return status.cache.on ? "Prompt cache on" : `Prompt cache off: ${status.cache.reason ?? "no reason given"}`;
+}
+// What's loaded, in words: the current dataset's engine, then the model and its prompt cache.
 function loaded(state) {
     if (state.statusError) {
         return h("span", { class: "loaded" }, h("span", { class: "state bad", attrs: { title: state.statusError } }, "Not connected"));
@@ -15,7 +30,8 @@ function loaded(state) {
     const engine = status.datasets[state.dataset];
     const model = status.model;
     const recorded = model.mode === "recorded" && model.state === "ready" ? " (recorded)" : "";
-    return h("span", { class: "loaded" }, engine ? h("span", { class: `state${QUIET_STATES.includes(engine.state) ? "" : " bad"}`, attrs: { title: engine.detail || null } }, `Engine ${engine.state}`) : null, h("span", { class: `state${QUIET_STATES.includes(model.state) ? "" : " bad"}`, attrs: { title: model.detail || null } }, `Model ${model.state}${recorded}`));
+    const cache = cacheWords(status);
+    return h("span", { class: "loaded" }, engine ? h("span", { class: `state${QUIET_STATES.includes(engine.state) ? "" : " bad"}`, attrs: { title: engine.detail || null } }, datasetWords(engine)) : null, h("span", { class: `state${QUIET_STATES.includes(model.state) ? "" : " bad"}`, attrs: { title: model.detail || null } }, `Model ${model.state}${recorded}`), cache ? h("span", { class: "state" }, cache) : null);
 }
 export function drawTop(root, state, actions) {
     const datasets = Object.entries(state.status?.datasets ?? {}).map(([value, info]) => ({ value, text: info.label }));

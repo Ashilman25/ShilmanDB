@@ -9,8 +9,11 @@ from app.prompt_cache import CHUNK, cache_len, dummy_prompts, encode, match, sha
 
 
 # A new prompt cache holding the prefix, prefilled in CHUNK pieces exactly as mlx_lm's generate_step does.
-# The prefix length is a whole number of chunks, so every piece is CHUNK tokens.
+# The prefix length must be a whole number of chunks, so every piece is CHUNK tokens.
 def fill_cache(model, prefix: list[int]) -> list:
+    if len(prefix) % CHUNK:
+        raise ValueError(f"the prefix must be a whole number of {CHUNK}-token chunks, got {len(prefix)} tokens")
+
     import mlx.core as mx
     from mlx_lm.generate import generation_stream, wired_limit
     from mlx_lm.models.cache import make_prompt_cache
