@@ -96,9 +96,23 @@ jobs:
           python -m venv .venv
           .venv/bin/pip install -r requirements.txt
 
-      # Tests that need Postgres, torch, faiss, LightGBM or MLX skip here
+      # The bench's tests and the app's; ones that need Postgres, torch, faiss, LightGBM or MLX skip here
       - name: Run Python tests
-        run: .venv/bin/python -m pytest bench -q -W error
+        run: .venv/bin/python -m pytest bench app -q -W error
+
+      # Node 24 (the current LTS line) runs tsc for the app's page
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: app/web/package-lock.json
+
+      # The committed JS in app/web/static/js must be exactly what the TypeScript builds to
+      - name: Build the app's page and check the committed JS
+        run: |
+          npm ci --prefix app/web
+          npm run --prefix app/web build
+          git diff --exit-code -- app/web/static/js && test -z "$(git status --porcelain -- app/web/static/js)"
 
   # The Debug job on Linux
   linux-debug:

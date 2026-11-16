@@ -1,0 +1,48 @@
+{
+  "files": {
+    "code/prompts.py": "92106d14185b537b7aa34d3f5aa7631d6d698e87",
+    "code/prompt_examples.json": "260ca1388bb8d849b1d4c2046ee07e6da730473a",
+    "code/sql_facts.py": "20929d48d6f8e0c85780cca54e66e969138fa12a",
+    "code/checks.py": "c25148dc366d50b12de3e497c48294be1a56f32b",
+    "code/scoring.py": "4b0f6667428d08ffd7a21803be14e41c3a5aeb4d",
+    "code/an_common.py": "463c09be1558b5dfdfca7d44c8ec96ebb2eb9552",
+    "code/describe_datasets.py": "cf754ec863925fc76fedb97bdad1b08c542682a9",
+    "code/model_mlx.py": "fd9508347b917ae0027aa17fdc6feacdc01827f1",
+    "code/datasets/tpch.json": "2750ac4bea213a57b697cc0527657abb4029ccb0",
+    "code/datasets/reviews.json": "2b344aee49c2fbba39a392bb83c64f66356c7073",
+    "results/datasets/tpch/description.md": "53a9013b944f22d0d2e5d5ba38af859a2a57a29a",
+    "results/datasets/reviews/description.md": "04ea92f407f856e562319ea8239ac85afe01b163",
+    "results/datasets/tpch/manifest.json": "ce113cf0e3a9bcfa022c84de8992236229b9df26",
+    "results/datasets/reviews/manifest.json": "67eec7e67868f29b6992c13a4f16e5fa542fc519",
+    "results/subset_rules.md": "cb9e1d7a5bad2a210dbc2389f05b5d71de9a8433",
+    "code/run_pipeline.py": "35f0ccb11e7218ac963382f8a4309e406786d777",
+    "code/bridge_client.py": "437f2813ce048e1ed2502a5f5fff82bb969e87a4",
+    "code/analyst_bridge.cpp": "918369ce4ee58489a247de1af1f0c00461f0613b"
+  },
+  "engine_src_sha1": "87fa707c9bb08619922af662f103894458cc36b5",
+  "model": {
+    "path": "mlx-community/gemma-4-26b-a4b-it-4bit",
+    "revision": "0d77464eeb233a2da68ebf9d7dc4edaac7db956d",
+    "thinking": false,
+    "max_tokens": 1024,
+    "id": "gemma4-26b"
+  },
+  "rates": {
+    "test_questions": 300,
+    "model_right": 252,
+    "shown_right": 227,
+    "shown_wrong": 35,
+    "caught": 20,
+    "refused_right": 0,
+    "warned_right": 18,
+    "second_catches": 15,
+    "second_alone": 15,
+    "engine_alone": 5,
+    "without_terms": 17,
+    "topn_caught": 6,
+    "topn_wrong": 13,
+    "median_s": 5.3,
+    "p90_s": 7.6
+  },
+  "source": "docs/research.md"
+}

@@ -6,7 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 Every number below is a result of the project's own runs (*measured*), recorded when the pull request merged.
 
-## [0.1.0] - unreleased
+## [Unreleased]
+
+### App
+
+- A first slice of the app in `app/`, started with `.venv-ai/bin/python -m app`: one local Python process, serving on `127.0.0.1` only, holds the engine (through the analyst check's bridge) and the local model (`gemma4-26b` through MLX), with a TypeScript page and no framework.
+- A SQL runner that checks typed SQL for the engine's known traps before it runs, and the AI analyst: the first answer at once, then the second phrasing and the verdict beside it, on the built-in TPC-H and product-review data.
+- A screen laid out like a database tool: a schema sidebar with row counts, columns, types and keys; a tab per table with a data grid and column notes; a Query tab with SQL highlighting and completion, a results grid and chart, and a Checks inspector; a status bar.
+- The analyst check's rates are shown only while the tested setup holds (its files, the model settings and today's engine); re-asked questions say they aren't part of the test, and typed or edited SQL shows no rates.
+- A prompt cache, on only while a replay proves it changes nothing: the replay matched all 300 test answers in each of two runs, and the median wait fell from 2.51 to 1.50-1.62 s for the first answer and from 5.29 to 3.32-3.52 s for the verdict (*measured*).
+- 388 tests for the app, run in CI with the bench tests (`pytest bench app`); no test loads the model.
+- The app's files are organized into folders (`core/`, `model/`, `answers/`, `server/`, `web/`); the commands are unchanged.
+
+## [0.1.0] - 2026-11-15
 
 ### I/O fix
 

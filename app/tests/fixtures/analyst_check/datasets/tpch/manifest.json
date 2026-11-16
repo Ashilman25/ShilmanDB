@@ -1,0 +1,47 @@
+{
+  "dataset": "tpch",
+  "tables": [
+    {
+      "name": "region",
+      "file": "region.tbl",
+      "rows": 5,
+      "columns": [
+        {
+          "name": "r_regionkey",
+          "type": "BIGINT"
+        },
+        {
+          "name": "r_name",
+          "type": "VARCHAR"
+        },
+        {
+          "name": "r_comment",
+          "type": "VARCHAR"
+        }
+      ]
+    },
+    {
+      "name": "nation",
+      "file": "nation.tbl",
+      "rows": 25,
+      "columns": [
+        {
+          "name": "n_nationkey",
+          "type": "BIGINT"
+        },
+        {
+          "name": "n_name",
+          "type": "VARCHAR"
+        },
+        {
+          "name": "n_regionkey",
+          "type": "BIGINT"
+        },
+        {
+          "name": "n_comment",
+          "type": "VARCHAR"
+        }
+      ]
+    }
+  ]
+}

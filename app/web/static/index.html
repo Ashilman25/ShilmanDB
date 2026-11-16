@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>ShilmanDB</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/static/app.css">
+<script type="module" src="/static/js/main.js"></script>
+</head>
+<body>
+<header class="top" id="top"></header>
+<section class="tested-panel" id="tested" role="dialog" aria-labelledby="tested-title" tabindex="-1" hidden></section>
+<div class="app">
+  <nav class="sidebar" id="sidebar" aria-label="Tables and history"></nav>
+  <main class="work">
+    <div class="tabs" id="tabs" role="tablist" aria-label="Open tabs"></div>
+    <div class="panes">
+      <section class="pane query" id="query-pane" role="tabpanel" aria-labelledby="tab-query">
+        <div class="pane-main">
+          <div class="editor">
+            <div class="editor-bar">
+              <div class="slot" id="mode"></div>
+              <div class="slot" id="db"></div>
+              <div class="slot end" id="action"></div>
+            </div>
+            <div class="editor-field">
+              <input class="field-line" id="question" type="text" aria-label="Question" autocomplete="off">
+              <div class="sql-box" id="sql-box" hidden>
+                <div class="code-lines" id="code-lines" aria-hidden="true"></div>
+                <textarea class="field-sql" id="sql" aria-label="SQL" rows="6"
+                          spellcheck="false" autocapitalize="off" autocorrect="off" autocomplete="off"
+                          data-gramm="false" data-gramm_editor="false" data-enable-grammarly="false"></textarea>
+              </div>
+            </div>
+            <div class="under" id="under"></div>
+          </div>
+          <div class="splitter" id="splitter" role="separator" aria-orientation="horizontal" aria-label="Editor height"
+               aria-controls="sql" tabindex="0" hidden></div>
+          <section class="results" id="result" aria-label="Result"></section>
+        </div>
+        <aside class="inspector" id="evidence" aria-label="Checks"></aside>
+      </section>
+      <section class="pane table-pane" id="table-pane" role="tabpanel" hidden></section>
+    </div>
+  </main>
+</div>
+<footer class="statusbar" id="statusbar"></footer>
+<p class="sr" id="announce" aria-live="polite"></p>
+<noscript><p class="noscript">This page needs JavaScript to run.</p></noscript>
+</body>
+</html>

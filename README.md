@@ -11,7 +11,7 @@ Numbers on this page are marked by how we know them: *measured* (we ran it), *fr
 
 **Today** ShilmanDB is a single-threaded row store. It runs 8 of the 22 TPC-H queries (8 *measured*; TPC-H has 22, *from docs*), and it has been measured on one Mac at SF=1 against SQLite, DuckDB and Postgres, and at SF=10 against DuckDB and Postgres. Every layer is written here, from page I/O up: a buffer pool, B+tree indexes, a hand-written SQL parser, a cost-based planner, and an executor that runs one row at a time, with a vectorized path that runs scans, filters, projections and aggregates a batch of rows at a time.
 
-**What it is becoming (in progress; none of this is built yet):**
+**What it is becoming (in progress; only a first slice of the app is built so far):**
 
 - A columnar, parallel engine.
 - One engine with two ways in: an app with a SQL runner and an AI analyst whose answers the database checks, and the Postgres protocol, so Postgres tools can connect to it.
@@ -69,8 +69,8 @@ Every table at SF=1 and SF=10, every config of all four engines, the indexes and
 
 Three tracks, in plain words. Step labels (such as 14a) are the names the code history uses.
 
-- **Docs** (now): this README, the baseline above, CI and the GitHub page.
-- **App:** next, a first slice of the app: a SQL runner and the AI analyst on the built-in TPC-H data (6e-1). Later the app on your own CSV and Postgres data (6e-2), a second measured check of the analyst (6d-2), and packaging as GitHub Releases and a Homebrew tap (6e-3).
+- **Docs** (done, release `v0.1.0`): this README, the baseline above, CI and the GitHub page.
+- **App:** a first slice of the app is built: a SQL runner and the AI analyst on the built-in data (6e-1, [below](#the-app)). Later the app on your own CSV and Postgres data (6e-2), a second measured check of the analyst (6d-2), and packaging as GitHub Releases and a Homebrew tap (6e-3).
 - **Engine:** first the columnar core: the file format (14a), the parallel vectorized executor (14b), out-of-core execution (14c), then the switch-over once TPC-H answers match on it (14d). Then NULLs and a real `LEFT JOIN` (8b), Postgres's SQL and all 22 TPC-H queries (step 12), writes and keys (8c), importing from Postgres and CSV (10a), the Postgres wire server (9a-9d), crash safety and many users (8d, 13a-13b), and Linux, Docker and SF=1000 (10d).
 
 Every engine step keeps TPC-H answers matching the reference and measures its speed changes. From 14b on, each one also reports its ratios to DuckDB and Postgres.
@@ -84,12 +84,27 @@ ShilmanDB has two learned components, a join order model and an eviction policy 
 - **The best classical eviction policy** misses 1.07-1.50× what Belady (the best possible, which needs to know the future) would, on the four pool-size and workload cells that matter at SF=1.0. That is the room a learned policy would have to win in.
 - **Both learned components stay in the code, off by default.** They build only with LibTorch (`-DSHILMANDB_ENABLE_ML=ON`) and run only when asked for.
 
-**The AI-analyst check: GO.** A local model (`gemma4-26b`, run on the Mac through MLX) turns plain-English questions into SQL, and ShilmanDB runs it. The check then tested each answer, by asking the question a second way and with evidence only the database has (such as the rows each step of the plan kept), and warned or refused when something looked wrong. The app that would show this to users is in progress. On 300 test questions, written by separate AI writers that never saw the checks, with the bars fixed before any model answered a test question:
+**The AI-analyst check: GO.** A local model (`gemma4-26b`, run on the Mac through MLX) turns plain-English questions into SQL, and ShilmanDB runs it. The check then tested each answer, by asking the question a second way and with evidence only the database has (such as the rows each step of the plan kept), and warned or refused when something looked wrong. The app now shows these checks beside each answer ([below](#the-app)). On 300 test questions, written by separate AI writers that never saw the checks, with the bars fixed before any model answered a test question:
 
 - 20 of 35 silent wrong answers were warned (0.571; the bar was at least 0.50).
 - 0 of 227 right answers were refused, and 18 of 227 were warned (0.079).
 
 Said honestly, the GO is mostly "ask twice": the check that asks the question a second way and compares the answers makes 15 of the 20 catches. Without it, the other checks catch 9 of 35, which would fail the catch bar. The engine's own checks (engine traps, empty input, fan-out, grain) catch 5 of 35 on their own, but only 2 that the second phrasing and the terms check both missed. The margin is thin: at 17 of 35 the bar fails.
+
+## The app
+
+A first slice of the app runs on the Mac today: a SQL runner and the AI analyst on the built-in data (TPC-H at SF=0.1 and a set of product reviews). One local Python process holds the engine and the model and serves a page on `127.0.0.1` only, so nothing goes to the internet. The screen is laid out like a database tool: the tables and their columns on the left, a tab per table with its rows, and a Query tab where you ask in plain English or type SQL. Typed SQL is checked for the engine's known traps before it runs. A question goes through the same model and checks as the test above, and the verdict lands beside the answer.
+
+The test's rates belong to the setup that was tested: that model, those files and today's engine. The app shows them only while all of that still matches. A question re-asked with a different reading of a term says it isn't part of the test, and SQL you type or edit shows no rates at all. When the columnar core changes the engine, the rates hide until the test is rerun on it.
+
+A prompt cache keeps the model's state after the long start every prompt shares. A replay of the 300 test questions with the cache gave the same output on all 300, so the cache could be turned on: the median wait for the first answer went from 2.51 to 1.50-1.62 s, and for the verdict from 5.29 to 3.32-3.52 s, over two replays (*measured*). The cache is on only while that replay's proof matches the cache code, the analyst check's tested files, the model settings, the model's libraries and the engine; after a change to any of them it stays off until the replay runs again.
+
+```bash
+cmake --build build --target analyst_bridge   # the engine bridge, from the Release build below
+.venv-ai/bin/python -m app                      # prints a link and opens the browser
+```
+
+It needs the analyst check's dataset files, a `.venv-ai` with MLX and the model in the Hugging Face cache, and about 16 GB of free memory (*inferred* from the model's peak). `--no-model` runs the SQL runner alone. The flags, the files and how to rebuild the page are in [app/README.md](app/README.md).
 
 ## How it's built
 

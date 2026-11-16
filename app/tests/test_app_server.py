@@ -1,0 +1,1139 @@
+"""Tests for app/server/server.py and app/__main__.py."""
+from __future__ import annotations
+
+import contextlib
+import http.client
+import json
+import os
+import re
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+from dataclasses import dataclass, replace
+from pathlib import Path
+from urllib.parse import quote
+
+import pytest
+
+from app import __main__ as app_main
+from app.__main__ import main, pick_port
+from app.core import analyst_check, schema
+from app.core.datasets import DATASETS, default_paths, load_dataset, missing_files
+from app.core.engine import Engine, EngineOptions
+from app.core.measured import Lock, read_json
+# check_views is reached as a module: pytest collects any test* name imported into a test module.
+from app.server import check_views, copy_rules
+from app.server.jobs import SNAPSHOT_KEYS, JobRunner
+from app.server.server import MAX_BODY, make_server
+from app.tests.fakes import FakeBridge, FakeModel, bridge_error, bridge_ok
+from app.tests.test_app_flows import LEFT_SQL, QUESTION, REPLIES, script
+
+an, pr = analyst_check.an, analyst_check.pr
+
+WAIT_S = 10.0
+CLIENT_TIMEOUT_S = 30.0  # above the server's 20 s long poll, so only a real hang times out
+TOKEN = "0123456789abcdef0123456789abcdef"
+APP_DIR = Path(__file__).resolve().parents[1]
+EXAMPLES = json.loads((APP_DIR / "server/examples.json").read_text(encoding="utf-8"))
+RATES = read_json(APP_DIR / "core/measured.json")["rates"]
+ENDED = ("done", "stopped", "error")
+
+TYPED = "SELECT n_name FROM nation WHERE n_regionkey = 1"
+AMERICAS = ["ARGENTINA", "BRAZIL", "CANADA", "PERU", "UNITED STATES"]
+SERVER_REPLIES = {**REPLIES, TYPED: bridge_ok([("n_name", "VARCHAR")], [[n] for n in AMERICAS])}
+
+DEV_QUESTIONS = Path("bench/results/analyst_check/questions.jsonl")
+DEV_RUN = Path("bench/results/analyst_check/runs/dev_gemma4-26b.jsonl")
+CSP = ("default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; "
+       "base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
+SECURITY_HEADERS = {"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer",
+                    "Content-Security-Policy": CSP}
+
+
+# One HTTP response, read in full.
+@dataclass
+class Reply:
+    status: int
+    headers: object  # http.client.HTTPMessage: case-insensitive get
+    body: bytes
+
+    def json(self):
+        return json.loads(self.body)
+
+    # The error message, which must pass the copy rules like every string the server sends.
+    def error(self) -> str:
+        message = self.json()["error"]
+        assert copy_rules.problems(message) == []
+        return message
+
+
+# Talks to one server as the page would: the cookie on every call, the page's Origin on writes.
+class Client:
+    def __init__(self, port: int, token: str = TOKEN):
+        self.port = port
+        self.cookie = f"shilmandb_token_{port}={token}"
+        self.origin = f"http://127.0.0.1:{port}"
+
+    def send(self, method: str, path: str, body=None, headers=None, cookie=True, origin=True) -> Reply:
+        sent = {}
+        if cookie:
+            sent["Cookie"] = self.cookie if cookie is True else cookie
+        if method == "POST" and origin:
+            sent["Origin"] = self.origin if origin is True else origin
+        sent.update(headers or {})
+        data = json.dumps(body).encode() if isinstance(body, (dict, list)) else body
+
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=CLIENT_TIMEOUT_S)
+        try:
+            conn.request(method, path, body=data, headers=sent)
+            resp = conn.getresponse()
+            try:
+                return Reply(resp.status, resp.headers, resp.read())
+            finally:
+                resp.close()
+        finally:
+            conn.close()
+
+    def get(self, path: str, **kw) -> Reply:
+        return self.send("GET", path, **kw)
+
+    def post(self, path: str, body=None, **kw) -> Reply:
+        return self.send("POST", path, body, **kw)
+
+    # A POST sent header by header, so the test picks the Content-Length (or leaves it out) and sends no body.
+    def bare_post(self, path: str, length: str | None) -> Reply:
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=CLIENT_TIMEOUT_S)
+        try:
+            conn.putrequest("POST", path)
+            conn.putheader("Cookie", self.cookie)
+            conn.putheader("Origin", self.origin)
+            if length is not None:
+                conn.putheader("Content-Length", length)
+            conn.endheaders()
+            resp = conn.getresponse()
+            try:
+                return Reply(resp.status, resp.headers, resp.read())
+            finally:
+                resp.close()
+        finally:
+            conn.close()
+
+    # Waits for a job to end over the long poll and returns its last snapshot.
+    def finish(self, job_id: str) -> dict:
+        deadline = time.monotonic() + WAIT_S
+        snapshot = self.get(f"/api/jobs/{job_id}").json()
+        while snapshot["stage"] not in ENDED:
+            assert time.monotonic() < deadline, f"job {job_id} stuck at {snapshot['stage']}"
+            snapshot = self.get(f"/api/jobs/{job_id}?after={snapshot['version']}").json()
+        return snapshot
+
+
+# One running app for a test: the client and what's behind it.
+@dataclass
+class App:
+    client: Client
+    runner: JobRunner
+    engine: object
+    port: int
+
+
+# An engine stand-in for the status route, with a lock that holds or not.
+class StubEngine:
+    def __init__(self, holds: bool):
+        self.lock = Lock(holds, None if holds else "a file changed")
+        self.measured = {"rates": RATES}
+
+    def status(self) -> dict:
+        return {"datasets": {}, "model": {"state": "off", "mode": "none", "detail": ""},
+                "lock": {"holds": self.lock.holds, "reason": self.lock.reason}, "cache": {"on": False, "reason": "off"}}
+
+    def load_model(self) -> None:
+        pass
+
+    def begin_quit(self) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+
+# Fixture paths with an empty app folder, so the engine finds no measured.json and hashes nothing.
+@pytest.fixture
+def paths(fixture_paths, tmp_path):
+    return replace(fixture_paths, app_dir=tmp_path / "app", src=tmp_path / "src")
+
+
+# Waits until the model has loaded, or failed to.
+def wait_model(engine) -> None:
+    deadline = time.monotonic() + WAIT_S
+    while engine.status()["model"]["state"] == "loading":
+        assert time.monotonic() < deadline, "the model never loaded"
+        time.sleep(0.001)
+
+
+# Starts servers over a runner and an engine with fake bridges (and a fake model when given), on free ports.
+# Each is shut down in the app's own order at the end: server, runner, engine.
+@pytest.fixture
+def start(paths):
+    made = []
+
+    def make(model=None, *, engine=None, static_dir=None) -> App:
+        if engine is None:
+            factory = (lambda: model) if model is not None else None
+            engine = Engine(paths, EngineOptions("mlx" if model is not None else "none"),
+                            bridge_factory=lambda name, tsv: FakeBridge(dict(SERVER_REPLIES)), model_factory=factory)
+            engine.start_bridges()
+            assert engine.wait_bridges(WAIT_S)
+        runner = JobRunner(engine)
+        runner.start()
+        server = make_server(runner, engine, TOKEN, 0, static_dir or APP_DIR / "web/static", EXAMPLES)
+        # A short poll interval, so shutdown at the end doesn't wait the default half second.
+        thread = threading.Thread(target=server.serve_forever, args=(0.01,), name="test-http", daemon=True)
+        thread.start()
+        made.append((server, thread, runner, engine))
+        if model is not None:
+            wait_model(engine)
+        return App(Client(server.server_port), runner, engine, server.server_port)
+
+    yield make
+    for server, thread, runner, engine in made:
+        server.shutdown()
+        server.server_close()
+        thread.join(WAIT_S)
+        runner.shutdown()
+        engine.close()
+
+
+# A port nothing listens on right now.
+def free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+# A socket listening on a port below the top of the range, so the next 20 ports exist.
+@contextlib.contextmanager
+def listening():
+    while True:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.bind(("127.0.0.1", 0))
+        if s.getsockname()[1] < 65000:
+            break
+        s.close()
+    try:
+        s.listen(1)
+        yield s.getsockname()[1]
+    finally:
+        s.close()
+
+
+def test_page_needs_token(start, capsys):
+    app = start()
+    c = app.client
+
+    page = c.get("/", cookie=False)
+    assert page.status == 403
+    assert page.headers["Content-Type"] == "text/html; charset=utf-8"
+    assert "Open the link the app printed." in page.body.decode()
+
+    login = c.get(f"/?token={TOKEN}", cookie=False)
+    assert login.status == 303
+    assert login.headers["Location"] == "/"
+    assert login.headers["Set-Cookie"] == f"shilmandb_token_{app.port}={TOKEN}; HttpOnly; SameSite=Strict; Path=/"
+
+    home = c.get("/", cookie=login.headers["Set-Cookie"].split(";")[0])
+    assert home.status == 200
+    assert home.headers["Content-Type"] == "text/html; charset=utf-8"
+    assert home.body.decode().lstrip().lower().startswith("<!doctype html>")
+
+    for reply in (page, login, home):
+        for name, value in SECURITY_HEADERS.items():
+            assert reply.headers[name] == value
+    assert TOKEN not in capsys.readouterr().err  # no request log line, which would print the token
+
+
+def test_wrong_token_gets_403_page(start):
+    c = start().client
+    wrong = c.get("/?token=" + "f" * 32, cookie=False)
+    assert wrong.status == 403
+    assert wrong.headers["Set-Cookie"] is None
+    assert "Open the link the app printed." in wrong.body.decode()
+    assert c.get("/?token=", cookie=False).status == 403
+
+
+def test_cookie_named_for_the_port(start):
+    app = start()
+    c = app.client
+    assert c.get("/api/status").status == 200
+    assert c.get("/api/status", cookie=f"other=1; shilmandb_token_{app.port}={TOKEN}").status == 200
+
+    for cookie in (False, f"shilmandb_token={TOKEN}", f"shilmandb_token_{app.port + 1}={TOKEN}",
+                   f"shilmandb_token_{app.port}={TOKEN[:-1]}0", f"shilmandb_token_{app.port}="):
+        refused = c.get("/api/status", cookie=cookie)
+        assert refused.status == 403
+        assert refused.error() == "Open the link the app printed."
+    assert c.get("/static/index.html", cookie=False).status == 403
+    assert c.get("/api/nowhere", cookie=False).status == 403  # even a 404 needs the cookie
+
+
+def test_bad_host_rejected(start):
+    app = start()
+    c = app.client
+    for host in (f"evil.example:{app.port}", f"127.0.0.1:{app.port + 1}", "127.0.0.1", f"LOCALHOST.:{app.port}"):
+        refused = c.get("/api/status", headers={"Host": host})
+        assert refused.status == 403, host
+        assert refused.error() == "This address isn't the app's. Open the link the app printed."
+    assert c.get(f"/?token={TOKEN}", cookie=False, headers={"Host": f"evil.example:{app.port}"}).status == 403
+    assert c.get("/api/status", headers={"Host": f"localhost:{app.port}"}).status == 200
+
+
+def test_post_needs_same_origin(start):
+    app = start()
+    c = app.client
+    body = {"dataset": "tpch", "sql": TYPED}
+    for origin in ("http://evil.example", f"http://127.0.0.1:{app.port + 1}", f"https://127.0.0.1:{app.port}", "null"):
+        refused = c.post("/api/sql", body, origin=origin)
+        assert refused.status == 403, origin
+        assert refused.error() == "Writes must come from the app's own page."
+    assert c.post("/api/sql", body, origin=False).status == 403
+
+    ok = c.post("/api/sql", body, origin=f"http://localhost:{app.port}")
+    assert ok.status == 200
+    c.finish(ok.json()["id"])
+
+
+def test_post_body_rules(start):
+    c = start().client
+    assert c.post("/api/sql", b"{nope").error() == "The request wasn't valid JSON."
+    assert c.post("/api/sql", b"\xff\xfe\x00").error() == "The request wasn't valid JSON."
+    assert c.post("/api/sql", [1, 2]).error() == "The request must be a JSON object."
+
+    missing = c.post("/api/sql", {"dataset": "tpch"})
+    assert (missing.status, missing.error()) == (400, 'The request needs "sql" as text.')
+    wrong = c.post("/api/sql", {"dataset": 1, "sql": TYPED})
+    assert (wrong.status, wrong.error()) == (400, 'The request needs "dataset" as text.')
+    assert c.post("/api/sql", {"dataset": "tpch", "sql": TYPED, "from_job": 3}).error() == \
+        'The request needs "from_job" as text.'
+
+    too_big = c.bare_post("/api/sql", str(MAX_BODY + 1))
+    assert (too_big.status, too_big.error()) == (413, "The request is larger than 1 MB.")
+    no_length = c.bare_post("/api/sql", None)
+    assert (no_length.status, no_length.error()) == (400, "The request needs a Content-Length header.")
+    assert c.bare_post("/api/sql", "lots").status == 400
+
+
+def test_unknown_route_and_wrong_method(start):
+    c = start().client
+    missing = c.get("/api/nowhere")
+    assert (missing.status, missing.error()) == (404, "Not found.")
+    assert c.get("/nowhere").status == 404
+
+    for method, path in (("GET", "/api/ask"), ("POST", "/api/status"), ("PUT", "/api/history"),
+                         ("DELETE", "/api/jobs/1"), ("GET", "/api/jobs/1/stop")):
+        wrong = c.send(method, path)
+        assert (wrong.status, wrong.error()) == (405, "Method not allowed."), (method, path)
+        for name, value in SECURITY_HEADERS.items():
+            assert wrong.headers[name] == value
+
+
+def test_static_module_served_and_contained(start, tmp_path):
+    static = tmp_path / "static"
+    (static / "js").mkdir(parents=True)
+    (static / "index.html").write_text("<!doctype html>\n<title>Test</title>\n", encoding="utf-8")
+    (static / "js" / "x.js").write_text("export const x = 1;\n", encoding="utf-8")
+    (static / "app.css").write_text("body { margin: 0; }\n", encoding="utf-8")
+    (tmp_path / "server.py").write_text("SECRET = 1\n", encoding="utf-8")  # a real file just outside
+    c = start(static_dir=static).client
+
+    module = c.get("/static/js/x.js")
+    assert (module.status, module.headers["Content-Type"]) == (200, "text/javascript; charset=utf-8")
+    assert module.body == b"export const x = 1;\n"
+    css = c.get("/static/app.css")
+    assert (css.status, css.headers["Content-Type"]) == (200, "text/css; charset=utf-8")
+    assert c.get("/").body == b"<!doctype html>\n<title>Test</title>\n"
+
+    for path in ("/static/../server.py", "/static/js/../../server.py", "/static/%2e%2e/server.py",
+                 "/static/js/%2E%2E/%2E%2E/server.py", "/static//etc/hosts", "/static/js", "/static/",
+                 "/static/missing.js", "/static/js/x.js%00.css"):
+        assert c.get(path).status == 404, path
+    assert c.get("/static/js/x.js", cookie=False).status == 403
+
+
+# The raw bytes the server answers to bytes sent on a fresh socket, read until it closes.
+def raw(port: int, data: bytes) -> bytes:
+    with socket.create_connection(("127.0.0.1", port), timeout=CLIENT_TIMEOUT_S) as s:
+        s.sendall(data)
+        chunks = []
+        while chunk := s.recv(65536):
+            chunks.append(chunk)
+    return b"".join(chunks)
+
+
+# Request lines no browser sends: HTTP/0.9, and a URL that won't split. Each gets a plain 400, no traceback.
+@pytest.mark.parametrize("line", [b"GET /\r\n", b"GET /api/status\r\n", b"GET http://[ HTTP/1.0\r\n\r\n",
+                                  b"GET http://[::1/api/status HTTP/1.0\r\n\r\n"])
+def test_malformed_request_lines_get_400(start, capsys, line):
+    app = start()
+    answer = raw(app.port, line)
+    assert answer.startswith(b"HTTP/1.0 400 "), answer[:80]
+    assert b"Traceback" not in answer and "Traceback" not in capsys.readouterr().err
+    assert app.client.get("/api/status").status == 200  # the server carries on
+
+
+# A static name too long for the file system: Python 3.13's is_file raises instead of saying no.
+def test_static_name_too_long_is_404(start, capsys, monkeypatch):
+    real = Path.is_file
+
+    def is_file(self):
+        if len(self.name) > 255:
+            raise OSError(63, "File name too long")
+        return real(self)
+
+    monkeypatch.setattr(Path, "is_file", is_file)
+    c = start().client
+    for path in ("/static/" + "a" * 300, "/static/js/" + "b" * 300 + ".js"):
+        found = c.get(path)
+        assert (found.status, found.body.count(b"Not found.")) == (404, 1), path
+    assert "Traceback" not in capsys.readouterr().err
+
+
+def test_lone_surrogate_text_refused(start):
+    c = start().client
+    message = "The text has a character the app can't send. Retype it and try again."
+    for route, field in (("/api/sql", "sql"), ("/api/ask", "question")):
+        body = ('{"dataset": "tpch", "%s": "SELECT \\ud800 FROM nation"}' % field).encode()
+        refused = c.post(route, body, headers={"Content-Type": "application/json"})
+        assert (refused.status, refused.error()) == (400, message), route
+
+
+def test_ask_round_trip(start):
+    app = start(FakeModel(script()))
+    c = app.client
+    queued = c.post("/api/ask", {"dataset": "tpch", "question": QUESTION})
+    assert queued.status == 200
+    assert queued.headers["Content-Type"] == "application/json; charset=utf-8"
+    for name, value in SECURITY_HEADERS.items():
+        assert queued.headers[name] == value
+    first = queued.json()
+    assert (first["kind"], first["text"], first["stage"]) == ("ask", QUESTION, "queued")
+
+    snapshot = first
+    deadline = time.monotonic() + WAIT_S
+    while snapshot["stage"] != "done":
+        assert time.monotonic() < deadline, f"stuck at {snapshot['stage']}"
+        newer = c.get(f"/api/jobs/{first['id']}?after={snapshot['version']}")
+        assert newer.status == 200
+        assert newer.json()["version"] > snapshot["version"]  # the long poll skips to the newest snapshot
+        snapshot = newer.json()
+
+    assert tuple(snapshot) == SNAPSHOT_KEYS
+    assert snapshot["first"]["row_count"] == 5
+    assert c.get(f"/api/jobs/{first['id']}").json() == snapshot  # after defaults to -1: at once
+
+    assert c.get("/api/jobs/999").status == 404
+    assert c.get("/api/jobs/999").error() == "Job not found."
+    for bad in ("1.5", "x", ""):
+        refused = c.get(f"/api/jobs/{first['id']}?after={bad}")
+        assert (refused.status, refused.error()) == (400, '"after" must be a whole number.')
+
+
+def test_long_poll_returns_on_change(start):
+    gate = threading.Event()
+    model = FakeModel(script(), gate=gate)
+    c = start(model).client
+    job_id = c.post("/api/ask", {"dataset": "tpch", "question": QUESTION}).json()["id"]
+    got = {}
+
+    def poll(after: int) -> None:
+        got["reply"] = c.get(f"/api/jobs/{job_id}?after={after}")
+        got["at"] = time.monotonic()
+
+    try:
+        assert model.called.wait(WAIT_S)
+        current = c.get(f"/api/jobs/{job_id}").json()
+        assert current["stage"] == "writing"
+        poller = threading.Thread(target=poll, args=(current["version"],), daemon=True)
+        poller.start()
+        time.sleep(0.2)
+        assert poller.is_alive()  # it waits for the next change
+        opened = time.monotonic()
+        gate.set()
+        poller.join(WAIT_S)
+    finally:
+        gate.set()
+
+    assert not poller.is_alive()
+    assert got["at"] - opened < 1.0
+    assert got["reply"].json()["version"] > current["version"]
+    c.finish(job_id)
+
+
+def test_empty_and_too_long_rejected(start):
+    c = start().client
+    for text in ("", "   ", "\n\t "):
+        refused = c.post("/api/ask", {"dataset": "tpch", "question": text})
+        assert (refused.status, refused.error()) == (400, "Type a question first.")
+        refused = c.post("/api/sql", {"dataset": "tpch", "sql": text})
+        assert (refused.status, refused.error()) == (400, "Type some SQL first.")
+
+    long_question = c.post("/api/ask", {"dataset": "tpch", "question": "x" * 2001})
+    assert (long_question.status, long_question.error()) == (400, "Questions are limited to 2,000 characters.")
+    long_sql = c.post("/api/sql", {"dataset": "tpch", "sql": "x" * 20001})
+    assert (long_sql.status, long_sql.error()) == (400, "SQL is limited to 20,000 characters.")
+
+    # At the limit the text passes, and the runner's own checks answer (an unknown dataset here).
+    unknown = "Unknown dataset. Use tpch or reviews."
+    assert c.post("/api/ask", {"dataset": "nope", "question": "x" * 2000}).error() == unknown
+    assert c.post("/api/sql", {"dataset": "nope", "sql": " " + "x" * 20000 + "\n"}).error() == unknown
+    off = c.post("/api/ask", {"dataset": "tpch", "question": QUESTION})
+    assert (off.status, off.error()) == (409, "The analyst is off (started with --no-model).")
+
+
+def test_sql_round_trip_trims_and_links(start):
+    c = start().client
+    typed = c.post("/api/sql", {"dataset": "tpch", "sql": f"\n  {TYPED}  \n"}).json()
+    assert (typed["kind"], typed["text"]) == ("sql", TYPED)
+    done = c.finish(typed["id"])
+    assert done["first"]["rows"] == [[n] for n in AMERICAS]
+
+    edit = c.post("/api/sql", {"dataset": "tpch", "sql": TYPED, "from_job": typed["id"]}).json()
+    assert edit["kind"] == "edit"
+    c.finish(edit["id"])
+    history = c.get("/api/history").json()["history"]
+    assert [(h["id"], h["kind"], h["from_job"]) for h in history] == [(edit["id"], "edit", typed["id"]),
+                                                                      (typed["id"], "sql", None)]
+
+
+def test_reask_builds_text(start):
+    c = start(FakeModel(script())).client
+    asked = c.post("/api/ask", {"dataset": "tpch", "question": QUESTION}).json()
+    c.finish(asked["id"])
+
+    reask = c.post("/api/reask", {"job": asked["id"], "term": "revenue", "reading": "gross"})
+    assert reask.status == 200
+    first = reask.json()
+    assert first["kind"] == "reask"
+    assert first["text"] == QUESTION + " Use the gross reading of revenue."
+    assert first["text"].endswith(" Use the gross reading of revenue.")
+    assert first["asked"] == {"term": "revenue", "reading": "gross", "question": QUESTION}
+    assert c.finish(first["id"])["stage"] == "done"
+
+    # A re-ask of a re-ask starts again from the typed question, so sentences never stack.
+    again = c.post("/api/reask", {"job": first["id"], "term": "revenue", "reading": "net"}).json()
+    assert again["text"] == QUESTION + " Use the net reading of revenue."
+    assert again["asked"] == {"term": "revenue", "reading": "net", "question": QUESTION}
+    c.finish(again["id"])
+    history = c.get("/api/history").json()["history"]
+    assert [h["from_job"] for h in history] == [first["id"], asked["id"], None]
+
+
+def test_reask_refusals(start):
+    gate = threading.Event()
+    model = FakeModel(script(), gate=gate)
+    c = start(model).client
+    running = c.post("/api/ask", {"dataset": "tpch", "question": QUESTION}).json()
+    try:
+        assert model.called.wait(WAIT_S)
+        busy = c.post("/api/reask", {"job": running["id"], "term": "revenue", "reading": "gross"})
+        assert (busy.status, busy.error()) == (409, "That question is still running.")
+    finally:
+        gate.set()
+    c.finish(running["id"])
+
+    for term, reading in (("revenue", "tax"), ("profit", "gross"), ("positive review", "4 or 5 stars")):
+        unknown = c.post("/api/reask", {"job": running["id"], "term": term, "reading": reading})
+        assert (unknown.status, unknown.error()) == (400, "Unknown reading."), (term, reading)
+
+    missing = c.post("/api/reask", {"job": "999", "term": "revenue", "reading": "gross"})
+    assert (missing.status, missing.error()) == (404, "Job not found.")
+    typed = c.post("/api/sql", {"dataset": "tpch", "sql": TYPED}).json()
+    c.finish(typed["id"])
+    sql = c.post("/api/reask", {"job": typed["id"], "term": "revenue", "reading": "gross"})
+    assert (sql.status, sql.error()) == (400, "Only a finished question can be asked again.")
+    assert c.post("/api/reask", {"job": int(running["id"]), "term": "revenue", "reading": "gross"}).error() == \
+        'The request needs "job" as text.'
+
+
+def test_csv_endpoint(start):
+    c = start(FakeModel(script(first_sql=LEFT_SQL))).client
+    typed = c.post("/api/sql", {"dataset": "tpch", "sql": TYPED}).json()
+    c.finish(typed["id"])
+
+    download = c.get(f"/api/jobs/{typed['id']}/csv?answer=first")
+    assert download.status == 200
+    assert download.headers["Content-Type"] == "text/csv; charset=utf-8"
+    assert download.headers["Content-Disposition"] == f'attachment; filename="shilmandb-{typed["id"]}.csv"'
+    assert download.body.decode() == "n_name\r\n" + "".join(f"{n}\r\n" for n in AMERICAS)
+
+    refused = c.finish(c.post("/api/ask", {"dataset": "tpch", "question": QUESTION}).json()["id"])
+    assert refused["verdict"]["kind"] == "refused"
+    for path in (f"/api/jobs/{refused['id']}/csv?answer=first", f"/api/jobs/{typed['id']}/csv?answer=second",
+                 f"/api/jobs/{refused['id']}/rows?answer=first"):
+        gone = c.get(path)
+        assert (gone.status, gone.error()) == (404, "That answer has no rows."), path
+    assert c.get("/api/jobs/999/csv?answer=first").error() == "Job not found."
+    bad = c.get(f"/api/jobs/{typed['id']}/csv?answer=third")
+    assert (bad.status, bad.error()) == (400, '"answer" must be first or second.')
+
+
+def test_rows_endpoint(start):
+    c = start().client
+    typed = c.post("/api/sql", {"dataset": "tpch", "sql": TYPED}).json()
+    c.finish(typed["id"])
+
+    page = c.get(f"/api/jobs/{typed['id']}/rows?answer=first&offset=3")
+    assert page.status == 200
+    assert page.json() == {"offset": 3, "rows": [["PERU"], ["UNITED STATES"]]}
+    assert c.get(f"/api/jobs/{typed['id']}/rows?answer=first").json()["rows"] == [[n] for n in AMERICAS]
+    for bad in ("-1", "two", "1e3"):
+        refused = c.get(f"/api/jobs/{typed['id']}/rows?answer=first&offset={bad}")
+        assert (refused.status, refused.error()) == (400, '"offset" must be a whole number, 0 or more.')
+
+
+def test_stop_and_history(start):
+    gate = threading.Event()
+    model = FakeModel(script(), gate=gate)
+    c = start(model).client
+    job_id = c.post("/api/ask", {"dataset": "tpch", "question": QUESTION}).json()["id"]
+    try:
+        assert model.called.wait(WAIT_S)
+        stopped = c.post(f"/api/jobs/{job_id}/stop")
+        assert (stopped.status, stopped.json()) == (200, {"stopped": True})
+    finally:
+        gate.set()
+    assert c.finish(job_id)["stage"] == "stopped"
+    assert c.post(f"/api/jobs/{job_id}/stop").json() == {"stopped": False}
+    assert c.post("/api/jobs/999/stop").status == 404
+    assert c.post(f"/api/jobs/{job_id}/stop", origin=False).status == 403
+
+    history = c.get("/api/history")
+    assert history.status == 200
+    assert [h["id"] for h in history.json()["history"]] == [job_id]
+
+
+def test_status_has_examples_and_panel(start):
+    app = start()
+    status = app.client.get("/api/status").json()
+    assert list(status) == ["datasets", "model", "lock", "cache", "examples", "tested_panel"]
+    assert status["examples"] == EXAMPLES
+    assert status["model"] == {"state": "off", "mode": "none", "detail": ""}
+    assert status["datasets"]["tpch"]["state"] == "ready"
+    assert status["lock"]["holds"] is False
+    assert status["tested_panel"] == []  # no rate shows on a setup that differs from the tested one
+
+    holding = start(engine=StubEngine(holds=True)).client.get("/api/status").json()
+    assert holding["tested_panel"] == check_views.tested_panel(RATES)
+    assert holding["tested_panel"] and holding["lock"] == {"holds": True, "reason": None}
+    differs = start(engine=StubEngine(holds=False)).client.get("/api/status").json()
+    assert differs["tested_panel"] == []
+
+
+def test_server_strings_pass_copy_rules(start):
+    c = start().client
+    pages = [c.get("/").body.decode(), c.get("/", cookie=False).body.decode(),
+             (APP_DIR / "web/static/index.html").read_text(encoding="utf-8")]
+    for text in pages:
+        assert copy_rules.problems(text) == []
+
+
+PREVIEW_SQL = "SELECT * FROM nation LIMIT 1000"
+NATION_ROWS = bridge_ok([("n_nationkey", "BIGINT"), ("n_name", "VARCHAR"), ("n_regionkey", "BIGINT"), ("n_comment", "VARCHAR")],
+                        [[0, "ALGERIA", 0, " haggle. carefully final"], [24, "UNITED STATES", 1, "y final packages"]])
+TPCH_SPEC = json.loads((APP_DIR.parent / "bench/analyst/datasets/tpch.json").read_text(encoding="utf-8"))
+
+
+# An engine on fake bridges, each kept by dataset so a test can read the SQL it was sent.
+@pytest.fixture
+def kept_bridges(paths):
+    def make(replies: dict | None = None):
+        made = {}
+
+        def factory(name, tables_tsv):
+            made[name] = FakeBridge(dict(replies or {}))
+            return made[name]
+
+        engine = Engine(paths, EngineOptions("none"), bridge_factory=factory)
+        engine.start_bridges()
+        assert engine.wait_bridges(WAIT_S)
+        return engine, made
+    return make
+
+
+# One column's entry in /api/schema, by table and column name.
+def _schema_column(dataset: dict, table: str, column: str) -> dict:
+    found = next(t for t in dataset["tables"] if t["name"] == table)
+    return next(c for c in found["columns"] if c["name"] == column)
+
+
+def test_schema_has_tables_columns_keys_and_values(start, kept_bridges):
+    engine, made = kept_bridges()
+    c = start(engine=engine).client
+    reply = c.get("/api/schema")
+    assert reply.status == 200
+    schema = reply.json()["datasets"]
+    assert list(schema) == list(DATASETS)
+
+    tpch = schema["tpch"]
+    status = engine.status()["datasets"]["tpch"]
+    assert {k: tpch[k] for k in ("label", "state", "detail")} == status
+    assert tpch["about"] == TPCH_SPEC["about"]
+    assert [(t["name"], t["rows"], t["primary_key"]) for t in tpch["tables"]] == [
+        ("region", 5, ["r_regionkey"]), ("nation", 25, ["n_nationkey"])]
+    assert [c["name"] for c in tpch["tables"][1]["columns"]] == ["n_nationkey", "n_name", "n_regionkey", "n_comment"]
+
+    assert _schema_column(tpch, "region", "r_regionkey") == {
+        "name": "r_regionkey", "type": "BIGINT", "description": "Region number, 0 to 4.", "key": True}
+    assert _schema_column(tpch, "nation", "n_regionkey") == {
+        "name": "n_regionkey", "type": "BIGINT", "description": TPCH_SPEC["columns"]["n_regionkey"],
+        "references": "region.r_regionkey"}
+    assert _schema_column(tpch, "region", "r_name")["values"] == ["AFRICA", "AMERICA", "ASIA", "EUROPE", "MIDDLE EAST"]
+    # values hold commas and keep leading spaces, as description.md quotes them
+    comments = _schema_column(tpch, "region", "r_comment")["values"]
+    assert len(comments) == 5 and "hs use ironic, even requests. s" in comments
+    nation_comments = _schema_column(tpch, "nation", "n_comment")["values"]
+    assert len(nation_comments) == 25 and nation_comments[0] == " haggle. carefully final deposits detect slyly agai"
+    assert "values" not in _schema_column(tpch, "nation", "n_regionkey")
+    assert "key" not in _schema_column(tpch, "nation", "n_name")
+
+    # the fixture has no reviews files: its state and the build hint, and no tables
+    reviews = schema["reviews"]
+    assert reviews == {**engine.status()["datasets"]["reviews"], "about": "", "tables": []}
+    assert reviews["state"] == "missing" and reviews["detail"].startswith("Missing: ")
+    assert made["tpch"].sent == []  # read from the files, never through the engine
+
+
+def test_schema_files_are_read_once(start, kept_bridges, paths):
+    engine, _ = kept_bridges()
+    c = start(engine=engine).client
+    first = c.get("/api/schema").json()
+    (paths.dataset_dir("tpch") / "description.md").unlink()
+    (paths.dataset_dir("tpch") / "manifest.json").write_text("{}", encoding="utf-8")
+    assert c.get("/api/schema").json() == first
+
+
+def test_schema_of_a_loading_dataset(start, paths):
+    gate = threading.Event()
+
+    def blocked(name, tables_tsv):
+        gate.wait(WAIT_S)
+        return FakeBridge({})
+
+    engine = Engine(paths, EngineOptions("none"), bridge_factory=blocked)
+    engine.start_bridges()
+    try:
+        c = start(engine=engine).client
+        tpch = c.get("/api/schema").json()["datasets"]["tpch"]
+        assert (tpch["state"], [t["name"] for t in tpch["tables"]]) == ("loading", ["region", "nation"])
+        loading = c.get("/api/preview?dataset=tpch&table=nation")
+        assert (loading.status, loading.error()) == (409, "TPC-H, SF 0.1 isn't loaded yet.")
+    finally:
+        gate.set()
+
+
+def test_parse_values_reads_sql_literals():
+    assert schema.parse_values("'A', 'B'") == ["A", "B"]
+    assert schema.parse_values("'it''s', ' x, y '") == ["it's", " x, y "]
+    assert schema.parse_values("'Cell Phones & Accessories'") == ["Cell Phones & Accessories"]
+    for broken in ("", "A, B", "'A' 'B'", "'A',", "'A', ", "'open"):
+        assert schema.parse_values(broken) is None, broken
+
+
+# Both real datasets, when they're here: every table in manifest order, each column's spec entry,
+# the keys and references from the spec, and values parsed from description.md.
+def test_schema_of_the_real_datasets():
+    paths = default_paths()
+    if any(missing_files(paths, name) for name in DATASETS):
+        pytest.skip("6d's dataset files aren't here")
+    for name in DATASETS:
+        ds = load_dataset(paths, name)
+        read = schema.dataset_schema(paths, name)
+        assert read["about"] == ds.spec["about"]
+        assert [t["name"] for t in read["tables"]] == [t["name"] for t in ds.manifest["tables"]]
+        for table in read["tables"]:
+            key = ds.spec["primary_keys"][table["name"]]
+            assert table["primary_key"] == key
+            assert [c["name"] for c in table["columns"] if c.get("key")] == [c for c in key]
+            assert all(c["description"] == ds.spec["columns"][c["name"]] for c in table["columns"])
+        refs = {f"{fk['table']}.{c}": f"{fk['ref_table']}.{r}" for fk in ds.spec["foreign_keys"] for c, r in zip(fk["columns"], fk["ref_columns"])}
+        found = {f"{t['name']}.{c['name']}": c["references"] for t in read["tables"] for c in t["columns"] if "references" in c}
+        assert found == refs
+    reviews = schema.dataset_schema(paths, "reviews")
+    assert "Cell Phones & Accessories" in _schema_column(reviews, "products", "p_main_category")["values"]
+    tpch = schema.dataset_schema(paths, "tpch")
+    assert _schema_column(tpch, "lineitem", "l_shipmode")["values"] == ["AIR", "FOB", "MAIL", "RAIL", "REG AIR", "SHIP", "TRUCK"]
+    assert _schema_column(tpch, "orders", "o_orderpriority")["values"][3] == "4-NOT SPECIFIED"
+
+
+def test_preview_rows_and_total(start, kept_bridges):
+    engine, made = kept_bridges({PREVIEW_SQL: NATION_ROWS})
+    c = start(engine=engine).client
+    reply = c.get("/api/preview?dataset=tpch&table=nation")
+    assert reply.status == 200
+    assert reply.json() == {
+        "dataset": "tpch", "table": "nation",
+        "columns": [{"name": "n_nationkey", "type": "BIGINT"}, {"name": "n_name", "type": "VARCHAR"},
+                    {"name": "n_regionkey", "type": "BIGINT"}, {"name": "n_comment", "type": "VARCHAR"}],
+        "rows": [["0", "ALGERIA", "0", " haggle. carefully final"], ["24", "UNITED STATES", "1", "y final packages"]],
+        "total": 25, "ms": 250.0,
+    }
+    assert made["tpch"].sent == [PREVIEW_SQL]
+    assert c.get("/api/history").json() == {"history": []}  # a preview is never a job
+
+
+def test_preview_refusals(start, kept_bridges):
+    engine, made = kept_bridges({PREVIEW_SQL: NATION_ROWS})
+    c = start(engine=engine).client
+    for table in ("lineitem", "NATION", "nation; DROP TABLE nation", "nation LIMIT 1", ""):
+        refused = c.get(f"/api/preview?dataset=tpch&table={quote(table)}")
+        assert (refused.status, refused.error()) == ((400, 'The request needs "dataset" and "table".') if not table
+                                                     else (404, "That table isn't in TPC-H, SF 0.1.")), table
+    unknown = c.get("/api/preview?dataset=nope&table=nation")
+    assert (unknown.status, unknown.error()) == (404, "Unknown dataset. Use tpch or reviews.")
+    assert c.get("/api/preview?table=nation").status == 400
+    missing = c.get("/api/preview?dataset=reviews&table=reviews")
+    assert missing.status == 409 and missing.error().startswith("Reviews isn't available: Missing: ")
+    assert made["tpch"].sent == []  # no name outside the manifest ever reaches the engine
+    assert c.post("/api/preview?dataset=tpch&table=nation").status == 405
+    assert c.get("/api/preview?dataset=tpch&table=nation", cookie=False).status == 403
+
+
+def test_preview_engine_error(start, kept_bridges):
+    engine, _ = kept_bridges({PREVIEW_SQL: bridge_error("run", "Table not found: nation")})
+    c = start(engine=engine).client
+    failed = c.get("/api/preview?dataset=tpch&table=nation")
+    assert (failed.status, failed.error()) == (502, "Run error: Table not found: nation")
+
+
+# Once quitting has begun a preview is refused with a plain sentence, even one already waiting for the
+# bridge behind a long query, so nothing more reaches a bridge that's about to close.
+def test_preview_refused_once_quitting(start, paths):
+    gate, holding, made = threading.Event(), threading.Event(), {}
+
+    class SlowBridge(FakeBridge):
+        def query(self, sql: str) -> dict:
+            if sql == "SLOW":
+                holding.set()
+                gate.wait(WAIT_S)
+            return super().query(sql)
+
+    def factory(name, tables_tsv):
+        made[name] = SlowBridge({PREVIEW_SQL: NATION_ROWS, "SLOW": NATION_ROWS})
+        return made[name]
+
+    engine = Engine(paths, EngineOptions("none"), bridge_factory=factory)
+    engine.start_bridges()
+    assert engine.wait_bridges(WAIT_S)
+    c = start(engine=engine).client
+    assert c.get("/api/preview?dataset=tpch&table=nation").status == 200
+
+    slow = threading.Thread(target=engine.bridge("tpch").query, args=("SLOW",))
+    slow.start()
+    assert holding.wait(WAIT_S)
+    replies = []
+    waiting = threading.Thread(target=lambda: replies.append(c.get("/api/preview?dataset=tpch&table=nation")))
+    waiting.start()
+    time.sleep(0.2)  # the preview waits for the bridge now; it's refused either way
+    engine.begin_quit()
+    gate.set()
+    waiting.join(WAIT_S)
+    slow.join(WAIT_S)
+    assert (replies[0].status, replies[0].error()) == (503, "The app is quitting.")  # as a job submit says it
+    late = c.get("/api/preview?dataset=tpch&table=nation")
+    assert (late.status, late.error()) == (503, "The app is quitting.")
+    assert made["tpch"].sent == [PREVIEW_SQL, "SLOW"]
+
+
+# Quitting starts when the server shuts down, the first thing the app closes.
+def test_server_shutdown_begins_quitting(kept_bridges):
+    engine, _ = kept_bridges()
+    server = make_server(JobRunner(engine), engine, TOKEN, 0, APP_DIR / "web/static", EXAMPLES)
+    thread = threading.Thread(target=server.serve_forever, args=(0.01,), name="test-http", daemon=True)
+    thread.start()
+    try:
+        assert engine.quitting is False
+        server.shutdown()
+        assert engine.quitting is True
+    finally:
+        server.server_close()
+        thread.join(WAIT_S)
+        engine.close()
+
+
+# A dataset with no tables gets an empty list of its own, never one shared with another dataset's entry.
+def test_no_tables_is_never_shared(paths):
+    one, two = schema.dataset_schema(paths, "reviews"), schema.dataset_schema(paths, "reviews")
+    assert one == two == {"about": "", "tables": []}
+    assert one["tables"] is not two["tables"]
+
+
+# A Values line counts only inside the Tables section: one under a bullet in a later section is never filed.
+def test_values_stop_where_the_tables_end():
+    text = "\n".join([
+        "## Tables", "", "### region (5 rows)", "",
+        "- `r_name` VARCHAR - Region name.", "  Values: 'AFRICA', 'ASIA'", "",
+        "## Missing values", "",
+        "- `r_name` is never empty.", "  Values: 'NONE'", "",
+        "## Glossary", "", "- `r_name` names a region.", "  Values: 'X'",
+    ])
+    assert schema.listed_values(text) == {("region", "r_name"): ["AFRICA", "ASIA"]}
+
+
+# Whether a question uses a glossary term, as the terms check decides.
+def _uses_term(question: str, spec: dict) -> bool:
+    return any(re.search(w, question, re.IGNORECASE) for term in spec["glossary"] for w in term["words"])
+
+
+def test_examples_file():
+    assert list(EXAMPLES) == list(DATASETS)
+    prompt_examples = json.loads((APP_DIR.parent / "bench/analyst/prompt_examples.json").read_text(encoding="utf-8"))
+    for name, questions in EXAMPLES.items():
+        assert len(questions) == 5 and len(set(questions)) == 5
+        assert all(isinstance(q, str) and q == q.strip() and copy_rules.problems(q) == [] for q in questions)
+        assert not set(questions) & {e["question"] for e in prompt_examples[name]}
+        spec = json.loads((APP_DIR.parent / f"bench/analyst/datasets/{name}.json").read_text(encoding="utf-8"))
+        assert any(_uses_term(q, spec) for q in questions), name
+
+    root, paths = APP_DIR.parent, default_paths()
+    if not (root / DEV_QUESTIONS).is_file() or not (root / DEV_RUN).is_file() or any(missing_files(paths, n) for n in DATASETS):
+        pytest.skip("6d's dev questions, dev run or dataset files aren't here")
+
+    dev = {(q["dataset"], q["question"]): q["qid"] for q in an.read_jsonl(root / DEV_QUESTIONS) if q["split"] == "dev"}
+    run = {r["qid"]: r for r in an.read_jsonl(root / DEV_RUN)}
+    for name, questions in EXAMPLES.items():
+        ctx = load_dataset(paths, name).context
+        for question in questions:
+            qid = dev.get((name, question))
+            assert qid is not None and qid in run, question
+            base = an.sha1_text(pr.build_sql_prompt(ctx.description, ctx.rules, ctx.examples, question))
+            assert base in {a["prompt_sha1"] for a in run[qid]["primary"]["attempts"]}, question
+
+
+def test_pick_port_skips_taken():
+    with listening() as taken:
+        picked = pick_port(taken, False)
+        assert taken < picked <= taken + 20
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", picked))  # it really is free
+        with pytest.raises(OSError, match=rf"^Port {taken} is in use\.$"):
+            pick_port(taken, True)
+        with pytest.raises(OSError, match=rf"^No free port from {taken} to {taken}\.$"):
+            pick_port(taken, False, tries=1)
+    port = free_port()
+    assert pick_port(port, True) == port
+
+
+# Main's paths: the fixture's, with no bridge binary, so nothing starts a process.
+@pytest.fixture
+def main_paths(paths, tmp_path):
+    return replace(paths, bridge=tmp_path / "no_bridge", app_results=tmp_path / "app_results")
+
+
+# The URL line main prints, read from captured stdout as it arrives.
+def wait_for_url(capsys, thread) -> str:
+    seen = ""
+    deadline = time.monotonic() + WAIT_S
+    while "\n" not in seen:
+        assert time.monotonic() < deadline and thread.is_alive(), f"no URL line yet: {seen!r}"
+        seen += capsys.readouterr().out
+        time.sleep(0.01)
+    return seen.splitlines()[0]
+
+
+# Everything main prints up to its quit hint, read from captured stdout as it arrives.
+def wait_for_launch(capsys, thread) -> list[str]:
+    seen = ""
+    deadline = time.monotonic() + WAIT_S
+    while "Press Ctrl-C to quit." not in seen:
+        assert time.monotonic() < deadline and thread.is_alive(), f"no quit hint yet: {seen!r}"
+        seen += capsys.readouterr().out
+        time.sleep(0.01)
+    return seen.splitlines()
+
+
+# Runs main on a thread with a stop event; returns the thread, the event and where its exit code lands.
+def run_main(argv: list[str], paths) -> tuple[threading.Thread, threading.Event, dict]:
+    stop, result = threading.Event(), {}
+    thread = threading.Thread(target=lambda: result.update(code=main(argv, stop=stop, paths=paths)), name="test-main", daemon=True)
+    thread.start()
+    return thread, stop, result
+
+
+@pytest.mark.parametrize("flags, line", [
+    ([], "Prompt cache: off (measured.json is missing or can't be read)"),
+    (["--no-cache"], "Prompt cache: off (cache turned off with --no-cache)"),
+    (["--no-model"], None),
+    (["--recorded-model", "RUN"], None),
+])
+def test_main_prints_the_cache_state(main_paths, capsys, monkeypatch, flags, line):
+    real = app_main.Engine
+    monkeypatch.setattr(app_main, "Engine", lambda paths, options: real(paths, options, model_factory=lambda: FakeModel({})))
+    flags = [str(main_paths.run_file("dev")) if f == "RUN" else f for f in flags]
+    thread, stop, result = run_main(["--no-browser", "--port", str(free_port()), *flags], main_paths)
+    try:
+        lines = wait_for_launch(capsys, thread)
+    finally:
+        stop.set()
+        thread.join(WAIT_S)
+    assert result == {"code": 0}
+    assert lines[0].startswith("ShilmanDB app: http://127.0.0.1:")
+    assert lines[1:] == ([line] if line else []) + ["Press Ctrl-C to quit."]
+
+
+def test_cache_line():
+    assert app_main.cache_line({"model": {"mode": "mlx"}, "cache": {"on": True, "reason": "the replay matched 300 of 300"}}) == "Prompt cache: on"
+    assert app_main.cache_line({"model": {"mode": "mlx"}, "cache": {"on": False, "reason": "the replay hasn't been run"}}) == \
+        "Prompt cache: off (the replay hasn't been run)"
+    for mode in ("none", "recorded"):
+        assert app_main.cache_line({"model": {"mode": mode}, "cache": {"on": False, "reason": "x"}}) is None
+
+
+# A bridge process that touches its db file, then answers each query after SLOW_QUERY_S.
+SLOW_QUERY_S = 1.0
+SLOW_BRIDGE = f"""
+import json, sys, time
+from pathlib import Path
+args = sys.argv[1:]
+Path(args[args.index("--db-file") + 1]).touch()
+print(json.dumps({{"ready": True, "tables": 0, "load_ms": 0, "rows": {{}}}}), flush=True)
+for raw in sys.stdin:
+    rid = raw.partition("\\t")[0]
+    time.sleep({SLOW_QUERY_S})
+    print(json.dumps({{"id": rid, "ok": True, "columns": [{{"name": "n", "type": "INTEGER"}}], "rows": [[1]],
+                      "row_count": 1, "truncated": False, "profile": {{}}, "ms": 1000}}), flush=True)
+"""
+
+
+# This process's child processes, by pid.
+def _children() -> list[str]:
+    return subprocess.run(["pgrep", "-P", str(os.getpid())], capture_output=True, text=True).stdout.split()
+
+
+def test_main_quits_with_a_query_in_flight(main_paths, capsys, monkeypatch):
+    bridges, runners = [], []
+    real_engine, real_runner = app_main.Engine, app_main.JobRunner
+
+    def factory(name, tables_tsv):
+        bridges.append(analyst_check.bc.Bridge(tables_tsv, command=[sys.executable, "-c", SLOW_BRIDGE]))
+        return bridges[-1]
+
+    def runner(engine):
+        runners.append(real_runner(engine))
+        return runners[-1]
+
+    monkeypatch.setattr(app_main, "Engine", lambda paths, options: real_engine(paths, options, bridge_factory=factory))
+    monkeypatch.setattr(app_main, "JobRunner", runner)
+    before = set(_children())
+    port = free_port()
+    thread, stop, result = run_main(["--no-browser", "--no-model", "--port", str(port)], main_paths)
+    try:
+        token = re.search(r"token=([0-9a-f]{32})", wait_for_url(capsys, thread)).group(1)
+        client = Client(port, token)
+        deadline = time.monotonic() + WAIT_S
+        while client.get("/api/status").json()["datasets"]["tpch"]["state"] != "ready":
+            assert time.monotonic() < deadline, "the bridge never got ready"
+            time.sleep(0.01)
+        db_files = [b.db_file for b in bridges]
+        assert all(f.exists() for f in db_files)
+
+        job = client.post("/api/sql", {"dataset": "tpch", "sql": TYPED}).json()
+        while client.get(f"/api/jobs/{job['id']}").json()["stage"] != "writing":
+            assert time.monotonic() < deadline, "the query never started"
+            time.sleep(0.005)
+    finally:
+        began = time.monotonic()
+        stop.set()
+        thread.join(WAIT_S)
+
+    assert not thread.is_alive() and result == {"code": 0}
+    assert time.monotonic() - began < SLOW_QUERY_S + 5.0  # the query's end, the closes and a margin
+    assert runners[0].wait(job["id"], -1, 0)["stage"] in ENDED
+    assert set(_children()) - before == set()  # every bridge closed
+    assert not any(f.exists() for f in db_files)
+
+
+# Records signal.signal calls without touching the process's real handlers.
+class FakeSignals:
+    def __init__(self):
+        self.handlers = {sig: f"previous {sig}" for sig in app_main.QUIT_SIGNALS}
+        self.calls: list[tuple] = []
+
+    def __call__(self, sig, handler):
+        self.calls.append((sig, handler))
+        previous, self.handlers[sig] = self.handlers[sig], handler
+        return previous
+
+
+def test_first_quit_signal_sets_quit_and_restores_the_defaults():
+    quit_event, fake = threading.Event(), FakeSignals()
+    restore = app_main._on_signals(quit_event, install=fake)
+    handler = fake.handlers[signal.SIGINT]
+    assert callable(handler) and fake.handlers[signal.SIGTERM] is handler and not quit_event.is_set()
+
+    handler(signal.SIGINT, None)
+    assert quit_event.is_set()
+    assert fake.handlers == {sig: signal.SIG_DFL for sig in app_main.QUIT_SIGNALS}  # a second press ends the app at once
+
+    restore()
+    assert fake.handlers == {sig: f"previous {sig}" for sig in app_main.QUIT_SIGNALS}
+
+
+def test_main_no_model_starts_and_stops(main_paths, capsys):
+    port = free_port()
+    stop = threading.Event()
+    result = {}
+    argv = ["--no-browser", "--no-model", "--port", str(port)]
+    thread = threading.Thread(target=lambda: result.update(code=main(argv, stop=stop, paths=main_paths)),
+                              name="test-main", daemon=True)
+    thread.start()
+    try:
+        line = wait_for_url(capsys, thread)
+        found = re.fullmatch(rf"ShilmanDB app: http://127\.0\.0\.1:{port}/\?token=([0-9a-f]{{32}})", line)
+        assert found, line
+        client = Client(port, found.group(1))
+        login = client.get(f"/?token={found.group(1)}", cookie=False)
+        assert login.status == 303
+        status = client.get("/api/status")
+        assert status.status == 200
+        assert status.json()["model"]["state"] == "off"
+        assert status.json()["examples"] == EXAMPLES
+    finally:
+        stop.set()
+        thread.join(WAIT_S)
+
+    assert not thread.is_alive()
+    assert result == {"code": 0}
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("127.0.0.1", port))  # the server let go of its port
+
+
+def test_main_fixed_port_in_use_exits_2(main_paths, capsys):
+    with listening() as taken:
+        assert main(["--no-browser", "--no-model", "--port", str(taken)], paths=main_paths) == 2
+    assert f"Port {taken} is in use." in capsys.readouterr().err
+
+
+def test_main_rejects_bad_model_flags(main_paths, tmp_path, capsys):
+    run = tmp_path / "run.jsonl"
+    run.write_text("", encoding="utf-8")
+    with pytest.raises(SystemExit) as e:
+        main(["--no-browser", "--no-model", "--recorded-model", str(run)], paths=main_paths)
+    assert e.value.code == 2
+    assert "not allowed with" in capsys.readouterr().err
+
+    with pytest.raises(SystemExit) as e:
+        main(["--no-browser", "--recorded-model", str(tmp_path / "nowhere.jsonl")], paths=main_paths)
+    assert e.value.code == 2
+    assert f"--recorded-model: no file at {tmp_path / 'nowhere.jsonl'}" in capsys.readouterr().err
+
+    with pytest.raises(SystemExit) as e:
+        main(["--no-browser", "--recorded-model", str(tmp_path)], paths=main_paths)  # a folder isn't a file
+    assert e.value.code == 2
+
+    with pytest.raises(SystemExit) as e:
+        main(["--no-browser", "--no-model", "--recorded-pace"], paths=main_paths)
+    assert e.value.code == 2
+    assert "--recorded-pace needs --recorded-model" in capsys.readouterr().err
