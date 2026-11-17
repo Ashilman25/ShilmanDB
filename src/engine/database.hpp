@@ -3,6 +3,7 @@
 #include "buffer/buffer_pool_manager.hpp"
 #include "buffer/eviction_policy_factory.hpp"
 #include "storage/disk_manager.hpp"
+#include "storage/columnar/columnar_file.hpp"
 #include "catalog/catalog.hpp"
 #include "types/tuple.hpp"
 #include "catalog/schema.hpp"
@@ -20,6 +21,13 @@
 #endif
 
 namespace shilmandb {
+
+struct LoadOptions {
+    StorageKind storage{StorageKind::ROW};
+    char delimiter{'|'};
+    unsigned threads{0};                    // columnar only; 0 = one per core
+    std::optional<std::string> null_text;   // columnar only; a field equal to this is NULL
+};
 
 struct QueryOptions {
     ExecutionMode mode{ExecutionMode::TUPLE};
@@ -82,6 +90,9 @@ public:
 
     void LoadTable(const std::string& table_name, const Schema& schema, const std::string& tbl_file_path, char delimiter = '|');
 
+    // Loads into the row store or, committed to the file, as a columnar table.
+    void LoadTable(const std::string& table_name, const Schema& schema, const std::string& tbl_file_path, const LoadOptions& options);
+
     [[nodiscard]] Catalog* GetCatalog() const;
     [[nodiscard]] BufferPoolManager* GetBufferPoolManager() const;
     [[nodiscard]] DiskManager* GetDiskManager() const;
@@ -98,6 +109,7 @@ private:
     std::optional<ScanCosts> scan_costs_;
     std::unique_ptr<DiskManager> disk_manager_;
     std::unique_ptr<BufferPoolManager> bpm_;
+    std::unique_ptr<ColumnarFile> columnar_file_;
     std::unique_ptr<Catalog> catalog_;
 
 #ifdef SHILMANDB_HAS_LIBTORCH
