@@ -21,6 +21,8 @@ shilmandb_add_test(column_vector_test storage/columnar/column_vector_test.cpp)
 shilmandb_add_test(field_parser_test storage/columnar/field_parser_test.cpp)
 shilmandb_add_test(crc32c_test storage/columnar/crc32c_test.cpp)
 shilmandb_add_test(encoding_test storage/columnar/encoding_test.cpp)
+shilmandb_add_test(catalog_codec_test storage/columnar/catalog_codec_test.cpp)
+shilmandb_add_test(superblock_test storage/columnar/superblock_test.cpp)
 
 # Buffer tests
 shilmandb_add_test(lru_eviction_policy_test buffer/lru_eviction_policy_test.cpp)
