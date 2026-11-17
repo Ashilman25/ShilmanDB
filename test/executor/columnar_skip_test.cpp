@@ -102,7 +102,7 @@ protected:
         db_file_ = TempPath(".db");
         std::filesystem::remove(db_file_);
 
-        // k is the line number minus 1, so each row group holds one stretch of k.
+        // k is the line number minus 1: each row group holds one stretch of k.
         std::string text;
         text.reserve(kRows * 16);
         for (size_t k = 0; k < kRows; ++k) text += std::to_string(k) + "|" + std::to_string(k % 100) + "\n";
@@ -153,7 +153,7 @@ protected:
         uint64_t misses{0};
     };
 
-    // A Filter over a scan of t reading only k, with or without skip hints, run cold.
+    // A Filter over a cold scan of t reading only k, skip hints if asked.
     Run Count(Op op, int32_t v, bool skip, ExecutionMode mode) {
         auto scan = std::make_unique<SeqScanPlanNode>(SchemaOf("t"), "t");
         scan->read_columns = std::vector<uint32_t>{0};
@@ -308,7 +308,7 @@ TEST_F(ColumnarSkipTest, FilterStaysAboveSkippingScan) {
             "WHERE t.k >= 200000 AND h.hv < 50 AND t.v < 3 AND h.hk BETWEEN 1000 AND 280000",
             mode);
         ASSERT_EQ(result.tuples.size(), 1u);
-        // Matches are hk = 300 i, i in [667, 933] with i % 70 < 50.
+        // Matches: hk = 300 i, i in [667, 933], i % 70 < 50.
         // Every such t.v is 0, so t.v < 3 keeps them all.
         EXPECT_EQ(result.tuples[0].GetValue(result.schema, 0).integer_, 187);
     }

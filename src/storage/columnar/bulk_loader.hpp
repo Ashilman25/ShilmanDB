@@ -8,9 +8,12 @@ namespace shilmandb {
 
 class DiskManager;
 
+// The most worker threads a load runs; a larger count is cut to this.
+inline constexpr unsigned kMaxLoadThreads = 256;
+
 struct BulkLoadOptions {
     char delimiter{'|'};
-    unsigned threads{0};                    // 0 = std::thread::hardware_concurrency(); at most 256
+    unsigned threads{0};                    // 0 = std::thread::hardware_concurrency(); at most kMaxLoadThreads
     std::optional<std::string> null_text;   // a field equal to this is NULL; unset = no NULLs
 };
 

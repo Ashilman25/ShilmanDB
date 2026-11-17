@@ -49,8 +49,14 @@ public:
     }
 
 private:
-    // A uniform integer in [lo, hi].
-    int Int(int lo, int hi) { return std::uniform_int_distribution<int>(lo, hi)(rng_); }
+    // An integer in [lo, hi], drawn straight from the engine so every library agrees.
+    int Int(int lo, int hi) {
+        const auto span = static_cast<uint64_t>(static_cast<int64_t>(hi) - lo + 1);
+        return static_cast<int>(lo + static_cast<int64_t>(Raw() % span));
+    }
+
+    // The engine's next 32 bits; mt19937's output is the same on every library.
+    uint64_t Raw() { return static_cast<uint64_t>(rng_()) & 0xFFFFFFFFu; }
 
     // Random bytes, any of the 256, of a length in [lo, hi].
     std::string Text(int lo, int hi) {
@@ -65,7 +71,7 @@ private:
             case 0: return std::numeric_limits<double>::quiet_NaN();
             case 1: return -0.0;
             case 2: return -std::numeric_limits<double>::infinity();
-            default: return std::uniform_real_distribution<double>(-1e12, 1e12)(rng_);
+            default: return -1e12 + 2e12 * (static_cast<double>(Raw()) / 4294967296.0);
         }
     }
 
@@ -92,8 +98,12 @@ private:
     Scalar MakeScalar() {
         Scalar s;
         switch (Int(0, 3)) {
-            case 0: s = static_cast<int64_t>(rng_()) << 32 | rng_(); break;
-            case 1: s = static_cast<__int128>(static_cast<int64_t>(rng_())) * -1000000000000000LL; break;
+            case 0: {
+                const uint64_t high = Raw();  // two statements, so the draw order is fixed
+                s = static_cast<int64_t>(high << 32 | Raw());
+                break;
+            }
+            case 1: s = static_cast<__int128>(static_cast<int64_t>(Raw())) * -1000000000000000LL; break;
             case 2: s = Double(); break;
             default: s = Text(0, 64); break;
         }
@@ -137,8 +147,8 @@ private:
     Value MakeValue(TypeId type) {
         values_seen.insert(type);
         switch (type) {
-            case TypeId::INTEGER: return Value(static_cast<int32_t>(rng_()));
-            case TypeId::BIGINT:  return Value(static_cast<int64_t>(rng_()) << 20);
+            case TypeId::INTEGER: return Value(static_cast<int32_t>(Raw()));
+            case TypeId::BIGINT:  return Value(static_cast<int64_t>(Raw()) << 20);
             case TypeId::DECIMAL: return Value(Double());
             case TypeId::VARCHAR: return Value(Text(0, 20));
             default:              return Value::MakeDate(Int(-30000, 30000));
@@ -172,7 +182,7 @@ private:
         t.stats.row_count = t.row_count;
         t.stats.page_count = static_cast<uint64_t>(Int(0, 100000));
         for (const auto& col : t.columns) {
-            if (Int(0, 1)) t.stats.distinct_counts[col.name] = static_cast<uint64_t>(rng_());
+            if (Int(0, 1)) t.stats.distinct_counts[col.name] = Raw();
             if (Int(0, 1)) {
                 const auto type = static_cast<TypeId>(Int(1, 5));
                 t.stats.min_max[col.name] = MinMax{MakeValue(type), MakeValue(type)};
@@ -456,7 +466,8 @@ TEST(CatalogCodecTest, StatsKeysOutOfOrderThrow) {
 }
 
 TEST(CatalogCodecTest, PageListShapeThrows) {
-    // Chunk 0 is BITPACK, 3000 values on pages {0, 2000}; chunk 1 has 40 dictionary entries.
+    // Chunk 0 is BITPACK, 3000 values on pages {0, 2000}.
+    // Chunk 1 has 40 dictionary entries.
     const auto chunks = [](CatalogMeta& m) -> std::vector<ChunkMeta>& { return m.tables[0].row_groups[0].chunks; };
     ExpectDamagedAfter([&](CatalogMeta& m) {
         chunks(m)[0].page_count = 3;
@@ -495,7 +506,8 @@ TEST(CatalogCodecTest, PageListShapeThrows) {
 }
 
 TEST(CatalogCodecTest, BadEnumBytesThrow) {
-    // The index's unique flag is the blob's last byte; its key type sits 5 bytes before.
+    // The index's unique flag is the blob's last byte.
+    // Its key type sits 5 bytes before it.
     const std::vector<char> bytes = EncodeCatalog(SmallCatalog());
     std::vector<char> bad_bool = bytes;
     bad_bool.back() = 2;

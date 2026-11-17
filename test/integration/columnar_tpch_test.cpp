@@ -1,7 +1,11 @@
 #include <gtest/gtest.h>
 #include <unistd.h>
 
+#include "catalog/catalog.hpp"
 #include "engine/database.hpp"
+#include "executor/executor_context.hpp"
+#include "executor/executor_factory.hpp"
+#include "planner/plan_node.hpp"
 #include "tpch/tpch_workload.hpp"
 
 #include <algorithm>
@@ -185,6 +189,21 @@ QueryRun RunQuery(Database& db, const std::string& sql, ExecutionMode mode,
     run.plan.edges = join.edges;
     run.plan.operators = operators;
     return run;
+}
+
+// Every row of a table read through a full-range scan of one index, all columns.
+QueryResult ScanWholeIndex(Database& db, const std::string& table, const std::string& index) {
+    const Schema& schema = db.GetCatalog()->GetTable(table)->schema;
+    const IndexScanPlanNode plan(schema, table, index);
+    ExecutorContext ctx{db.GetBufferPoolManager(), db.GetCatalog()};
+    auto exec = ExecutorFactory::CreateExecutor(&plan, &ctx, ExecutionMode::TUPLE);
+    QueryResult result;
+    result.schema = schema;
+    exec->Init();
+    Tuple tuple;
+    while (exec->Next(&tuple)) result.tuples.push_back(tuple);
+    exec->Close();
+    return result;
 }
 
 class ColumnarTpchTest : public ::testing::Test {
@@ -398,6 +417,19 @@ TEST_F(ColumnarTpchTest, EveryValueBitIdentical) {
         EXPECT_TRUE(BitIdentical(want, row.ExecuteSQL(sql, ExecutionMode::VECTORIZED), td.name + " row vectorized"));
         EXPECT_TRUE(BitIdentical(want, col.ExecuteSQL(sql, ExecutionMode::TUPLE), td.name + " columnar tuple"));
         EXPECT_TRUE(BitIdentical(want, col.ExecuteSQL(sql, ExecutionMode::VECTORIZED), td.name + " columnar vectorized"));
+    }
+}
+
+// Every value fetched through each index matches the row store, in index order.
+TEST_F(ColumnarTpchTest, EveryIndexFetchBitIdentical) {
+    if (data_dir_.empty()) GTEST_SKIP() << kNoData;
+    Database& row = Get(false, true);
+    Database& col = Get(true, true);
+    for (const auto& idx : tpch::IndexDescs()) {
+        const QueryResult want = ScanWholeIndex(row, idx.table_name, idx.index_name);
+        ASSERT_EQ(want.tuples.size(), row.GetCatalog()->GetTable(idx.table_name)->stats.row_count) << idx.index_name;
+        ASSERT_GT(want.tuples.size(), 0u) << idx.index_name;
+        EXPECT_TRUE(BitIdentical(want, ScanWholeIndex(col, idx.table_name, idx.index_name), idx.index_name));
     }
 }
 

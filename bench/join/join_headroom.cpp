@@ -585,6 +585,12 @@ int Run(const Args& args) {
     const auto run_start = Clock::now();
     const size_t pool_size = args.pool_size;
 
+    // A file another run left can't be loaded into, so every run starts fresh.
+    std::error_code ec;
+    fs::remove(args.db_file, ec);
+    if (ec) Fail("could not remove " + args.db_file + ": " + ec.message());
+    std::cout << "Starting a fresh database file: " << args.db_file << "\n";
+
     // Built before the load: with a model path this loads the model, so a bad path fails fast.
     std::unique_ptr<Database> db;
     try {

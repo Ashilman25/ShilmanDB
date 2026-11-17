@@ -3,9 +3,11 @@
 #include "planner/index_selector.hpp"
 #include "planner/cost_model.hpp"
 #include "planner/expression_binder.hpp"
+#include "planner/column_usage.hpp"
 #include "common/exception.hpp"
 #include "types/value.hpp"
 #include <algorithm>
+#include <cassert>
 #include <cmath>
 #include <numeric>
 #include <string>
@@ -890,6 +892,10 @@ auto Planner::Plan(SelectStatement stmt) -> std::unique_ptr<PlanNode> {
 
     BindPlan(current.get());
     AssignReadColumns(current.get());
+#ifndef NDEBUG
+    // A columnar scan hands up placeholders for unlisted columns, so none may be read.
+    assert(FindUnlistedReads(*current).empty() && "an operator reads a column its scan doesn't list");
+#endif
     return current;
 }
 

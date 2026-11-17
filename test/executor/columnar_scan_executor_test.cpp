@@ -354,6 +354,29 @@ TEST_F(ColumnarScanExecutorTest, PlanColumnTypesMustMatch) {
     EXPECT_EQ(ErrorOf([&] { exec->Init(); }), "ColumnarScanExecutor: the plan's column 2 has a different type than table c");
 }
 
+TEST_F(ColumnarScanExecutorTest, IndexScanPlanColumnTypesMustMatch) {
+    ASSERT_NE(db_->GetCatalog()->CreateIndex("idx_c_id", "c", "id"), nullptr);
+    ASSERT_NE(db_->GetCatalog()->CreateIndex("idx_r_id", "r", "id"), nullptr);
+    Schema wrong({Column("id", TypeId::BIGINT), Column("qty", TypeId::INTEGER), Column("price", TypeId::INTEGER),
+                  Column("cost", TypeId::DECIMAL), Column("ship", TypeId::DATE), Column("label", TypeId::VARCHAR)});
+    Schema short_by_one({Column("id", TypeId::BIGINT), Column("qty", TypeId::INTEGER), Column("price", TypeId::DECIMAL),
+                         Column("cost", TypeId::DECIMAL), Column("ship", TypeId::DATE)});
+
+    IndexScanPlanNode typed(wrong, "c", "idx_c_id");
+    auto exec = ExecutorFactory::CreateExecutor(&typed, ctx_.get(), ExecutionMode::TUPLE);
+    EXPECT_EQ(ErrorOf([&] { exec->Init(); }), "IndexScanExecutor: the plan's column 2 has a different type than table c");
+
+    IndexScanPlanNode counted(short_by_one, "c", "idx_c_id");
+    exec = ExecutorFactory::CreateExecutor(&counted, ctx_.get(), ExecutionMode::TUPLE);
+    EXPECT_EQ(ErrorOf([&] { exec->Init(); }), "IndexScanExecutor: the plan's columns don't match table c");
+
+    // A heap table isn't checked, as before.
+    IndexScanPlanNode heap(wrong, "r", "idx_r_id");
+    exec = ExecutorFactory::CreateExecutor(&heap, ctx_.get(), ExecutionMode::TUPLE);
+    EXPECT_EQ(ErrorOf([&] { exec->Init(); }), "");
+    exec->Close();
+}
+
 TEST_F(ColumnarScanExecutorTest, FilteredQueriesMatchRowStore) {
     const std::vector<std::string> queries = {
         "SELECT id, qty, price FROM T WHERE qty > 0 AND price < 500.0 AND label = 'beta3'",

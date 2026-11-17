@@ -28,6 +28,9 @@ public:
     [[nodiscard]] static std::vector<RID> Lookup(const char* page_data, const Value& key, TypeId key_type);
     [[nodiscard]] static uint16_t LowerBound(const char* page_data, const Value& key, TypeId key_type);
 
+    // Throws "damaged index" if the page claims more keys than fit.
+    static void CheckKeyCount(const char* page_data, TypeId key_type);
+
     [[nodiscard]] static uint16_t MaxKeys(TypeId key_type);
     [[nodiscard]] static bool NeedsSplit(const char* page_data, TypeId key_type);
 

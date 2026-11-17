@@ -1,11 +1,16 @@
 #include <gtest/gtest.h>
 
+#include <poll.h>
+#include <signal.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -13,6 +18,8 @@
 #include "catalog/catalog.hpp"
 #include "common/exception.hpp"
 #include "engine/database.hpp"
+#include "index/btree_internal_page.hpp"
+#include "index/btree_leaf_page.hpp"
 #include "storage/columnar/column_vector.hpp"
 #include "storage/columnar/columnar_file.hpp"
 #include "storage/columnar/columnar_table.hpp"
@@ -24,6 +31,8 @@ namespace {
 
 constexpr size_t kBigRows = 150000;
 constexpr int64_t kKeySpread = 60000;
+constexpr int64_t kDamageRows = 5000;  // enough sorted keys for a root over about 17 leaves
+constexpr int kChildSeconds = 20;
 
 // Runs fn and returns what it threw, or "" if it didn't throw.
 template <typename Fn>
@@ -88,6 +97,56 @@ int64_t KeyAt(const ColumnarTable& table, const RID& rid) {
     return out.GetInt(0);
 }
 
+// Runs fn in a forked child, so a hang or abort fails the test.
+// Returns what fn threw, or how the child ended without throwing.
+std::string ErrorInChild(const std::function<void()>& fn) {
+    int fds[2];
+    if (::pipe(fds) != 0) return "pipe failed";
+    const pid_t pid = ::fork();
+    if (pid < 0) return "fork failed";
+    if (pid == 0) {
+        ::close(fds[0]);
+        std::string text = "no throw";
+        try {
+            fn();
+        } catch (const std::exception& e) {
+            text = e.what();
+        }
+        (void)!::write(fds[1], text.data(), text.size());
+        ::_exit(0);
+    }
+    ::close(fds[1]);
+
+    std::string out;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(kChildSeconds);
+    char buf[512];
+    while (true) {
+        const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()).count();
+        pollfd p{fds[0], POLLIN, 0};
+        if (left <= 0 || ::poll(&p, 1, static_cast<int>(left)) == 0) {
+            ::kill(pid, SIGKILL);
+            ::waitpid(pid, nullptr, 0);
+            ::close(fds[0]);
+            return "timed out after " + std::to_string(kChildSeconds) + " s";
+        }
+        const ssize_t n = ::read(fds[0], buf, sizeof(buf));
+        if (n <= 0) break;
+        out.append(buf, static_cast<size_t>(n));
+    }
+    ::close(fds[0]);
+    int status = 0;
+    ::waitpid(pid, &status, 0);
+    if (WIFSIGNALED(status)) return "killed by signal " + std::to_string(WTERMSIG(status));
+    return out;
+}
+
+// Pinned frames in the pool, as a note to add to an error, or "".
+std::string PinNote(const BufferPoolManager& bpm) {
+    size_t pinned = 0;
+    for (size_t f = 0; f < bpm.GetPoolSize(); ++f) pinned += bpm.GetPage(static_cast<frame_id_t>(f)).GetPinCount() > 0;
+    return pinned == 0 ? "" : " (and " + std::to_string(pinned) + " pages left pinned)";
+}
+
 class ColumnarIndexTest : public ::testing::Test {
 protected:
     std::string db_file_;
@@ -125,6 +184,66 @@ protected:
         in.read(bytes.data(), static_cast<std::streamsize>(bytes.size()));
         EXPECT_EQ(static_cast<uint64_t>(in.gcount()), bytes.size());
         return bytes;
+    }
+
+    // Overwrites one page of the db file.
+    void WritePage(page_id_t pid, const std::vector<char>& bytes) const {
+        std::fstream out(db_file_, std::ios::binary | std::ios::in | std::ios::out);
+        out.seekp(static_cast<std::streamoff>(pid) * PAGE_SIZE);
+        out.write(bytes.data(), PAGE_SIZE);
+        ASSERT_TRUE(out.good());
+    }
+
+    // Commits a table of sorted keys with a two-level index, and returns the root.
+    page_id_t CommitTwoLevelIndex() {
+        const std::string tbl = WriteTbl("damage", KeyRange(1, kDamageRows));
+        {
+            Database db(db_file_);
+            db.LoadTable("t", KeyValue(), tbl, Columnar());
+            EXPECT_NE(db.GetCatalog()->CreateIndex("idx_k", "t", "k"), nullptr);
+        }
+        const page_id_t root = SavedRoots().at(0).second;
+        const std::vector<char> page = ReadPages(root, 1);
+        EXPECT_EQ(SlottedPage::GetHeader(page.data())->flags & 1u, 0u) << "the root should be internal";
+        const page_id_t first = BTreeInternalPage::GetChild(page.data(), 0, TypeId::BIGINT);
+        EXPECT_NE(SlottedPage::GetHeader(ReadPages(first, 1).data())->flags & 1u, 0u) << "its children should be leaves";
+        return root;
+    }
+
+    // Opens the file in a child and runs a point lookup, range scans and SQL.
+    // Each must throw "damaged index: ..." with every page unpinned.
+    void ExpectDamaged(int64_t point, int64_t low, const std::string& what) {
+        const auto run = [&](const std::function<void(Database&, BTreeIndex&)>& op) {
+            return ErrorInChild([&] {
+                Database db(db_file_);
+                try {
+                    op(db, *db.GetCatalog()->GetIndex("idx_k")->index);
+                } catch (const std::exception& e) {
+                    throw DatabaseException(e.what() + PinNote(*db.GetBufferPoolManager()));
+                }
+            });
+        };
+        const std::vector<std::pair<std::string, std::function<void(Database&, BTreeIndex&)>>> ops = {
+            {"point lookup", [&](Database&, BTreeIndex& index) { (void)index.PointLookup(Value(point)); }},
+            {"range scan", [&](Database&, BTreeIndex& index) {
+                 for (auto it = index.Begin(Value(low)); !it.IsEnd(); ++it) (void)*it;
+             }},
+            {"full scan", [&](Database&, BTreeIndex& index) {
+                 for (auto it = index.Begin(); !it.IsEnd(); ++it) (void)*it;
+             }},
+            {"SQL point", [&](Database& db, BTreeIndex&) {
+                 (void)db.ExecuteSQL("SELECT v FROM t WHERE k = " + std::to_string(point));
+             }},
+            {"SQL range", [&](Database& db, BTreeIndex&) {
+                 (void)db.ExecuteSQL("SELECT v FROM t WHERE k >= " + std::to_string(low) + " AND k <= " +
+                                     std::to_string(low + 10));
+             }},
+        };
+        for (const auto& [name, op] : ops) {
+            const std::string error = run(op);
+            EXPECT_EQ(error.rfind("damaged index: ", 0), 0u) << what << ", " << name << ": " << error;
+            EXPECT_EQ(error.find("pinned"), std::string::npos) << what << ", " << name << ": " << error;
+        }
     }
 
     // The index roots the file has saved, by index name, read with a fresh open.
@@ -413,6 +532,33 @@ TEST_F(ColumnarIndexTest, NullKeyRefused) {
     IndexInfo* index = db.GetCatalog()->CreateIndex("idx_v", "t", "v");
     ASSERT_NE(index, nullptr);
     EXPECT_EQ(index->oid, 16385u);
+}
+
+
+TEST_F(ColumnarIndexTest, ZeroedRootThrows) {
+    const page_id_t root = CommitTwoLevelIndex();
+    WritePage(root, std::vector<char>(PAGE_SIZE, 0));
+    ExpectDamaged(777, 777, "zeroed root");
+}
+
+TEST_F(ColumnarIndexTest, ChildPointingAtItsParentThrows) {
+    const page_id_t root = CommitTwoLevelIndex();
+    std::vector<char> page = ReadPages(root, 1);
+    BTreeInternalPage::SetChild(page.data(), 0, root, TypeId::BIGINT);
+    WritePage(root, page);
+    ExpectDamaged(1, 1, "child pointing at its parent");
+}
+
+TEST_F(ColumnarIndexTest, LeafChainCycleThrows) {
+    const page_id_t root = CommitTwoLevelIndex();
+    const std::vector<char> root_page = ReadPages(root, 1);
+    const page_id_t last = BTreeInternalPage::GetChild(root_page.data(), BTreeInternalPage::GetNumKeys(root_page.data()),
+                                                       TypeId::BIGINT);
+    std::vector<char> leaf = ReadPages(last, 1);
+    ASSERT_EQ(BTreeLeafPage::GetNextLeafPageId(leaf.data()), INVALID_PAGE_ID) << "the last leaf ends the chain";
+    BTreeLeafPage::SetNextLeafPageId(leaf.data(), last);
+    WritePage(last, leaf);
+    ExpectDamaged(kDamageRows, kDamageRows - 10, "leaf chain cycle");
 }
 
 }  // namespace

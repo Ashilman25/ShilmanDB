@@ -473,7 +473,7 @@ TEST_F(ColumnarFileTest, CreateCrashStatesReopenEmpty) {
         EXPECT_EQ(file.Catalog().tables.size(), 1u);
     }
 
-    // Slot 0 lost but slot 1 kept: slot 1 checks out, so it opens as it is.
+    // Slot 0 lost, slot 1 kept: slot 1 checks out and opens as it is.
     const std::vector<char> slot1_only = join(zeros, slot1);
     WriteRaw(slot1_only);
     {
@@ -511,7 +511,7 @@ TEST_F(ColumnarFileTest, CreateCrashStatesReopenEmpty) {
         EXPECT_EQ(file.Current().generation, 1u);
     }
 
-    // Two pages of junk with no magic are not ours, so they stay as they are.
+    // Two pages of junk with no magic aren't ours, so they're left alone.
     WriteRaw(std::vector<char>(2 * PAGE_SIZE, 'j'));
     const std::vector<char> junk = FileBytes();
     EXPECT_EQ(OpenError(), path_ + ": not a ShilmanDB file, or an older format; reload it");

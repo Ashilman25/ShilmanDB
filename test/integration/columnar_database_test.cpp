@@ -2,6 +2,7 @@
 
 #include <unistd.h>
 
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -318,6 +319,44 @@ TEST_F(ColumnarDatabaseTest, HeapPageIdsShiftByTwo) {
     auto* info = db.GetCatalog()->CreateTable("t", TwoInts());
     ASSERT_NE(info, nullptr);
     EXPECT_EQ(info->first_page_id, 2);
+}
+
+
+TEST_F(ColumnarDatabaseTest, NumericNegativeZeroIsPlusZero) {
+    // NUMERIC keeps an exact scaled integer, which has one zero, so "-0.00" reads back
+    // as +0.0. The row store parses the text and gives -0.0. This is the one
+    // NUMERIC(p <= 15) value where the two stores differ; DOUBLE keeps -0.0 in both.
+    const std::string tbl = WriteTbl("negzero", "1|-0.00|-0.00|\n");
+    const Schema schema({Column("k", ColumnType::Integer()), Column("m", ColumnType::Numeric(15, 2)),
+                         Column("d", ColumnType::Double())});
+    const std::string row_file = TempPath("_negzero_row.db");
+    std::filesystem::remove(row_file);
+    tbl_files_.push_back(row_file);  // removed in TearDown, after both databases close
+    Database row(row_file);
+    row.LoadTable("t", schema, tbl);
+    Database columnar(db_file_);
+    columnar.LoadTable("t", schema, tbl, Columnar());
+
+    for (const ExecutionMode mode : {ExecutionMode::TUPLE, ExecutionMode::VECTORIZED}) {
+        const std::string at = mode == ExecutionMode::TUPLE ? "tuple mode" : "vectorized mode";
+        const QueryResult r = row.ExecuteSQL("SELECT m, d FROM t", mode);
+        const QueryResult c = columnar.ExecuteSQL("SELECT m, d FROM t", mode);
+        ASSERT_EQ(r.tuples.size(), 1u) << at;
+        ASSERT_EQ(c.tuples.size(), 1u) << at;
+
+        const Value row_m = r.tuples[0].GetValue(r.schema, 0);
+        const Value col_m = c.tuples[0].GetValue(c.schema, 0);
+        ASSERT_EQ(col_m.type_, TypeId::DECIMAL) << at;
+        EXPECT_EQ(col_m.decimal_, 0.0) << at;
+        EXPECT_FALSE(std::signbit(col_m.decimal_)) << at << ": columnar NUMERIC has one zero";
+        EXPECT_TRUE(std::signbit(row_m.decimal_)) << at << ": the row store parses -0.0";
+
+        for (const QueryResult* result : {&r, &c}) {
+            const Value d = result->tuples[0].GetValue(result->schema, 1);
+            ASSERT_EQ(d.type_, TypeId::DECIMAL) << at;
+            EXPECT_TRUE(std::signbit(d.decimal_)) << at << (result == &r ? ": row store" : ": columnar") << " DOUBLE";
+        }
+    }
 }
 
 }  // namespace

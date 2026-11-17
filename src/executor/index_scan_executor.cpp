@@ -30,6 +30,15 @@ void IndexScanExecutor::Init() {
     scratch_.clear();
     defaults_.clear();
     if (table_info->storage == StorageKind::COLUMNAR) {
+        const Schema& plan_schema = plan_->output_schema;
+        if (plan_schema.GetColumnCount() != schema_->GetColumnCount()) {
+            throw DatabaseException("IndexScanExecutor: the plan's columns don't match table " + scan_plan->table_name);
+        }
+        for (uint32_t c = 0; c < plan_schema.GetColumnCount(); ++c) {
+            if (plan_schema.GetColumn(c).type != schema_->GetColumn(c).type) {
+                throw DatabaseException("IndexScanExecutor: the plan's column " + std::to_string(c) + " has a different type than table " + scan_plan->table_name);
+            }
+        }
         for (const auto& col : schema_->GetColumns()) defaults_.push_back(Value::DefaultFor(col.type));
         columnar_ = table_info->columnar.get();
         read_columns_ = ColumnarReadColumns(*table_info, scan_plan->read_columns);

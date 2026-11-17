@@ -2,6 +2,7 @@
 #include "buffer/eviction_policy_factory.hpp"
 #include "executor/executor.hpp"
 #include "common/exception.hpp"
+#include "storage/columnar/bulk_loader.hpp"
 #include "tpch/page_owners.hpp"
 #include "tpch/tpch_streams.hpp"
 #include "tpch/tpch_workload.hpp"
@@ -20,7 +21,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
-#include <limits>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -231,8 +231,8 @@ static Args ParseArgs(int argc, char* argv[]) {
         } else if (arg == "--load-threads" && i + 1 < argc) {
             const std::string val = argv[++i];
             const auto threads = ParseUnsigned(val);
-            if (!threads || *threads < 1 || *threads > std::numeric_limits<unsigned>::max()) {
-                ExitWithError("--load-threads expects a whole number >= 1, got '" + val + "'");
+            if (!threads || *threads < 1 || *threads > kMaxLoadThreads) {
+                ExitWithError("--load-threads expects a whole number from 1 to " + std::to_string(kMaxLoadThreads) + ", got '" + val + "'");
             }
             args.load_threads = static_cast<unsigned>(*threads);
             load_threads_given = true;
@@ -307,7 +307,8 @@ static Args ParseArgs(int argc, char* argv[]) {
     if (args.reuse_db && !columnar) ExitWithError("--reuse-db needs --storage columnar");
     // Page owners walk heap pages, which a columnar table doesn't have
     if (!args.dump_page_owners.empty() && columnar) ExitWithError("--dump-page-owners needs --storage row");
-    if (columnar && !load_threads_given) args.load_threads = std::max(1U, std::thread::hardware_concurrency());
+    // The loader runs at most kMaxLoadThreads workers, so the count printed is the real one
+    if (columnar && !load_threads_given) args.load_threads = std::clamp(std::thread::hardware_concurrency(), 1U, kMaxLoadThreads);
     if (!single && !args.stream_length) {
         args.stream_length = tpch::DefaultStreamLength(args.workload, args.sf);
         if (!args.stream_length) {
@@ -510,7 +511,7 @@ static void WriteStorageInfo(std::ostream& ofs, const Args& args) {
     const page_id_t pages = db.GetDiskManager()->GetNumPages();
     const double mib = static_cast<double>(pages) * static_cast<double>(PAGE_SIZE) / (1024.0 * 1024.0);
     std::cout << "Loaded " << loads.size() << " tables in " << static_cast<int64_t>(total_ms) << " ms ("
-              << StorageName(args.storage) << ", " << args.load_threads << " threads)\n"
+              << StorageName(args.storage) << ", " << args.load_threads << (args.load_threads == 1 ? " thread)\n" : " threads)\n")
               << "Database file: " << pages << " pages (" << Fixed(mib, 1) << " MiB)\n";
 
     return args.results_dir.empty() || WriteLoadTimes(args, loads, total_ms);

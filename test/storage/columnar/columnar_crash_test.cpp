@@ -17,6 +17,7 @@
 #include <functional>
 #include <iostream>
 #include <iterator>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <random>
@@ -31,6 +32,7 @@
 #include "executor/executor_factory.hpp"
 #include "planner/plan_node.hpp"
 #include "storage/columnar/superblock.hpp"
+#include "storage/slotted_page.hpp"
 #include "tpch/tpch_workload.hpp"
 
 extern char** environ;
@@ -39,6 +41,8 @@ namespace shilmandb {
 namespace {
 
 constexpr size_t kPoolSize = 64;
+constexpr size_t kIndexBuildPool = 8;   // small, so the tree outgrows it and pages leave before the flush
+constexpr int64_t kIndexRows = 5000;    // a supplier-shaped table big enough for a two-level tree
 constexpr size_t kMaxCrashPoints = 400;
 constexpr int64_t kKey = 3;  // the s_nationkey and n_nationkey value the index queries look up
 constexpr size_t kTornSplitFull = 4096;  // covers every slot field, so it equals the whole write
@@ -144,11 +148,94 @@ int64_t IndexCount(Database& db, const std::string& table, const std::string& in
     return rows;
 }
 
+// Same type, then the same bytes in the member that type uses.
+bool SameBits(const Value& a, const Value& b) {
+    if (a.type_ != b.type_) return false;
+    switch (a.type_) {
+        case TypeId::INTEGER: return std::memcmp(&a.integer_, &b.integer_, sizeof(a.integer_)) == 0;
+        case TypeId::BIGINT: return std::memcmp(&a.bigint_, &b.bigint_, sizeof(a.bigint_)) == 0;
+        case TypeId::DECIMAL: return std::memcmp(&a.decimal_, &b.decimal_, sizeof(a.decimal_)) == 0;
+        case TypeId::DATE: return std::memcmp(&a.date_, &b.date_, sizeof(a.date_)) == 0;
+        case TypeId::VARCHAR: return a.varchar_ == b.varchar_;
+        case TypeId::INVALID: return true;
+    }
+    return false;
+}
+
+// SELECT * from a row-store load of file, loaded once per table and file.
+const QueryResult& RowStoreRows(const std::string& table, const Schema& schema, const std::string& file) {
+    static std::map<std::string, QueryResult> loaded;
+    const std::string key = table + "|" + file;
+    if (auto it = loaded.find(key); it != loaded.end()) return it->second;
+
+    const std::string path = TempPath("row_" + std::to_string(loaded.size()));
+    std::filesystem::remove(path);
+    const RemoveOnExit remove_path{path};
+    QueryResult rows;
+    {
+        Database db(path, kPoolSize);
+        db.LoadTable(table, schema, file);
+        rows = db.ExecuteSQL("SELECT * FROM " + table);
+    }
+    return loaded.emplace(key, std::move(rows)).first->second;
+}
+
+// Checks two row lists match bit for bit, row by row, in order.
+void ExpectSameTuples(const Schema& schema, const std::vector<Tuple>& want, const std::vector<Tuple>& got,
+                      const std::string& what) {
+    ASSERT_EQ(got.size(), want.size()) << what;
+    for (size_t r = 0; r < want.size(); ++r) {
+        for (uint32_t c = 0; c < schema.GetColumnCount(); ++c) {
+            const Value x = want[r].GetValue(schema, c);
+            const Value y = got[r].GetValue(schema, c);
+            ASSERT_TRUE(SameBits(x, y)) << what << " row " << r << " column " << schema.GetColumn(c).name << " is "
+                                        << y.ToString() << ", want " << x.ToString();
+        }
+    }
+}
+
+// Checks every row and column, in row order, against a row-store load of file.
+void ExpectSameRows(Database& db, const std::string& table, const Schema& schema, const std::string& file,
+                    const std::string& at) {
+    ASSERT_FALSE(file.empty()) << at << ": no input file named for " << table;
+    const QueryResult& want = RowStoreRows(table, schema, file);
+    const QueryResult got = db.ExecuteSQL("SELECT * FROM " + table);
+    ASSERT_EQ(got.schema.GetColumnCount(), want.schema.GetColumnCount()) << at << ": " << table;
+    ExpectSameTuples(want.schema, want.tuples, got.tuples, at + ": " + table);
+}
+
+// Reads every entry of the index, all columns, and checks it against a row-store load.
+// Equal keys sit in file order, so a stable sort by key matches the tree.
+void ExpectSameIndexRows(Database& db, const std::string& table, const Schema& schema, const std::string& file,
+                         const std::string& index, const std::string& column, const std::string& at) {
+    ASSERT_FALSE(file.empty()) << at << ": no input file named for " << table;
+    const QueryResult& loaded = RowStoreRows(table, schema, file);
+    const uint32_t key = loaded.schema.GetColumnIndex(column);
+    std::vector<Tuple> want = loaded.tuples;
+    std::stable_sort(want.begin(), want.end(), [&](const Tuple& a, const Tuple& b) {
+        return a.GetValue(loaded.schema, key) < b.GetValue(loaded.schema, key);
+    });
+
+    const TableInfo* info = db.GetCatalog()->GetTable(table);
+    ASSERT_NE(info, nullptr) << at;
+    const IndexScanPlanNode plan(info->schema, table, index);
+    ExecutorContext ctx{db.GetBufferPoolManager(), db.GetCatalog()};
+    auto exec = ExecutorFactory::CreateExecutor(&plan, &ctx, ExecutionMode::TUPLE);
+    std::vector<Tuple> got;
+    exec->Init();
+    Tuple tuple;
+    while (exec->Next(&tuple)) got.push_back(tuple);
+    exec->Close();
+    ExpectSameTuples(loaded.schema, want, got, at + ": " + index);
+}
+
 // What one committed version of the file holds.
 struct Version {
     std::string name;
-    int64_t supplier_rows{0};  // 0 means no supplier table
-    int64_t supplier_key{0};   // supplier rows with s_nationkey = kKey
+    std::string nation_file;     // the nation rows' input
+    std::string supplier_file;   // the supplier rows' input, when there is a supplier table
+    int64_t supplier_rows{0};    // 0 means no supplier table
+    int64_t supplier_key{0};     // supplier rows with s_nationkey = kKey
     bool supplier_index{false};
     bool nation_index{false};
 };
@@ -159,9 +246,11 @@ void ExpectVersion(Database& db, const Version& v, const std::string& where) {
     Catalog* catalog = db.GetCatalog();
 
     EXPECT_EQ(CountOf(db, "SELECT COUNT(*) FROM nation"), 25) << at;
+    ExpectSameRows(db, "nation", tpch::NationSchema(), v.nation_file, at);
     if (v.nation_index) {
         ASSERT_NE(catalog->GetIndex("idx_nation_nationkey"), nullptr) << at;
         EXPECT_EQ(IndexCount(db, "nation", "idx_nation_nationkey", "n_nationkey", at), 1) << at;
+        ExpectSameIndexRows(db, "nation", tpch::NationSchema(), v.nation_file, "idx_nation_nationkey", "n_nationkey", at);
         EXPECT_EQ(CountOf(db, "SELECT COUNT(*) FROM nation WHERE n_nationkey = " + std::to_string(kKey)), 1) << at;
     }
 
@@ -176,9 +265,12 @@ void ExpectVersion(Database& db, const Version& v, const std::string& where) {
     if (v.supplier_index) {
         ASSERT_NE(catalog->GetIndex("idx_supplier_nationkey"), nullptr) << at;
         EXPECT_EQ(IndexCount(db, "supplier", "idx_supplier_nationkey", "s_nationkey", at), v.supplier_key) << at;
+        ExpectSameIndexRows(db, "supplier", tpch::SupplierSchema(), v.supplier_file, "idx_supplier_nationkey",
+                            "s_nationkey", at);
     } else {
         EXPECT_EQ(catalog->GetIndex("idx_supplier_nationkey"), nullptr) << at;
     }
+    ExpectSameRows(db, "supplier", tpch::SupplierSchema(), v.supplier_file, at);
 }
 
 // One page write or sync, as the disk manager reported it.
@@ -247,7 +339,8 @@ std::vector<char> Build(const std::vector<char>& snapshot, const std::vector<Eve
 
 // Runs setup, snapshots the file, records op, then opens every crash state.
 void RunScenario(const std::string& tag, const std::function<void(Database&)>& setup,
-                 const std::function<void(Database&)>& op, const Version& old_v, const Version& new_v) {
+                 const std::function<void(Database&)>& op, const Version& old_v, const Version& new_v,
+                 size_t op_pool = kPoolSize) {
     const std::string work = TempPath(tag + "_work");
     std::filesystem::remove(work);
     const RemoveOnExit remove_work{work};
@@ -260,7 +353,7 @@ void RunScenario(const std::string& tag, const std::function<void(Database&)>& s
 
     Recorder recorder;
     {
-        Database db(work, kPoolSize);
+        Database db(work, op_pool);
         db.GetDiskManager()->SetWriteObserver(&recorder);
         op(db);
         db.GetDiskManager()->SetWriteObserver(nullptr);
@@ -397,9 +490,11 @@ protected:
 TEST_F(ColumnarCrashTest, SimulatedCrashesDuringLoad) {
     Version old_v;
     old_v.name = "old";
+    old_v.nation_file = data_dir_ + "nation.tbl";
     old_v.nation_index = true;
     Version new_v = old_v;
     new_v.name = "new";
+    new_v.supplier_file = data_dir_ + "supplier.tbl";
     new_v.supplier_rows = static_cast<int64_t>(supplier_.size());
     new_v.supplier_key = CountKey(supplier_, 3, kKey);
     ASSERT_EQ(new_v.supplier_rows, 100);
@@ -426,11 +521,14 @@ TEST_F(ColumnarCrashTest, SimulatedCrashesDuringReplace) {
 
     Version old_v;
     old_v.name = "old";
+    old_v.nation_file = data_dir_ + "nation.tbl";
+    old_v.supplier_file = data_dir_ + "supplier.tbl";
     old_v.supplier_rows = static_cast<int64_t>(supplier_.size());
     old_v.supplier_key = CountKey(supplier_, 3, kKey);
     old_v.supplier_index = true;
     Version new_v = old_v;
     new_v.name = "new";
+    new_v.supplier_file = half_path;
     new_v.supplier_rows = static_cast<int64_t>(half.size());
     new_v.supplier_key = CountKey(half, 3, kKey);
     ASSERT_EQ(new_v.supplier_rows, 50);
@@ -446,6 +544,60 @@ TEST_F(ColumnarCrashTest, SimulatedCrashesDuringReplace) {
         },
         [&](Database& db) { db.LoadTable("supplier", tpch::SupplierSchema(), half_path, Columnar()); }, old_v,
         new_v);
+}
+
+TEST_F(ColumnarCrashTest, SimulatedCrashesDuringIndexBuild) {
+    // Supplier's lines over and over, sorted by s_nationkey so each leaf fills once
+    const auto nation_of = [](const std::string& line) {
+        const size_t start = line.find('|', line.find('|', line.find('|') + 1) + 1) + 1;
+        return std::stoll(line.substr(start, line.find('|', start) - start));
+    };
+    std::vector<std::string> lines;
+    for (size_t n = 0; n < static_cast<size_t>(kIndexRows); ++n) lines.push_back(supplier_[n % supplier_.size()]);
+    std::stable_sort(lines.begin(), lines.end(),
+                     [&](const std::string& a, const std::string& b) { return nation_of(a) < nation_of(b); });
+    for (size_t n = 0; n < lines.size(); ++n) lines[n] = std::to_string(n + 1) + lines[n].substr(lines[n].find('|'));
+    const std::string big_path = TempPath("supplier_big") + ".tbl";
+    const RemoveOnExit remove_big{big_path};
+    {
+        std::ofstream out(big_path, std::ios::trunc);
+        for (const std::string& line : lines) out << line << '\n';
+    }
+
+    Version old_v;
+    old_v.name = "old";
+    old_v.nation_file = data_dir_ + "nation.tbl";
+    old_v.supplier_file = big_path;
+    old_v.supplier_rows = kIndexRows;
+    old_v.supplier_key = CountKey(lines, 3, kKey);
+    Version new_v = old_v;
+    new_v.name = "new";
+    new_v.supplier_index = true;
+    ASSERT_GT(old_v.supplier_key, 0);
+
+    RunScenario(
+        "index",
+        [&](Database& db) {
+            db.LoadTable("nation", tpch::NationSchema(), data_dir_ + "nation.tbl", Columnar());
+            db.LoadTable("supplier", tpch::SupplierSchema(), big_path, Columnar());
+        },
+        [&](Database& db) {
+            const page_id_t before = db.GetDiskManager()->GetNumPages();
+            IndexInfo* index = db.GetCatalog()->CreateIndex("idx_supplier_nationkey", "supplier", "s_nationkey");
+            ASSERT_NE(index, nullptr);
+
+            // More new pages than frames, so tree pages were written before the flush
+            const page_id_t added = db.GetDiskManager()->GetNumPages() - before;
+            EXPECT_GT(added, kIndexBuildPool + 2) << "the tree must outgrow the pool";
+            BufferPoolManager* bpm = db.GetBufferPoolManager();
+            const page_id_t root = index->index->GetRootPageId();
+            const bool internal = (SlottedPage::GetHeader(bpm->FetchPage(root)->GetData())->flags & 1u) == 0;
+            (void)bpm->UnpinPage(root, false);
+            EXPECT_TRUE(internal) << "the tree should have two levels or more";
+            std::cout << "index: " << added << " new pages for the tree and catalog, pool of " << kIndexBuildPool
+                      << " frames\n";
+        },
+        old_v, new_v, kIndexBuildPool);
 }
 
 // The generation of the slot an open would pick, or 0 if none is valid.
@@ -592,6 +744,10 @@ TEST_F(ColumnarCrashTest, KillDuringReplaces) {
             EXPECT_EQ(CountOf(db, "SELECT COUNT(*) FROM supplier"), row_rows[v]) << at;
             EXPECT_EQ(CountOf(db, key_sql), row_answer[v]) << at;
             EXPECT_EQ(IndexCount(db, "supplier", "idx_supplier_nationkey", "s_nationkey", at), row_answer[v]) << at;
+            ExpectSameRows(db, "supplier", tpch::SupplierSchema(), sources[v], at);
+            ExpectSameIndexRows(db, "supplier", tpch::SupplierSchema(), sources[v], "idx_supplier_nationkey",
+                                "s_nationkey", at);
+            ExpectSameRows(db, "nation", tpch::NationSchema(), data_dir_ + "nation.tbl", at);
         } catch (const std::exception& e) {
             ADD_FAILURE() << where << ": " << e.what();
         }

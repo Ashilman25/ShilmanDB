@@ -29,7 +29,6 @@ namespace {
 constexpr size_t kReadBlockBytes = size_t{1} << 20;               // the reader takes the file 1 MiB at a time
 constexpr uint64_t kNoFailure = std::numeric_limits<uint64_t>::max();
 constexpr size_t kAbortCheckRows = 4096;                          // how often a worker looks for a failure
-constexpr unsigned kMaxThreads = 256;
 
 // One row group's lines, cut by the reader and parsed by one worker.
 struct Batch {
@@ -460,7 +459,7 @@ ColumnarTableMeta BulkLoad(DiskManager* disk, const std::string& table_name, con
 
     unsigned workers = options.threads;
     if (workers == 0) workers = std::max(1u, std::thread::hardware_concurrency());
-    workers = std::min(workers, kMaxThreads);
+    workers = std::min(workers, kMaxLoadThreads);
 
     TableBuilder builder(table_name, schema);
     {

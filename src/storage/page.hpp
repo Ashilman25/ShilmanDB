@@ -26,7 +26,8 @@ public:
     char* GetData() { return data_; }
     const char* GetData() const { return data_; }
 
-    // Forgets which page this is, its pin count and both flags. The bytes stay as they are.
+    // Forgets which page this is, its pin count and both flags.
+    // The bytes stay as they are.
     void ClearMetadata() {
         page_id_ = INVALID_PAGE_ID;
         pin_count_ = 0;

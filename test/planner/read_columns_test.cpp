@@ -14,6 +14,7 @@
 #include "buffer/lru_eviction_policy.hpp"
 #include "catalog/catalog.hpp"
 #include "parser/parser.hpp"
+#include "planner/column_usage.hpp"
 #include "planner/planner.hpp"
 #include "storage/disk_manager.hpp"
 #include "tpch/tpch_workload.hpp"
@@ -212,6 +213,38 @@ TEST_F(ReadColumnsTest, SeqScanCarriesItsPredicatesAsSkipHints) {
     const auto* bare = ScanOf(no_where.get(), "lineitem");
     ASSERT_NE(bare, nullptr);
     EXPECT_TRUE(static_cast<const SeqScanPlanNode*>(bare)->skip_conjuncts.empty());
+}
+
+TEST_F(ReadColumnsTest, EveryTpchPlanReadsOnlyListedColumns) {
+    for (const bool with_indexes : {false, true}) {
+        SCOPED_TRACE(with_indexes ? "with indexes" : "without indexes");
+        if (with_indexes) {
+            // SF=1-sized stats on the two date columns, so date ranges pick their index.
+            auto* lineitem = catalog_->GetTable("lineitem");
+            lineitem->stats.row_count = 6000000;
+            lineitem->stats.page_count = 120000;
+            lineitem->stats.min_max["l_shipdate"] = {Value::FromString(TypeId::DATE, "1992-01-02"),
+                                                     Value::FromString(TypeId::DATE, "1998-12-01")};
+            auto* orders = catalog_->GetTable("orders");
+            orders->stats.row_count = 1500000;
+            orders->stats.page_count = 25000;
+            orders->stats.min_max["o_orderdate"] = {Value::FromString(TypeId::DATE, "1992-01-01"),
+                                                    Value::FromString(TypeId::DATE, "1998-08-02")};
+            for (const auto& idx : tpch::IndexDescs()) {
+                ASSERT_NE(catalog_->CreateIndex(idx.index_name, idx.table_name, idx.column_name), nullptr);
+            }
+        }
+        size_t index_scans = 0;
+        for (const auto& q : tpch::Queries()) {
+            SCOPED_TRACE(q.tag);
+            const auto plan = Plan(q.sql);
+            EXPECT_TRUE(FindUnlistedReads(*plan).empty());
+            std::vector<const PlanNode*> scans;
+            CollectScans(plan.get(), scans);
+            for (const auto* s : scans) index_scans += s->type == PlanNodeType::INDEX_SCAN ? 1 : 0;
+        }
+        if (with_indexes) EXPECT_GT(index_scans, 0u);
+    }
 }
 
 }  // namespace
