@@ -427,7 +427,7 @@ static void WritePolicyColumns(std::ostream& ofs, const PolicyRecord& rec) {
 
 // What every run_info.csv records about the database.
 struct RunInfo {
-    page_id_t db_pages;        // tables only, right after the load
+    page_id_t db_pages;        // the whole file right after the load, before any index
     page_id_t db_pages_total;  // after the indexes
     std::string eviction;
     double planner_read_us;  // the page read cost the planner priced scans with
