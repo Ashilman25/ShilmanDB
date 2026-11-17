@@ -2,6 +2,7 @@
 #include "buffer/eviction_policy_factory.hpp"
 #include "executor/executor.hpp"
 #include "common/exception.hpp"
+#include "storage/columnar/bulk_loader.hpp"
 #include "tpch/page_owners.hpp"
 #include "tpch/tpch_streams.hpp"
 #include "tpch/tpch_workload.hpp"
@@ -23,6 +24,7 @@
 #include <memory>
 #include <optional>
 #include <stdexcept>
+#include <thread>
 #include <unordered_set>
 
 using namespace shilmandb;
@@ -54,6 +56,9 @@ struct Args {
     std::string eviction_model_path;
     std::string dump_page_owners;  // write the page-owner map to this path, then exit
     bool keep_load_pool{false};  // a workload starts with the pool the load left, not an empty one
+    StorageKind storage{StorageKind::ROW};
+    unsigned load_threads{1};    // columnar loader threads; one per core unless --load-threads
+    bool reuse_db{false};        // open the columnar file a run left instead of loading
 #ifdef SHILMANDB_HAS_LIBTORCH
     bool use_learned_join{false};
     std::string join_model_path;
@@ -69,6 +74,7 @@ static void PrintUsage(const char* prog) {
               << " [--miss-penalty-us <N>] [--direct-io] [--policy-timing] [--planner-read-us <X>]"
               << " [--workload <single|stream|lookup|mixed>] [--stream-length <N>] [--seed <S>] [--keep-load-pool]"
               << " [--dump-page-owners <path>]"
+              << " [--storage <row|columnar>] [--load-threads <N>] [--reuse-db]"
               << " [--eviction-policy <lru|clock|lru2|arc|lirs|learned-v2|learned-v1>] [--eviction-model-path <path>]"
 #ifdef SHILMANDB_HAS_LIBTORCH
               << " [--use-learned-join --join-model-path <path>]"
@@ -112,6 +118,7 @@ static Args ParseArgs(int argc, char* argv[]) {
     bool use_learned_eviction = false;
     std::string eviction_version{"v2"};
     bool version_given = false;
+    bool load_threads_given = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -212,6 +219,25 @@ static Args ParseArgs(int argc, char* argv[]) {
             args.trace_collapse = true;
         } else if (arg == "--keep-load-pool") {
             args.keep_load_pool = true;
+        } else if (arg == "--storage" && i + 1 < argc) {
+            const std::string val = argv[++i];
+            if (val == "row") {
+                args.storage = StorageKind::ROW;
+            } else if (val == "columnar") {
+                args.storage = StorageKind::COLUMNAR;
+            } else {
+                ExitWithError("--storage expects 'row' or 'columnar', got '" + val + "'");
+            }
+        } else if (arg == "--load-threads" && i + 1 < argc) {
+            const std::string val = argv[++i];
+            const auto threads = ParseUnsigned(val);
+            if (!threads || *threads < 1 || *threads > kMaxLoadThreads) {
+                ExitWithError("--load-threads expects a whole number from 1 to " + std::to_string(kMaxLoadThreads) + ", got '" + val + "'");
+            }
+            args.load_threads = static_cast<unsigned>(*threads);
+            load_threads_given = true;
+        } else if (arg == "--reuse-db") {
+            args.reuse_db = true;
         } else if (arg == "--eviction-policy" && i + 1 < argc) {
             policy_name = argv[++i];
             const auto kind = ParseEvictionPolicyKind(policy_name);
@@ -276,6 +302,13 @@ static Args ParseArgs(int argc, char* argv[]) {
     if (single && seed_given) ExitWithError("--seed needs --workload stream, lookup or mixed");
     if (single && args.keep_load_pool) ExitWithError("--keep-load-pool needs --workload stream, lookup or mixed");
     if (args.trace_collapse && args.trace_path.empty()) ExitWithError("--trace-collapse needs --enable-tracing <path>");
+    const bool columnar = args.storage == StorageKind::COLUMNAR;
+    if (load_threads_given && !columnar) ExitWithError("--load-threads needs --storage columnar");
+    if (args.reuse_db && !columnar) ExitWithError("--reuse-db needs --storage columnar");
+    // Page owners walk heap pages, which a columnar table doesn't have
+    if (!args.dump_page_owners.empty() && columnar) ExitWithError("--dump-page-owners needs --storage row");
+    // The loader runs at most kMaxLoadThreads workers, so the count printed is the real one
+    if (columnar && !load_threads_given) args.load_threads = std::clamp(std::thread::hardware_concurrency(), 1U, kMaxLoadThreads);
     if (!single && !args.stream_length) {
         args.stream_length = tpch::DefaultStreamLength(args.workload, args.sf);
         if (!args.stream_length) {
@@ -394,7 +427,7 @@ static void WritePolicyColumns(std::ostream& ofs, const PolicyRecord& rec) {
 
 // What every run_info.csv records about the database.
 struct RunInfo {
-    page_id_t db_pages;        // tables only, right after the load
+    page_id_t db_pages;        // the whole file right after the load, before any index
     page_id_t db_pages_total;  // after the indexes
     std::string eviction;
     double planner_read_us;  // the page read cost the planner priced scans with
@@ -418,6 +451,86 @@ static void WriteRunInfo(std::ostream& ofs, const Args& args, const RunInfo& inf
     }
     ofs << "\n"
         << "planner_read_us," << Fixed(info.planner_read_us, 2) << "\n";
+}
+
+// "row" or "columnar", as the output and the CSVs name it.
+static const char* StorageName(StorageKind storage) {
+    return storage == StorageKind::COLUMNAR ? "columnar" : "row";
+}
+
+// The keys every run_info.csv ends with: how the tables are stored.
+static void WriteStorageInfo(std::ostream& ofs, const Args& args) {
+    ofs << "storage," << StorageName(args.storage) << "\n"
+        << "reuse_db," << BoolText(args.reuse_db) << "\n";
+}
+
+// Writes load_times.csv: one row per table, then a TOTAL row.
+[[nodiscard]] static bool WriteLoadTimes(const Args& args, const std::vector<tpch::TableLoad>& loads, double total_ms) {
+    if (!MakeResultsDir(args.results_dir)) return false;
+    const std::string prefix = std::string(",") + StorageName(args.storage) + "," + std::to_string(args.load_threads) + ",";
+    return WriteCsv(fs::path(args.results_dir) / "load_times.csv", "table,storage,threads,rows,ms,pages", [&](std::ostream& ofs) {
+        uint64_t rows = 0;
+        uint64_t pages = 0;
+        for (const auto& load : loads) {
+            ofs << load.name << prefix << load.rows << "," << Fixed(load.ms, 3) << "," << load.pages << "\n";
+            rows += load.rows;
+            pages += load.pages;
+        }
+        ofs << "TOTAL" << prefix << rows << "," << Fixed(total_ms, 3) << "," << pages << "\n";
+    });
+}
+
+// With --reuse-db: true when the file has every table, else says which one is missing.
+[[nodiscard]] static bool HasAllTables(Database& db, const std::string& db_file) {
+    for (const auto& td : tpch::TableDescs()) {
+        if (db.GetCatalog()->GetTable(td.name) == nullptr) {
+            std::cerr << "Error: --reuse-db: " << db_file << " has no table " << td.name << "\n";
+            return false;
+        }
+    }
+    return true;
+}
+
+// Loads the 7 tables, prints the totals and writes load_times.csv if asked. False on error.
+[[nodiscard]] static bool LoadAllTables(Database& db, const Args& args) {
+    LoadOptions options;
+    options.storage = args.storage;
+    if (args.storage == StorageKind::COLUMNAR) options.threads = args.load_threads;
+
+    const auto start = std::chrono::steady_clock::now();
+    std::vector<tpch::TableLoad> loads;
+    try {
+        loads = tpch::LoadTables(db, args.data_dir, options);
+    } catch (const std::exception& e) {
+        std::cerr << "\n" << e.what() << "\n";
+        return false;
+    }
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+    const double total_ms = std::chrono::duration<double, std::milli>(elapsed).count();
+
+    const page_id_t pages = db.GetDiskManager()->GetNumPages();
+    const double mib = static_cast<double>(pages) * static_cast<double>(PAGE_SIZE) / (1024.0 * 1024.0);
+    std::cout << "Loaded " << loads.size() << " tables in " << static_cast<int64_t>(total_ms) << " ms ("
+              << StorageName(args.storage) << ", " << args.load_threads << (args.load_threads == 1 ? " thread)\n" : " threads)\n")
+              << "Database file: " << pages << " pages (" << Fixed(mib, 1) << " MiB)\n";
+
+    return args.results_dir.empty() || WriteLoadTimes(args, loads, total_ms);
+}
+
+// With --reuse-db and indexes on: builds only the indexes the file doesn't have yet.
+static void CreateMissingIndexes(Database& db) {
+    size_t existing = 0;
+    size_t created = 0;
+    for (const auto& idx : tpch::IndexDescs()) {
+        if (db.GetCatalog()->GetIndex(idx.index_name) != nullptr) {
+            ++existing;
+        } else if (db.GetCatalog()->CreateIndex(idx.index_name, idx.table_name, idx.column_name) != nullptr) {
+            ++created;
+        } else {
+            std::cout << "  " << idx.index_name << " on " << idx.table_name << "(" << idx.column_name << ") ... FAILED\n";
+        }
+    }
+    std::cout << "\nIndexes: " << existing << " already in the file, " << created << " created\n";
 }
 
 //Workloads
@@ -669,6 +782,7 @@ static int RunWorkload(Database& db, const Args& args, const RunInfo& info) {
         if (has_lookups) ofs << "zipf_s," << tpch::kLookupZipfS << "\n";
         ofs << "trace_collapse," << BoolText(args.trace_collapse) << "\n"
             << "cold_start," << BoolText(!args.keep_load_pool) << "\n";
+        WriteStorageInfo(ofs, args);
     });
     if (!info_ok) return 1;
 
@@ -704,6 +818,26 @@ int main(int argc, char* argv[]) {
 #ifdef SHILMANDB_HAS_LIBTORCH
     if (args.use_learned_join) join_model_path = args.join_model_path;
 #endif
+    // Built once as a check, so a bad policy leaves an existing file untouched
+    try {
+        (void)MakeEvictionPolicy(args.eviction, args.pool_size, args.eviction_model_path);
+    } catch (const std::exception& e) {
+        ExitWithError(std::string("could not open the database: ") + e.what());
+    }
+
+    // Without --reuse-db every run starts from an empty file
+    if (args.reuse_db) {
+        std::error_code ec;
+        const bool exists = fs::exists(args.db_file, ec);
+        if (ec) ExitWithError("--reuse-db: could not check " + args.db_file + ": " + ec.message());
+        if (!exists) ExitWithError("--reuse-db: " + args.db_file + " does not exist");
+    } else {
+        std::error_code ec;
+        fs::remove(args.db_file, ec);
+        if (ec) ExitWithError("could not remove " + args.db_file + ": " + ec.message());
+        std::cout << "Starting a fresh database file: " << args.db_file << "\n";
+    }
+
     std::unique_ptr<Database> db_owner;
     try {
         db_owner = std::make_unique<Database>(args.db_file, args.pool_size, args.eviction, args.eviction_model_path, join_model_path);
@@ -730,17 +864,16 @@ int main(int argc, char* argv[]) {
         std::cout << "Direct I/O: ON\n";
     }
 
-    try {
-        tpch::LoadTables(db, args.data_dir);
-    } catch (const std::exception& e) {
-        std::cerr << "\n" << e.what() << "\n";
+    if (args.reuse_db) {
+        if (!HasAllTables(db, args.db_file)) return 1;
+    } else if (!LoadAllTables(db, args)) {
         return 1;
     }
     const page_id_t db_pages = db.GetDiskManager()->GetNumPages();
 
-
-
-    if (args.create_indexes) {
+    if (args.create_indexes && args.reuse_db) {
+        CreateMissingIndexes(db);
+    } else if (args.create_indexes) {
         std::cout << "\nCreating indexes ...\n";
         auto indexes = tpch::IndexDescs();
         for (const auto& idx : indexes) {
@@ -1007,6 +1140,7 @@ int main(int argc, char* argv[]) {
                 ofs << "key,value\n";
                 WriteRunInfo(ofs, args, run_info, ReadStats{total_reads, total_read_time});
                 if (args.trace_collapse) ofs << "trace_collapse,true\n";
+                WriteStorageInfo(ofs, args);
                 std::cout << "Run info written to " << info_path.string() << "\n";
             } else {
                 std::cerr << "Warning: could not open " << info_path.string() << " for writing\n";

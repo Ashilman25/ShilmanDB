@@ -26,6 +26,9 @@ public:
 
     static void InsertAfter(char* page_data, page_id_t left_child, const Value& key, page_id_t right_child, TypeId key_type);
 
+    // Throws "damaged index" unless the page holds 1 to MaxKeys + 1 keys.
+    static void CheckKeyCount(const char* page_data, TypeId key_type);
+
     [[nodiscard]] static uint16_t MaxKeys(TypeId key_type);
     [[nodiscard]] static bool NeedsSplit(const char* page_data, TypeId key_type);
 

@@ -67,6 +67,9 @@ public:
     [[nodiscard]] auto GetScanNodes() const -> const std::vector<const PlanNode*>& { return scan_nodes_; }
 
 private:
+    // Lists on every scan the columns its plan reads (read_columns).
+    void AssignReadColumns(PlanNode* root) const;
+
     Catalog* catalog_;
     ScanCosts scan_costs_{};
 

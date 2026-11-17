@@ -2,11 +2,13 @@
 #include <string>
 #include <unistd.h>
 #include "index/btree_index.hpp"
+#include "common/exception.hpp"
 #include "storage/slotted_page.hpp"
 #include "buffer/buffer_pool_manager.hpp"
 #include "buffer/lru_eviction_policy.hpp"
 #include "storage/disk_manager.hpp"
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <vector>
 #include <algorithm>
@@ -535,6 +537,148 @@ TEST_F(BTreeIndexTest, DuplicatesAcrossLeavesDelete) {
         EXPECT_EQ(std::find(rids.begin(), rids.end(), gone), rids.end()) << "RID(" << gone.page_id << ", 1) is still there";
     }
     EXPECT_NE(std::find(rids.begin(), rids.end(), RID(1, 1)), rids.end());
+}
+
+
+namespace {
+
+constexpr int64_t kDamageKeys = 5000;  // sorted keys: a root over about 17 BIGINT leaves
+
+// A two-level tree of keys 0 to kDamageKeys - 1.
+void FillTwoLevels(BTreeIndex& index, BufferPoolManager& bpm) {
+    for (int64_t k = 0; k < kDamageKeys; ++k) index.Insert(Value(k), RID(static_cast<page_id_t>(k), 0));
+    const page_id_t root = index.GetRootPageId();
+    const char* data = bpm.FetchPage(root)->GetData();
+    const bool internal = (SlottedPage::GetHeader(data)->flags & 1u) == 0;
+    (void)bpm.UnpinPage(root, false);
+    ASSERT_TRUE(internal);
+}
+
+// Changes one page in place, through the pool.
+void Damage(BufferPoolManager& bpm, page_id_t pid, const std::function<void(char*)>& change) {
+    change(bpm.FetchPage(pid)->GetData());
+    (void)bpm.UnpinPage(pid, true);
+}
+
+// Child i of an internal page.
+page_id_t ChildOf(BufferPoolManager& bpm, page_id_t pid, uint16_t i) {
+    const page_id_t child = BTreeInternalPage::GetChild(bpm.FetchPage(pid)->GetData(), i, TypeId::BIGINT);
+    (void)bpm.UnpinPage(pid, false);
+    return child;
+}
+
+// Expects every frame of the pool to be unpinned.
+void ExpectNoPins(const BufferPoolManager& bpm, const std::string& what) {
+    for (size_t f = 0; f < bpm.GetPoolSize(); ++f) {
+        ASSERT_EQ(bpm.GetPage(static_cast<frame_id_t>(f)).GetPinCount(), 0) << what << ": frame " << f << " left pinned";
+    }
+}
+
+// Expects a point lookup, a range scan and a full scan to throw this text.
+void ExpectDamaged(BTreeIndex& index, const BufferPoolManager& bpm, int64_t key, const std::string& text) {
+    const std::vector<std::pair<std::string, std::function<void()>>> ops = {
+        {"point lookup", [&] { (void)index.PointLookup(Value(key)); }},
+        {"range scan", [&] { for (auto it = index.Begin(Value(key)); !it.IsEnd(); ++it) (void)*it; }},
+        {"full scan", [&] { for (auto it = index.Begin(); !it.IsEnd(); ++it) (void)*it; }},
+    };
+    for (const auto& [name, op] : ops) {
+        std::string error = "no throw";
+        try {
+            op();
+        } catch (const std::exception& e) {
+            error = e.what();
+        }
+        EXPECT_EQ(error, text) << name;
+        ExpectNoPins(bpm, name);
+    }
+}
+
+}  // namespace
+
+TEST_F(BTreeIndexTest, DamagedInternalKeyCountThrows) {
+    auto bundle = MakeBPM();
+    BTreeIndex index(bundle.bpm.get(), TypeId::BIGINT);
+    ASSERT_NO_FATAL_FAILURE(FillTwoLevels(index, *bundle.bpm));
+    const page_id_t root = index.GetRootPageId();
+
+    Damage(*bundle.bpm, root, [](char* data) { BTreeInternalPage::SetNumKeys(data, 0); });
+    ExpectDamaged(index, *bundle.bpm, 10, "damaged index: internal page has 0 keys");
+
+    const auto too_many = static_cast<uint16_t>(BTreeInternalPage::MaxKeys(TypeId::BIGINT) + 2);
+    Damage(*bundle.bpm, root, [&](char* data) { BTreeInternalPage::SetNumKeys(data, too_many); });
+    ExpectDamaged(index, *bundle.bpm, 10,
+                  "damaged index: internal page has " + std::to_string(too_many) + " keys, more than " +
+                      std::to_string(too_many - 1) + " fit");
+}
+
+TEST_F(BTreeIndexTest, DamagedLeafKeyCountThrows) {
+    auto bundle = MakeBPM();
+    BTreeIndex index(bundle.bpm.get(), TypeId::BIGINT);
+    ASSERT_NO_FATAL_FAILURE(FillTwoLevels(index, *bundle.bpm));
+    const page_id_t leaf = ChildOf(*bundle.bpm, index.GetRootPageId(), 0);
+
+    const uint16_t max = BTreeLeafPage::MaxKeys(TypeId::BIGINT);
+    Damage(*bundle.bpm, leaf, [&](char* data) { BTreeLeafPage::SetNumKeys(data, static_cast<uint16_t>(max + 1)); });
+    ExpectDamaged(index, *bundle.bpm, 10,
+                  "damaged index: leaf page has " + std::to_string(max + 1) + " keys, more than " + std::to_string(max) +
+                      " fit");
+}
+
+TEST_F(BTreeIndexTest, DamagedChildPointerThrows) {
+    auto bundle = MakeBPM();
+    BTreeIndex index(bundle.bpm.get(), TypeId::BIGINT);
+    ASSERT_NO_FATAL_FAILURE(FillTwoLevels(index, *bundle.bpm));
+    const page_id_t root = index.GetRootPageId();
+    const std::string at = "damaged index: page " + std::to_string(root) + " has a child pointer ";
+
+    Damage(*bundle.bpm, root, [](char* data) { BTreeInternalPage::SetChild(data, 0, INVALID_PAGE_ID, TypeId::BIGINT); });
+    ExpectDamaged(index, *bundle.bpm, 10, at + "that is INVALID_PAGE_ID");
+
+    const page_id_t pages = bundle.bpm->GetNumPages();
+    Damage(*bundle.bpm, root, [&](char* data) { BTreeInternalPage::SetChild(data, 0, pages, TypeId::BIGINT); });
+    ExpectDamaged(index, *bundle.bpm, 10,
+                  at + "to page " + std::to_string(pages) + ", past the file's " + std::to_string(pages) + " pages");
+}
+
+TEST_F(BTreeIndexTest, LeafCycleThrows) {
+    auto bundle = MakeBPM();
+    BTreeIndex index(bundle.bpm.get(), TypeId::BIGINT);
+    ASSERT_NO_FATAL_FAILURE(FillTwoLevels(index, *bundle.bpm));
+    const page_id_t first = ChildOf(*bundle.bpm, index.GetRootPageId(), 0);
+    const page_id_t second = ChildOf(*bundle.bpm, index.GetRootPageId(), 1);
+
+    // The second leaf points back at the first; the walk would never end
+    Damage(*bundle.bpm, second, [&](char* data) { BTreeLeafPage::SetNextLeafPageId(data, first); });
+    const std::string text =
+        "damaged index: leaf chain longer than the file's " + std::to_string(bundle.bpm->GetNumPages()) + " pages";
+    std::string error = "no throw";
+    size_t rows = 0;
+    try {
+        for (auto it = index.Begin(); !it.IsEnd() && rows <= 10 * static_cast<size_t>(kDamageKeys); ++it) ++rows;
+    } catch (const std::exception& e) {
+        error = e.what();
+    }
+    EXPECT_EQ(error, text) << "after " << rows << " rows";
+    ExpectNoPins(*bundle.bpm, "leaf cycle");
+}
+
+TEST_F(BTreeIndexTest, LeafPointerPastTheEndThrows) {
+    auto bundle = MakeBPM();
+    BTreeIndex index(bundle.bpm.get(), TypeId::BIGINT);
+    ASSERT_NO_FATAL_FAILURE(FillTwoLevels(index, *bundle.bpm));
+    const page_id_t first = ChildOf(*bundle.bpm, index.GetRootPageId(), 0);
+    const page_id_t pages = bundle.bpm->GetNumPages();
+
+    Damage(*bundle.bpm, first, [&](char* data) { BTreeLeafPage::SetNextLeafPageId(data, pages); });
+    std::string error = "no throw";
+    try {
+        for (auto it = index.Begin(); !it.IsEnd(); ++it) (void)*it;
+    } catch (const std::exception& e) {
+        error = e.what();
+    }
+    EXPECT_EQ(error, "damaged index: leaf chain goes to page " + std::to_string(pages) + ", past the file's " +
+                         std::to_string(pages) + " pages");
+    ExpectNoPins(*bundle.bpm, "leaf pointer past the end");
 }
 
 }  // namespace shilmandb

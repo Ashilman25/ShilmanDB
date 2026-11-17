@@ -48,6 +48,10 @@ file(GLOB_RECURSE CORE_SOURCES
 add_library(shilmandb_core STATIC ${CORE_SOURCES})
 target_include_directories(shilmandb_core PUBLIC ${CMAKE_SOURCE_DIR}/src)
 
+# The columnar bulk loader runs worker threads
+find_package(Threads REQUIRED)
+target_link_libraries(shilmandb_core PUBLIC Threads::Threads)
+
 if(SHILMANDB_ENABLE_ML)
     # ML source files
     target_sources(shilmandb_core PRIVATE

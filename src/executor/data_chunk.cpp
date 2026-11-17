@@ -22,6 +22,7 @@ void DataChunk::AppendRow(const char* data, uint32_t length) {
     assert(!has_selection_ && "AppendRow requires no active selection vector");
     assert(size_ < capacity_ && "AppendRow on full chunk");
     assert(!from_values_ && "a chunk holds row bytes or values, not both");
+    assert(!column_fill_ && "AppendRow on a column-filled chunk");
 
     if (size_ == 0) std::fill(decoded_.begin(), decoded_.end(), 0);
     assert(std::none_of(decoded_.begin(), decoded_.end(), [](uint8_t d) { return d != 0; }) && "AppendRow after columns were decoded");
@@ -35,6 +36,7 @@ void DataChunk::AppendTuple(const Tuple& tuple) {
     assert(!has_selection_ && "AppendTuple requires no active selection vector");
     assert(size_ < capacity_ && "AppendTuple on full chunk");
     assert(!from_values_ && "a chunk holds row bytes or values, not both");
+    assert(!column_fill_ && "AppendTuple on a column-filled chunk");
 
     const auto n_cols = schema_.GetColumnCount();
     if (size_ == 0) std::fill(decoded_.begin(), decoded_.end(), 1);
@@ -52,6 +54,7 @@ void DataChunk::AppendValues(std::vector<Value>&& values) {
     assert(!has_selection_ && "AppendValues requires no active selection vector");
     assert(size_ < capacity_ && "AppendValues on full chunk");
     assert(row_starts_.empty() && "a chunk holds row bytes or values, not both");
+    assert(!column_fill_ && "AppendValues on a column-filled chunk");
 
     const auto n_cols = schema_.GetColumnCount();
     if (values.size() != n_cols) {
@@ -78,6 +81,25 @@ void DataChunk::AppendValues(std::vector<Value>&& values) {
     ++size_;
 }
 
+void DataChunk::StartColumnFill(size_t n, const std::vector<uint32_t>& cols) {
+    assert(size_ == 0 && !has_selection_ && "StartColumnFill needs an empty chunk");
+    assert(!from_values_ && row_starts_.empty() && !column_fill_ && "StartColumnFill on a chunk already filled");
+    assert(n <= capacity_ && "StartColumnFill past the chunk's capacity");
+
+    if (fill_defaults_.empty()) {
+        fill_defaults_.reserve(columns_.size());
+        for (const auto& col : schema_.GetColumns()) fill_defaults_.push_back(Value::DefaultFor(col.type));
+    }
+    std::fill(decoded_.begin(), decoded_.end(), 0);
+    for (uint32_t c : cols) {
+        assert(c < columns_.size() && "StartColumnFill column out of range");
+        columns_[c].resize(n);
+        decoded_[c] = 1;
+    }
+    column_fill_ = true;
+    size_ = n;
+}
+
 namespace {
 
 // Per-type cell readers shared by the batch and single-cell decoders.
@@ -100,6 +122,7 @@ void DataChunk::EnsureDecoded(const std::vector<uint32_t>& cols) {
     for (uint32_t c : cols) {
         if (decoded_[c]) continue;
         assert(!from_values_ && "EnsureDecoded needs row bytes");
+        assert(!column_fill_ && "EnsureDecoded on a column the column fill didn't fill");
         decoded_[c] = 1;
         if (size_ == 0) continue;
 
@@ -141,7 +164,7 @@ void DataChunk::EnsureDecoded(const std::vector<uint32_t>& cols) {
 }
 
 Value DataChunk::DecodeCell(size_t col_idx, size_t physical_row) const {
-    assert(HasRowStore() && "DecodeCell needs row bytes");
+    assert(HasRowStore() && "DecodeCell needs row bytes (a column fill has none)");
     assert(physical_row < size_ && "DecodeCell row out of range");
     const char* row = arena_.data() + row_starts_[physical_row];
     const uint32_t offset = schema_.GetOffset(col_idx);
@@ -172,8 +195,13 @@ Tuple DataChunk::MaterializeTuple(size_t logical_row_idx) const {
     std::vector<Value> values;
     values.reserve(n_cols);
     for (size_t c = 0; c < n_cols; ++c) {
-        assert(IsDecoded(c) && "column is not decoded");
-        values.push_back(columns_[c][physical]);
+        if (IsDecoded(c)) {
+            values.push_back(columns_[c][physical]);
+        } else {
+            // Only a column fill leaves columns unread; they read as placeholders.
+            assert(column_fill_ && "column is not decoded");
+            values.push_back(fill_defaults_[c]);
+        }
     }
     return Tuple(std::move(values), schema_);
 }
@@ -226,6 +254,7 @@ void DataChunk::Reset() {
     row_starts_.clear();
     std::fill(decoded_.begin(), decoded_.end(), 0);
     from_values_ = false;
+    column_fill_ = false;
     size_ = 0;
     has_selection_ = false;
 }

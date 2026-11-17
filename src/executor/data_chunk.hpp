@@ -22,6 +22,10 @@ public:
     // Takes already decoded values for every column (no row bytes kept).
     void AppendValues(std::vector<Value>&& values);
 
+    // Starts a chunk of n rows, filled one column at a time.
+    // Listed columns are sized for the caller to write; others are never read.
+    void StartColumnFill(size_t n, const std::vector<uint32_t>& cols);
+
     // Decodes these columns for the active rows; decoded columns are skipped.
     void EnsureDecoded(const std::vector<uint32_t>& cols);
     
@@ -71,6 +75,8 @@ private:
     std::vector<uint32_t> row_starts_;    // start of each row in arena_
     std::vector<uint8_t> decoded_;        // per column: filled for the active rows
     bool from_values_{false};             // rows came from AppendValues
+    bool column_fill_{false};             // rows came from StartColumnFill
+    std::vector<Value> fill_defaults_;    // placeholder per column, built on the first column fill
 };
 
 }  // namespace shilmandb

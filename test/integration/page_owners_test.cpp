@@ -50,8 +50,14 @@ TEST_F(PageOwnersTest, CollectPageOwnersCoversEveryPage) {
     EXPECT_EQ(owners.size(), db.GetDiskManager()->GetNumPages());
 
     size_t tables = 0, inner = 0, leaves = 0;
-    for (const auto& o : owners) {
-        ASSERT_NE(o.kind, tpch::OwnedKind::OTHER);
+    for (size_t id = 0; id < owners.size(); ++id) {
+        const auto& o = owners[id];
+        // Pages 0 and 1 hold the file header, and only those belong to nobody
+        if (id < 2) {
+            EXPECT_EQ(o.kind, tpch::OwnedKind::OTHER) << "page " << id;
+            continue;
+        }
+        ASSERT_NE(o.kind, tpch::OwnedKind::OTHER) << "page " << id;
         if (o.kind == tpch::OwnedKind::TABLE) {
             ++tables;
             EXPECT_EQ(o.object, 0);
@@ -88,7 +94,9 @@ TEST_F(PageOwnersTest, TablesOnlyWithoutIndexes) {
     Build(db, false);
     const auto owners = tpch::CollectPageOwners(db, {"t"}, {});
     EXPECT_EQ(owners.size(), db.GetDiskManager()->GetNumPages());
-    for (const auto& o : owners) EXPECT_EQ(o.kind, tpch::OwnedKind::TABLE);
+    for (size_t id = 0; id < owners.size(); ++id) {
+        EXPECT_EQ(owners[id].kind, id < 2 ? tpch::OwnedKind::OTHER : tpch::OwnedKind::TABLE) << "page " << id;
+    }
 }
 
 }  // namespace shilmandb

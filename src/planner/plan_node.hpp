@@ -1,6 +1,7 @@
 #pragma once
 #include "catalog/schema.hpp"
 #include "parser/ast.hpp"
+#include <cstdint>
 #include <utility>
 #include <vector>
 #include <memory>
@@ -28,6 +29,8 @@ protected:
 
 struct SeqScanPlanNode : PlanNode {
     std::string table_name;
+    std::optional<std::vector<uint32_t>> read_columns;       // columnar only; nullopt reads every column
+    std::vector<std::unique_ptr<Expression>> skip_conjuncts;  // columnar only; lets a scan skip row groups
     SeqScanPlanNode(Schema schema, std::string tbl) : PlanNode(PlanNodeType::SEQ_SCAN, std::move(schema)), table_name(std::move(tbl)) {}
 };
 
@@ -36,6 +39,7 @@ struct IndexScanPlanNode : PlanNode {
     std::string index_name;
     std::optional<Value> low_key;
     std::optional<Value> high_key;
+    std::optional<std::vector<uint32_t>> read_columns;  // columnar only; nullopt reads every column
 
     IndexScanPlanNode(Schema schema, std::string tbl, std::string idx) : PlanNode(PlanNodeType::INDEX_SCAN, std::move(schema)), table_name(std::move(tbl)), index_name(std::move(idx)) {}
 };

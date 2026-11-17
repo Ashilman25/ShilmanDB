@@ -5,6 +5,7 @@
 #include "executor/executor_factory.hpp"
 #include "executor/executor_context.hpp"
 #include "common/exception.hpp"
+#include "storage/columnar/bulk_loader.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -109,7 +110,10 @@ Database::Database(const std::string& db_file, size_t buffer_pool_size, Eviction
     auto policy = MakeEvictionPolicy(eviction, buffer_pool_size, eviction_model_path);
     disk_manager_ = std::make_unique<DiskManager>(db_file);
     bpm_ = std::make_unique<BufferPoolManager>(buffer_pool_size, disk_manager_.get(), std::move(policy));
-    catalog_ = std::make_unique<Catalog>(bpm_.get());
+    // Built before any page is handed out; it creates or checks the header
+    columnar_file_ = std::make_unique<ColumnarFile>(disk_manager_.get());
+    catalog_ = std::make_unique<Catalog>(bpm_.get(), columnar_file_.get());
+    catalog_->RestoreFromFile();
 
 #ifdef SHILMANDB_HAS_LIBTORCH
     if (!join_model_path.empty()) {
@@ -233,6 +237,23 @@ void Database::LoadTable(const std::string& table_name, const Schema& schema, co
     }
 
     catalog_->UpdateTableStats(table_name);
+}
+
+void Database::LoadTable(const std::string& table_name, const Schema& schema, const std::string& tbl_file_path, const LoadOptions& options) {
+    if (options.storage == StorageKind::ROW) {
+        // The row store has no NULLs, so the marker would load as data
+        if (options.null_text) {
+            throw DatabaseException("null_text needs columnar storage");
+        }
+        LoadTable(table_name, schema, tbl_file_path, options.delimiter);
+        return;
+    }
+
+    BulkLoadOptions bulk;
+    bulk.delimiter = options.delimiter;
+    bulk.threads = options.threads;
+    bulk.null_text = options.null_text;
+    (void)catalog_->LoadColumnarTable(table_name, schema, tbl_file_path, bulk);
 }
 
 Catalog* Database::GetCatalog() const { return catalog_.get(); }

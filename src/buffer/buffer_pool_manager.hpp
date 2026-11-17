@@ -55,6 +55,9 @@ public:
     void DisableTracing();
     [[nodiscard]] uint64_t GetTraceCount() const { return access_counter_; }  // fetches since EnableTracing
 
+    // Pages the file has handed out; every valid page id is below this
+    [[nodiscard]] page_id_t GetNumPages() const { return disk_manager_->GetNumPages(); }
+
     size_t GetPoolSize() const;
     const Page& GetPage(frame_id_t frame_id) const;
 

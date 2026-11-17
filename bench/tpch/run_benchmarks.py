@@ -26,6 +26,12 @@ stream_correctness.csv (every workload item checked against SQLite). A
 workload label adds _<workload>_s<seed> after the config name, for example
 baseline_stream_s1. The three files above only cover the single workload.
 
+The columnar, columnar+index and columnar+vectorized configs run only when
+named. Within one call each columnar file is loaded once per scale factor and
+reused by later runs: columnar has its own, and columnar+index and
+columnar+vectorized share an indexed one. Every run that loads
+its tables leaves load_times_<label>_sf<sf>.csv in the output folder.
+
 """
 
 from __future__ import annotations
@@ -44,7 +50,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import ModuleType
@@ -77,6 +83,8 @@ DB_PAGES: Dict[str, int] = {
     "10": 1439816,
 }
 MIN_POOL_PAGES: int = 16
+# The file's two header pages, counted in db_pages since the columnar format
+HEADER_PAGES: int = 2
 
 # What load_tpch runs: "single" is one query at a time, the rest are streams of queries.
 WORKLOADS: List[str] = ["single", "stream", "lookup", "mixed"]
@@ -115,11 +123,30 @@ PRIMARY_CONFIGS: Dict[str, List[str]] = {
         "--create-indexes", "true",
         "--execution-mode", "vectorized",
     ],
+    # baseline, +index and +vectorized again, on columnar storage
+    "columnar": [
+        "--create-indexes", "false",
+        "--execution-mode", "tuple",
+        "--storage", "columnar",
+    ],
+    "columnar+index": [
+        "--create-indexes", "true",
+        "--execution-mode", "tuple",
+        "--storage", "columnar",
+    ],
+    "columnar+vectorized": [
+        "--create-indexes", "true",
+        "--execution-mode", "vectorized",
+        "--storage", "columnar",
+    ],
 }
 
-SHILMANDB_CONFIG_NAMES: List[str] = list(PRIMARY_CONFIGS.keys())
+# What --configs all runs. The columnar configs run only when named.
+SHILMANDB_CONFIG_NAMES: List[str] = ["baseline", "+index", "+learned", "+vectorized"]
+COLUMNAR_CONFIG_NAMES: List[str] = ["columnar", "columnar+index", "columnar+vectorized"]
 SQLITE_CONFIG_NAMES: List[str] = ["sqlite_disk", "sqlite_memory"]
 ALL_CONFIG_NAMES: List[str] = SHILMANDB_CONFIG_NAMES + SQLITE_CONFIG_NAMES
+KNOWN_CONFIG_NAMES: List[str] = ALL_CONFIG_NAMES + COLUMNAR_CONFIG_NAMES
 
 # Other engines, added to a run only by --duckdb and --postgres.
 DUCKDB_CONFIG_NAMES: List[str] = ["duckdb", "duckdb_1thread"]
@@ -502,7 +529,7 @@ def read_policy_total_ms(path: Path) -> Optional[float]:
 #Build the load_tpch CLI for a given config.
 def build_command(binary: Path, sf: str, config_name: str, data_dir: Path, results_dir: Path,
                   db_file: Path, pool_size: int, warmup_runs: int, timed_runs: int,
-                  extra_flags: Sequence[str] = ()) -> List[str]:
+                  extra_flags: Sequence[str] = (), reuse_db: bool = False) -> List[str]:
 
     if config_name not in PRIMARY_CONFIGS:
         raise ValueError(f"unknown ShilmanDB config: {config_name}")
@@ -519,18 +546,43 @@ def build_command(binary: Path, sf: str, config_name: str, data_dir: Path, resul
         "--no-verify",
     ]
     cmd += PRIMARY_CONFIGS[config_name]
+    if reuse_db:
+        cmd.append("--reuse-db")
     cmd += extra_flags
     return cmd
 
 
 # Warn (never fail) when the loaded database isn't the size DB_PAGES says it is.
+# Older binaries report heap pages only; newer ones add the header pages.
 def warn_on_db_pages_mismatch(info: Dict[str, str], sf: str) -> None:
     reported = info.get("db_pages")
     if reported is None or sf not in DB_PAGES:
         return
-    if not reported.isdigit() or int(reported) != DB_PAGES[sf]:
+    if not reported.isdigit() or int(reported) not in (DB_PAGES[sf], DB_PAGES[sf] + HEADER_PAGES):
         eprint(f"  ! warning: run_info.csv db_pages={reported} but DB_PAGES[{sf}]={DB_PAGES[sf]}; "
                "pool fractions may be off")
+
+
+# The database files the columnar configs share in one runner call, all in one folder.
+# Per scale factor, columnar has a file and the two indexed configs share another.
+@dataclass
+class ColumnarFiles:
+    root: Path
+    loaded: set = field(default_factory=set)    # files a run that exited 0 loaded
+
+    # The file this config uses at this scale factor; None for a row config.
+    def db_file(self, sf: str, config_name: str) -> Optional[Path]:
+        if config_name not in COLUMNAR_CONFIG_NAMES:
+            return None
+        kind = "plain" if config_name == "columnar" else "indexed"
+        return self.root / f"tpch_sf{sf}_{kind}.db"
+
+
+# Copy a run's load_times.csv, when it wrote one, to <output>/load_times_<label>_sf<sf>.csv.
+def copy_load_times(tmp_path: Path, output_dir: Path, label: str, sf: str) -> None:
+    src = tmp_path / "load_times.csv"
+    if src.exists():
+        shutil.copyfile(src, output_dir / f"load_times_{label}_sf{sf}.csv")
 
 
 # Run load_tpch once for a (sf, config) in a temp folder and hand that folder to the caller.
@@ -538,10 +590,17 @@ def warn_on_db_pages_mismatch(info: Dict[str, str], sf: str) -> None:
 @contextmanager
 def load_tpch_run(binary: Path, sf: str, config_name: str, data_dir: Path, pool_size: int, warmup_runs: int,
                   timed_runs: int, timeout_seconds: Optional[int], label: str,
-                  extra_flags: Sequence[str]) -> Iterator[Optional[Path]]:
+                  extra_flags: Sequence[str],
+                  columnar_files: Optional[ColumnarFiles] = None) -> Iterator[Optional[Path]]:
+    
     with tempfile.TemporaryDirectory(prefix=f"shilmandb_{label}_sf{sf}_") as tmp:
         tmp_path = Path(tmp)
         db_file = tmp_path / f"tpch_sf{sf}.db"
+        shared_file = columnar_files.db_file(sf, config_name) if columnar_files else None
+        reuse_db = False
+        if shared_file is not None:
+            db_file = shared_file
+            reuse_db = shared_file in columnar_files.loaded
 
         cmd = build_command(
             binary=binary,
@@ -554,6 +613,7 @@ def load_tpch_run(binary: Path, sf: str, config_name: str, data_dir: Path, pool_
             warmup_runs=warmup_runs,
             timed_runs=timed_runs,
             extra_flags=extra_flags,
+            reuse_db=reuse_db,
         )
 
         print(f"  $ {' '.join(cmd)}", flush=True)
@@ -583,6 +643,8 @@ def load_tpch_run(binary: Path, sf: str, config_name: str, data_dir: Path, pool_
             yield None
             return
 
+        if shared_file is not None:
+            columnar_files.loaded.add(shared_file)
         yield tmp_path
 
 
@@ -591,13 +653,14 @@ def load_tpch_run(binary: Path, sf: str, config_name: str, data_dir: Path, pool_
 def run_shilmandb_config(binary: Path, sf: str, config_name: str, data_dir: Path, output_dir: Path, pool_size: int, 
                          warmup_runs: int, timed_runs: int, timeout_seconds: Optional[int] = None,
                          label: Optional[str] = None,
-                         extra_flags: Sequence[str] = ()) -> Optional[Dict[str, QueryStats]]:
+                         extra_flags: Sequence[str] = (),
+                         columnar_files: Optional[ColumnarFiles] = None) -> Optional[Dict[str, QueryStats]]:
 
     label = label or config_name
     results_parent = output_dir / "shilmandb_results" / label
     results_parent.mkdir(parents=True, exist_ok=True)
 
-    with load_tpch_run(binary, sf, config_name, data_dir, pool_size, warmup_runs, timed_runs, timeout_seconds, label, extra_flags) as tmp_path:
+    with load_tpch_run(binary, sf, config_name, data_dir, pool_size, warmup_runs, timed_runs, timeout_seconds, label, extra_flags, columnar_files) as tmp_path:
         if tmp_path is None:
             return None
 
@@ -619,9 +682,12 @@ def run_shilmandb_config(binary: Path, sf: str, config_name: str, data_dir: Path
             src = tmp_path / f"{name}.csv"
             if src.exists():
                 shutil.copyfile(src, results_parent / f"{name}_sf{sf}.csv")
+        copy_load_times(tmp_path, output_dir, label, sf)
 
         info = read_run_info(tmp_path / "run_info.csv")
-        warn_on_db_pages_mismatch(info, sf)
+        # DB_PAGES counts heap pages, so only a row run can be checked against it
+        if config_name not in COLUMNAR_CONFIG_NAMES:
+            warn_on_db_pages_mismatch(info, sf)
         policy_ms = read_policy_ms(tmp_path / "policy_time.csv")
 
         options = parse_label(label)
@@ -639,12 +705,14 @@ def run_shilmandb_config(binary: Path, sf: str, config_name: str, data_dir: Path
 # to shilmandb_results/<label>/<name>_sf<sf>.csv. None if the run failed or its files are missing.
 def run_workload_config(binary: Path, sf: str, config_name: str, data_dir: Path, output_dir: Path, pool_size: int,
                         warmup_runs: int, timed_runs: int, timeout_seconds: Optional[int], label: str,
-                        extra_flags: Sequence[str] = ()) -> Optional[WorkloadStats]:
+                        extra_flags: Sequence[str] = (),
+                        columnar_files: Optional[ColumnarFiles] = None) -> Optional[WorkloadStats]:
 
     results_parent = output_dir / "shilmandb_results" / label
     results_parent.mkdir(parents=True, exist_ok=True)
 
-    with load_tpch_run(binary, sf, config_name, data_dir, pool_size, warmup_runs, timed_runs, timeout_seconds, label, extra_flags) as tmp_path:
+    with load_tpch_run(binary, sf, config_name, data_dir, pool_size, warmup_runs, timed_runs, timeout_seconds, label, extra_flags,
+                       columnar_files) as tmp_path:
         if tmp_path is None:
             return None
 
@@ -657,9 +725,11 @@ def run_workload_config(binary: Path, sf: str, config_name: str, data_dir: Path,
             src = tmp_path / f"{name}.csv"
             if src.exists():
                 shutil.copyfile(src, results_parent / f"{name}_sf{sf}.csv")
+        copy_load_times(tmp_path, output_dir, label, sf)
 
         info = read_run_info(tmp_path / "run_info.csv")
-        warn_on_db_pages_mismatch(info, sf)
+        if config_name not in COLUMNAR_CONFIG_NAMES:
+            warn_on_db_pages_mismatch(info, sf)
         try:
             totals = parse_stream_totals(tmp_path / "stream_totals.csv")
             policy_ms = read_policy_total_ms(tmp_path / "policy_time.csv")
@@ -1362,13 +1432,12 @@ def stream_length_value(text: str) -> int:
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="TPC-H benchmark runner",
-                                epilog="Exit 3: --duckdb or --postgres was asked for and its runner failed; every other output is still written.")
+    p = argparse.ArgumentParser(description="TPC-H benchmark runner", epilog="Exit 3: --duckdb or --postgres was asked for and its runner failed; every other output is still written.")
     p.add_argument("--binary", type=Path, default=DEFAULT_BINARY, help=f"Path to load_tpch binary (default: {DEFAULT_BINARY})")
     p.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR, help=f"TPC-H data dir (default: {DEFAULT_DATA_DIR})")
     p.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR, help=f"Output dir (default: {DEFAULT_OUTPUT_DIR})")
     p.add_argument("--sf", action="append", choices=KNOWN_SCALE_FACTORS + ["all"], help="Scale factor(s). Repeat flag or use 'all'. Default: 'all'.")
-    p.add_argument("--configs", default="all", help=("Comma-separated configs. Accepts 'all', 'none' (no ShilmanDB or SQLite config) or a subset of: " + ",".join(ALL_CONFIG_NAMES)))
+    p.add_argument("--configs", default="all", help=("Comma-separated configs. Accepts 'all' (" + ",".join(ALL_CONFIG_NAMES) + "), 'none' (no ShilmanDB or SQLite config) or a subset of: " + ",".join(KNOWN_CONFIG_NAMES) + ". The columnar configs run only when named; columnar+index loads a file that a later columnar+vectorized reuses"))
     p.add_argument("--duckdb", action="store_true", help="Also run DuckDB (duckdb, duckdb_1thread) through run_duckdb_benchmarks.py; exit 3 if it fails")
     p.add_argument("--postgres", action="store_true", help="Also run Postgres (postgres, postgres_1worker) through run_postgres_benchmarks.py; needs the server on port 5434; exit 3 if it fails")
     p.add_argument("--warmup", type=int, default=1, help="Warmup runs per query, DuckDB and Postgres included (default 1)")
@@ -1405,8 +1474,8 @@ def resolve_configs(arg: str) -> List[str]:
             raise SystemExit("'none' can't be mixed with other configs.")
         return []
     for c in requested:
-        if c not in ALL_CONFIG_NAMES:
-            raise SystemExit(f"unknown config: {c!r}. Choose from: {','.join(ALL_CONFIG_NAMES)} or 'all'.")
+        if c not in KNOWN_CONFIG_NAMES:
+            raise SystemExit(f"unknown config: {c!r}. Choose from: {','.join(KNOWN_CONFIG_NAMES)} or 'all'.")
     return requested
 
 
@@ -1475,7 +1544,7 @@ def main() -> int:
     ran_labels: List[str] = []      # every single-query ShilmanDB label that was run, for the correctness check
     workload_records: List[WorkloadStats] = []
 
-    def run_single(spec: RunSpec) -> None:
+    def run_single(spec: RunSpec, columnar_files: Optional[ColumnarFiles]) -> None:
         label = config_label(spec.base, spec.penalty, args.direct_io, spec.fraction, eviction=spec.eviction)
         section(f"ShilmanDB {label} @ SF={spec.sf}")
         stats = run_shilmandb_config(
@@ -1484,6 +1553,7 @@ def main() -> int:
             pool_size=spec.pool, warmup_runs=args.warmup, timed_runs=args.runs,
             timeout_seconds=args.timeout, label=label,
             extra_flags=option_flags(spec.penalty, args.direct_io, args.policy_timing, spec.eviction),
+            columnar_files=columnar_files,
         )
         pool_sizes_by_config[(spec.sf, label)] = spec.pool
         if label not in ran_labels:
@@ -1493,7 +1563,7 @@ def main() -> int:
         for q, qs in stats.items():
             all_records[(spec.sf, label, q)] = qs
 
-    def run_workload(spec: RunSpec) -> None:
+    def run_workload(spec: RunSpec, columnar_files: Optional[ColumnarFiles]) -> None:
         label = config_label(spec.base, spec.penalty, args.direct_io, spec.fraction, spec.workload, args.seed, spec.eviction)
         section(f"ShilmanDB {label} @ SF={spec.sf}")
         stats = run_workload_config(
@@ -1502,14 +1572,19 @@ def main() -> int:
             pool_size=spec.pool, warmup_runs=args.warmup, timed_runs=args.runs,
             timeout_seconds=args.timeout, label=label,
             extra_flags=(workload_flags(spec.workload, args.seed, args.stream_length) + option_flags(spec.penalty, args.direct_io, args.policy_timing, spec.eviction)),
+            columnar_files=columnar_files,
         )
         if stats is None:
             eprint(f"  ! {label} @ SF={spec.sf} failed - skipping")
             return
         workload_records.append(stats)
 
-    for spec in planned_runs(sfs, shilmandb_configs, args.workloads, args.miss_penalty_us, args.pool_fractions, args.eviction_policies):
-        (run_single if spec.workload == "single" else run_workload)(spec)
+    # Columnar files last this call only; removed at the end, even on error
+    uses_columnar = any(c in COLUMNAR_CONFIG_NAMES for c in shilmandb_configs)
+    with (tempfile.TemporaryDirectory(prefix="shilmandb_columnar_") if uses_columnar else nullcontext()) as shared_dir:
+        columnar_files = ColumnarFiles(Path(shared_dir)) if shared_dir else None
+        for spec in planned_runs(sfs, shilmandb_configs, args.workloads, args.miss_penalty_us, args.pool_fractions, args.eviction_policies):
+            (run_single if spec.workload == "single" else run_workload)(spec, columnar_files)
 
     if args.pool_sweep:
         sweep_records = run_pool_size_sweep(

@@ -11,6 +11,7 @@
 #include <iostream>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 // The TPC-H tables, indexes and queries every bench tool and test runs.
@@ -18,8 +19,17 @@ namespace shilmandb::tpch {
 
 // Schemas
 
+// Money is DECIMAL to the executor and stored as NUMERIC(15,2) when columnar.
+// Marks every DECIMAL column that way; in TPC-H those are the 8 money columns.
+[[nodiscard]] inline Schema MoneyAsNumeric(std::vector<Column> columns) {
+    for (Column& c : columns) {
+        if (c.type == TypeId::DECIMAL) c.storage_type = ColumnType::Numeric(15, 2);
+    }
+    return Schema(std::move(columns));
+}
+
 [[nodiscard]] inline Schema LineitemSchema() {
-    return Schema({
+    return MoneyAsNumeric({
         {"l_orderkey", TypeId::BIGINT},
         {"l_partkey", TypeId::BIGINT},
         {"l_suppkey", TypeId::BIGINT},
@@ -40,7 +50,7 @@ namespace shilmandb::tpch {
 }
 
 [[nodiscard]] inline Schema OrdersSchema() {
-    return Schema({
+    return MoneyAsNumeric({
         {"o_orderkey", TypeId::BIGINT},
         {"o_custkey", TypeId::BIGINT},
         {"o_orderstatus", TypeId::VARCHAR},
@@ -54,7 +64,7 @@ namespace shilmandb::tpch {
 }
 
 [[nodiscard]] inline Schema CustomerSchema() {
-    return Schema({
+    return MoneyAsNumeric({
         {"c_custkey", TypeId::BIGINT},
         {"c_name", TypeId::VARCHAR},
         {"c_address", TypeId::VARCHAR},
@@ -67,7 +77,7 @@ namespace shilmandb::tpch {
 }
 
 [[nodiscard]] inline Schema SupplierSchema() {
-    return Schema({
+    return MoneyAsNumeric({
         {"s_suppkey", TypeId::BIGINT},
         {"s_name", TypeId::VARCHAR},
         {"s_address", TypeId::VARCHAR},
@@ -96,7 +106,7 @@ namespace shilmandb::tpch {
 }
 
 [[nodiscard]] inline Schema PartSchema() {
-    return Schema({
+    return MoneyAsNumeric({
         {"p_partkey", TypeId::BIGINT},
         {"p_name", TypeId::VARCHAR},
         {"p_mfgr", TypeId::VARCHAR},
@@ -275,15 +285,26 @@ struct Query {
 
 //  Loading and comparing
 
+// How one table's load went. Pages: heap pages for row, chunk pages for columnar.
+struct TableLoad {
+    std::string name;
+    uint64_t rows{0};
+    double ms{0.0};
+    uint64_t pages{0};
+};
+
 // Loads all 7 tables from data_dir (which must end with '/'), printing one line per table.
-inline void LoadTables(Database& db, const std::string& data_dir) {
+// The default options load into the row store.
+inline std::vector<TableLoad> LoadTables(Database& db, const std::string& data_dir, const LoadOptions& options = {}) {
+    const bool columnar = options.storage == StorageKind::COLUMNAR;
+    std::vector<TableLoad> loads;
     for (const auto& td : TableDescs()) {
         std::string path = data_dir + td.tbl_file;
         std::cout << "Loading " << td.name << " from " << path << " ... " << std::flush;
 
         auto start = std::chrono::steady_clock::now();
         try {
-            db.LoadTable(td.name, td.schema, path);
+            db.LoadTable(td.name, td.schema, path, options);
         } catch (const std::exception& e) {
             throw DatabaseException("Error loading " + td.name + ": " + e.what());
         }
@@ -291,8 +312,14 @@ inline void LoadTables(Database& db, const std::string& data_dir) {
         auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
 
         auto* info = db.GetCatalog()->GetTable(td.name);
-        std::cout << info->stats.row_count << " rows (" << ms << " ms)\n";
+        std::cout << info->stats.row_count << " rows (" << ms << " ms)";
+        if (columnar) std::cout << ", " << info->stats.page_count << " pages";
+        std::cout << "\n";
+
+        const double exact_ms = std::chrono::duration<double, std::milli>(elapsed).count();
+        loads.push_back({td.name, info->stats.row_count, exact_ms, info->stats.page_count});
     }
+    return loads;
 }
 
 // True when both results have the same rows in the same order

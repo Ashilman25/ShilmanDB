@@ -33,6 +33,7 @@ public:
         TypeId key_type_;
         page_id_t current_page_id_;
         uint16_t current_slot_;
+        uint64_t leaves_walked_{0};  // leaf changes so far, to catch a cycle in the chain
     };
 
     [[nodiscard]] Iterator Begin();
@@ -48,6 +49,9 @@ private:
     page_id_t FindLeftmostLeaf();
     // The first leaf that can hold `key`. It may hold only smaller keys, then the entries for `key` start in a later leaf.
     page_id_t FindLeftmostLeaf(const Value& key);
+    // Walks down to a leaf by key, or by child 0 when key is null.
+    // Throws "damaged index" instead of looping or reading past a page.
+    page_id_t Descend(const Value* key, bool go_right_on_equal, std::vector<page_id_t>* path);
 
     void SplitLeaf(page_id_t leaf_id, std::vector<page_id_t>& path);
     void InsertIntoParent(std::vector<page_id_t>& path, page_id_t left_child, const Value& key, page_id_t right_child);

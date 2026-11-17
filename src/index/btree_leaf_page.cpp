@@ -2,6 +2,7 @@
 #include "common/exception.hpp"
 #include <cassert>
 #include <cstring>
+#include <string>
 
 namespace shilmandb {
 
@@ -88,6 +89,18 @@ void BTreeLeafPage::SetNextLeafPageId(char* page_data, page_id_t next_leaf) {
 uint16_t BTreeLeafPage::MaxKeys(TypeId key_type) {
     const auto ks = static_cast<size_t>(KeySize(key_type));
     return static_cast<uint16_t>((PAGE_SIZE - DATA_START) / (ks + RID_SIZE));
+}
+
+// Builds and throws the bad key count error, kept off the hot path.
+[[noreturn]] __attribute__((cold, noinline)) static void ThrowBadLeafCount(uint16_t num_keys, uint16_t max) {
+    throw DatabaseException("damaged index: leaf page has " + std::to_string(num_keys) + " keys, more than " + std::to_string(max) + " fit");
+}
+
+// A leaf splits before it fills, so MaxKeys is the most a real leaf holds.
+void BTreeLeafPage::CheckKeyCount(const char* page_data, TypeId key_type) {
+    const auto num_keys = GetNumKeys(page_data);
+    const auto max = MaxKeys(key_type);
+    if (num_keys > max) ThrowBadLeafCount(num_keys, max);
 }
 
 bool BTreeLeafPage::NeedsSplit(const char* page_data, TypeId key_type) {

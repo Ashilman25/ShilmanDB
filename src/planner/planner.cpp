@@ -3,9 +3,11 @@
 #include "planner/index_selector.hpp"
 #include "planner/cost_model.hpp"
 #include "planner/expression_binder.hpp"
+#include "planner/column_usage.hpp"
 #include "common/exception.hpp"
 #include "types/value.hpp"
 #include <algorithm>
+#include <cassert>
 #include <cmath>
 #include <numeric>
 #include <string>
@@ -408,6 +410,83 @@ auto ResolveExprType(const Expression* expr, const Schema& schema) -> TypeId {
     return TypeId::INTEGER;
 }
 
+// Adds every column name the expression reads; an unknown kind reads every column.
+void CollectReadNames(const Expression* expr, std::unordered_set<std::string>& names, bool& reads_all) {
+    if (expr == nullptr) return;
+    switch (expr->type) {
+        case ExprType::COLUMN_REF:
+            names.insert(static_cast<const ColumnRef*>(expr)->column_name);
+            return;
+        case ExprType::LITERAL:
+            return;
+        case ExprType::BINARY_OP: {
+            const auto* bin = static_cast<const BinaryOp*>(expr);
+            CollectReadNames(bin->left.get(), names, reads_all);
+            CollectReadNames(bin->right.get(), names, reads_all);
+            return;
+        }
+        case ExprType::UNARY_OP:
+            CollectReadNames(static_cast<const UnaryOp*>(expr)->operand.get(), names, reads_all);
+            return;
+        case ExprType::AGGREGATE: {
+            // COUNT(*) reads no column.
+            const auto* arg = static_cast<const Aggregate*>(expr)->arg.get();
+            if (arg != nullptr && arg->type != ExprType::STAR) CollectReadNames(arg, names, reads_all);
+            return;
+        }
+        case ExprType::STAR:
+            reads_all = true;
+            return;
+        case ExprType::CASE: {
+            const auto* ce = static_cast<const CaseExpression*>(expr);
+            for (const auto& [cond, result] : ce->when_clauses) {
+                CollectReadNames(cond.get(), names, reads_all);
+                CollectReadNames(result.get(), names, reads_all);
+            }
+            CollectReadNames(ce->else_clause.get(), names, reads_all);
+            return;
+        }
+    }
+    reads_all = true;
+}
+
+// Walks the plan: every name its expressions read, and every scan node.
+void CollectPlanReads(PlanNode* node, std::unordered_set<std::string>& names, bool& reads_all, std::vector<PlanNode*>& scans) {
+    switch (node->type) {
+        case PlanNodeType::SEQ_SCAN:
+        case PlanNodeType::INDEX_SCAN:
+            scans.push_back(node);
+            break;
+        case PlanNodeType::FILTER:
+            CollectReadNames(static_cast<const FilterPlanNode*>(node)->predicate.get(), names, reads_all);
+            break;
+        case PlanNodeType::HASH_JOIN:
+            CollectReadNames(static_cast<const HashJoinPlanNode*>(node)->join_predicate.get(), names, reads_all);
+            break;
+        case PlanNodeType::NESTED_LOOP_JOIN:
+            CollectReadNames(static_cast<const NestedLoopJoinPlanNode*>(node)->predicate.get(), names, reads_all);
+            break;
+        case PlanNodeType::SORT:
+            for (const auto& item : static_cast<const SortPlanNode*>(node)->order_by) CollectReadNames(item.expr.get(), names, reads_all);
+            break;
+        case PlanNodeType::AGGREGATE: {
+            const auto* agg = static_cast<const AggregatePlanNode*>(node);
+            for (const auto& e : agg->group_by_exprs) CollectReadNames(e.get(), names, reads_all);
+            for (const auto& e : agg->aggregate_exprs) CollectReadNames(e.get(), names, reads_all);
+            break;
+        }
+        case PlanNodeType::PROJECTION:
+            for (const auto& e : static_cast<const ProjectionPlanNode*>(node)->expressions) CollectReadNames(e.get(), names, reads_all);
+            break;
+        case PlanNodeType::LIMIT:
+            break;
+        default:
+            reads_all = true;
+            break;
+    }
+    for (auto& child : node->children) CollectPlanReads(child.get(), names, reads_all, scans);
+}
+
 }  // anonymous namespace
 
 Planner::Planner(Catalog* catalog) : catalog_(catalog) {}
@@ -502,8 +581,15 @@ auto Planner::Plan(SelectStatement stmt) -> std::unique_ptr<PlanNode> {
     std::vector<std::unique_ptr<PlanNode>> scans;
     scans.reserve(tables.size());
     for (size_t i = 0; i < tables.size(); ++i) {
+        // Copies of the table's predicates, taken before the scan choice uses them up.
+        std::vector<std::unique_ptr<Expression>> skip_hints;
+        skip_hints.reserve(table_predicates[i].size());
+        for (const auto& pred : table_predicates[i]) skip_hints.push_back(pred->Clone());
+
         std::vector<std::unique_ptr<Expression>> residual;
         auto scan = IndexSelector::SelectScanStrategy(tables[i].table_name, table_infos[i]->schema, table_predicates[i], residual, catalog_, scan_costs_);
+        // Only a table scan skips row groups; the filter built below still checks every row.
+        if (scan->type == PlanNodeType::SEQ_SCAN) static_cast<SeqScanPlanNode*>(scan.get())->skip_conjuncts = std::move(skip_hints);
 
         if (!residual.empty()) {
             auto pred = CombinePredicates(residual);
@@ -805,7 +891,34 @@ auto Planner::Plan(SelectStatement stmt) -> std::unique_ptr<PlanNode> {
     }
 
     BindPlan(current.get());
+    AssignReadColumns(current.get());
+#ifndef NDEBUG
+    // A columnar scan hands up placeholders for unlisted columns, so none may be read.
+    assert(FindUnlistedReads(*current).empty() && "an operator reads a column its scan doesn't list");
+#endif
     return current;
+}
+
+// A name read anywhere counts for every table that has it, as binding ignores qualifiers.
+void Planner::AssignReadColumns(PlanNode* root) const {
+    std::unordered_set<std::string> names;
+    bool reads_all = false;
+    std::vector<PlanNode*> scans;
+    CollectPlanReads(root, names, reads_all, scans);
+
+    for (auto* scan : scans) {
+        // The scan's schema is its table's schema, so these are table column indexes.
+        const auto& columns = scan->output_schema.GetColumns();
+        std::vector<uint32_t> read;
+        for (uint32_t c = 0; c < columns.size(); ++c) {
+            if (reads_all || names.find(columns[c].name) != names.end()) read.push_back(c);
+        }
+        if (scan->type == PlanNodeType::SEQ_SCAN) {
+            static_cast<SeqScanPlanNode*>(scan)->read_columns = std::move(read);
+        } else {
+            static_cast<IndexScanPlanNode*>(scan)->read_columns = std::move(read);
+        }
+    }
 }
 
 }  // namespace shilmandb

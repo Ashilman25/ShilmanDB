@@ -1,11 +1,139 @@
 #include "catalog/catalog.hpp"
 #include "common/exception.hpp"
+#include "storage/columnar/bulk_loader.hpp"
+#include "storage/columnar/column_vector.hpp"
+#include "storage/columnar/columnar_file.hpp"
+#include "storage/columnar/field_parser.hpp"
+#include <algorithm>
 #include <optional>
 #include <unordered_set>
+#include <utility>
 
 namespace shilmandb {
 
-Catalog::Catalog(BufferPoolManager* bpm) : bpm_(bpm) {}
+namespace {
+
+// The executor schema a saved table's columns describe.
+Schema SchemaOf(const ColumnarTableMeta& meta) {
+    std::vector<Column> columns;
+    columns.reserve(meta.columns.size());
+    for (const ColumnMeta& col : meta.columns) {
+        columns.emplace_back(col.name, col.type, col.nullable);
+    }
+    return Schema(std::move(columns));
+}
+
+// Same column count, names and storage types; nullability may differ.
+bool SameColumns(const Schema& a, const Schema& b) {
+    return std::equal(
+        a.GetColumns().begin(), a.GetColumns().end(), b.GetColumns().begin(), b.GetColumns().end(),
+        [](const Column& x, const Column& y) { return x.name == y.name && x.storage_type == y.storage_type; }
+    );
+}
+
+}  // namespace
+
+Catalog::Catalog(BufferPoolManager* bpm, ColumnarFile* file) : bpm_(bpm), file_(file) {}
+
+void Catalog::RestoreFromFile() {
+    if (file_ == nullptr) return;
+    const CatalogMeta& saved = file_->Catalog();
+    for (const ColumnarTableMeta& meta : saved.tables) {
+        (void)AddColumnar(meta);
+    }
+
+    // The decoder already checked that each index's table and column exist
+    for (const IndexMeta& meta : saved.indexes) {
+        const auto table = std::find_if(saved.tables.begin(), saved.tables.end(), [&](const ColumnarTableMeta& t) { return t.oid == meta.table_oid; });
+        auto info = std::make_unique<IndexInfo>();
+        info->index_name = meta.name;
+        info->table_name = table->name;
+        info->col_idx = meta.column_number - 1;
+        info->column_name = table->columns[info->col_idx].name;
+        info->index = std::make_unique<BTreeIndex>(bpm_, meta.key_type, meta.root_page);
+        info->root_page_id = meta.root_page;
+        info->oid = meta.oid;
+        indexes_[meta.name] = std::move(info);
+    }
+}
+
+TableInfo* Catalog::LoadColumnarTable(const std::string& name, const Schema& schema, const std::string& path, const BulkLoadOptions& options) {
+    if (file_ == nullptr) {
+        throw DatabaseException("columnar tables need a database file");
+    }
+    if (auto it = tables_.find(name); it != tables_.end()) {
+        if (it->second->storage == StorageKind::ROW) {
+            throw DatabaseException("table " + name + " already exists as a row-store table");
+        }
+        return ReplaceColumnar(*it->second, schema, path, options);
+    }
+
+    // The OID is taken only after the load works, so a failed load wastes none
+    ColumnarTableMeta meta = BulkLoad(file_->Disk(), name, schema, path, options);
+    meta.oid = file_->AllocateOid();
+
+    CatalogMeta next = file_->Catalog();
+    next.tables.push_back(meta);
+    file_->Commit(std::move(next));
+    return AddColumnar(meta);
+}
+
+TableInfo* Catalog::ReplaceColumnar(TableInfo& info, const Schema& schema, const std::string& path, const BulkLoadOptions& options) {
+    if (!SameColumns(info.schema, schema)) {
+        throw DatabaseException("table " + info.name + " exists with a different schema");
+    }
+
+    ColumnarTableMeta meta = BulkLoad(file_->Disk(), info.name, schema, path, options);
+    meta.oid = info.oid;
+    auto table = std::make_unique<ColumnarTable>(bpm_, meta);
+
+    // New trees on new pages: a committed tree's pages are never written again
+    const std::vector<IndexInfo*> indexes = GetTableIndexes(info.name);
+    std::vector<std::unique_ptr<BTreeIndex>> trees;
+    trees.reserve(indexes.size());
+    for (const IndexInfo* index : indexes) {
+        trees.push_back(BuildColumnarIndex(*table, index->col_idx));
+    }
+    bpm_->FlushAllPages();
+
+    // Built before the commit, so nothing after it can throw
+    Schema new_schema = SchemaOf(meta);
+    CatalogMeta next = file_->Catalog();
+    for (ColumnarTableMeta& saved : next.tables) {
+        if (saved.oid == meta.oid) saved = meta;
+    }
+    for (size_t i = 0; i < indexes.size(); ++i) {
+        for (IndexMeta& saved : next.indexes) {
+            if (saved.oid == indexes[i]->oid) saved.root_page = trees[i]->GetRootPageId();
+        }
+    }
+    file_->Commit(std::move(next));
+
+    // Only now, with the commit done, does anyone see the new data
+    info.schema = std::move(new_schema);
+    info.stats = std::move(meta.stats);
+    info.columnar = std::move(table);
+    for (size_t i = 0; i < indexes.size(); ++i) {
+        indexes[i]->root_page_id = trees[i]->GetRootPageId();
+        indexes[i]->index = std::move(trees[i]);
+    }
+    return &info;
+}
+
+TableInfo* Catalog::AddColumnar(const ColumnarTableMeta& meta) {
+    auto info = std::make_unique<TableInfo>();
+    info->name = meta.name;
+    info->schema = SchemaOf(meta);
+    info->first_page_id = INVALID_PAGE_ID;
+    info->stats = meta.stats;
+    info->storage = StorageKind::COLUMNAR;
+    info->oid = meta.oid;
+    info->columnar = std::make_unique<ColumnarTable>(bpm_, meta);
+
+    auto* ptr = info.get();
+    tables_[meta.name] = std::move(info);
+    return ptr;
+}
 
 TableInfo* Catalog::CreateTable(const std::string& name, const Schema& schema) {
     if (tables_.find(name) != tables_.end()) {
@@ -48,6 +176,9 @@ IndexInfo* Catalog::CreateIndex(const std::string& index_name, const std::string
     if (key_type == TypeId::VARCHAR || key_type == TypeId::INVALID) {
         throw DatabaseException("Cannot create index on column '" + column_name + "': unsupported key type");
     }
+    if (table_info->storage == StorageKind::COLUMNAR) {
+        return CreateColumnarIndex(index_name, *table_info, col_idx);
+    }
 
     auto btree = std::make_unique<BTreeIndex>(bpm_, key_type);
 
@@ -71,6 +202,56 @@ IndexInfo* Catalog::CreateIndex(const std::string& index_name, const std::string
     return ptr;
 }
 
+IndexInfo* Catalog::CreateColumnarIndex(const std::string& index_name, const TableInfo& table, uint32_t col_idx) {
+    auto btree = BuildColumnarIndex(*table.columnar, col_idx);
+    // The commit only counts pages already on disk
+    bpm_->FlushAllPages();
+
+    IndexMeta meta;
+    meta.oid = file_->AllocateOid();
+    meta.name = index_name;
+    meta.table_oid = table.oid;
+    meta.column_number = col_idx + 1;
+    meta.key_type = table.schema.GetColumn(col_idx).type;
+    meta.root_page = btree->GetRootPageId();
+
+    CatalogMeta next = file_->Catalog();
+    next.indexes.push_back(meta);
+    file_->Commit(std::move(next));
+
+    auto info = std::make_unique<IndexInfo>();
+    info->index_name = index_name;
+    info->table_name = table.name;
+    info->column_name = table.schema.GetColumn(col_idx).name;
+    info->col_idx = col_idx;
+    info->root_page_id = meta.root_page;
+    info->index = std::move(btree);
+    info->oid = meta.oid;
+
+    auto* ptr = info.get();
+    indexes_.emplace(index_name, std::move(info));
+    return ptr;
+}
+
+std::unique_ptr<BTreeIndex> Catalog::BuildColumnarIndex(const ColumnarTable& table, uint32_t col_idx) const {
+    const ColumnMeta& column = table.Meta().columns.at(col_idx);
+    auto btree = std::make_unique<BTreeIndex>(bpm_, ExecutorType(column.type));
+    ColumnVector chunk(column.type);
+    for (size_t group = 0; group < table.RowGroupCount(); ++group) {
+        chunk.Clear();
+        table.ReadChunk(group, col_idx, chunk);
+        // The tree has no NULL keys
+        if (chunk.NullCount() > 0) {
+            throw DatabaseException("Cannot create index on column '" + column.name + "': it holds a NULL");
+        }
+        for (size_t row = 0; row < chunk.Size(); ++row) {
+            const RowPosition pos{static_cast<uint32_t>(group), static_cast<uint16_t>(row)};
+            btree->Insert(ToExecutorValue(chunk, row), ToRid(pos));
+        }
+    }
+    return btree;
+}
+
 IndexInfo* Catalog::GetIndex(const std::string& index_name) {
     auto it = indexes_.find(index_name);
     if (it == indexes_.end()) {
@@ -91,7 +272,8 @@ std::vector<IndexInfo*> Catalog::GetTableIndexes(const std::string& table_name) 
 
 void Catalog::UpdateTableStats(const std::string& table_name) {
     auto* table_info = GetTable(table_name);
-    if (table_info == nullptr) {
+    // A columnar table's stats come from its loader; there is no heap to scan
+    if (table_info == nullptr || table_info->storage == StorageKind::COLUMNAR) {
         return;
     }
 

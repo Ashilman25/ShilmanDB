@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -376,6 +377,15 @@ int main(int argc, char* argv[]) {
     std::cout << "=== Join Training Data Generator ===\n";
     std::cout << "SF=" << args.sf << "  perturbations=" << args.perturbations << "  seed=" << args.seed << "\n\n";
 
+
+    // A file another run left can't be loaded into, so every run starts fresh.
+    std::error_code ec;
+    std::filesystem::remove(args.db_file, ec);
+    if (ec) {
+        std::cerr << "Error: could not remove " << args.db_file << ": " << ec.message() << "\n";
+        return 1;
+    }
+    std::cout << "Starting a fresh database file: " << args.db_file << "\n";
 
     constexpr size_t kBufferPoolSize = 4096;
     Database db(args.db_file, kBufferPoolSize);

@@ -258,10 +258,14 @@ The steps meant to close the gap:
 |---|---:|---:|---|
 | DuckDB | 2.5 s | 10.9 s | reading the `.tbl` files into a database file |
 | Postgres | 15.7 s | 159.5 s | `COPY`, the 8 indexes, then `VACUUM (ANALYZE)` |
-| ShilmanDB | not recorded | at most about 195 s *inferred* | the load and everything else outside the timed queries (above) |
-| SQLite | not recorded | did not run | |
+| ShilmanDB, row store (step 7) | not recorded | at most about 195 s *inferred* | the load and everything else outside the timed queries (above) |
+| ShilmanDB, row store, 1 thread (since 14a) | 16.8 s | not planned | the 7 tables loaded into the row store, before indexes |
+| ShilmanDB, columnar, all cores (14a) | 0.6 s | 4.2 s | the 7 tables loaded in parallel into the columnar file, with their statistics, before indexes |
+| ShilmanDB, columnar, 1 thread (14a) | 3.3 s | not planned | the same on one loader thread |
+| SQLite, on disk (since 14a) | 19.2 s | did not run | Python reads the `.tbl` files and inserts the rows, then builds the 6 indexes |
+| SQLite, in memory (since 14a) | 18.1 s | did not run | the same, in memory |
 
-DuckDB and Postgres are *measured* by their runners (2.475, 10.894, 15.731 and 159.456 s). The runner doesn't record ShilmanDB's or SQLite's load time. Load times are recorded, not compared: no engine was tuned for loading.
+DuckDB and Postgres are *measured* by their runners on 2026-11-14 (2.475, 10.894, 15.731 and 159.456 s). Step 7's runner didn't record ShilmanDB's or SQLite's load time. Since 14a (the columnar file format) `run_benchmarks.py` records ShilmanDB's load time per table and in total, for both storages. The rows marked "(14a)" or "(since 14a)" are *measured* on 2026-11-17, on the `columnar-format` branch at `96f4625`, by 14a's SF=1 and SF=10 runs: the row store and the all-cores columnar load at SF=1 from `run_benchmarks.py` (`baseline` 16,825 ms, `columnar` 588 ms, 18 loader threads); the 1-thread columnar load from `load_tpch --storage columnar --load-threads 1 --create-indexes false` (3,277 ms); SF=10 from the `columnar` config (4,185 ms); SQLite from `run_sqlite_benchmarks.py`'s printed load lines in the same SF=1 run (19,247 ms on disk, 18,138 ms in memory). Load times are recorded, not compared: no engine was tuned for loading, and the loads cover different work (Postgres and SQLite build indexes, ShilmanDB's columnar load and DuckDB don't).
 
 ## How to reproduce
 

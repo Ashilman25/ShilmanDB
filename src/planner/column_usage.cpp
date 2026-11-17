@@ -1,6 +1,8 @@
 #include "planner/column_usage.hpp"
 
 #include <algorithm>
+#include <optional>
+#include <utility>
 
 namespace shilmandb {
 
@@ -107,6 +109,70 @@ std::vector<uint32_t> ColumnsReadBy(const PlanNode& node) {
         case PlanNodeType::LIMIT:
             break;
     }
+    return out;
+}
+
+namespace {
+
+// Where an output column comes from: a scan's table column, or nothing if derived.
+using Source = std::optional<std::pair<const PlanNode*, uint32_t>>;
+
+// The columns a scan lists; unset means every column.
+const std::optional<std::vector<uint32_t>>& ListedColumns(const PlanNode& scan) {
+    if (scan.type == PlanNodeType::SEQ_SCAN) return static_cast<const SeqScanPlanNode&>(scan).read_columns;
+    return static_cast<const IndexScanPlanNode&>(scan).read_columns;
+}
+
+// Checks the node's reads against the scans below it and returns its output's sources.
+std::vector<Source> CheckReads(const PlanNode& node, std::vector<UnlistedRead>& out) {
+    std::vector<std::vector<Source>> below;
+    for (const auto& child : node.children) below.push_back(CheckReads(*child, out));
+
+    const size_t width = node.output_schema.GetColumnCount();
+    std::vector<Source> sources(width);
+    switch (node.type) {
+        case PlanNodeType::SEQ_SCAN:
+        case PlanNodeType::INDEX_SCAN:
+            for (uint32_t c = 0; c < width; ++c) sources[c] = std::make_pair(&node, c);
+            break;
+        case PlanNodeType::FILTER:
+        case PlanNodeType::SORT:
+        case PlanNodeType::LIMIT:
+            if (!below.empty()) sources = below[0];
+            break;
+        case PlanNodeType::HASH_JOIN:
+        case PlanNodeType::NESTED_LOOP_JOIN:
+            // Left columns, then right, as BuildJoinSchema lays them out.
+            if (below.size() == 2) {
+                sources = below[0];
+                sources.insert(sources.end(), below[1].begin(), below[1].end());
+            }
+            break;
+        case PlanNodeType::PROJECTION:
+        case PlanNodeType::AGGREGATE:
+            break;
+    }
+
+    // Joins read their own combined row; the others read their child's.
+    const bool is_join = node.type == PlanNodeType::HASH_JOIN || node.type == PlanNodeType::NESTED_LOOP_JOIN;
+    const std::vector<Source>* input = is_join ? &sources : (below.empty() ? nullptr : &below[0]);
+    if (input == nullptr) return sources;
+
+    for (const uint32_t idx : ColumnsReadBy(node)) {
+        if (idx >= input->size() || !(*input)[idx]) continue;
+        const auto [scan, column] = *(*input)[idx];
+        const auto& listed = ListedColumns(*scan);
+        if (!listed || std::find(listed->begin(), listed->end(), column) != listed->end()) continue;
+        out.push_back(UnlistedRead{&node, idx, scan, column});
+    }
+    return sources;
+}
+
+}  // namespace
+
+std::vector<UnlistedRead> FindUnlistedReads(const PlanNode& root) {
+    std::vector<UnlistedRead> out;
+    (void)CheckReads(root, out);
     return out;
 }
 

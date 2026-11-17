@@ -7,6 +7,8 @@
 #include <chrono>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <vector>
 
 namespace shilmandb {
 
@@ -302,6 +304,107 @@ TEST_F(DiskManagerTest, NumPagesFollowsAllocation) {
         dm.AllocatePage();
     }
     EXPECT_EQ(dm.GetNumPages(), 3u);
+}
+
+TEST_F(DiskManagerTest, AllocatePagesGivesContiguousRun) {
+    DiskManager dm(test_file_);
+
+    EXPECT_EQ(dm.AllocatePage(), 0u);
+    EXPECT_EQ(dm.AllocatePages(5), 1u);
+    EXPECT_EQ(dm.AllocatePage(), 6u);
+    EXPECT_EQ(dm.GetNumPages(), 7u);
+
+    // a run of zero pages moves nothing
+    EXPECT_EQ(dm.AllocatePages(0), 7u);
+    EXPECT_EQ(dm.GetNumPages(), 7u);
+}
+
+TEST_F(DiskManagerTest, TruncateCutsFileAndResetsNextPage) {
+    DiskManager dm(test_file_);
+
+    std::array<char, PAGE_SIZE> buf{};
+    for (int i = 0; i < 5; ++i) {
+        std::memset(buf.data(), i + 1, PAGE_SIZE);
+        dm.WritePage(dm.AllocatePage(), buf.data());
+    }
+    ASSERT_EQ(dm.GetFileBytes(), 5 * PAGE_SIZE);
+    EXPECT_THROW(dm.Truncate(INVALID_PAGE_ID), IOException);
+
+    dm.Truncate(2);
+
+    EXPECT_EQ(dm.GetNumPages(), 2u);
+    EXPECT_EQ(dm.GetFileBytes(), 2 * PAGE_SIZE);
+    EXPECT_EQ(dm.AllocatePage(), 2u);
+
+    // the kept pages keep their bytes, a cut page reads as zeros
+    dm.ReadPage(1, buf.data());
+    EXPECT_EQ(static_cast<unsigned char>(buf[0]), 2);
+    EXPECT_EQ(static_cast<unsigned char>(buf[PAGE_SIZE - 1]), 2);
+    dm.ReadPage(3, buf.data());
+    std::array<char, PAGE_SIZE> zeros{};
+    EXPECT_EQ(std::memcmp(buf.data(), zeros.data(), PAGE_SIZE), 0);
+}
+
+TEST_F(DiskManagerTest, SyncSucceeds) {
+    DiskManager dm(test_file_);
+    std::array<char, PAGE_SIZE> buf{};
+    std::memset(buf.data(), 0x42, PAGE_SIZE);
+    dm.WritePage(dm.AllocatePage(), buf.data());
+
+    EXPECT_NO_THROW(dm.Sync());
+}
+
+// Writes down every write and sync it hears about, in order
+class RecordingObserver : public WriteObserver {
+public:
+    std::vector<std::string> events;
+    std::vector<char> first_bytes;
+
+    void OnWrite(page_id_t page_id, const char* data) override {
+        events.push_back("W" + std::to_string(page_id));
+        first_bytes.push_back(data[0]);
+    }
+    void OnSync() override { events.push_back("S"); }
+};
+
+TEST_F(DiskManagerTest, ObserverSeesWritesAndSyncsInOrder) {
+    DiskManager dm(test_file_);
+    RecordingObserver observer;
+    dm.SetWriteObserver(&observer);
+
+    std::array<char, PAGE_SIZE> buf{};
+    buf[0] = 'a';
+    dm.WritePage(0, buf.data());
+    buf[0] = 'b';
+    dm.WritePage(1, buf.data());
+    dm.Sync();
+    buf[0] = 'c';
+    dm.WritePage(0, buf.data());
+
+    // a failed write is not reported
+    EXPECT_THROW(dm.WritePage(INVALID_PAGE_ID, buf.data()), IOException);
+
+    const std::vector<std::string> expected{"W0", "W1", "S", "W0"};
+    EXPECT_EQ(observer.events, expected);
+    EXPECT_EQ(observer.first_bytes, (std::vector<char>{'a', 'b', 'c'}));
+
+    // nullptr turns it off
+    dm.SetWriteObserver(nullptr);
+    dm.WritePage(2, buf.data());
+    dm.Sync();
+    EXPECT_EQ(observer.events, expected);
+}
+
+TEST_F(DiskManagerTest, GetFileBytesCountsPartialPage) {
+    {
+        std::ofstream out(test_file_, std::ios::binary);
+        const std::string bytes(100, 'x');
+        out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    }
+
+    DiskManager dm(test_file_);
+    EXPECT_EQ(dm.GetFileBytes(), 100u);
+    EXPECT_EQ(dm.GetNumPages(), 0u);
 }
 
 }  // namespace shilmandb

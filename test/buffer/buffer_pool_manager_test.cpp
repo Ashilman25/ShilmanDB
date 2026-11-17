@@ -787,12 +787,14 @@ TEST(PageTest, ClearMetadataKeepsData) {
     page->SetPageId(7);
     page->Pin();
     page->MarkDirty();
+    page->MarkVerified();
 
     page->ClearMetadata();
 
     EXPECT_EQ(page->GetPageId(), INVALID_PAGE_ID);
     EXPECT_EQ(page->GetPinCount(), 0);
     EXPECT_FALSE(page->IsDirty());
+    EXPECT_FALSE(page->IsVerified());
     EXPECT_EQ(std::memcmp(page->GetData(), "keep me", 8), 0);
 }
 
@@ -1299,6 +1301,56 @@ TEST_F(BufferPoolManagerTest, PolicyTimingKeepsAccessTypes) {
     ASSERT_EQ(plain.first.size(), 74u);
     EXPECT_EQ(plain.first, timed.first);
     EXPECT_EQ(plain.second, timed.second);
+}
+
+// A frame loaded from disk again, or reused for another page, starts unverified
+TEST_F(BufferPoolManagerTest, VerifiedFlagClearedWhenPageReloaded) {
+    auto [dm, bpm] = MakeBPM(1);  // one frame, so every page shares it
+
+    page_id_t a, b;
+    ASSERT_NE(bpm->NewPage(&a), nullptr);
+    (void)bpm->UnpinPage(a, true);
+    ASSERT_NE(bpm->NewPage(&b), nullptr);  // evicts a and writes it out
+    (void)bpm->UnpinPage(b, true);
+
+    auto* page = bpm->FetchPage(a);
+    ASSERT_NE(page, nullptr);
+    EXPECT_FALSE(page->IsVerified());
+    page->MarkVerified();
+    (void)bpm->UnpinPage(a, false);
+
+    bpm->DropAllPages();
+    page = bpm->FetchPage(a);
+    ASSERT_NE(page, nullptr);
+    EXPECT_FALSE(page->IsVerified());
+    page->MarkVerified();
+    (void)bpm->UnpinPage(a, false);
+
+    // b takes over the frame a was verified in
+    page = bpm->FetchPage(b);
+    ASSERT_NE(page, nullptr);
+    EXPECT_FALSE(page->IsVerified());
+    (void)bpm->UnpinPage(b, false);
+}
+
+TEST_F(BufferPoolManagerTest, VerifiedFlagSurvivesHit) {
+    auto [dm, bpm] = MakeBPM(4);
+
+    page_id_t a;
+    ASSERT_NE(bpm->NewPage(&a), nullptr);
+    (void)bpm->UnpinPage(a, true);
+
+    auto* page = bpm->FetchPage(a);
+    ASSERT_NE(page, nullptr);
+    page->MarkVerified();
+    (void)bpm->UnpinPage(a, false);
+
+    const uint64_t hits = bpm->GetHitCount();
+    page = bpm->FetchPage(a);
+    ASSERT_NE(page, nullptr);
+    EXPECT_EQ(bpm->GetHitCount(), hits + 1);
+    EXPECT_TRUE(page->IsVerified());
+    (void)bpm->UnpinPage(a, false);
 }
 
 }  // namespace shilmandb

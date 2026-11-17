@@ -2,6 +2,7 @@
 #include "common/exception.hpp"
 #include <cassert>
 #include <cstring>
+#include <string>
 
 
 namespace shilmandb {
@@ -72,6 +73,23 @@ uint16_t BTreeInternalPage::MaxKeys(TypeId key_type) {
     return static_cast<uint16_t>(((available - 4) / (ks + 4)) - 1);
 }
 
+namespace {
+
+// Builds and throws the bad key count error, kept off the hot path.
+[[noreturn]] __attribute__((cold, noinline)) void ThrowBadInternalCount(uint16_t num_keys, size_t fit) {
+    if (num_keys == 0) throw DatabaseException("damaged index: internal page has 0 keys");
+    throw DatabaseException("damaged index: internal page has " + std::to_string(num_keys) + " keys, more than " + std::to_string(fit) + " fit");
+}
+
+}  // namespace
+
+// A page briefly holds one key over MaxKeys before it splits, so that still fits.
+void BTreeInternalPage::CheckKeyCount(const char* page_data, TypeId key_type) {
+    const auto num_keys = GetNumKeys(page_data);
+    const auto fit = static_cast<size_t>(MaxKeys(key_type)) + 1;
+    if (num_keys == 0 || num_keys > fit) ThrowBadInternalCount(num_keys, fit);
+}
+
 bool BTreeInternalPage::NeedsSplit(const char* page_data, TypeId key_type) {
     return GetNumKeys(page_data) > MaxKeys(key_type);
 }
@@ -129,8 +147,8 @@ void BTreeInternalPage::SetChild(char* page_data, uint16_t child_idx, page_id_t 
 
 
 page_id_t BTreeInternalPage::FindChild(const char* page_data, const Value& key, TypeId key_type, bool go_right_on_equal) {
+    CheckKeyCount(page_data, key_type);
     auto num_keys = GetNumKeys(page_data);
-    assert(num_keys > 0 && "Lookup on empty internal node is undefined");
 
     uint16_t lo = 0;
     uint16_t hi = num_keys;
