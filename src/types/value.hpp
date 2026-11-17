@@ -25,6 +25,8 @@ public:
     explicit Value(double val);
     explicit Value(const std::string& val);
     static Value MakeDate(int32_t days_since_epoch);
+    // A zero, empty string or day 0 of the given type; INVALID gives Value().
+    [[nodiscard]] static Value DefaultFor(TypeId type);
 
     bool operator==(const Value& other) const;
     bool operator!=(const Value& other) const;

@@ -1,5 +1,6 @@
 #pragma once
 #include "types/types.hpp"
+#include "types/column_type.hpp"
 #include <string>
 #include <vector>
 #include <cstdint>
@@ -27,11 +28,16 @@ constexpr uint32_t FixedLengthForType(TypeId type) {
 
 struct Column {
     std::string name;
-    TypeId type;
+    TypeId type;               // what the planner and executor see
     uint32_t fixed_length;
     bool nullable;
+    ColumnType storage_type;   // what a columnar file stores
 
+    // Storage type is the default for this TypeId (ColumnType{} for INVALID)
     Column(std::string name, TypeId type, bool nullable = false);
+
+    // Executor type comes from the storage type
+    Column(std::string name, ColumnType storage_type, bool nullable = false);
 };
 
 class Schema {

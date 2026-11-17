@@ -99,6 +99,19 @@ Value Value::MakeDate(int32_t days_since_epoch) {
     return v;
 }
 
+// Each type is built with its own constructor, so its union member is set.
+Value Value::DefaultFor(TypeId type) {
+    switch (type) {
+        case TypeId::INTEGER: return Value(int32_t{0});
+        case TypeId::BIGINT:  return Value(int64_t{0});
+        case TypeId::DECIMAL: return Value(0.0);
+        case TypeId::VARCHAR: return Value(std::string());
+        case TypeId::DATE:    return MakeDate(0);
+        case TypeId::INVALID: break;
+    }
+    return Value();
+}
+
 //compare operators
 
 bool Value::operator==(const Value& other) const {

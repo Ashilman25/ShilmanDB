@@ -11,6 +11,7 @@ endmacro()
 # Types tests
 shilmandb_add_test(value_test types/value_test.cpp)
 shilmandb_add_test(tuple_test types/tuple_test.cpp)
+shilmandb_add_test(column_type_test types/column_type_test.cpp)
 
 # Storage tests
 shilmandb_add_test(disk_manager_test storage/disk_manager_test.cpp)

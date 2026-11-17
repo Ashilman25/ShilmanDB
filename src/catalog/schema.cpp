@@ -6,7 +6,10 @@ namespace shilmandb {
 
 
 
-Column::Column(std::string name, TypeId type, bool nullable) : name{std::move(name)}, type{type}, fixed_length{FixedLengthForType(type)}, nullable{nullable} {}
+// An INVALID column keeps the ColumnType{} default instead of throwing.
+Column::Column(std::string name, TypeId type, bool nullable) : name{std::move(name)}, type{type}, fixed_length{FixedLengthForType(type)}, nullable{nullable}, storage_type{type == TypeId::INVALID ? ColumnType{} : DefaultColumnType(type)} {}
+
+Column::Column(std::string name, ColumnType storage_type, bool nullable) : name{std::move(name)}, type{ExecutorType(storage_type)}, fixed_length{FixedLengthForType(type)}, nullable{nullable}, storage_type{storage_type} {}
 
 
 Schema::Schema(std::vector<Column> columns) : columns_{std::move(columns)} {
