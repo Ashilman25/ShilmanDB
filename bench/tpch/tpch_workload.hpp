@@ -285,9 +285,19 @@ struct Query {
 
 //  Loading and comparing
 
+// How one table's load went. Pages: heap pages for row, chunk pages for columnar.
+struct TableLoad {
+    std::string name;
+    uint64_t rows{0};
+    double ms{0.0};
+    uint64_t pages{0};
+};
+
 // Loads all 7 tables from data_dir (which must end with '/'), printing one line per table.
 // The default options load into the row store.
-inline void LoadTables(Database& db, const std::string& data_dir, const LoadOptions& options = {}) {
+inline std::vector<TableLoad> LoadTables(Database& db, const std::string& data_dir, const LoadOptions& options = {}) {
+    const bool columnar = options.storage == StorageKind::COLUMNAR;
+    std::vector<TableLoad> loads;
     for (const auto& td : TableDescs()) {
         std::string path = data_dir + td.tbl_file;
         std::cout << "Loading " << td.name << " from " << path << " ... " << std::flush;
@@ -302,8 +312,14 @@ inline void LoadTables(Database& db, const std::string& data_dir, const LoadOpti
         auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
 
         auto* info = db.GetCatalog()->GetTable(td.name);
-        std::cout << info->stats.row_count << " rows (" << ms << " ms)\n";
+        std::cout << info->stats.row_count << " rows (" << ms << " ms)";
+        if (columnar) std::cout << ", " << info->stats.page_count << " pages";
+        std::cout << "\n";
+
+        const double exact_ms = std::chrono::duration<double, std::milli>(elapsed).count();
+        loads.push_back({td.name, info->stats.row_count, exact_ms, info->stats.page_count});
     }
+    return loads;
 }
 
 // True when both results have the same rows in the same order
