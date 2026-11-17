@@ -2,6 +2,7 @@
 #include <unistd.h>
 
 #include "engine/database.hpp"
+#include "tpch/tpch_workload.hpp"
 #include "executor/vectorized_parity_harness.hpp"
 
 #include <filesystem>
@@ -11,122 +12,12 @@
 
 namespace shilmandb {
 
-// ── TPC-H schema helpers (mirrors bench/tpch/load_tpch.cpp) ──────────────
-
-static Schema RegionSchema() {
-    return Schema({
-        {"r_regionkey", TypeId::BIGINT},
-        {"r_name", TypeId::VARCHAR},
-        {"r_comment", TypeId::VARCHAR},
-    });
-}
-
-static Schema NationSchema() {
-    return Schema({
-        {"n_nationkey", TypeId::BIGINT},
-        {"n_name", TypeId::VARCHAR},
-        {"n_regionkey", TypeId::BIGINT},
-        {"n_comment", TypeId::VARCHAR},
-    });
-}
-
-static Schema PartSchema() {
-    return Schema({
-        {"p_partkey", TypeId::BIGINT},
-        {"p_name", TypeId::VARCHAR},
-        {"p_mfgr", TypeId::VARCHAR},
-        {"p_brand", TypeId::VARCHAR},
-        {"p_type", TypeId::VARCHAR},
-        {"p_size", TypeId::INTEGER},
-        {"p_container", TypeId::VARCHAR},
-        {"p_retailprice", TypeId::DECIMAL},
-        {"p_comment", TypeId::VARCHAR},
-    });
-}
-
-static Schema SupplierSchema() {
-    return Schema({
-        {"s_suppkey", TypeId::BIGINT},
-        {"s_name", TypeId::VARCHAR},
-        {"s_address", TypeId::VARCHAR},
-        {"s_nationkey", TypeId::BIGINT},
-        {"s_phone", TypeId::VARCHAR},
-        {"s_acctbal", TypeId::DECIMAL},
-        {"s_comment", TypeId::VARCHAR},
-    });
-}
-
-static Schema CustomerSchema() {
-    return Schema({
-        {"c_custkey", TypeId::BIGINT},
-        {"c_name", TypeId::VARCHAR},
-        {"c_address", TypeId::VARCHAR},
-        {"c_nationkey", TypeId::BIGINT},
-        {"c_phone", TypeId::VARCHAR},
-        {"c_acctbal", TypeId::DECIMAL},
-        {"c_mktsegment", TypeId::VARCHAR},
-        {"c_comment", TypeId::VARCHAR},
-    });
-}
-
-static Schema OrdersSchema() {
-    return Schema({
-        {"o_orderkey", TypeId::BIGINT},
-        {"o_custkey", TypeId::BIGINT},
-        {"o_orderstatus", TypeId::VARCHAR},
-        {"o_totalprice", TypeId::DECIMAL},
-        {"o_orderdate", TypeId::DATE},
-        {"o_orderpriority", TypeId::VARCHAR},
-        {"o_clerk", TypeId::VARCHAR},
-        {"o_shippriority", TypeId::INTEGER},
-        {"o_comment", TypeId::VARCHAR},
-    });
-}
-
-static Schema LineitemSchema() {
-    return Schema({
-        {"l_orderkey", TypeId::BIGINT},
-        {"l_partkey", TypeId::BIGINT},
-        {"l_suppkey", TypeId::BIGINT},
-        {"l_linenumber", TypeId::INTEGER},
-        {"l_quantity", TypeId::DECIMAL},
-        {"l_extendedprice", TypeId::DECIMAL},
-        {"l_discount", TypeId::DECIMAL},
-        {"l_tax", TypeId::DECIMAL},
-        {"l_returnflag", TypeId::VARCHAR},
-        {"l_linestatus", TypeId::VARCHAR},
-        {"l_shipdate", TypeId::DATE},
-        {"l_commitdate", TypeId::DATE},
-        {"l_receiptdate", TypeId::DATE},
-        {"l_shipinstruct", TypeId::VARCHAR},
-        {"l_shipmode", TypeId::VARCHAR},
-        {"l_comment", TypeId::VARCHAR},
-    });
-}
-
-struct TableDesc {
-    std::string name;
-    Schema schema;
-    std::string tbl_file;
-};
-
+// This suite's own 6 indexes, not the shared 8.
 struct IndexDesc {
     std::string index_name;
     std::string table_name;
     std::string column_name;
 };
-
-static std::vector<TableDesc> BuildTableDescs() {
-    return {
-        {"region",   RegionSchema(),   "region.tbl"},
-        {"nation",   NationSchema(),   "nation.tbl"},
-        {"part",     PartSchema(),     "part.tbl"},
-        {"supplier", SupplierSchema(), "supplier.tbl"},
-        {"customer", CustomerSchema(), "customer.tbl"},
-        {"orders",   OrdersSchema(),   "orders.tbl"},
-        {"lineitem", LineitemSchema(), "lineitem.tbl"},
-    };
-}
 
 static std::vector<IndexDesc> BuildIndexDescs() {
     return {
@@ -139,12 +30,16 @@ static std::vector<IndexDesc> BuildIndexDescs() {
     };
 }
 
-// ── Fixture: load TPC-H SF=0.01 once for the whole suite ────────────
+// ── Fixture: load TPC-H SF=0.01 once per storage for the whole suite ─
 
-class VectorizedTpchParityTest : public ::testing::Test {
+class VectorizedTpchParityTest : public ::testing::TestWithParam<StorageKind> {
 protected:
-    static std::unique_ptr<Database> db_;
-    static std::string test_file_;
+    static std::unique_ptr<Database> row_db_;
+    static std::unique_ptr<Database> columnar_db_;
+    static std::string row_file_;
+    static std::string columnar_file_;
+    static std::string data_dir_;
+    Database* db_{nullptr};
 
     // CTest runs from build/, so ../bench/... is the typical relative path.
     static std::string FindDataDir() {
@@ -161,45 +56,58 @@ protected:
         return {};
     }
 
-    static void SetUpTestSuite() {
-        test_file_ = (std::filesystem::temp_directory_path() /
-                      ("shilmandb_vec_tpch_parity_test_" + std::to_string(::getpid()) + ".db")).string();
-        std::filesystem::remove(test_file_);
-
-        auto data_dir = FindDataDir();
-        if (data_dir.empty()) {
-            // Leave db_ null; every test skips via RunParity.
-            return;
-        }
+    // Loads the TPC-H tables into one storage, then adds the indexes and stats.
+    static std::unique_ptr<Database> Load(const std::string& file, const std::string& data_dir,
+                                          StorageKind storage) {
+        std::filesystem::remove(file);
 
         // Large pool so eviction does not interfere with correctness.
         constexpr size_t kPoolSize = 4096;
-        db_ = std::make_unique<Database>(test_file_, kPoolSize);
+        auto db = std::make_unique<Database>(file, kPoolSize);
 
-        for (const auto& td : BuildTableDescs()) {
-            db_->LoadTable(td.name, td.schema, data_dir + td.tbl_file);
+        LoadOptions options;
+        options.storage = storage;
+        for (const auto& td : tpch::TableDescs()) {
+            db->LoadTable(td.name, td.schema, data_dir + td.tbl_file, options);
         }
-        auto* catalog = db_->GetCatalog();
+        auto* catalog = db->GetCatalog();
         for (const auto& idx : BuildIndexDescs()) {
             (void)catalog->CreateIndex(idx.index_name, idx.table_name, idx.column_name);
         }
-        for (const auto& td : BuildTableDescs()) {
+        for (const auto& td : tpch::TableDescs()) {
             catalog->UpdateTableStats(td.name);
         }
+        return db;
+    }
+
+    static void SetUpTestSuite() {
+        const auto temp = std::filesystem::temp_directory_path();
+        const std::string pid = std::to_string(::getpid());
+        row_file_ = (temp / ("shilmandb_vec_tpch_parity_test_row_" + pid + ".db")).string();
+        columnar_file_ = (temp / ("shilmandb_vec_tpch_parity_test_col_" + pid + ".db")).string();
+        data_dir_ = FindDataDir();
     }
 
     static void TearDownTestSuite() {
-        db_.reset();
-        if (!test_file_.empty()) {
-            std::filesystem::remove(test_file_);
-        }
+        row_db_.reset();
+        columnar_db_.reset();
+        std::filesystem::remove(row_file_);
+        std::filesystem::remove(columnar_file_);
     }
 
-    static void RunParity(const std::string& sql) {
-        if (!db_) {
+    // Loads only this test's storage, the first time a test asks for it.
+    void SetUp() override {
+        if (data_dir_.empty()) {
             GTEST_SKIP() << "TPC-H SF=0.01 data not found. "
                             "Run bench/tpch/generate_tpch_data.sh first.";
         }
+        const bool row = GetParam() == StorageKind::ROW;
+        auto& slot = row ? row_db_ : columnar_db_;
+        if (!slot) slot = Load(row ? row_file_ : columnar_file_, data_dir_, GetParam());
+        db_ = slot.get();
+    }
+
+    void RunParity(const std::string& sql) {
         auto tuple_rs = db_->ExecuteSQL(sql, ExecutionMode::TUPLE);
         auto vec_rs   = db_->ExecuteSQL(sql, ExecutionMode::VECTORIZED);
         ASSERT_EQ(tuple_rs.tuples.size(), vec_rs.tuples.size())
@@ -208,12 +116,26 @@ protected:
     }
 };
 
-std::unique_ptr<Database> VectorizedTpchParityTest::db_;
-std::string VectorizedTpchParityTest::test_file_;
+std::unique_ptr<Database> VectorizedTpchParityTest::row_db_;
+std::unique_ptr<Database> VectorizedTpchParityTest::columnar_db_;
+std::string VectorizedTpchParityTest::row_file_;
+std::string VectorizedTpchParityTest::columnar_file_;
+std::string VectorizedTpchParityTest::data_dir_;
+
+// Names the storage in test output, so ctest shows /Row and /Columnar.
+static void PrintTo(StorageKind storage, std::ostream* os) {
+    *os << (storage == StorageKind::ROW ? "Row" : "Columnar");
+}
+
+INSTANTIATE_TEST_SUITE_P(Storage, VectorizedTpchParityTest,
+                         ::testing::Values(StorageKind::ROW, StorageKind::COLUMNAR),
+                         [](const ::testing::TestParamInfo<StorageKind>& info) {
+                             return std::string(info.param == StorageKind::ROW ? "Row" : "Columnar");
+                         });
 
 // ── Q1: Pricing Summary ─────────────────────────────────────────────
 
-TEST_F(VectorizedTpchParityTest, Q1Parity) {
+TEST_P(VectorizedTpchParityTest, Q1Parity) {
     RunParity(
         "SELECT l_returnflag, l_linestatus, SUM(l_quantity), SUM(l_extendedprice), "
         "SUM(l_discount), COUNT(*) "
@@ -225,7 +147,7 @@ TEST_F(VectorizedTpchParityTest, Q1Parity) {
 
 // ── Q3: Shipping Priority ───────────────────────────────────────────
 
-TEST_F(VectorizedTpchParityTest, Q3Parity) {
+TEST_P(VectorizedTpchParityTest, Q3Parity) {
     RunParity(
         "SELECT l_orderkey, SUM(l_extendedprice * (1 - l_discount)), o_orderdate, o_shippriority "
         "FROM customer c "
@@ -241,7 +163,7 @@ TEST_F(VectorizedTpchParityTest, Q3Parity) {
 
 // ── Q5: Local Supplier Volume ───────────────────────────────────────
 
-TEST_F(VectorizedTpchParityTest, Q5Parity) {
+TEST_P(VectorizedTpchParityTest, Q5Parity) {
     RunParity(
         "SELECT n_name, SUM(l_extendedprice * (1 - l_discount)) "
         "FROM customer c "
@@ -256,7 +178,7 @@ TEST_F(VectorizedTpchParityTest, Q5Parity) {
 
 // ── Q6: Revenue Forecast ────────────────────────────────────────────
 
-TEST_F(VectorizedTpchParityTest, Q6Parity) {
+TEST_P(VectorizedTpchParityTest, Q6Parity) {
     RunParity(
         "SELECT SUM(l_extendedprice * l_discount) "
         "FROM lineitem "
@@ -266,7 +188,7 @@ TEST_F(VectorizedTpchParityTest, Q6Parity) {
 
 // ── Q10: Returned Item Reporting ────────────────────────────────────
 
-TEST_F(VectorizedTpchParityTest, Q10Parity) {
+TEST_P(VectorizedTpchParityTest, Q10Parity) {
     RunParity(
         "SELECT c_custkey, c_name, SUM(l_extendedprice * (1 - l_discount)), "
         "c_acctbal, n_name, c_address, c_phone, c_comment "
@@ -281,7 +203,7 @@ TEST_F(VectorizedTpchParityTest, Q10Parity) {
 
 // ── Q12: Shipping Modes and Order Priority ──────────────────────────
 
-TEST_F(VectorizedTpchParityTest, Q12Parity) {
+TEST_P(VectorizedTpchParityTest, Q12Parity) {
     RunParity(
         "SELECT l_shipmode, "
         "SUM(CASE WHEN o_orderpriority = '1-URGENT' OR o_orderpriority = '2-HIGH' THEN 1 ELSE 0 END), "
@@ -297,7 +219,7 @@ TEST_F(VectorizedTpchParityTest, Q12Parity) {
 
 // ── Q14: Promotion Effect ───────────────────────────────────────────
 
-TEST_F(VectorizedTpchParityTest, Q14Parity) {
+TEST_P(VectorizedTpchParityTest, Q14Parity) {
     RunParity(
         "SELECT 100.00 * SUM(CASE WHEN p_type LIKE 'PROMO%' "
         "THEN l_extendedprice * (1 - l_discount) ELSE 0 END) "
@@ -309,7 +231,7 @@ TEST_F(VectorizedTpchParityTest, Q14Parity) {
 
 // ── Q19: Discounted Revenue ─────────────────────────────────────────
 
-TEST_F(VectorizedTpchParityTest, Q19Parity) {
+TEST_P(VectorizedTpchParityTest, Q19Parity) {
     RunParity(
         "SELECT SUM(l_extendedprice * (1 - l_discount)) "
         "FROM lineitem, part "

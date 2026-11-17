@@ -2,131 +2,22 @@
 #include <unistd.h>
 
 #include "engine/database.hpp"
+#include "tpch/tpch_workload.hpp"
 
 #include <filesystem>
+#include <memory>
 #include <string>
 #include <vector>
 
 namespace shilmandb {
 
-// ── TPC-H schema helpers (mirrors bench/tpch/load_tpch.cpp) ──────────────
-
-static Schema RegionSchema() {
-    return Schema({
-        {"r_regionkey", TypeId::BIGINT},
-        {"r_name", TypeId::VARCHAR},
-        {"r_comment", TypeId::VARCHAR},
-    });
-}
-
-static Schema NationSchema() {
-    return Schema({
-        {"n_nationkey", TypeId::BIGINT},
-        {"n_name", TypeId::VARCHAR},
-        {"n_regionkey", TypeId::BIGINT},
-        {"n_comment", TypeId::VARCHAR},
-    });
-}
-
-static Schema PartSchema() {
-    return Schema({
-        {"p_partkey", TypeId::BIGINT},
-        {"p_name", TypeId::VARCHAR},
-        {"p_mfgr", TypeId::VARCHAR},
-        {"p_brand", TypeId::VARCHAR},
-        {"p_type", TypeId::VARCHAR},
-        {"p_size", TypeId::INTEGER},
-        {"p_container", TypeId::VARCHAR},
-        {"p_retailprice", TypeId::DECIMAL},
-        {"p_comment", TypeId::VARCHAR},
-    });
-}
-
-static Schema SupplierSchema() {
-    return Schema({
-        {"s_suppkey", TypeId::BIGINT},
-        {"s_name", TypeId::VARCHAR},
-        {"s_address", TypeId::VARCHAR},
-        {"s_nationkey", TypeId::BIGINT},
-        {"s_phone", TypeId::VARCHAR},
-        {"s_acctbal", TypeId::DECIMAL},
-        {"s_comment", TypeId::VARCHAR},
-    });
-}
-
-static Schema CustomerSchema() {
-    return Schema({
-        {"c_custkey", TypeId::BIGINT},
-        {"c_name", TypeId::VARCHAR},
-        {"c_address", TypeId::VARCHAR},
-        {"c_nationkey", TypeId::BIGINT},
-        {"c_phone", TypeId::VARCHAR},
-        {"c_acctbal", TypeId::DECIMAL},
-        {"c_mktsegment", TypeId::VARCHAR},
-        {"c_comment", TypeId::VARCHAR},
-    });
-}
-
-static Schema OrdersSchema() {
-    return Schema({
-        {"o_orderkey", TypeId::BIGINT},
-        {"o_custkey", TypeId::BIGINT},
-        {"o_orderstatus", TypeId::VARCHAR},
-        {"o_totalprice", TypeId::DECIMAL},
-        {"o_orderdate", TypeId::DATE},
-        {"o_orderpriority", TypeId::VARCHAR},
-        {"o_clerk", TypeId::VARCHAR},
-        {"o_shippriority", TypeId::INTEGER},
-        {"o_comment", TypeId::VARCHAR},
-    });
-}
-
-static Schema LineitemSchema() {
-    return Schema({
-        {"l_orderkey", TypeId::BIGINT},
-        {"l_partkey", TypeId::BIGINT},
-        {"l_suppkey", TypeId::BIGINT},
-        {"l_linenumber", TypeId::INTEGER},
-        {"l_quantity", TypeId::DECIMAL},
-        {"l_extendedprice", TypeId::DECIMAL},
-        {"l_discount", TypeId::DECIMAL},
-        {"l_tax", TypeId::DECIMAL},
-        {"l_returnflag", TypeId::VARCHAR},
-        {"l_linestatus", TypeId::VARCHAR},
-        {"l_shipdate", TypeId::DATE},
-        {"l_commitdate", TypeId::DATE},
-        {"l_receiptdate", TypeId::DATE},
-        {"l_shipinstruct", TypeId::VARCHAR},
-        {"l_shipmode", TypeId::VARCHAR},
-        {"l_comment", TypeId::VARCHAR},
-    });
-}
-
-// ── Table/index descriptors ─────────────────────────────────────────
-
-struct TableDesc {
-    std::string name;
-    Schema schema;
-    std::string tbl_file;
-};
+// ── Index descriptors (this suite's own 6, not the shared 8) ────────
 
 struct IndexDesc {
     std::string index_name;
     std::string table_name;
     std::string column_name;
 };
-
-static std::vector<TableDesc> BuildTableDescs() {
-    return {
-        {"region",   RegionSchema(),   "region.tbl"},
-        {"nation",   NationSchema(),   "nation.tbl"},
-        {"part",     PartSchema(),     "part.tbl"},
-        {"supplier", SupplierSchema(), "supplier.tbl"},
-        {"customer", CustomerSchema(), "customer.tbl"},
-        {"orders",   OrdersSchema(),   "orders.tbl"},
-        {"lineitem", LineitemSchema(),  "lineitem.tbl"},
-    };
-}
 
 static std::vector<IndexDesc> BuildIndexDescs() {
     return {
@@ -139,12 +30,16 @@ static std::vector<IndexDesc> BuildIndexDescs() {
     };
 }
 
-// ── Fixture ─────────────────────────────────────────────────────────
+// ── Fixture: one database per storage, loaded once for the suite ────
 
-class SqliteComparisonTest : public ::testing::Test {
+class SqliteComparisonTest : public ::testing::TestWithParam<StorageKind> {
 protected:
-    std::string test_file_;
-    std::unique_ptr<Database> db_;
+    static std::unique_ptr<Database> row_db_;
+    static std::unique_ptr<Database> columnar_db_;
+    static std::string row_file_;
+    static std::string columnar_file_;
+    static std::string data_dir_;
+    Database* db_{nullptr};
 
     // Try several candidate paths for the SF=0.01 data directory.
     // CTest runs from build/test/, so ../../bench/... is the typical relative path.
@@ -162,47 +57,79 @@ protected:
         return {};
     }
 
-    void SetUp() override {
-        test_file_ = (std::filesystem::temp_directory_path() /
-                      ("shilmandb_sqlite_cmp_test_" + std::to_string(::getpid()) + ".db")).string();
-        std::filesystem::remove(test_file_);
-
-        auto data_dir = FindDataDir();
-        if (data_dir.empty()) {
-            GTEST_SKIP() << "TPC-H SF=0.01 data not found. "
-                            "Run bench/tpch/generate_tpch_data.sh first.";
-        }
+    // Loads the TPC-H tables into one storage, then adds the indexes and stats.
+    static std::unique_ptr<Database> Load(const std::string& file, const std::string& data_dir,
+                                          StorageKind storage) {
+        std::filesystem::remove(file);
 
         // Large pool so eviction does not interfere with correctness.
         constexpr size_t kPoolSize = 4096;
-        db_ = std::make_unique<Database>(test_file_, kPoolSize);
+        auto db = std::make_unique<Database>(file, kPoolSize);
 
-        // Load tables in dependency order.
-        for (const auto& td : BuildTableDescs()) {
-            db_->LoadTable(td.name, td.schema, data_dir + td.tbl_file);
+        LoadOptions options;
+        options.storage = storage;
+        for (const auto& td : tpch::TableDescs()) {
+            db->LoadTable(td.name, td.schema, data_dir + td.tbl_file, options);
         }
 
-        // Create indexes.
-        auto* catalog = db_->GetCatalog();
+        auto* catalog = db->GetCatalog();
         for (const auto& idx : BuildIndexDescs()) {
             (void)catalog->CreateIndex(idx.index_name, idx.table_name, idx.column_name);
         }
-
-        // Refresh statistics.
-        for (const auto& td : BuildTableDescs()) {
+        for (const auto& td : tpch::TableDescs()) {
             catalog->UpdateTableStats(td.name);
         }
+        return db;
     }
 
-    void TearDown() override {
-        db_.reset();
-        std::filesystem::remove(test_file_);
+    static void SetUpTestSuite() {
+        const auto temp = std::filesystem::temp_directory_path();
+        const std::string pid = std::to_string(::getpid());
+        row_file_ = (temp / ("shilmandb_sqlite_cmp_test_row_" + pid + ".db")).string();
+        columnar_file_ = (temp / ("shilmandb_sqlite_cmp_test_col_" + pid + ".db")).string();
+        data_dir_ = FindDataDir();
+    }
+
+    static void TearDownTestSuite() {
+        row_db_.reset();
+        columnar_db_.reset();
+        std::filesystem::remove(row_file_);
+        std::filesystem::remove(columnar_file_);
+    }
+
+    // Loads only this test's storage, the first time a test asks for it.
+    void SetUp() override {
+        if (data_dir_.empty()) {
+            GTEST_SKIP() << "TPC-H SF=0.01 data not found. "
+                            "Run bench/tpch/generate_tpch_data.sh first.";
+        }
+        const bool row = GetParam() == StorageKind::ROW;
+        auto& slot = row ? row_db_ : columnar_db_;
+        if (!slot) slot = Load(row ? row_file_ : columnar_file_, data_dir_, GetParam());
+        db_ = slot.get();
     }
 };
 
+std::unique_ptr<Database> SqliteComparisonTest::row_db_;
+std::unique_ptr<Database> SqliteComparisonTest::columnar_db_;
+std::string SqliteComparisonTest::row_file_;
+std::string SqliteComparisonTest::columnar_file_;
+std::string SqliteComparisonTest::data_dir_;
+
+// Names the storage in test output, so ctest shows /Row and /Columnar.
+static void PrintTo(StorageKind storage, std::ostream* os) {
+    *os << (storage == StorageKind::ROW ? "Row" : "Columnar");
+}
+
+INSTANTIATE_TEST_SUITE_P(Storage, SqliteComparisonTest,
+                         ::testing::Values(StorageKind::ROW, StorageKind::COLUMNAR),
+                         [](const ::testing::TestParamInfo<StorageKind>& info) {
+                             return std::string(info.param == StorageKind::ROW ? "Row" : "Columnar");
+                         });
+
 // ── Q1: Pricing Summary ─────────────────────────────────────────────
 
-TEST_F(SqliteComparisonTest, Q1PricingSummary) {
+TEST_P(SqliteComparisonTest, Q1PricingSummary) {
     const std::string sql =
         "SELECT l_returnflag, l_linestatus, SUM(l_quantity), SUM(l_extendedprice), "
         "SUM(l_discount), COUNT(*) "
@@ -253,7 +180,7 @@ TEST_F(SqliteComparisonTest, Q1PricingSummary) {
 
 // ── Q6: Revenue Forecast ────────────────────────────────────────────
 
-TEST_F(SqliteComparisonTest, Q6RevenueForecast) {
+TEST_P(SqliteComparisonTest, Q6RevenueForecast) {
     const std::string sql =
         "SELECT SUM(l_extendedprice * l_discount) "
         "FROM lineitem "
@@ -270,7 +197,7 @@ TEST_F(SqliteComparisonTest, Q6RevenueForecast) {
 
 // ── Q3: Shipping Priority ───────────────────────────────────────────
 
-TEST_F(SqliteComparisonTest, Q3ShippingPriority) {
+TEST_P(SqliteComparisonTest, Q3ShippingPriority) {
     const std::string sql =
         "SELECT l_orderkey, SUM(l_extendedprice * (1 - l_discount)), "
         "o_orderdate, o_shippriority "
@@ -306,7 +233,7 @@ TEST_F(SqliteComparisonTest, Q3ShippingPriority) {
 
 // ── Q5: Local Supplier Volume ───────────────────────────────────────
 
-TEST_F(SqliteComparisonTest, Q5LocalSupplierVolume) {
+TEST_P(SqliteComparisonTest, Q5LocalSupplierVolume) {
     const std::string sql =
         "SELECT n_name, SUM(l_extendedprice * (1 - l_discount)) "
         "FROM customer c JOIN orders o ON c.c_custkey = o.o_custkey "
@@ -332,7 +259,7 @@ TEST_F(SqliteComparisonTest, Q5LocalSupplierVolume) {
 
 // ── Q10: Returned Item Reporting ────────────────────────────────────
 
-TEST_F(SqliteComparisonTest, Q10ReturnedItemReporting) {
+TEST_P(SqliteComparisonTest, Q10ReturnedItemReporting) {
     const std::string sql =
         "SELECT c_custkey, c_name, SUM(l_extendedprice * (1 - l_discount)), "
         "c_acctbal, n_name, c_address, c_phone, c_comment "
@@ -366,7 +293,7 @@ TEST_F(SqliteComparisonTest, Q10ReturnedItemReporting) {
 
 // ── Q12: Shipping Modes and Order Priority ──────────────────────────
 
-TEST_F(SqliteComparisonTest, Q12ShippingModes) {
+TEST_P(SqliteComparisonTest, Q12ShippingModes) {
     const std::string sql =
         "SELECT l_shipmode, "
         "SUM(CASE WHEN o_orderpriority = '1-URGENT' OR "
@@ -401,7 +328,7 @@ TEST_F(SqliteComparisonTest, Q12ShippingModes) {
 
 // ── Q14: Promotion Effect ───────────────────────────────────────────
 
-TEST_F(SqliteComparisonTest, Q14PromotionEffect) {
+TEST_P(SqliteComparisonTest, Q14PromotionEffect) {
     const std::string sql =
         "SELECT 100.00 * SUM(CASE WHEN p_type LIKE 'PROMO%' "
         "       THEN l_extendedprice * (1 - l_discount) ELSE 0 END) "
@@ -420,7 +347,7 @@ TEST_F(SqliteComparisonTest, Q14PromotionEffect) {
 
 // ── Q19: Discounted Revenue ─────────────────────────────────────────
 
-TEST_F(SqliteComparisonTest, Q19DiscountedRevenue) {
+TEST_P(SqliteComparisonTest, Q19DiscountedRevenue) {
     const std::string sql =
         "SELECT SUM(l_extendedprice * (1 - l_discount)) "
         "FROM lineitem, part "
