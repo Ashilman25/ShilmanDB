@@ -3,6 +3,7 @@
 #include "common/config.hpp"
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <map>
 #include <optional>
 
@@ -75,6 +76,11 @@ struct Interval {
         if (whole_numbers) return (to - from + 1.0) / (col_max - col_min + 1.0);
         if (col_max == col_min) return 1.0;
         return (to - from) / (col_max - col_min);
+    }
+
+    // True when no value of the column's range fits the bounds.
+    [[nodiscard]] bool Empty() const {
+        return std::min(hi.value_or(col_max), col_max) < std::max(lo.value_or(col_min), col_min);
     }
 };
 
@@ -153,7 +159,110 @@ void Flatten(const Expression* e, std::vector<const Expression*>& out) {
     }
 }
 
+// From 2^53 on, doubles can't hold every whole number, so I don't trust bounds.
+constexpr double kExactDoubleLimit = 9007199254740992.0;
+
+// A literal's value, also through a minus sign on a number (how -1 parses).
+std::optional<Value> LiteralValue(const Expression* e) {
+    if (const auto* lit = dynamic_cast<const Literal*>(e)) return lit->value;
+    const auto* neg = dynamic_cast<const UnaryOp*>(e);
+    if (!neg || neg->op != UnaryOp::Op::NEGATE) return std::nullopt;
+    const auto* lit = dynamic_cast<const Literal*>(neg->operand.get());
+    if (!lit) return std::nullopt;
+    const Value& v = lit->value;
+    switch (v.type_) {
+        case TypeId::INTEGER:
+            if (v.integer_ == std::numeric_limits<int32_t>::min()) return std::nullopt;
+            return Value(-v.integer_);
+        case TypeId::BIGINT:
+            if (v.bigint_ == std::numeric_limits<int64_t>::min()) return std::nullopt;
+            return Value(-v.bigint_);
+        case TypeId::DECIMAL:
+            return Value(-v.decimal_);
+        default:
+            return std::nullopt;
+    }
+}
+
+// A column compared with a value on either side; the op reads col op value.
+struct ValueCompare {
+    const ColumnRef* col{nullptr};
+    Value value;
+    BinaryOp::Op op{};
+};
+
+std::optional<ValueCompare> CompareWithValue(const BinaryOp* bin) {
+    const NormalizedCompare n = NormalizeCompare(bin);
+    if (n.col) return ValueCompare{n.col, n.lit->value, n.op};
+
+    const auto* lc = dynamic_cast<const ColumnRef*>(bin->left.get());
+    const auto* rc = dynamic_cast<const ColumnRef*>(bin->right.get());
+    if (lc) {
+        if (auto v = LiteralValue(bin->right.get())) return ValueCompare{lc, *v, bin->op};
+    } else if (rc) {
+        if (auto v = LiteralValue(bin->left.get())) return ValueCompare{rc, *v, MirrorComparison(bin->op)};
+    }
+    return std::nullopt;
+}
+
+// A usable number, NaN never counts; whole-number columns also need exact doubles.
+std::optional<double> SkipNumber(const Value& v, bool whole) {
+    const auto num = AsNumber(v);
+    if (!num || std::isnan(*num)) return std::nullopt;
+    if (whole && std::fabs(*num) >= kExactDoubleLimit) return std::nullopt;
+    return num;
+}
+
 }  // namespace
+
+bool CostModel::MayMatch(const std::vector<const Expression*>& conjuncts, const std::unordered_map<std::string, MinMax>& ranges) {
+    std::vector<const Expression*> leaves;
+    for (const auto* c : conjuncts) Flatten(c, leaves);
+
+    std::map<std::string, Interval> intervals;
+    for (const auto* leaf : leaves) {
+        const auto* bin = dynamic_cast<const BinaryOp*>(leaf);
+        if (!bin) continue;
+
+        if (bin->op == BinaryOp::Op::OR) {
+            if (!MayMatch({bin->left.get()}, ranges) && !MayMatch({bin->right.get()}, ranges)) return false;
+            continue;
+        }
+        if (bin->op != BinaryOp::Op::EQ && !IsInequality(bin->op)) continue;
+
+        const auto cmp = CompareWithValue(bin);
+        if (!cmp) continue;
+        const auto range = ranges.find(cmp->col->column_name);
+        if (range == ranges.end()) continue;
+
+        // Only number and date ranges, both ends the same type.
+        const TypeId col_type = range->second.min.type_;
+        if (range->second.max.type_ != col_type) continue;
+        if (!IsNumeric(col_type) && col_type != TypeId::DATE) continue;
+
+        const bool whole = col_type != TypeId::DECIMAL;
+        const auto lo = SkipNumber(range->second.min, whole);
+        const auto hi = SkipNumber(range->second.max, whole);
+        const auto lit = SkipNumber(cmp->value.WidenTo(col_type), whole);
+        if (!lo || !hi || !lit || *hi < *lo) continue;
+
+        auto [it, fresh] = intervals.try_emplace(cmp->col->column_name);
+        if (fresh) {
+            it->second.col_min = *lo;
+            it->second.col_max = *hi;
+            it->second.whole_numbers = whole;
+        }
+        // An equality is the closed interval [value, value].
+        if (cmp->op == BinaryOp::Op::EQ) {
+            (void)AddBound(it->second, col_type, BinaryOp::Op::GTE, cmp->value);
+            (void)AddBound(it->second, col_type, BinaryOp::Op::LTE, cmp->value);
+        } else {
+            (void)AddBound(it->second, col_type, cmp->op, cmp->value);
+        }
+    }
+
+    return std::none_of(intervals.begin(), intervals.end(), [](const auto& entry) { return entry.second.Empty(); });
+}
 
 double CostModel::EstimateTablePages(uint64_t row_count, const Schema& schema) {
     const auto bytes_per_tuple = std::max<uint32_t>(1u, schema.GetFixedLength());

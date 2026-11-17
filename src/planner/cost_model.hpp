@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace shilmandb {
@@ -41,6 +42,10 @@ struct CostModel {
     // on one column are merged into a single interval and priced from the column's min and max.
     // With `only_column`, predicates on other columns count as 1.0 (how one index is priced).
     [[nodiscard]] static double EstimateSelectivity(const std::vector<const Expression*>& conjuncts, const TableStats& stats, std::string_view only_column = {});
+
+    // False only when some conjunct can't be true for any value in the ranges.
+    // Anything it doesn't understand, or a column with no range, may match.
+    [[nodiscard]] static bool MayMatch(const std::vector<const Expression*>& conjuncts, const std::unordered_map<std::string, MinMax>& ranges);
 
     // Rows a table's own filters keep: row_count * selectivity, at least 1 (0 for an empty table).
     [[nodiscard]] static double EstimateFilteredRows(const std::vector<const Expression*>& filters, const TableStats& stats);

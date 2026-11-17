@@ -64,6 +64,7 @@ shilmandb_add_test(column_usage_test planner/column_usage_test.cpp)
 shilmandb_add_test(index_selection_test planner/index_selection_test.cpp)
 shilmandb_add_test(selectivity_test planner/selectivity_test.cpp)
 shilmandb_add_test(nested_aggregate_test planner/nested_aggregate_test.cpp)
+shilmandb_add_test(may_match_test planner/may_match_test.cpp)
 
 # Executor tests
 shilmandb_add_test(seq_scan_executor_test executor/seq_scan_executor_test.cpp)
