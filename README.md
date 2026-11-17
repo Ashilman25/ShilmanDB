@@ -9,7 +9,7 @@ Numbers on this page are marked by how we know them: *measured* (we ran it), *fr
 
 ## Status
 
-**Today** ShilmanDB is a single-threaded row store. It runs 8 of the 22 TPC-H queries (8 *measured*; TPC-H has 22, *from docs*), and it has been measured on one Mac at SF=1 against SQLite, DuckDB and Postgres, and at SF=10 against DuckDB and Postgres. Every layer is written here, from page I/O up: a buffer pool, B+tree indexes, a hand-written SQL parser, a cost-based planner, and an executor that runs one row at a time, with a vectorized path that runs scans, filters, projections and aggregates a batch of rows at a time.
+**Today** ShilmanDB is a single-threaded row store, with an opt-in columnar file format (14a) that the same executor reads. It runs 8 of the 22 TPC-H queries (8 *measured*; TPC-H has 22, *from docs*), and it has been measured on one Mac at SF=1 against SQLite, DuckDB and Postgres, and at SF=10 against DuckDB and Postgres. Every layer is written here, from page I/O up: a buffer pool, B+tree indexes, a hand-written SQL parser, a cost-based planner, and an executor that runs one row at a time, with a vectorized path that runs scans, filters, projections and aggregates a batch of rows at a time.
 
 **What it is becoming (in progress; only a first slice of the app is built so far):**
 
@@ -53,7 +53,7 @@ In plain words:
 
 **Why the gap to DuckDB** (*inferred* from how the engines are built, not profiled): DuckDB stores columns, compressed, and reads only the columns a query uses; its loops use the CPU's vector instructions; and it uses every core. ShilmanDB reads whole rows, on one thread, through a buffer pool. The steps meant to close it:
 
-- **14a:** a columnar file format, with exact decimal storage.
+- **14a (done, 2026-11-17):** a columnar file format, with exact decimal storage. It loads TPC-H SF=10 in 4.2 s and every answer still matches (*measured*), but queries aren't faster yet: today's executor rebuilds rows from the columns (*inferred*), so the speed has to come from 14b.
 - **14b:** a parallel vectorized executor, target SF=10.
 - **14c:** out-of-core execution (joins, aggregates and sorts that spill to disk), target SF=100.
 
