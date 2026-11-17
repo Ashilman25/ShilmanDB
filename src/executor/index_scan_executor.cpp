@@ -1,4 +1,6 @@
 #include "executor/index_scan_executor.hpp"
+#include "executor/columnar_scan_executor.hpp"
+#include "storage/columnar/field_parser.hpp"
 #include "planner/plan_node.hpp"
 #include "common/exception.hpp"
 #include <cassert>
@@ -22,6 +24,21 @@ void IndexScanExecutor::Init() {
     schema_ = &table_info->schema;
     high_key_ = scan_plan->high_key;
 
+    columnar_ = nullptr;
+    read_columns_.clear();
+    read_names_.clear();
+    scratch_.clear();
+    defaults_.clear();
+    if (table_info->storage == StorageKind::COLUMNAR) {
+        for (const auto& col : schema_->GetColumns()) defaults_.push_back(Value::DefaultFor(col.type));
+        columnar_ = table_info->columnar.get();
+        read_columns_ = ColumnarReadColumns(*table_info, scan_plan->read_columns);
+        for (uint32_t c : read_columns_) {
+            read_names_.push_back(columnar_->Meta().columns[c].name);
+            scratch_.emplace_back(columnar_->Meta().columns[c].type);
+        }
+    }
+
     if (scan_plan->low_key.has_value()) {
         iter_.emplace(index_info->index->Begin(scan_plan->low_key.value()));
     } else {
@@ -43,11 +60,29 @@ bool IndexScanExecutor::Next(Tuple* tuple) {
 
         ++(*iter_);
 
+        if (columnar_ != nullptr) {
+            *tuple = FetchColumnar(rid);
+            return true;
+        }
         if (table_->GetTuple(rid, tuple, *schema_)) {
             return true;
         }
     }
     return false;
+}
+
+Tuple IndexScanExecutor::FetchColumnar(const RID& rid) {
+    const RowPosition pos = FromRid(rid);
+    std::vector<Value> values = defaults_;
+
+    for (size_t k = 0; k < read_columns_.size(); ++k) {
+        ColumnVector& one = scratch_[k];
+        one.Clear();
+        columnar_->ReadValue(pos, read_columns_[k], one);
+        if (one.IsNull(0)) throw DatabaseException(ColumnarNullError(read_names_[k]));
+        values[read_columns_[k]] = ToExecutorValue(one, 0);
+    }
+    return Tuple(std::move(values), *schema_);
 }
 
 void IndexScanExecutor::Close() {}

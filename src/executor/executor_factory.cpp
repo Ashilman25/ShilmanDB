@@ -1,5 +1,7 @@
 #include "executor/executor_factory.hpp"
 #include "executor/seq_scan_executor.hpp"
+#include "executor/columnar_scan_executor.hpp"
+#include "catalog/catalog.hpp"
 #include "executor/index_scan_executor.hpp"
 #include "executor/filter_executor.hpp"
 #include "executor/hash_join_executor.hpp"
@@ -40,11 +42,20 @@ namespace {
     return child;
 }
 
+// True when a scan's table is in the catalog and stored by column.
+[[nodiscard]] bool ScansColumnarTable(const PlanNode* plan, ExecutorContext* ctx) {
+    if (ctx->catalog == nullptr) return false;
+    const auto* info = ctx->catalog->GetTable(static_cast<const SeqScanPlanNode*>(plan)->table_name);
+    return info != nullptr && info->storage == StorageKind::COLUMNAR;
+}
+
 // Builds the executor for one plan node. Children go back through
 // ExecutorFactory::CreateExecutor so they get profiled too.
 [[nodiscard]] std::unique_ptr<Executor> BuildExecutor(const PlanNode* plan, ExecutorContext* ctx, ExecutionMode mode) {
     switch (plan->type) {
         case PlanNodeType::SEQ_SCAN: {
+            // One columnar scan serves both modes.
+            if (ScansColumnarTable(plan, ctx)) return std::make_unique<ColumnarScanExecutor>(plan, ctx);
             switch (mode) {
                 case ExecutionMode::VECTORIZED:
                     return std::make_unique<VectorizedSeqScanExecutor>(plan, ctx);
