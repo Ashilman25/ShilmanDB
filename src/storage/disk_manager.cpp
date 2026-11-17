@@ -111,6 +111,10 @@ void DiskManager::WritePage(page_id_t page_id, const char* page_data) {
         }
         bytes_written += static_cast<size_t>(n);
     }
+
+    if (observer_) {
+        observer_->OnWrite(page_id, page_data);
+    }
 }
 
 page_id_t DiskManager::AllocatePage() {
@@ -119,6 +123,48 @@ page_id_t DiskManager::AllocatePage() {
 
 void DiskManager::DeallocatePage([[maybe_unused]] page_id_t page_id) {
     // for other classes to use and such
+}
+
+// F_FULLFSYNC flushes the drive's own cache too; a plain fsync on macOS doesnt
+void DiskManager::Sync() {
+#ifdef __APPLE__
+    int rc = ::fcntl(fd_, F_FULLFSYNC);
+    if (rc == -1 && errno == ENOTSUP) {
+        rc = ::fsync(fd_);  // some file systems dont support a full sync
+    }
+#else
+    int rc = ::fdatasync(fd_);
+#endif
+    if (rc == -1) {
+        const int err = errno;
+        throw IOException("Failed to sync " + file_name_ + ": " + std::strerror(err));
+    }
+
+    if (observer_) {
+        observer_->OnSync();
+    }
+}
+
+// Cuts the file to num_pages pages and hands out num_pages next
+void DiskManager::Truncate(page_id_t num_pages) {
+    if (num_pages == INVALID_PAGE_ID) {
+        throw IOException("Cannot truncate to INVALID_PAGE_ID pages");
+    }
+    if (::ftruncate(fd_, PageOffset(num_pages)) == -1) {
+        const int err = errno;
+        throw IOException("Failed to truncate " + file_name_ + " to " + std::to_string(num_pages) + " pages: " + std::strerror(err));
+    }
+    next_page_id_.store(num_pages);
+}
+
+// Asks the OS for the file size, so it counts a partial last page
+uint64_t DiskManager::GetFileBytes() const {
+    struct stat st{};
+    if (::fstat(fd_, &st) < 0) {
+        const int err = errno;
+        throw IOException("Cannot stat database file: " + file_name_ + " (" + std::strerror(err) + ")");
+    }
+    return static_cast<uint64_t>(st.st_size);
 }
 
 }  // namespace shilmandb
