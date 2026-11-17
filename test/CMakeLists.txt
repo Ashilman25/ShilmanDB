@@ -18,6 +18,7 @@ shilmandb_add_test(disk_manager_test storage/disk_manager_test.cpp)
 shilmandb_add_test(slotted_page_test storage/slotted_page_test.cpp)
 shilmandb_add_test(table_heap_test         storage/table_heap_test.cpp)
 shilmandb_add_test(column_vector_test storage/columnar/column_vector_test.cpp)
+shilmandb_add_test(field_parser_test storage/columnar/field_parser_test.cpp)
 
 # Buffer tests
 shilmandb_add_test(lru_eviction_policy_test buffer/lru_eviction_policy_test.cpp)
