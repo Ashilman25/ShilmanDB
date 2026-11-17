@@ -20,7 +20,7 @@ TEST(HyperLogLogTest, AccuracyLarge) {
     HyperLogLog sketch;
     constexpr uint64_t kCount = 1'000'000;
     // 0..999,999 lands at +2.27% with this hash, a 2.8-sigma draw.
-    // This set is typical: the error's sd is about 0.8%.
+    // The v*7+3 set below is typical: the error's sd is about 0.8%.
     for (int64_t v = 0; v < static_cast<int64_t>(kCount); ++v) sketch.Add(HashInt(v * 7 + 3));
     const uint64_t estimate = sketch.Estimate();
     EXPECT_LE(RelativeError(estimate, kCount), 0.02) << "estimate " << estimate;

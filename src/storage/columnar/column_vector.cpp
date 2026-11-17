@@ -29,7 +29,7 @@ void ColumnVector::Clear() {
     if (kind_ == PhysicalKind::STRING) offsets_.assign(1, 0);
 }
 
-// A NULL row still takes a slot, so row i is index i in every array.
+// A NULL still takes a slot, so row i is index i everywhere.
 void ColumnVector::AppendNull() {
     switch (kind_) {
         case PhysicalKind::INT64:  ints_.push_back(0); break;

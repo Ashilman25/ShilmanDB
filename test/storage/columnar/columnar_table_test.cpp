@@ -7,6 +7,7 @@
 #include "storage/page.hpp"
 #include "types/value.hpp"
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <memory>
@@ -243,7 +244,9 @@ TEST_F(ColumnarTableTest, VerifiedOncePerRead) {
     page->GetData()[kPageHeaderSize + 8] ^= 0x01;
     (void)bpm->UnpinPage(pid, false);
     try {
-        EXPECT_EQ(Read(table, 2, kBigInt).Size(), 10u);
+        const ColumnVector served = Read(table, 2, kBigInt);
+        EXPECT_EQ(served.Size(), 10u);
+        EXPECT_FALSE(SameValues(served, source_[2][kBigInt])) << "the changed frame was not the one served";
     } catch (const DatabaseException& e) {
         FAIL() << "a verified frame was checked again: " << e.what();
     }
@@ -301,6 +304,33 @@ TEST_F(ColumnarTableTest, ConstantChunkNeedsNoPages) {
     table.ReadValue(RowPosition{0, 999}, 0, one);
     EXPECT_EQ(one.GetInt(0), 7);
     EXPECT_EQ(table.GroupRanges(0).at("x").min, Value(int64_t{7}));
+}
+
+// A DOUBLE chunk holding NaN has no range, so nothing can skip its group.
+TEST_F(ColumnarTableTest, NaNChunkHasNoRange) {
+    ColumnVector doubles(ColumnType::Double());
+    for (double x : {10.0, 20.0, std::nan("")}) doubles.AppendDouble(x);
+    const ColumnVector ids = [] {
+        ColumnVector v(ColumnType::BigInt());
+        for (int64_t x : {1, 2, 3}) v.AppendInt(x);
+        return v;
+    }();
+
+    ColumnarTableMeta meta;
+    meta.name = "readings";
+    meta.columns = {{"r_value", 1, ColumnType::Double(), false}, {"r_id", 2, ColumnType::BigInt(), false}};
+    meta.row_count = 3;
+    meta.row_groups.push_back(RowGroupMeta{3, {WriteChunk(disk_.get(), doubles), WriteChunk(disk_.get(), ids)}});
+    auto bpm = MakePool(4);
+    const ColumnarTable table(bpm.get(), meta);
+    const auto ranges = table.GroupRanges(0);
+    EXPECT_EQ(ranges.count("r_value"), 0u);
+    ASSERT_EQ(ranges.count("r_id"), 1u);
+    EXPECT_EQ(ranges.at("r_id").max, Value(int64_t{3}));
+
+    ColumnVector out(ColumnType::Double());
+    table.ReadChunk(0, 0, out);
+    EXPECT_TRUE(SameValues(out, doubles));
 }
 
 TEST_F(ColumnarTableTest, WrongVectorTypeThrows) {

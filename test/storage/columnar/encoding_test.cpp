@@ -166,6 +166,49 @@ ColumnarPageHeader HeaderOf(const EncodedChunk& chunk, uint32_t index) {
     return h;
 }
 
+ColumnVector Wides(const ColumnType& type, std::initializer_list<__int128> values) {
+    ColumnVector v(type);
+    for (__int128 x : values) v.AppendWide(x);
+    return v;
+}
+
+// Rewrites one page's value count and NULL flag, then reseals so checksums pass.
+void ForgeHeader(EncodedChunk& chunk, uint32_t index, uint16_t count, bool nulls) {
+    char* page = chunk.pages.data() + static_cast<size_t>(index) * PAGE_SIZE;
+    ColumnarPageHeader h;
+    std::memcpy(&h, page, sizeof(h));
+    h.value_count = count;
+    if (nulls) h.flags = static_cast<uint8_t>(h.flags | kPageHasNulls);
+    std::memcpy(page, &h, sizeof(h));
+    SealPages(chunk.pages.data(), chunk.meta.page_count, 7);
+}
+
+// The text of the DatabaseException f throws, or "" when it throws none.
+template <typename F>
+std::string ThrownText(F f) {
+    try {
+        f();
+    } catch (const DatabaseException& e) {
+        return e.what();
+    }
+    return "";
+}
+
+// Both the whole decode and one row's decode refuse the chunk as damaged.
+void ExpectDamaged(const EncodedChunk& chunk, const ColumnType& type, uint32_t row) {
+    MemoryPages pages(chunk);
+    const std::string whole = ThrownText([&] {
+        ColumnVector out(type);
+        DecodeChunk(chunk.meta, pages, out);
+    });
+    EXPECT_EQ(whole.rfind("damaged column page", 0), 0u) << "DecodeChunk: " << whole;
+    const std::string one = ThrownText([&] {
+        ColumnVector out(type);
+        DecodeValue(chunk.meta, pages, row, out);
+    });
+    EXPECT_EQ(one.rfind("damaged column page", 0), 0u) << "DecodeValue: " << one;
+}
+
 // Every encoding that applies gives back the input, whole and row by row.
 void ExpectEveryEncodingRoundTrips(const ColumnVector& v) {
     for (Encoding e : kAllEncodings) {
@@ -261,6 +304,49 @@ TEST(EncodingTest, IntegerExtremes) {
     ExpectEveryEncodingRoundTrips(wide);
     EXPECT_FALSE(TryEncodeChunk(wide, Encoding::BITPACK).has_value()) << "a range over 64 bits can't pack";
     EXPECT_TRUE(SameValues(Decode(EncodeChunk(wide), wide.Type()), wide));
+}
+
+// int128 NUMERIC at the edge of 38 digits, both too wide to pack and packing.
+TEST(EncodingTest, WideNumericAtItsLimits) {
+    const ColumnType type = ColumnType::Numeric(38, 0);
+    const __int128 top = Pow10(38) - 1;
+    const auto extremes = Wides(type, {-top, top, 0, -top});
+    ExpectEveryEncodingRoundTrips(extremes);
+    EXPECT_FALSE(TryEncodeChunk(extremes, Encoding::BITPACK).has_value());
+    EXPECT_TRUE(SameValues(Decode(EncodeChunk(extremes), type), extremes));
+
+    // Near either limit, a range under 2^64 packs against an int128 frame.
+    std::mt19937_64 rng(38);
+    for (const __int128 edge : {top, -top}) {
+        ColumnVector near(type);
+        near.AppendWide(edge);
+        for (int i = 0; i < 2000; ++i) {
+            const auto step = static_cast<__int128>(rng() >> 1);
+            near.AppendWide(edge > 0 ? edge - step : edge + step);
+        }
+        auto packed = TryEncodeChunk(near, Encoding::BITPACK);
+        ASSERT_TRUE(packed.has_value());
+        EXPECT_EQ(HeaderOf(*packed, 0).bit_width, 63);
+        ExpectEveryEncodingRoundTrips(near);
+    }
+}
+
+// NUMERIC(18,s) is 64-bit; values near -(10^18 - 1) pack and come back exact.
+TEST(EncodingTest, NegativeNumeric18Packs) {
+    const ColumnType type = ColumnType::Numeric(18, 4);
+    const auto low = static_cast<int64_t>(-(Pow10(18) - 1));
+    std::mt19937_64 rng(18);
+    ColumnVector near(type);
+    near.AppendInt(low);
+    for (int i = 0; i < 2000; ++i) near.AppendInt(low + static_cast<int64_t>(rng() % 1000000));
+    ASSERT_TRUE(TryEncodeChunk(near, Encoding::BITPACK).has_value());
+    ExpectEveryEncodingRoundTrips(near);
+
+    const auto both = Ints(type, {low, -low, 0, low + 1});
+    auto packed = TryEncodeChunk(both, Encoding::BITPACK);
+    ASSERT_TRUE(packed.has_value());
+    EXPECT_EQ(HeaderOf(*packed, 0).bit_width, 61);
+    ExpectEveryEncodingRoundTrips(both);
 }
 
 TEST(EncodingTest, DecodeValueMatchesDecodeChunk) {
@@ -382,16 +468,15 @@ TEST(EncodingTest, MinMaxSkipsNulls) {
     EXPECT_EQ(std::get<std::string>(*text_meta.min), "a");
     EXPECT_EQ(std::get<std::string>(*text_meta.max), "c");
 
-    // NaN is skipped too; all NULLs means no min or max at all.
+    // Any NaN means no min or max; all NULLs means none either.
     ColumnVector doubles(ColumnType::Double());
     doubles.AppendDouble(std::nan(""));
     doubles.AppendDouble(2.5);
     doubles.AppendNull();
     doubles.AppendDouble(-1.0);
     const auto double_meta = EncodeChunk(doubles).meta;
-    ASSERT_TRUE(double_meta.min.has_value() && double_meta.max.has_value());
-    EXPECT_EQ(std::get<double>(*double_meta.min), -1.0);
-    EXPECT_EQ(std::get<double>(*double_meta.max), 2.5);
+    EXPECT_FALSE(double_meta.min.has_value());
+    EXPECT_FALSE(double_meta.max.has_value());
 
     ColumnVector all_null(ColumnType::Integer());
     all_null.AppendNull();
@@ -402,6 +487,42 @@ TEST(EncodingTest, MinMaxSkipsNulls) {
     EXPECT_FALSE(null_meta.max.has_value());
     EXPECT_FALSE(null_meta.constant.has_value());
     EXPECT_TRUE(SameValues(Decode(EncodeChunk(all_null), all_null.Type()), all_null));
+}
+
+// Value's <= and >= match NaN, so a chunk holding one must never be skipped.
+TEST(EncodingTest, NaNMeansNoMinMax) {
+    ColumnVector with_nan(ColumnType::Double());
+    for (double x : {10.0, 20.0, std::nan("")}) with_nan.AppendDouble(x);
+    for (Encoding e : kAllEncodings) {
+        auto chunk = TryEncodeChunk(with_nan, e);
+        if (!chunk) continue;
+        EXPECT_FALSE(chunk->meta.min.has_value()) << static_cast<int>(e);
+        EXPECT_FALSE(chunk->meta.max.has_value()) << static_cast<int>(e);
+    }
+    ExpectEveryEncodingRoundTrips(with_nan);
+
+    ColumnVector numbers(ColumnType::Double());
+    for (double x : {10.0, 20.0, -0.5}) numbers.AppendDouble(x);
+    const auto kept = EncodeChunk(numbers).meta;
+    ASSERT_TRUE(kept.min.has_value() && kept.max.has_value());
+    EXPECT_EQ(std::get<double>(*kept.min), -0.5);
+    EXPECT_EQ(std::get<double>(*kept.max), 20.0);
+
+    // One repeated value is still CONSTANT, with or without NaN.
+    ColumnVector same(ColumnType::Double());
+    for (int i = 0; i < 100; ++i) same.AppendDouble(2.5);
+    const auto same_meta = EncodeChunk(same).meta;
+    EXPECT_EQ(same_meta.encoding, Encoding::CONSTANT);
+    ASSERT_TRUE(same_meta.min.has_value() && same_meta.max.has_value());
+    EXPECT_EQ(std::get<double>(*same_meta.min), 2.5);
+    EXPECT_EQ(std::get<double>(*same_meta.max), 2.5);
+
+    ColumnVector all_nan(ColumnType::Double());
+    for (int i = 0; i < 100; ++i) all_nan.AppendDouble(std::numeric_limits<double>::quiet_NaN());
+    const auto nan_meta = EncodeChunk(all_nan).meta;
+    EXPECT_EQ(nan_meta.encoding, Encoding::CONSTANT);
+    EXPECT_FALSE(nan_meta.min.has_value());
+    EXPECT_TRUE(SameValues(Decode(EncodeChunk(all_nan), all_nan.Type()), all_nan));
 }
 
 TEST(EncodingTest, LongStringsHaveNoMinMax) {
@@ -528,7 +649,70 @@ TEST(EncodingTest, BitWidthOver64Throws) {
     } catch (const DatabaseException& e) {
         EXPECT_NE(std::string(e.what()).find("damaged column page"), std::string::npos) << e.what();
     }
-    EXPECT_THROW(DecodeChunk(chunk.meta, pages, out), DatabaseException);
+    const std::string whole = ThrownText([&] { DecodeChunk(chunk.meta, pages, out); });
+    EXPECT_EQ(whole, "damaged column page: bit width 65");
+}
+
+// A sealed page whose value count is too big is refused before any read.
+TEST(EncodingTest, OversizedValueCountThrows) {
+    const ColumnVector ints = Ints(ColumnType::BigInt(), {5, 900, 17, 5, 900, 17, 42, 5, 900, 17});
+    const ColumnVector words = Strings({"alpha", "bravo", "charlie", "delta", "echo", "alpha", "bravo"});
+    const std::pair<const ColumnVector*, Encoding> cases[] = {
+        {&ints, Encoding::PLAIN}, {&words, Encoding::PLAIN}, {&ints, Encoding::BITPACK},
+        {&ints, Encoding::DICTIONARY}, {&words, Encoding::DICTIONARY}};
+    for (const auto& [values, encoding] : cases) {
+        for (bool nulls : {false, true}) {
+            SCOPED_TRACE(ColumnTypeName(values->Type()) + " encoding " + std::to_string(static_cast<int>(encoding)) +
+                         (nulls ? " with" : " without") + " NULL bits");
+            EncodedChunk chunk = *TryEncodeChunk(*values, encoding);
+            ASSERT_EQ(chunk.meta.page_first_rows.size(), 1u);
+            const uint32_t data_page = chunk.meta.dict_page_count;
+            if (encoding != Encoding::PLAIN) {
+                ASSERT_GT(HeaderOf(chunk, data_page).bit_width, 0);
+            }
+            ForgeHeader(chunk, data_page, 65535, nulls);
+            chunk.meta.value_count = 65535;
+            ExpectDamaged(chunk, values->Type(), 65534);
+        }
+    }
+
+    // 1,010 BIGINTs fit a page alone, but not after their NULL bits.
+    ColumnVector longs(ColumnType::BigInt());
+    for (int i = 0; i < 1010; ++i) longs.AppendInt(i * 1000003LL * 1000003LL);
+    EncodedChunk chunk = *TryEncodeChunk(longs, Encoding::PLAIN);
+    ASSERT_EQ(chunk.meta.page_first_rows.size(), 1u);
+    ForgeHeader(chunk, 0, 1010, true);
+    ExpectDamaged(chunk, longs.Type(), 1009);
+}
+
+// A string's start offset pointing into the header or the offset table is refused.
+TEST(EncodingTest, StringOffsetInsideTableThrows) {
+    const ColumnVector words = Strings({"alpha", "bravo", "charlie", "delta", "echo"});
+    for (uint16_t from : {uint16_t{4}, uint16_t{kPageHeaderSize + 2}}) {
+        SCOPED_TRACE("from " + std::to_string(from));
+        EncodedChunk chunk = *TryEncodeChunk(words, Encoding::PLAIN);
+        std::memcpy(chunk.pages.data() + kPageHeaderSize, &from, sizeof(from));
+        SealPages(chunk.pages.data(), chunk.meta.page_count, 7);
+        ExpectDamaged(chunk, words.Type(), 0);
+    }
+}
+
+// The catalog's page starts must match the pages' own headers.
+TEST(EncodingTest, FirstRowMismatchThrows) {
+    ColumnVector v(ColumnType::BigInt());
+    for (int i = 0; i < 1500; ++i) v.AppendInt(i * 1000003LL * 1000003LL);
+    EncodedChunk chunk = *TryEncodeChunk(v, Encoding::PLAIN);
+    ASSERT_EQ(chunk.meta.page_first_rows, (std::vector<uint32_t>{0, 1020}));
+    chunk.meta.page_first_rows[1] = 1015;
+    ExpectDamaged(chunk, v.Type(), 1015);
+
+    // The same for a dictionary page's first entry.
+    ColumnVector distinct(ColumnType::BigInt());
+    for (int i = 0; i < 1500; ++i) distinct.AppendInt(i * 1000003LL * 1000003LL);
+    EncodedChunk coded = *TryEncodeChunk(distinct, Encoding::DICTIONARY);
+    ASSERT_EQ(coded.meta.dict_page_first_entries, (std::vector<uint32_t>{0, 1020}));
+    coded.meta.dict_page_first_entries[1] = 1015;
+    ExpectDamaged(coded, distinct.Type(), 1015);
 }
 
 // Values outside a narrow type's range throw instead of being cut short.
@@ -544,6 +728,24 @@ TEST(EncodingTest, ValueOutsideTypeThrows) {
     expect_throw(Ints(ColumnType::Integer(), {1, int64_t{1} << 31}), "value 2147483648 does not fit INTEGER");
     expect_throw(Ints(ColumnType::Boolean(), {0, 1, 2}), "value 2 does not fit BOOLEAN");
     expect_throw(Ints(ColumnType::Boolean(), {-1, 1}), "value -1 does not fit BOOLEAN");
+
+    // Forcing an encoding checks the values the same way.
+    for (Encoding e : kAllEncodings) {
+        SCOPED_TRACE("encoding " + std::to_string(static_cast<int>(e)));
+        EXPECT_EQ(ThrownText([&] { (void)TryEncodeChunk(Ints(ColumnType::Integer(), {1, int64_t{1} << 31}), e); }),
+                  "value 2147483648 does not fit INTEGER");
+        EXPECT_EQ(ThrownText([&] { (void)TryEncodeChunk(Ints(ColumnType::Boolean(), {1, 2}), e); }),
+                  "value 2 does not fit BOOLEAN");
+    }
+
+    // NULLs mixed with 0 and 1 are fine; a 2 among them still isn't.
+    ColumnVector flags(ColumnType::Boolean());
+    for (int x : {-1, 0, 1, -1, 1, 0, -1}) {
+        if (x < 0) flags.AppendNull(); else flags.AppendInt(x);
+    }
+    ExpectEveryEncodingRoundTrips(flags);
+    flags.AppendInt(2);
+    expect_throw(flags, "value 2 does not fit BOOLEAN");
 
     ExpectEveryEncodingRoundTrips(Ints(ColumnType::Boolean(), {0, 1, 1, 0}));
     ExpectEveryEncodingRoundTrips(Ints(ColumnType::Integer(), {INT32_MIN, INT32_MAX}));

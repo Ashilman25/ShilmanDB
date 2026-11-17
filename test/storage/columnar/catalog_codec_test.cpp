@@ -120,13 +120,16 @@ private:
             c.constant = MaybeScalar();
             return c;
         }
-        c.dict_page_count = encoding == Encoding::DICTIONARY ? Int(1, 3) : 0;
-        const uint32_t data_pages = Int(1, 4);
+        // Page starts begin at 0 and rise strictly, all below the count they split.
+        if (encoding == Encoding::DICTIONARY) c.dict_size = Int(0, static_cast<int>(rows - c.null_count));
+        c.dict_page_count = c.dict_size == 0 ? 0 : Int(1, static_cast<int>(std::min<uint32_t>(3, c.dict_size)));
+        const auto data_pages = static_cast<uint32_t>(Int(1, static_cast<int>(std::min<uint32_t>(4, rows))));
         c.page_count = c.dict_page_count + data_pages;
         c.first_page = static_cast<page_id_t>(Int(2, 1 << 24));
-        for (uint32_t i = 0; i < data_pages; ++i) c.page_first_rows.push_back(i * 1000);
-        for (uint32_t i = 0; i < c.dict_page_count; ++i) c.dict_page_first_entries.push_back(i * 500);
-        if (encoding == Encoding::DICTIONARY) c.dict_size = Int(0, static_cast<int>(rows - c.null_count));
+        for (uint32_t i = 0; i < data_pages; ++i) c.page_first_rows.push_back(i * (rows / data_pages));
+        for (uint32_t i = 0; i < c.dict_page_count; ++i) {
+            c.dict_page_first_entries.push_back(i * (c.dict_size / c.dict_page_count));
+        }
         return c;
     }
 
@@ -450,6 +453,45 @@ TEST(CatalogCodecTest, StatsKeysOutOfOrderThrow) {
     ASSERT_GT(b_at, 0);
     repeated[b_at + 4] = 'a';
     ExpectDamaged(repeated, "repeated distinct key", "distinct count keys out of order");
+}
+
+TEST(CatalogCodecTest, PageListShapeThrows) {
+    // Chunk 0 is BITPACK, 3000 values on pages {0, 2000}; chunk 1 has 40 dictionary entries.
+    const auto chunks = [](CatalogMeta& m) -> std::vector<ChunkMeta>& { return m.tables[0].row_groups[0].chunks; };
+    ExpectDamagedAfter([&](CatalogMeta& m) {
+        chunks(m)[0].page_count = 3;
+        chunks(m)[0].page_first_rows = {0, 2000, 1000};
+    }, "chunk data page list doesn't rise at entry 2");
+    ExpectDamagedAfter([&](CatalogMeta& m) { chunks(m)[0].page_first_rows = {0, 0}; },
+                       "chunk data page list doesn't rise at entry 1");
+    ExpectDamagedAfter([&](CatalogMeta& m) { chunks(m)[0].page_first_rows = {5, 2000}; },
+                       "chunk data page list starts at 5, not 0");
+    ExpectDamagedAfter([&](CatalogMeta& m) { chunks(m)[0].page_first_rows = {0, 3000}; },
+                       "chunk data page list ends at 3000, not below 3000");
+
+    // Several dictionary pages, so the order can be wrong; one data page follows them.
+    const auto dict_pages = [&](CatalogMeta& m, std::vector<uint32_t> entries) {
+        chunks(m)[1].dict_page_count = static_cast<uint32_t>(entries.size());
+        chunks(m)[1].page_count = chunks(m)[1].dict_page_count + 1;
+        chunks(m)[1].dict_page_first_entries = std::move(entries);
+    };
+    ExpectDamagedAfter([&](CatalogMeta& m) { dict_pages(m, {0, 30, 10}); },
+                       "chunk dictionary page list doesn't rise at entry 2");
+    ExpectDamagedAfter([&](CatalogMeta& m) { dict_pages(m, {0, 0}); },
+                       "chunk dictionary page list doesn't rise at entry 1");
+    ExpectDamagedAfter([&](CatalogMeta& m) { dict_pages(m, {1, 30}); },
+                       "chunk dictionary page list starts at 1, not 0");
+    ExpectDamagedAfter([&](CatalogMeta& m) { dict_pages(m, {0, 40}); },
+                       "chunk dictionary page list ends at 40, not below 40");
+    ExpectDamagedAfter([&](CatalogMeta& m) { chunks(m)[1].dict_size = 0; },
+                       "chunk dictionary page list ends at 0, not below 0");
+
+    // Well-formed lists still decode.
+    CatalogMeta good = SmallCatalog();
+    dict_pages(good, {0, 39});
+    chunks(good)[0].page_first_rows = {0, 2999};
+    const std::vector<char> bytes = EncodeCatalog(good);
+    EXPECT_NO_THROW((void)DecodeCatalog(bytes.data(), bytes.size()));
 }
 
 TEST(CatalogCodecTest, BadEnumBytesThrow) {

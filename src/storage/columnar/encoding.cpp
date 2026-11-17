@@ -12,6 +12,7 @@ namespace {
 
 constexpr size_t kDataBytes = PAGE_SIZE - kPageHeaderSize;  // room after the header
 constexpr uint32_t kMaxPageValues = UINT16_MAX;             // a header counts values in 16 bits
+static_assert(sizeof(ColumnarPageHeader::value_count) == 2, "so no header count passes kMaxPageValues");
 
 // Facts about a chunk, gathered in one pass before any encoding is built.
 struct Stats {
@@ -39,8 +40,10 @@ struct Dictionary {
 
 //  sizes
 
+// Bytes of NULL bits for n values; none when the page stores no NULLs.
 size_t NullBytes(size_t n, bool nulls) { return nulls ? (n + 7) / 8 : 0; }
 
+// Bits needed to hold every offset up to range.
 uint32_t BitsFor(uint64_t range) { return range == 0 ? 0 : 64 - __builtin_clzll(range); }
 
 // Whether n values of `bits` each fit on one page.
@@ -87,6 +90,7 @@ std::vector<uint32_t> StringPages(uint32_t n, bool nulls, Length length) {
     return starts;
 }
 
+// One past the last row of page p: the next page's start, or n.
 uint32_t PageEnd(const std::vector<uint32_t>& starts, size_t p, uint32_t n) {
     return p + 1 < starts.size() ? starts[p + 1] : n;
 }
@@ -99,10 +103,12 @@ uint64_t Offset(__int128 lo, __int128 x) {
 
 //  stats
 
+// Refuses a value that no page could hold.
 [[noreturn]] void ThrowTooBig(size_t bytes) {
     throw DatabaseException("value of " + std::to_string(bytes) + " bytes is bigger than a page");
 }
 
+// Refuses a page that doesn't match what its chunk says.
 [[noreturn]] void ThrowDamaged(const std::string& what) {
     throw DatabaseException("damaged column page: " + what);
 }
@@ -144,9 +150,10 @@ void IntegerStats(const ColumnVector& v, Stats& s, Get get) {
     if (s.nulls == 0 && s.constant) s.value = Scalar(lo);
 }
 
-// Doubles count as equal only by their bits; NaN never becomes min or max.
+// Doubles count as equal only by their bits. Any NaN means no min or max,
+// since Value's <= and >= treat NaN as matching every value.
 void DoubleStats(const ColumnVector& v, Stats& s) {
-    bool any = false, any_number = false, same_bits = true;
+    bool any = false, any_number = false, any_nan = false, same_bits = true;
     uint64_t first_bits = 0;
     double lo = 0, hi = 0;
     for (uint32_t i = 0; i < s.count; ++i) {
@@ -159,7 +166,10 @@ void DoubleStats(const ColumnVector& v, Stats& s) {
 
         same_bits = same_bits && bits == first_bits;
         any = true;
-        if (std::isnan(x)) continue;
+        if (std::isnan(x)) {
+            any_nan = true;
+            continue;
+        }
         if (!any_number) {
             lo = hi = x;
             any_number = true;
@@ -169,7 +179,7 @@ void DoubleStats(const ColumnVector& v, Stats& s) {
         }
     }
     s.constant = s.nulls == s.count || (s.nulls == 0 && same_bits);
-    if (any_number) {
+    if (any_number && !any_nan) {
         s.min = Scalar(lo);
         s.max = Scalar(hi);
     }
@@ -201,6 +211,7 @@ void StringStats(const ColumnVector& v, Stats& s) {
     if (s.nulls == 0 && s.constant && any) s.value = Scalar(std::string(lo));
 }
 
+// Gathers a chunk's stats by its physical kind.
 Stats ComputeStats(const ColumnVector& v) {
     if (v.Size() > UINT32_MAX) throw DatabaseException("a column chunk holds at most 2^32 - 1 values");
     Stats s;
@@ -221,6 +232,7 @@ Stats ComputeStats(const ColumnVector& v) {
 
 //  layouts
 
+// PLAIN pages: strings fill each page, fixed widths take a set number.
 Layout PlainLayout(const ColumnVector& v, const Stats& s) {
     Layout layout;
     const bool nulls = s.nulls > 0;
@@ -265,6 +277,7 @@ std::vector<uint32_t> PackedPages(const ColumnVector& v, const Stats& s, Get get
     return starts;
 }
 
+// BITPACK pages for a 64-bit or 128-bit integer chunk.
 Layout PackedLayout(const ColumnVector& v, const Stats& s) {
     Layout layout;
     layout.encoding = Encoding::BITPACK;
@@ -276,8 +289,10 @@ Layout PackedLayout(const ColumnVector& v, const Stats& s) {
     return layout;
 }
 
+// Bits per dictionary code; a single entry needs none.
 uint32_t CodeBits(size_t dict_size) { return dict_size <= 1 ? 0 : BitsFor(dict_size - 1); }
 
+// Dictionary pages for the entries, then data pages of packed codes.
 Layout DictionaryLayout(const ColumnVector& v, const Stats& s, const Dictionary& dict) {
     Layout layout;
     layout.encoding = Encoding::DICTIONARY;
@@ -292,6 +307,7 @@ Layout DictionaryLayout(const ColumnVector& v, const Stats& s, const Dictionary&
     return layout;
 }
 
+// Scrambles a 64-bit value so nearby keys spread across the table.
 uint64_t Mix(uint64_t x) {
     x ^= x >> 33;
     x *= 0xff51afd7ed558ccdULL;
@@ -339,6 +355,7 @@ std::optional<Dictionary> CollectEntries(const ColumnVector& v, const Stats& s, 
     return dict;
 }
 
+// Builds the dictionary with a hash and equality that fit the kind.
 std::optional<Dictionary> MakeDictionary(const ColumnVector& v, const Stats& s, size_t best_pages) {
     const bool nulls = s.nulls > 0;
     const uint32_t per_page = v.Kind() == PhysicalKind::STRING ? 0 : PackedCapacity(8 * PlainWidth(v.Type()), false);
@@ -496,6 +513,7 @@ void WritePackedPage(char* page, const ColumnVector& v, bool nulls, uint32_t fir
     writer.Flush();
 }
 
+// Writes the chunk's meta and every page of the chosen layout.
 EncodedChunk Build(const ColumnVector& v, const Stats& s, Layout layout, const Dictionary* dict) {
     EncodedChunk chunk;
     ChunkMeta& meta = chunk.meta;
@@ -582,6 +600,7 @@ struct PageView {
     ColumnarPageHeader header;
     const uint8_t* null_bits{nullptr};  // nullptr when the page stores none
     const char* data{nullptr};
+    size_t strings_start{0};            // PLAIN strings: the byte after the offset table
 
     [[nodiscard]] bool IsNull(uint32_t i) const {
         return null_bits != nullptr && ((null_bits[i >> 3] >> (i & 7)) & 1) != 0;
@@ -589,8 +608,9 @@ struct PageView {
     [[nodiscard]] size_t DataBit() const { return static_cast<size_t>(data - page) * 8; }
 };
 
-// Reads a page's header, throwing when it isn't the page the chunk says.
-PageView OpenPage(const char* page, PageKind kind, Encoding encoding) {
+// Reads a page's header, throwing when it isn't the page the chunk says
+// or when its values would run past the page.
+PageView OpenPage(const char* page, PageKind kind, Encoding encoding, uint32_t first, const ColumnType& type) {
     PageView view;
     view.page = page;
     std::memcpy(&view.header, page, sizeof(view.header));
@@ -603,18 +623,38 @@ PageView OpenPage(const char* page, PageKind kind, Encoding encoding) {
         );
     }
     if (view.header.bit_width > 64) ThrowDamaged("bit width " + std::to_string(view.header.bit_width));
-    const char* p = page + kPageHeaderSize;
-    if ((view.header.flags & kPageHasNulls) != 0) {
-        view.null_bits = reinterpret_cast<const uint8_t*>(p);
-        p += NullBytes(view.header.value_count, true);
+    if (view.header.first_row != first) {
+        const char* unit = kind == PageKind::DATA ? "row " : "entry ";
+        ThrowDamaged("page starts at " + std::string(unit) + std::to_string(view.header.first_row) + ", the chunk says " + std::to_string(first));
     }
-    view.data = p;
+
+    // Every byte the header implies must sit inside the page.
+    const size_t n = view.header.value_count;
+    const size_t null_bytes = NullBytes(n, (view.header.flags & kPageHasNulls) != 0);
+    if (null_bytes > kDataBytes) ThrowDamaged("NULL bits for " + std::to_string(n) + " values run past the page");
+    const size_t room = kDataBytes - null_bytes;
+    const uint32_t width = PlainWidth(type);
+    if (encoding != Encoding::PLAIN) {
+        if (n * view.header.bit_width > room * 8) {
+            ThrowDamaged(std::to_string(n) + " values of " + std::to_string(view.header.bit_width) + " bits run past the page");
+        }
+    } else if (width == 0) {
+        if (2 * (n + 1) > room) ThrowDamaged("offsets for " + std::to_string(n) + " strings run past the page");
+    } else if (n * width > room) {
+        ThrowDamaged(std::to_string(n) + " values of " + std::to_string(width) + " bytes run past the page");
+    }
+
+    const char* p = page + kPageHeaderSize;
+    if (null_bytes > 0) view.null_bits = reinterpret_cast<const uint8_t*>(p);
+    view.data = p + null_bytes;
+    view.strings_start = kPageHeaderSize + null_bytes + 2 * (n + 1);
     return view;
 }
 
 // Reads `bits` bits at bit position `bit` of a page, never past its end.
 uint64_t ReadPacked(const char* page, size_t bit, uint32_t bits) {
     if (bits == 0) return 0;
+    if (bit + bits > PAGE_SIZE * 8) ThrowDamaged("packed value at bit " + std::to_string(bit) + " runs past the page");
     const size_t byte = bit >> 3;
     const uint32_t shift = bit & 7;
     uint64_t word = 0;
@@ -630,6 +670,7 @@ uint64_t ReadPacked(const char* page, size_t bit, uint32_t bits) {
     return bits == 64 ? value : value & ((uint64_t{1} << bits) - 1);
 }
 
+// Reads a little-endian integer of 1, 2, 4 or 8 bytes, sign-extended.
 int64_t ReadPlainInt(const char* p, uint32_t width) {
     switch (width) {
         case 1: { int8_t x; std::memcpy(&x, p, 1); return x; }
@@ -659,6 +700,9 @@ void AppendPlain(const PageView& view, uint32_t i, uint32_t width, ColumnVector&
             uint16_t from, to;
             std::memcpy(&from, view.data + 2 * static_cast<size_t>(i), sizeof(from));
             std::memcpy(&to, view.data + 2 * (static_cast<size_t>(i) + 1), sizeof(to));
+            if (from < view.strings_start) {
+                ThrowDamaged("string starts at byte " + std::to_string(from) + ", before the strings at byte " + std::to_string(view.strings_start));
+            }
             if (to < from || to > PAGE_SIZE) ThrowDamaged("string offsets out of order");
             out.AppendString(std::string_view(view.page + from, to - from));
             break;
@@ -683,6 +727,7 @@ void AppendPacked(const PageView& view, uint32_t i, ColumnVector& out) {
     }
 }
 
+// Reads dictionary code i, refusing one past the dictionary.
 uint32_t ReadCode(const PageView& view, uint32_t i, uint32_t dict_size) {
     const uint32_t bits = view.header.bit_width;
     const auto code = static_cast<uint32_t>(ReadPacked(view.page, view.DataBit() + static_cast<size_t>(i) * bits, bits));
@@ -724,6 +769,7 @@ void AppendConstant(const ChunkMeta& meta, uint32_t n, ColumnVector& out) {
 
 }  // namespace
 
+// CONSTANT when it applies, else the smallest of the rest.
 EncodedChunk EncodeChunk(const ColumnVector& values) {
     const Stats s = ComputeStats(values);
     if (s.constant) {
@@ -745,6 +791,7 @@ EncodedChunk EncodeChunk(const ColumnVector& values) {
     return Build(values, s, std::move(best), dict ? &*dict : nullptr);
 }
 
+// Builds exactly the encoding asked for, when it applies.
 std::optional<EncodedChunk> TryEncodeChunk(const ColumnVector& values, Encoding encoding) {
     const Stats s = ComputeStats(values);
     switch (encoding) {
@@ -775,6 +822,7 @@ void SealPages(char* pages, uint32_t page_count, page_id_t first_page) {
     }
 }
 
+// True when the stored checksum matches the page and its id.
 bool VerifyPage(const char* page, page_id_t page_id) {
     uint32_t stored;
     std::memcpy(&stored, page, sizeof(stored));
@@ -790,20 +838,35 @@ void DecodeChunk(const ChunkMeta& meta, ChunkPages& pages, ColumnVector& out) {
         return;
     }
     const uint32_t width = PlainWidth(out.Type());
+    const auto& entries = meta.dict_page_first_entries;
+    if (entries.size() != meta.dict_page_count) ThrowDamaged("dictionary page list doesn't match its page count");
+
+    // Each page must hold exactly the values between its start and the next.
+    auto check_count = [](const std::vector<uint32_t>& starts, size_t p, uint32_t total, uint32_t n) {
+        const uint32_t end = PageEnd(starts, p, total);
+        const uint32_t want = end > starts[p] ? end - starts[p] : 0;
+        if (n != want) ThrowDamaged("page holds " + std::to_string(n) + " values, the chunk says " + std::to_string(want));
+    };
+
     ColumnVector dict(out.Type());
     if (meta.encoding == Encoding::DICTIONARY) {
         dict.Reserve(meta.dict_size);
         for (uint32_t j = 0; j < meta.dict_page_count; ++j) {
             PinnedPage pin(pages, j);
-            const PageView view = OpenPage(pin.Data(), PageKind::DICTIONARY, Encoding::PLAIN);
+            const PageView view = OpenPage(pin.Data(), PageKind::DICTIONARY, Encoding::PLAIN, entries[j], out.Type());
+            check_count(entries, j, meta.dict_size, view.header.value_count);
             for (uint32_t i = 0; i < view.header.value_count; ++i) AppendPlain(view, i, width, dict);
         }
     }
 
     for (uint32_t p = 0; p < meta.page_first_rows.size(); ++p) {
         PinnedPage pin(pages, meta.dict_page_count + p);
-        const PageView view = OpenPage(pin.Data(), PageKind::DATA, meta.encoding);
+        const PageView view = OpenPage(pin.Data(), PageKind::DATA, meta.encoding, meta.page_first_rows[p], out.Type());
         const uint32_t n = view.header.value_count;
+        if (n > meta.value_count - (out.Size() - start_size)) {
+            ThrowDamaged("pages hold more than the chunk's " + std::to_string(meta.value_count) + " values");
+        }
+        check_count(meta.page_first_rows, p, meta.value_count, n);
         switch (meta.encoding) {
             case Encoding::PLAIN:
                 for (uint32_t i = 0; i < n; ++i) {
@@ -847,7 +910,7 @@ void DecodeValue(const ChunkMeta& meta, ChunkPages& pages, uint32_t row, ColumnV
     uint32_t code = 0;
     {
         PinnedPage pin(pages, meta.dict_page_count + p);
-        const PageView view = OpenPage(pin.Data(), PageKind::DATA, meta.encoding);
+        const PageView view = OpenPage(pin.Data(), PageKind::DATA, meta.encoding, firsts[p], out.Type());
         if (slot >= view.header.value_count) ThrowDamaged("row " + std::to_string(row) + " past its page");
         if (view.IsNull(slot)) {
             out.AppendNull();
@@ -867,7 +930,7 @@ void DecodeValue(const ChunkMeta& meta, ChunkPages& pages, uint32_t row, ColumnV
     if (entry_it == entries.begin()) ThrowDamaged("no dictionary page holds entry " + std::to_string(code));
     const auto j = static_cast<uint32_t>(entry_it - entries.begin() - 1);
     PinnedPage pin(pages, j);
-    const PageView view = OpenPage(pin.Data(), PageKind::DICTIONARY, Encoding::PLAIN);
+    const PageView view = OpenPage(pin.Data(), PageKind::DICTIONARY, Encoding::PLAIN, entries[j], out.Type());
     const uint32_t entry = code - entries[j];
     if (entry >= view.header.value_count) ThrowDamaged("entry " + std::to_string(code) + " past its page");
     AppendPlain(view, entry, width, out);

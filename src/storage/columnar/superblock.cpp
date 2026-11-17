@@ -54,7 +54,8 @@ void EncodeSuperblock(const Superblock& sb, page_id_t slot, char* page) {
     SealPages(page, 1, slot);
 }
 
-// Checks the magic, then the checksum and kind, then the version.
+// Checks the magic, then the version, then the checksum and kind.
+// Another version may checksum differently, so its checksum is never looked at.
 SlotRead DecodeSuperblock(const char* page, page_id_t slot) {
     SlotRead read;
     SlotLayout layout;
@@ -63,15 +64,15 @@ SlotRead DecodeSuperblock(const char* page, page_id_t slot) {
         read.state = SlotState::NO_MAGIC;
         return read;
     }
+    read.block.format_version = layout.format_version;
+    if (layout.format_version != kFormatVersion) {
+        read.state = SlotState::OTHER_VERSION;
+        return read;
+    }
     ColumnarPageHeader header;
     std::memcpy(&header, page, sizeof(header));
     if (!VerifyPage(page, slot) || header.kind != static_cast<uint8_t>(PageKind::SUPERBLOCK)) {
         read.state = SlotState::BAD_CHECKSUM;
-        return read;
-    }
-    read.block.format_version = layout.format_version;
-    if (layout.format_version != kFormatVersion) {
-        read.state = SlotState::OTHER_VERSION;
         return read;
     }
     read.block.page_size = layout.page_size;

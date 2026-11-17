@@ -98,7 +98,7 @@ public:
             const ChunkMeta& chunk = result.group.chunks[c];
             page_count_ += chunk.page_count;
             sketches_[c].Merge(result.sketches[c]);
-            // An all-NaN DOUBLE chunk has no min or max, so it gets no range.
+            // A DOUBLE chunk holding any NaN has no min or max, so no range.
             if (!KeepsRange(schema_.GetColumn(static_cast<uint32_t>(c)).type) || !chunk.min || !chunk.max) continue;
             if (!lo_[c] || *chunk.min < *lo_[c]) lo_[c] = chunk.min;
             if (!hi_[c] || *hi_[c] < *chunk.max) hi_[c] = chunk.max;
@@ -131,6 +131,9 @@ private:
 
 // One reader cuts batches, workers parse and write them, the calling thread merges.
 // Every field below the mutex is shared and guarded by it.
+// Memory: at most 2 x workers batches in flight, plus the one being read.
+// Each holds up to 65,536 lines of at most the line cap.
+// There is no byte budget.
 class Pipeline {
 public:
     Pipeline(DiskManager* disk, const std::string& table, const std::string& path, const Schema& schema, const BulkLoadOptions& options, std::ifstream file, unsigned workers)
@@ -231,11 +234,17 @@ private:
         uint64_t line = 0;
         size_t row_start = 0;
 
+        // Queues the whole lines read so far with an error thrown after they parse.
+        // An earlier bad line in the batch still wins.
+        auto push_with_error = [&](std::exception_ptr error) {
+            batch.text.resize(row_start);
+            batch.tail_error = std::move(error);
+            (void)Push(std::move(batch));
+        };
+
         // Queues the lines before a too-long line, carrying its error, then stops.
         auto refuse_long_line = [&](uint64_t at) {
-            batch.text.resize(row_start);
-            batch.tail_error = std::make_exception_ptr(DatabaseException(table_ + ": line " + std::to_string(at) + ": line is longer than " + std::to_string(max_line_bytes_) + " bytes"));
-            (void)Push(std::move(batch));
+            push_with_error(std::make_exception_ptr(DatabaseException(table_ + ": line " + std::to_string(at) + ": line is longer than " + std::to_string(max_line_bytes_) + " bytes")));
         };
 
         // Ends the current line; false when the pipeline wants the reader to stop.
@@ -265,7 +274,11 @@ private:
             bool reading = true;
             while (reading) {
                 file_.read(block.data(), static_cast<std::streamsize>(block.size()));
-                if (file_.bad()) throw IOException(table_ + ": cannot read " + path_);
+                if (file_.bad()) {
+                    push_with_error(std::make_exception_ptr(IOException(table_ + ": cannot read " + path_)));
+                    reading = false;
+                    break;
+                }
                 const auto n = static_cast<size_t>(file_.gcount());
                 if (n == 0) break;
 
@@ -388,8 +401,19 @@ private:
         if (Abandoned(batch.number)) return std::nullopt;
 
         result.group.chunks.reserve(width);
-        for (const ColumnVector& col : cols) result.group.chunks.push_back(WriteChunk(disk_, col));
+        try {
+            for (const ColumnVector& col : cols) result.group.chunks.push_back(WriteChunk(disk_, col));
+        } catch (const IOException& e) {
+            throw IOException(WriteContext(batch) + e.what());
+        } catch (const DatabaseException& e) {
+            throw DatabaseException(WriteContext(batch) + e.what());
+        }
         return result;
+    }
+
+    // "<table>: writing lines <first>-<last>: ", naming a batch whose write failed.
+    [[nodiscard]] std::string WriteContext(const Batch& batch) const {
+        return table_ + ": writing lines " + std::to_string(batch.line_numbers.front()) + "-" + std::to_string(batch.line_numbers.back()) + ": ";
     }
 
     DiskManager* disk_;
@@ -400,7 +424,9 @@ private:
     std::ifstream file_;  // the reader's alone once Run starts
     const unsigned workers_;
     const uint64_t max_in_flight_;
-    const uint64_t max_line_bytes_;  // past this, some field must be bigger than a page
+    // Longer lines are refused. Such a line has a field bigger than a page,
+    // or absurdly padded number fields; the cap refuses those too.
+    const uint64_t max_line_bytes_;
     std::vector<std::thread> threads_;  // the calling thread's alone
 
     std::mutex mu_;

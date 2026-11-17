@@ -55,7 +55,7 @@ struct ChunkMeta {
     std::vector<uint32_t> page_first_rows;           // per data page: first row in the group
     std::vector<uint32_t> dict_page_first_entries;   // per dictionary page: first entry index
     uint32_t dict_size{0};
-    std::optional<Scalar> min, max;                  // absent when every value is NULL, or strings over 64 bytes
+    std::optional<Scalar> min, max;                  // absent when all NULL, any NaN, or a string over 64 bytes
     std::optional<Scalar> constant;                  // CONSTANT with no NULLs
 };
 

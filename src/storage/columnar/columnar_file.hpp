@@ -11,7 +11,8 @@ namespace shilmandb {
 // Owns the two superblock slots and the catalog, and commits a new catalog crash-safely.
 class ColumnarFile {
 public:
-    // An empty file gets a fresh header; otherwise the header is checked and the catalog read.
+    // Creates the header in an empty file, else checks it and reads the catalog.
+    // A file a crash left half created, with nothing ever committed, is created again.
     // Pages past the last commit are cut off. Throws DatabaseException naming the file.
     explicit ColumnarFile(DiskManager* disk);
 
@@ -24,11 +25,14 @@ public:
 
     // New data pages must already be written. Writes next to fresh pages, syncs,
     // writes the other slot, syncs, and only then switches to it.
+    // Throws before writing anything if the file wouldn't reopen with this catalog.
+    // After a failed write or sync, reload: don't retry over the same data pages.
     void Commit(CatalogMeta next);
 
 private:
     void Create();
     void Open();
+    void OpenWinner(uint64_t bytes, const SlotRead* slots);
     [[nodiscard]] CatalogMeta ReadCatalog(const Superblock& sb) const;
     [[noreturn]] void Refuse(const std::string& why) const;
 

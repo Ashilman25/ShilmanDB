@@ -145,6 +145,11 @@ private:
 
 // ---- writing ----
 
+// The blob stores these enums as one byte each, and the reader reads uint8_t.
+static_assert(sizeof(ColumnTypeId) == 1, "ColumnTypeId is one byte in the catalog");
+static_assert(sizeof(Encoding) == 1, "Encoding is one byte in the catalog");
+static_assert(sizeof(TypeId) == 1, "TypeId is one byte in the catalog");
+
 // Id, precision, scale, then max length.
 void PutType(Writer& w, const ColumnType& type) {
     w.Put(type.id);
@@ -357,6 +362,19 @@ std::vector<uint32_t> GetU32List(Reader& r, const char* what) {
     return list;
 }
 
+// Page starts must begin at 0 and rise strictly, all below count.
+void CheckPageStarts(const std::vector<uint32_t>& starts, uint32_t count, const char* what) {
+    const std::string list = std::string("chunk ") + what + " page list";
+    if (starts.empty()) return;
+    if (starts[0] != 0) Damaged(list + " starts at " + std::to_string(starts[0]) + ", not 0");
+    for (size_t i = 1; i < starts.size(); ++i) {
+        if (starts[i] <= starts[i - 1]) Damaged(list + " doesn't rise at entry " + std::to_string(i));
+    }
+    if (starts.back() >= count) {
+        Damaged(list + " ends at " + std::to_string(starts.back()) + ", not below " + std::to_string(count));
+    }
+}
+
 // Reads a chunk and checks the page lists readers index by.
 ChunkMeta GetChunk(Reader& r, uint32_t group_rows) {
     ChunkMeta c;
@@ -389,6 +407,8 @@ ChunkMeta GetChunk(Reader& r, uint32_t group_rows) {
     if (c.dict_size > max_dict) {
         Damaged("dictionary of " + std::to_string(c.dict_size) + " entries in a chunk allowing " + std::to_string(max_dict));
     }
+    CheckPageStarts(c.page_first_rows, c.value_count, "data");
+    CheckPageStarts(c.dict_page_first_entries, c.dict_size, "dictionary");
     return c;
 }
 

@@ -86,5 +86,27 @@ TEST(SuperblockTest, SuperblockStates) {
     EXPECT_EQ(DecodeSuperblock(no_magic.data(), 0).state, SlotState::NO_MAGIC);
 }
 
+TEST(SuperblockTest, OtherVersionWhateverTheChecksum) {
+    // A newer format may change the checksum, so the version is read first.
+    Superblock newer = Sample();
+    newer.format_version = 2;
+    std::vector<char> page(PAGE_SIZE);
+    EncodeSuperblock(newer, 1, page.data());
+    page[56] ^= 0x10;  // a bit of the generation, so the checksum fails
+    const SlotRead read = DecodeSuperblock(page.data(), 1);
+    EXPECT_EQ(read.state, SlotState::OTHER_VERSION);
+    EXPECT_EQ(read.block.format_version, 2u);
+
+    // Also with the wrong slot's seed.
+    EncodeSuperblock(newer, 1, page.data());
+    EXPECT_EQ(DecodeSuperblock(page.data(), 0).state, SlotState::OTHER_VERSION);
+
+    // A format-1 slot with a bad checksum is still just damaged.
+    std::vector<char> torn(PAGE_SIZE);
+    EncodeSuperblock(Sample(), 0, torn.data());
+    torn[56] ^= 0x10;
+    EXPECT_EQ(DecodeSuperblock(torn.data(), 0).state, SlotState::BAD_CHECKSUM);
+}
+
 }  // namespace
 }  // namespace shilmandb

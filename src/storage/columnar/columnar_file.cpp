@@ -3,10 +3,11 @@
 #include "storage/columnar/catalog_codec.hpp"
 #include "storage/columnar/encoding.hpp"
 #include <algorithm>
-#include <cassert>
 #include <cstring>
+#include <iterator>
 #include <limits>
 #include <optional>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -16,6 +17,38 @@ namespace {
 
 constexpr size_t kCatalogSlice = PAGE_SIZE - kPageHeaderSize;  // blob bytes per catalog page
 constexpr const char* kNotOurs = "not a ShilmanDB file, or an older format; reload it";
+
+// What the open refuses with, so a half-created file can be created again instead.
+class Refusal : public DatabaseException {
+public:
+    using DatabaseException::DatabaseException;
+};
+
+// Why the catalog doesn't fit below page end or next_oid; empty if it fits.
+std::string Misfit(const CatalogMeta& meta, uint64_t end, uint32_t next_oid) {
+    const std::string range = end > kHeaderPages ? "pages " + std::to_string(kHeaderPages) + " to " + std::to_string(end - 1) : "a file with no data pages";
+    const auto oid_text = [&](uint32_t oid) {
+        return " has oid " + std::to_string(oid) + ", not below the next oid " + std::to_string(next_oid);
+    };
+    for (const ColumnarTableMeta& table : meta.tables) {
+        if (table.oid >= next_oid) return "table " + table.name + oid_text(table.oid);
+        for (size_t g = 0; g < table.row_groups.size(); ++g) {
+            const std::vector<ChunkMeta>& chunks = table.row_groups[g].chunks;
+            for (size_t c = 0; c < chunks.size(); ++c) {
+                const ChunkMeta& chunk = chunks[c];
+                if (chunk.page_count == 0) continue;
+                if (chunk.first_page >= kHeaderPages && static_cast<uint64_t>(chunk.first_page) + chunk.page_count <= end) continue;
+                return "table " + table.name + " column " + table.columns.at(c).name + " row group " + std::to_string(g) + ": " + std::to_string(chunk.page_count) + " pages from page " + std::to_string(chunk.first_page) + " lie outside " + range;
+            }
+        }
+    }
+    for (const IndexMeta& index : meta.indexes) {
+        if (index.oid >= next_oid) return "index " + index.name + oid_text(index.oid);
+        if (index.root_page == INVALID_PAGE_ID || (index.root_page >= kHeaderPages && index.root_page < end)) continue;
+        return "index " + index.name + " root page " + std::to_string(index.root_page) + " lies outside " + range;
+    }
+    return "";
+}
 
 }  // namespace
 
@@ -30,8 +63,10 @@ ColumnarFile::ColumnarFile(DiskManager* disk) : disk_(disk) {
 
 // Slot 0 at generation 1 and slot 1 at 0, both with an empty catalog.
 void ColumnarFile::Create() {
-    [[maybe_unused]] const page_id_t first = disk_->AllocatePages(kHeaderPages);
-    assert(first == 0 && "an empty file should hand out page 0 first");
+    if (disk_->GetNumPages() != 0) {
+        throw DatabaseException(disk_->GetFileName() + ": can't create the header, " + std::to_string(disk_->GetNumPages()) + " pages were already handed out");
+    }
+    (void)disk_->AllocatePages(kHeaderPages);
     std::vector<char> page(PAGE_SIZE);
     for (page_id_t slot = 0; slot < kHeaderPages; ++slot) {
         Superblock sb;
@@ -44,17 +79,21 @@ void ColumnarFile::Create() {
     current_slot_ = 0;
 }
 
-// Checks every refusal rule before anything is written, then cuts off pages past the commit.
+// Refuses before writing anything, or creates again a file a crash left half created.
+// Then cuts off pages past the commit.
 void ColumnarFile::Open() {
     const uint64_t bytes = disk_->GetFileBytes();
-    if (bytes < PAGE_SIZE) Refuse(kNotOurs);
 
+    // Past the end reads as zeros, so a short file still gives both slots
     SlotRead slots[kHeaderPages];
-    std::vector<char> page(PAGE_SIZE);
+    std::vector<char> header(static_cast<size_t>(kHeaderPages) * PAGE_SIZE);
     for (page_id_t slot = 0; slot < kHeaderPages; ++slot) {
-        disk_->ReadPage(slot, page.data());
-        slots[slot] = DecodeSuperblock(page.data(), slot);
+        char* page = header.data() + static_cast<size_t>(slot) * PAGE_SIZE;
+        disk_->ReadPage(slot, page);
+        slots[slot] = DecodeSuperblock(page, slot);
     }
+    const bool all_zero = std::all_of(header.begin(), header.end(), [](char c) { return c == 0; });
+    if (bytes < PAGE_SIZE && !all_zero) Refuse(kNotOurs);
 
     // Another version in either slot refuses, so I never cut pages a newer build committed
     std::optional<uint32_t> other;
@@ -72,11 +111,35 @@ void ColumnarFile::Open() {
         Refuse("written by a newer ShilmanDB (format " + theirs + "; this build reads format " + ours + ")");
     }
 
-    // A usable slot checks out and has this build's page size; the higher generation wins
+    // A good slot for another page size means another build; refuse rather than fall back
+    for (const SlotRead& s : slots) {
+        if (s.state == SlotState::VALID && s.block.page_size != PAGE_SIZE) {
+            Refuse("written with " + std::to_string(s.block.page_size) + "-byte pages; this build uses " + std::to_string(PAGE_SIZE) + "-byte pages");
+        }
+    }
+
+    // Every commit adds a catalog page, so at most 2 pages means never committed.
+    // A slot counts as a commit by what it points at, not only its generation.
+    const bool magic = std::any_of(std::begin(slots), std::end(slots), [](const SlotRead& s) { return s.state != SlotState::NO_MAGIC; });
+    const bool committed = std::any_of(std::begin(slots), std::end(slots), [](const SlotRead& s) {
+        return s.state == SlotState::VALID && (s.block.generation >= 2 || s.block.committed_pages > kHeaderPages || s.block.catalog_page_count > 0);
+    });
+    const bool never_committed = bytes <= static_cast<uint64_t>(kHeaderPages) * PAGE_SIZE && !committed && (all_zero || magic);
+    try {
+        OpenWinner(bytes, slots);
+    } catch (const Refusal&) {
+        if (!never_committed) throw;
+        disk_->Truncate(0);  // a crash during create left this; nothing in it was ever committed
+        Create();
+    }
+}
+
+// Opens the newer valid slot, or refuses; nothing is written before the last check.
+void ColumnarFile::OpenWinner(uint64_t bytes, const SlotRead* slots) {
     std::optional<page_id_t> winner;
     for (page_id_t slot = 0; slot < kHeaderPages; ++slot) {
         const SlotRead& s = slots[slot];
-        if (s.state != SlotState::VALID || s.block.page_size != PAGE_SIZE) continue;
+        if (s.state != SlotState::VALID) continue;
         if (!winner || s.block.generation > slots[*winner].block.generation) winner = slot;
     }
     if (!winner) {
@@ -90,9 +153,14 @@ void ColumnarFile::Open() {
     if (sb.committed_pages > file_pages) {
         Refuse("the file is shorter than its last commit (" + std::to_string(file_pages) + " of " + std::to_string(sb.committed_pages) + " pages)");
     }
-    catalog_ = ReadCatalog(sb);
+    CatalogMeta catalog = ReadCatalog(sb);
+
+    // Everything the catalog names must survive the cut below
+    const std::string misfit = Misfit(catalog, sb.committed_pages, sb.next_oid);
+    if (!misfit.empty()) Refuse("damaged catalog: " + misfit);
 
     if (bytes != static_cast<uint64_t>(sb.committed_pages) * PAGE_SIZE) disk_->Truncate(sb.committed_pages);
+    catalog_ = std::move(catalog);
     current_ = sb;
     current_slot_ = *winner;
     next_oid_ = sb.next_oid;
@@ -151,6 +219,11 @@ void ColumnarFile::Commit(CatalogMeta next) {
     if (blob.size() > std::numeric_limits<uint32_t>::max()) {
         throw DatabaseException("the catalog is too big to commit: " + std::to_string(blob.size()) + " bytes");
     }
+    // Checked as the open would check it, so a bad catalog never reaches the disk
+    (void)DecodeCatalog(blob.data(), blob.size());
+    const std::string misfit = Misfit(next, disk_->GetNumPages(), next_oid_);
+    if (!misfit.empty()) throw DatabaseException("damaged catalog: " + misfit);
+
     const auto count = static_cast<uint32_t>((blob.size() + kCatalogSlice - 1) / kCatalogSlice);
     const page_id_t first = disk_->AllocatePages(count);
 
@@ -192,7 +265,7 @@ void ColumnarFile::Commit(CatalogMeta next) {
 
 // Throws with the file's path in front of the reason.
 void ColumnarFile::Refuse(const std::string& why) const {
-    throw DatabaseException(disk_->GetFileName() + ": " + why);
+    throw Refusal(disk_->GetFileName() + ": " + why);
 }
 
 }  // namespace shilmandb

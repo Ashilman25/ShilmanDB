@@ -111,6 +111,38 @@ std::string IntLines(size_t lines, const std::vector<std::pair<size_t, std::stri
 // Two plain integer columns, a and b.
 Schema IntSchema() { return Schema({Column("a", ColumnType::Integer()), Column("b", ColumnType::Integer())}); }
 
+// An integer and a text column, for lines of any length.
+Schema TextSchema() { return Schema({Column("a", ColumnType::Integer()), Column("b", ColumnType::Text())}); }
+
+constexpr size_t kBlock = size_t{1} << 20;  // the reader's block size
+
+// Valid TextSchema lines totalling exactly `bytes` bytes (at least 4).
+std::string FillerLines(size_t bytes, size_t& lines) {
+    std::string text;
+    while (bytes - text.size() > 300) {
+        text += "0|" + std::string(200, 's') + "\n";
+        ++lines;
+    }
+    text += "0|" + std::string(bytes - text.size() - 3, 's') + "\n";
+    ++lines;
+    return text;
+}
+
+// Throws on every page write, as a failing disk would.
+class FailingWrites : public WriteObserver {
+public:
+    explicit FailingWrites(int kind) : kind_(kind) {}
+    void OnWrite(page_id_t, const char*) override {
+        if (kind_ == 0) throw IOException("disk full");
+        if (kind_ == 1) throw DatabaseException("bad page");
+        throw std::runtime_error("not ours");
+    }
+    void OnSync() override {}
+
+private:
+    int kind_;
+};
+
 class BulkLoaderTest : public ::testing::Test {
 protected:
     std::filesystem::path dir_;
@@ -314,7 +346,6 @@ TEST_F(BulkLoaderTest, FirstErrorWinsOutOfOrder) {
 
 // A \r\n split across the reader's 1 MiB blocks, and lines that straddle them.
 TEST_F(BulkLoaderTest, LinesAcrossReadBlocks) {
-    constexpr size_t kBlock = size_t{1} << 20;
     const Schema schema({Column("a", ColumnType::Integer()), Column("b", ColumnType::Text())});
     std::vector<std::string> rows;
     size_t crlf_bytes = 0;
@@ -349,6 +380,44 @@ TEST_F(BulkLoaderTest, LinesAcrossReadBlocks) {
         EXPECT_TRUE(SameValues(got[0], expected[0]));
         EXPECT_TRUE(SameValues(got[1], expected[1]));
     }
+}
+
+// A one-block file whose last line has no newline, with and without \r.
+TEST_F(BulkLoaderTest, LastLineEndsAtBlockEdge) {
+    for (const std::string tail : {"", "\r"}) {
+        SCOPED_TRACE(tail.empty() ? "no \\r" : "with \\r");
+        size_t lines = 0;
+        const std::string last = "77|" + std::string(5000, 'e');
+        const std::string text = FillerLines(kBlock - last.size() - tail.size(), lines) + last + tail;
+        ASSERT_EQ(text.size(), kBlock);
+        const auto meta = BulkLoad(disk_.get(), "t", TextSchema(), WriteFile("edge.tbl", text), Threads(2));
+        ASSERT_EQ(meta.row_count, lines + 1);
+        const auto got = ReadAll(meta);
+        EXPECT_EQ(got[0].GetInt(lines), 77);
+        EXPECT_EQ(got[1].GetString(lines), std::string(5000, 'e'));
+        EXPECT_EQ(got[1].GetString(lines - 1).substr(0, 1), "s");
+    }
+}
+
+// A line of exactly the limit whose \r ends a block still reaches the parser.
+TEST_F(BulkLoaderTest, CarriageReturnAllowanceAtBlockEdge) {
+    const size_t limit = 2 * (kMaxValueBytes + 1);
+    size_t lines = 0;
+    const std::string line = "1|" + std::string(limit - 2, 'x');
+    const std::string at_limit = FillerLines(kBlock - line.size() - 1, lines) + line + "\r\n2|end\n";
+    ASSERT_EQ(at_limit[kBlock - 1], '\r');
+    ASSERT_EQ(at_limit[kBlock], '\n');
+    const std::string msg = LoadError(TextSchema(), WriteFile("cr_edge.tbl", at_limit), Threads(2));
+    const std::string want = "t: line " + std::to_string(lines + 1) + ", column b: value of " +
+                             std::to_string(limit - 2) + " bytes is bigger than a page";
+    EXPECT_EQ(msg, want);
+
+    // One byte longer, and the block's end already holds too much.
+    lines = 0;
+    const std::string longer = FillerLines(kBlock - line.size() - 2, lines) + line + "x\r\n2|end\n";
+    ASSERT_EQ(longer[kBlock - 1], '\r');
+    EXPECT_EQ(LoadError(TextSchema(), WriteFile("cr_over.tbl", longer), Threads(2)),
+              "t: line " + std::to_string(lines + 1) + ": line is longer than " + std::to_string(limit) + " bytes");
 }
 
 TEST_F(BulkLoaderTest, LongLineRefused) {
@@ -472,6 +541,70 @@ TEST_F(BulkLoaderTest, StatsMatchRowStoreRules) {
     }
     EXPECT_EQ(stats.page_count, pages);
     EXPECT_GT(pages, 0u);
+}
+
+// Any NaN in a DOUBLE chunk keeps that chunk out of the table's range.
+TEST_F(BulkLoaderTest, NaNChunksGiveNoRange) {
+    const Schema schema({Column("a", ColumnType::Integer()), Column("x", ColumnType::Double()),
+                         Column("y", ColumnType::Double())});
+    constexpr size_t kLines = kRowGroupSize + 1000;
+    std::string text;
+    for (size_t n = 1; n <= kLines; ++n) {
+        const bool second_group = n > kRowGroupSize;
+        const std::string x = (n == 1 || n == kRowGroupSize + 1) ? "nan" : std::to_string(n) + ".5";
+        const std::string y = n == 7 ? "nan" : std::to_string(second_group ? n : n * 10) + ".25";
+        text += std::to_string(n) + "|" + x + "|" + y + "\n";
+    }
+    for (unsigned threads : {1u, 4u}) {
+        const auto meta = BulkLoad(disk_.get(), "t", schema, WriteFile("nan.tbl", text), Threads(threads));
+        ASSERT_EQ(meta.row_groups.size(), 2u);
+        EXPECT_EQ(meta.stats.min_max.count("x"), 0u) << "every chunk of x holds a NaN";
+
+        // y's range comes only from the second group, the one without NaN.
+        ASSERT_EQ(meta.stats.min_max.count("y"), 1u);
+        EXPECT_DOUBLE_EQ(meta.stats.min_max.at("y").min.decimal_, static_cast<double>(kRowGroupSize + 1) + 0.25);
+        EXPECT_DOUBLE_EQ(meta.stats.min_max.at("y").max.decimal_, static_cast<double>(kLines) + 0.25);
+        ASSERT_EQ(meta.stats.min_max.count("a"), 1u);
+    }
+}
+
+// A failed page write names the table and the batch's lines, keeping its class.
+TEST_F(BulkLoaderTest, WriteFailureNamesTable) {
+    const std::string path = WriteFile("w.tbl", "1|2\n\n3|4\n5|6\n");
+    for (unsigned threads : {1u, 4u}) {
+        SCOPED_TRACE(std::to_string(threads) + " threads");
+        FailingWrites io(0);
+        disk_->SetWriteObserver(&io);
+        try {
+            (void)BulkLoad(disk_.get(), "t", IntSchema(), path, Threads(threads));
+            ADD_FAILURE() << "expected a throw";
+        } catch (const IOException& e) {
+            EXPECT_EQ(std::string(e.what()), "t: writing lines 1-4: disk full");
+        }
+
+        FailingWrites db(1);
+        disk_->SetWriteObserver(&db);
+        try {
+            (void)BulkLoad(disk_.get(), "t", IntSchema(), path, Threads(threads));
+            ADD_FAILURE() << "expected a throw";
+        } catch (const IOException& e) {
+            ADD_FAILURE() << "became an IOException: " << e.what();
+        } catch (const DatabaseException& e) {
+            EXPECT_EQ(std::string(e.what()), "t: writing lines 1-4: bad page");
+        }
+
+        FailingWrites other(2);
+        disk_->SetWriteObserver(&other);
+        try {
+            (void)BulkLoad(disk_.get(), "t", IntSchema(), path, Threads(threads));
+            ADD_FAILURE() << "expected a throw";
+        } catch (const DatabaseException& e) {
+            ADD_FAILURE() << "became a DatabaseException: " << e.what();
+        } catch (const std::runtime_error& e) {
+            EXPECT_EQ(std::string(e.what()), "not ours");
+        }
+        disk_->SetWriteObserver(nullptr);
+    }
 }
 
 TEST_F(BulkLoaderTest, EmptyFileGivesNoRowGroups) {

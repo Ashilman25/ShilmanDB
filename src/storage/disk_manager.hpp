@@ -13,7 +13,8 @@ struct ReadStats {
     std::chrono::nanoseconds time{0};
 };
 
-// Hears about every page write and sync, so crash tests can replay them
+// Hears about every page write and sync, so crash tests can replay them.
+// OnWrite can come from several loader threads at once, so it must be thread-safe.
 class WriteObserver {
 public:
     virtual ~WriteObserver() = default;
@@ -37,13 +38,17 @@ public:
     // Hands out count pages in a row and returns the first id; safe across threads
     [[nodiscard]] page_id_t AllocatePages(uint32_t count) { return next_page_id_.fetch_add(count); }
 
-    // Waits until every write so far is on stable storage; throws IOException
+    // Flushes every write so far to the drive: F_FULLFSYNC on macOS, fdatasync on Linux.
+    // Without F_FULLFSYNC support it falls back to fsync, which may stop at the drive's cache.
+    // Throws IOException; after a failure, treat every write since the last sync as lost.
     void Sync();
 
-    // Cuts the file to num_pages pages, so the next new page is num_pages
+    // Cuts the file to num_pages pages, so the next new page is num_pages.
+    // Drop buffer pool frames past the cut first, or a flush writes them back.
     void Truncate(page_id_t num_pages);
 
     // Tells the observer about every write and sync. nullptr (the default) is none.
+    // Set it only while no writes are running; the pointer isn't guarded.
     void SetWriteObserver(WriteObserver* observer) { observer_ = observer; }
 
     // The file's real size in bytes, partial last page included
