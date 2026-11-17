@@ -12,8 +12,6 @@ namespace {
 
 constexpr size_t kDataBytes = PAGE_SIZE - kPageHeaderSize;  // room after the header
 constexpr uint32_t kMaxPageValues = UINT16_MAX;             // a header counts values in 16 bits
-// The biggest string a page holds: one NULL-bits byte and two offsets sit beside it.
-constexpr size_t kMaxValueBytes = kDataBytes - 1 - 2 * sizeof(uint16_t);
 
 // Facts about a chunk, gathered in one pass before any encoding is built.
 struct Stats {

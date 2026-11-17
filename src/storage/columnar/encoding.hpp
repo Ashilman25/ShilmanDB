@@ -22,6 +22,10 @@ inline constexpr size_t kPageHeaderSize = 32;
 inline constexpr uint8_t kPageHasNulls = 0x01;     // NULL bits follow the header
 inline constexpr uint8_t kPageBigValues = 0x02;    // reserved for values bigger than a page
 
+// The biggest string a page holds: one NULL-bits byte and two offsets sit beside it.
+inline constexpr size_t kMaxValueBytes = PAGE_SIZE - kPageHeaderSize - 1 - 2 * sizeof(uint16_t);
+static_assert(kMaxValueBytes == 8155, "a stored string is at most 8,155 bytes");
+
 // The first 32 bytes of every page, stored exactly as laid out here.
 struct ColumnarPageHeader {
     uint32_t crc32c{0};         // over bytes 4 to the end, seeded with the page id
