@@ -5,6 +5,7 @@
 #include "storage/columnar/string_arena.hpp"
 #include <algorithm>
 #include <cassert>
+#include <cmath>
 #include <cstddef>
 #include <limits>
 #include <numeric>
@@ -19,10 +20,16 @@ struct SortedRows {
     std::vector<uint32_t> order;  // rows in output order, already cut at the limit
 };
 
-// -1, 0 or 1 using < alone, as Value does; NaN equals everything.
+// -1, 0 or 1 using < alone, as Value does.
 template <typename T>
 int Order(const T& a, const T& b) {
     return a < b ? -1 : (b < a ? 1 : 0);
+}
+
+// Doubles as Value compares them, except a NaN: after every number, NaNs by bits.
+// So the sorts always get a strict weak order.
+int OrderDoubles(double a, double b) {
+    return std::isnan(a) || std::isnan(b) ? TotalOrder(a, b) : Order(a, b);
 }
 
 // Rows a and b of one buffer, compared as Value's < and > compare them.
@@ -33,7 +40,7 @@ int CompareAt(const ColumnBuffer& buf, const VType& t, uint32_t a, uint32_t b) {
             return (c > 0) - (c < 0);
         }
         case Kind::DOUBLE:
-            return Order(buf.f64[a], buf.f64[b]);
+            return OrderDoubles(buf.f64[a], buf.f64[b]);
         case Kind::DECIMAL:
             return t.wide ? Order(buf.i128[a], buf.i128[b]) : Order(buf.i64[a], buf.i64[b]);
         case Kind::INTEGER:
@@ -124,7 +131,7 @@ public:
 
 private:
     // True when row a comes before row b: keys first, then kept columns ascending.
-    // Keys compare as Value does; the tie pass uses a total order on doubles.
+    // Keys compare as Value does, NaN last; the tie pass uses a total order on doubles.
     bool Before(const ColumnStore& keys, const ColumnStore& kept, uint32_t a, uint32_t b) const {
         for (size_t i = 0; i < keys.columns.size(); ++i) {
             const int c = CompareAt(keys.columns[i], key_types_[i], a, b);
@@ -138,7 +145,6 @@ private:
     }
 
     // Row numbers in output order, cut at the limit.
-    // Merge sort and heap selection stay in bounds even if a NaN key breaks order.
     std::vector<uint32_t> SortedOrder(const ColumnStore& keys, const ColumnStore& kept) const {
         const size_t rows = kept.rows;
         if (rows > std::numeric_limits<uint32_t>::max()) throw DatabaseException("the parallel executor can't sort more than 4294967295 rows");

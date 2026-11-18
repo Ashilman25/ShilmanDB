@@ -578,6 +578,121 @@ TEST_F(ParallelSortTest, DoubleTiesHaveATotalOrder) {
     }
 }
 
+TEST_F(ParallelSortTest, NanKeysSortAfterNumbersInOneOrder) {
+    // A NaN key comes after every number in ASC (before in DESC), NaNs by their bits.
+    // That's one order, so sort and top n agree in any worker split.
+    const VType kDouble{Kind::DOUBLE, 0, false, TypeId::DECIMAL};
+    const auto from_bits = [](uint64_t b) {
+        double d = 0.0;
+        std::memcpy(&d, &b, sizeof(d));
+        return d;
+    };
+    const auto bits = [](double d) {
+        uint64_t b = 0;
+        std::memcpy(&b, &d, sizeof(b));
+        return b;
+    };
+    const double inf = std::numeric_limits<double>::infinity();
+    const std::vector<double> pool = {from_bits(0x7FF8000000000000ULL), from_bits(0x7FF8000000000003ULL), from_bits(0xFFF8000000000000ULL),
+                                      -inf, inf, -0.0, 0.0, 1.5, -2.25, 1e300, 3.0, 7.0};
+    using KeyRow = std::pair<double, int64_t>;  // (key, unique id)
+    std::vector<KeyRow> rows;
+    std::mt19937 rng(20261118);
+    for (int64_t id = 0; id < 3000; ++id) rows.emplace_back(pool[rng() % pool.size()], id);
+
+    // Written without the code under test: numbers by value (zeros tie), then NaNs by bits.
+    const auto key_order = [&](double a, double b) {
+        if (std::isnan(a) != std::isnan(b)) return std::isnan(a) ? 1 : -1;
+        if (std::isnan(a)) return bits(a) < bits(b) ? -1 : (bits(b) < bits(a) ? 1 : 0);
+        return a < b ? -1 : (b < a ? 1 : 0);
+    };
+    // Ties go to the kept columns ascending: the key if kept (-0.0 first), then id.
+    // A key that isn't kept shows as 0.
+    const auto reference = [&](bool ascending, std::optional<int64_t> limit, bool keep_key) {
+        std::vector<KeyRow> want = rows;
+        std::sort(want.begin(), want.end(), [&](const KeyRow& a, const KeyRow& b) {
+            const int c = key_order(a.first, b.first);
+            if (c != 0) return ascending ? c < 0 : c > 0;
+            if (keep_key && std::signbit(a.first) != std::signbit(b.first) && a.first == 0.0) return std::signbit(a.first);
+            return a.second < b.second;
+        });
+        if (limit) want.resize(std::min<size_t>(want.size(), static_cast<size_t>(*limit)));
+        std::vector<std::pair<uint64_t, int64_t>> out;
+        for (const KeyRow& r : want) out.emplace_back(keep_key ? bits(r.first) : 0, r.second);
+        return out;
+    };
+
+    // Rows shuffled by seed, dealt to workers in batches of up to 700.
+    const auto run = [&](bool ascending, std::optional<int64_t> limit, bool keep_key, size_t workers, uint32_t seed) {
+        std::vector<KeyRow> input = rows;
+        std::mt19937 shuffle(seed);
+        for (size_t i = input.size() - 1; i > 0; --i) std::swap(input[i], input[shuffle() % (i + 1)]);
+        InputLayout in;
+        in.slot_of_column = {0, 1};
+        in.slot_types = {kDouble, kInt};
+        in.slot_precision = {0, 0};
+        ColumnRef key;
+        key.column_name = "k";
+        key.bound_index = 0;
+        SortSpec spec;
+        spec.keys.push_back(CompiledExpr::Compile(key, in));
+        spec.ascending.push_back(ascending);
+        spec.columns = keep_key ? std::vector<uint32_t>{0, 1} : std::vector<uint32_t>{1};
+        spec.types = keep_key ? std::vector<VType>{kDouble, kInt} : std::vector<VType>{kInt};
+        spec.limit = limit;
+        auto made = MakeSort(std::move(spec));
+        QueryContext ctx{nullptr, nullptr};
+        std::vector<std::unique_ptr<LocalState>> locals;
+        for (size_t w = 0; w < workers; ++w) locals.push_back(made.first->MakeLocal());
+        size_t turn = 0;
+        for (size_t at = 0; at < input.size(); at += 700, ++turn) {
+            const auto n = static_cast<uint32_t>(std::min<size_t>(700, input.size() - at));
+            Batch b;
+            ShapeBatch(b, {kDouble, kInt});
+            b.Reset(n);
+            for (uint32_t i = 0; i < n; ++i) {
+                b.slots[0].F64()[i] = input[at + i].first;
+                b.slots[1].I64()[i] = input[at + i].second;
+            }
+            made.first->Consume(b, *locals[turn % workers]);
+        }
+        for (auto& local : locals) made.first->Combine(std::move(local));
+        made.first->Finalize(ctx);
+        made.second->Prepare(ctx);
+        auto local = made.second->MakeLocal();
+        made.second->StartMorsel(0, *local);
+        std::vector<std::pair<uint64_t, int64_t>> out;
+        Batch batch;
+        while (made.second->NextBatch(*local, batch)) {
+            for (uint32_t k = 0; k < batch.Active(); ++k) {
+                const uint32_t r = batch.sel[k];
+                out.emplace_back(keep_key ? bits(batch.slots[0].F64()[r]) : 0, batch.slots[keep_key ? 1 : 0].I64()[r]);
+            }
+        }
+        return out;
+    };
+
+    for (const bool keep_key : {true, false}) {
+        for (const bool ascending : {true, false}) {
+            for (const std::optional<int64_t> limit : {std::optional<int64_t>{}, std::optional<int64_t>{1}, std::optional<int64_t>{10},
+                                                       std::optional<int64_t>{900}, std::optional<int64_t>{2999}}) {
+                const auto want = reference(ascending, limit, keep_key);
+                for (const size_t workers : {size_t{1}, size_t{2}, size_t{5}}) {
+                    for (const uint32_t seed : {1u, 2u, 3u}) {
+                        EXPECT_EQ(run(ascending, limit, keep_key, workers, seed), want)
+                            << (keep_key ? "key kept, " : "key not kept, ") << (ascending ? "asc" : "desc") << " limit "
+                            << (limit ? std::to_string(*limit) : "none") << ", " << workers << " workers, seed " << seed;
+                    }
+                }
+            }
+        }
+    }
+    // The whole ascending order ends in the NaNs.
+    const auto all = reference(true, std::nullopt, true);
+    EXPECT_TRUE(std::isnan(from_bits(all.back().first)));
+    EXPECT_FALSE(std::isnan(from_bits(all.front().first)));
+}
+
 TEST_F(ParallelSortTest, WorkersCombineIntoOneOrder) {
     // 5,000 rows, 50 distinct keys, split across workers and batches in different ways.
     constexpr size_t kRows = 5000;
