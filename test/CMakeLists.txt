@@ -101,6 +101,8 @@ shilmandb_add_test(like_expression_test executor/like_expression_test.cpp)
 shilmandb_add_test(profiling_executor_test executor/profiling_executor_test.cpp)
 shilmandb_add_test(parallel_vector_test executor/parallel/vector_test.cpp)
 shilmandb_add_test(parallel_decimal_test executor/parallel/decimal_test.cpp)
+shilmandb_add_test(parallel_expression_test executor/parallel/expression_test.cpp)
+shilmandb_add_test(parallel_expression_differential_test executor/parallel/expression_differential_test.cpp)
 
 # Integration tests
 shilmandb_add_test(end_to_end_test integration/end_to_end_test.cpp)
