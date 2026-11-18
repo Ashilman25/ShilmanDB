@@ -1,13 +1,27 @@
 #include "executor/parallel/parallel_executor.hpp"
+#include "common/exception.hpp"
 #include "executor/parallel/compiler.hpp"
 #include <algorithm>
+#include <string>
 #include <thread>
 
 namespace shilmandb::parallel {
 
-// Pipelines are stored in dependency order, so running them in turn is enough.
+// Compiles, then runs.
 std::vector<Tuple> RunParallelQuery(const PlanNode& root, QueryContext& ctx) {
     PhysicalPlan plan = CompilePlan(root, ctx);
+    return RunPhysicalPlan(plan, ctx);
+}
+
+// Running in turn is enough once every dependency comes earlier in the list.
+std::vector<Tuple> RunPhysicalPlan(PhysicalPlan& plan, QueryContext& ctx) {
+    for (size_t i = 0; i < plan.pipelines.size(); ++i) {
+        for (size_t d : plan.pipelines[i].depends_on) {
+            if (d >= i) {
+                throw DatabaseException("the parallel executor's pipeline " + std::to_string(i) + " depends on pipeline " + std::to_string(d) + ", which doesn't run before it");
+            }
+        }
+    }
     for (Pipeline& p : plan.pipelines) RunPipeline(p, ctx);
     return plan.result->TakeTuples();
 }

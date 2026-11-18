@@ -207,7 +207,7 @@ public:
         const InputLayout layout = Build(root, all);
 
         auto sink = std::make_unique<ResultSink>(root.output_schema, layout);
-        AssertLimitsAboveExpanding();
+        CheckLimitsAboveExpanding();
         for (const LimitOperator* limit : current_.limits) sink->WatchLimit(&limit->Counter());
         plan_.result = sink.get();
         Close(Own(std::move(sink)));
@@ -216,17 +216,15 @@ public:
 private:
     // Done() stops a pipeline mid-batch. A watched limit below an operator still
     // expanding its batch would cut that batch short, so every limit must come after.
-    // The planner puts LIMIT at the root, so this holds today.
-    void AssertLimitsAboveExpanding() const {
-#ifndef NDEBUG
+    // The planner puts LIMIT at the root, so this holds today; every build checks it.
+    void CheckLimitsAboveExpanding() const {
         const auto& ops = current_.pipeline.operators;
         const auto position = [&](const Operator* op) { return std::find(ops.begin(), ops.end(), op) - ops.begin(); };
         for (const LimitOperator* limit : current_.limits) {
             for (const Operator* op : current_.expanding) {
-                assert(position(limit) > position(op) && "a watched LIMIT sits below an operator that can answer HAVE_MORE_OUTPUT");
+                if (position(limit) <= position(op)) throw DatabaseException("the parallel executor can't run a LIMIT below a join");
             }
         }
-#endif
     }
 
     // Compiles node's subtree; returns where node's output columns sit in its batches.

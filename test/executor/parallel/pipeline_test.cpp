@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
+#include "common/exception.hpp"
 #include "executor/parallel/batch.hpp"
+#include "executor/parallel/compiler.hpp"
 #include "executor/parallel/parallel_executor.hpp"
 #include "executor/parallel/pipeline.hpp"
 #include "executor/parallel/vector.hpp"
@@ -7,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -224,6 +227,36 @@ TEST(ParallelPipelineTest, DoneStopsTakingMorsels) {
     EXPECT_EQ(sink.values.size(), kRowsPerBatch);
     EXPECT_EQ(sink.combines, 1);
     EXPECT_EQ(sink.finalizes, 1);
+}
+
+TEST(ParallelPipelineTest, DependencyOnALaterPipelineIsRefused) {
+    // Pipelines run in list order, so each may depend only on earlier ones:
+    // not a later one, not itself, not one past the end.
+    struct Bad {
+        size_t pipeline;
+        std::vector<size_t> depends_on;
+    };
+    for (const Bad& bad : {Bad{0, {1}}, Bad{0, {0}}, Bad{1, {1}}, Bad{1, {0, 2}}}) {
+        FakeSource first(1, 1);
+        FakeSource second(1, 1);
+        FakeSink sink;
+        ResultSink result(Schema(std::vector<Column>{}), InputLayout{});  // never fed; there if the run goes ahead
+        PhysicalPlan plan;
+        plan.pipelines.push_back(Pipeline{&first, {}, &sink, {}});
+        plan.pipelines.push_back(Pipeline{&second, {}, &sink, {}});
+        plan.pipelines[bad.pipeline].depends_on = bad.depends_on;
+        plan.result = &result;
+        QueryContext ctx = NoDatabase();
+        try {
+            (void)RunPhysicalPlan(plan, ctx);
+            ADD_FAILURE() << "pipeline " << bad.pipeline << " ran with a bad dependency";
+        } catch (const DatabaseException& e) {
+            EXPECT_NE(std::string(e.what()).find("which doesn't run before it"), std::string::npos) << e.what();
+        }
+        // Refused before anything ran.
+        EXPECT_EQ(first.prepared, 0);
+        EXPECT_EQ(second.prepared, 0);
+    }
 }
 
 TEST(ParallelPipelineTest, ResolveThreadsDefaultsAndCaps) {

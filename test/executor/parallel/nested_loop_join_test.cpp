@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "catalog/catalog.hpp"
+#include "common/exception.hpp"
 #include "engine/database.hpp"
 #include "executor/parallel/basic_operators.hpp"
 #include "executor/parallel/batch.hpp"
@@ -325,8 +326,9 @@ TEST_F(ParallelNestedLoopJoinTest, PipelinesInDependencyOrder) {
     EXPECT_EQ(cut.physical.result->TakeTuples().size(), 5u);
 }
 
-TEST_F(ParallelNestedLoopJoinTest, LimitBelowAJoinIsCaughtInDebug) {
+TEST_F(ParallelNestedLoopJoinTest, LimitBelowAJoinIsRefused) {
     // No planner builds this: a LIMIT under the join, in the result's own pipeline.
+    // Its counter would cut the join's output short, so every build refuses it.
     const Schema& a = db_->GetCatalog()->GetTable("a")->schema;
     const Schema& b = db_->GetCatalog()->GetTable("b")->schema;
     std::vector<Column> joined = a.GetColumns();
@@ -338,7 +340,12 @@ TEST_F(ParallelNestedLoopJoinTest, LimitBelowAJoinIsCaughtInDebug) {
     join.children.push_back(std::make_unique<SeqScanPlanNode>(b, "b"));
 
     QueryContext ctx{db_->GetBufferPoolManager(), db_->GetCatalog(), 1};
-    EXPECT_DEBUG_DEATH((void)CompilePlan(join, ctx), "below an operator that can answer HAVE_MORE_OUTPUT");
+    try {
+        (void)CompilePlan(join, ctx);
+        ADD_FAILURE() << "a LIMIT below a join compiled";
+    } catch (const DatabaseException& e) {
+        EXPECT_STREQ(e.what(), "the parallel executor can't run a LIMIT below a join");
+    }
 }
 
 TEST_F(ParallelNestedLoopJoinTest, CursorLivesInEachWorkersState) {
