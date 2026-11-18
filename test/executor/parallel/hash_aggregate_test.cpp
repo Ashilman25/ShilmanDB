@@ -1223,5 +1223,108 @@ TEST_F(ParallelHashAggregateTest, DoubleMinMaxSameInAnyMergeOrder) {
     }
 }
 
+TEST_F(ParallelHashAggregateTest, DoubleKeysShowTheSameBitsInAnyMergeOrder) {
+    // Equal DOUBLE keys show their smallest member in a total order: -0.0 over
+    // +0.0, and the NaN with the smallest bits, however rows and tables merge.
+    const auto from_bits = [](uint64_t b) {
+        double d = 0.0;
+        std::memcpy(&d, &b, sizeof(d));
+        return d;
+    };
+    const auto bits = [](double d) {
+        uint64_t b = 0;
+        std::memcpy(&b, &d, sizeof(b));
+        return b;
+    };
+    const uint64_t kNanLow = 0x7FF8000000000000ULL;
+    const std::vector<double> special = {0.0, -0.0, from_bits(0x7FF8000000000005ULL), from_bits(kNanLow), from_bits(0xFFF8000000000000ULL), 0.0,
+                                         from_bits(0x7FF8000000000005ULL), 1.5};
+    const InputLayout in = HandLayout();
+
+    // Per key shown, as bits: its count. Filler keys are left out.
+    const auto run = [&](const std::vector<std::vector<double>>& workers) {
+        AggregateSpec spec;
+        spec.keys.push_back(Col(3, in));
+        spec.out_types.push_back(kDouble);
+        spec.funcs.push_back(Func::COUNT);
+        spec.args.push_back(nullptr);
+        spec.out_types.push_back(kInt);
+        auto made = MakeHashAggregate(std::move(spec));
+        QueryContext ctx{nullptr, nullptr};
+        for (const auto& keys : workers) {
+            auto local = made.first->MakeLocal();
+            Batch b;
+            ShapeBatch(b, in.slot_types);
+            for (size_t at = 0; at < keys.size(); at += kBatchSize) {
+                const auto n = static_cast<uint32_t>(std::min<size_t>(kBatchSize, keys.size() - at));
+                b.Reset(n);
+                for (uint32_t i = 0; i < n; ++i) b.slots[3].F64()[i] = keys[at + i];
+                made.first->Consume(b, *local);
+            }
+            made.first->Combine(std::move(local));
+        }
+        made.first->Finalize(ctx);
+        made.second->Prepare(ctx);
+        std::map<uint64_t, int64_t> shown;
+        auto local = made.second->MakeLocal();
+        Batch o;
+        for (size_t m = 0; m < made.second->MorselCount(); ++m) {
+            made.second->StartMorsel(m, *local);
+            while (made.second->NextBatch(*local, o)) {
+                for (uint32_t i = 0; i < o.Active(); ++i) {
+                    const double k = o.slots[0].F64()[o.sel[i]];
+                    if (k == 0.0 || std::isnan(k) || k == 1.5) shown[bits(k)] = o.slots[1].I64()[o.sel[i]];
+                }
+            }
+        }
+        return shown;
+    };
+    const std::map<uint64_t, int64_t> want = {{bits(-0.0), 3}, {kNanLow, 4}, {bits(1.5), 1}};
+
+    // The special keys shuffled and cut into three workers; the biggest table varies.
+    std::mt19937 rng(20261118);
+    for (int variant = 0; variant < 24; ++variant) {
+        std::vector<double> keys = special;
+        for (size_t i = keys.size() - 1; i > 0; --i) std::swap(keys[i], keys[rng() % (i + 1)]);
+        const size_t cut1 = rng() % (keys.size() + 1);
+        const size_t cut2 = cut1 + rng() % (keys.size() - cut1 + 1);
+        std::vector<std::vector<double>> workers = {std::vector<double>(keys.begin(), keys.begin() + cut1),
+                                                    std::vector<double>(keys.begin() + cut1, keys.begin() + cut2),
+                                                    std::vector<double>(keys.begin() + cut2, keys.end())};
+        // Odd variants add 40,000 to 60,000 filler keys per worker, so tables merge by partition.
+        double next = 2.0;
+        size_t fillers = 0;
+        for (size_t w = 0; w < workers.size(); ++w) {
+            const size_t filler = variant % 2 == 0 ? (w == static_cast<size_t>(variant / 2) % 3 ? 5 : 0) : 40000 + 10000 * ((w + variant) % 3);
+            for (size_t f = 0; f < filler; ++f) workers[w].push_back(next++);
+            fillers += filler;
+        }
+        ASSERT_EQ(MergePartitionCount(fillers + special.size(), 1) > 1, variant % 2 == 1);
+        EXPECT_EQ(run(workers), want) << "variant " << variant;
+    }
+}
+
+TEST_F(ParallelHashAggregateTest, IntendedDifferenceDoubleKeyShowsNegativeZero) {
+    // One group holds 0.0 and -0.0. Today's executor shows the first one seen;
+    // this one shows -0.0, as it would at any thread count.
+    Load("z", Schema({Column("zf", ColumnType::Double()), Column("zi", ColumnType::Integer())}), "0.0|1|\n-0.0|2|\n0.0|3|\n2.5|4|\n");
+    const QueryResult got = Run("SELECT zf, COUNT(*) FROM z GROUP BY zf", ExecutionMode::PARALLEL, 1);
+    ASSERT_EQ(got.tuples.size(), 2u);
+    bool saw_zero = false;
+    for (const Tuple& row : got.tuples) {
+        const double k = row.GetValue(got.schema, 0).decimal_;
+        if (k != 0.0) continue;
+        saw_zero = true;
+        EXPECT_TRUE(std::signbit(k)) << "the zero group shows +0.0";
+        EXPECT_EQ(row.GetValue(got.schema, 1).integer_, 3);
+    }
+    EXPECT_TRUE(saw_zero);
+    const QueryResult today = Run("SELECT zf, COUNT(*) FROM z GROUP BY zf", ExecutionMode::VECTORIZED);
+    for (const Tuple& row : today.tuples) {
+        const double k = row.GetValue(today.schema, 0).decimal_;
+        if (k == 0.0) EXPECT_FALSE(std::signbit(k)) << "today shows the first zero seen";
+    }
+}
+
 }  // namespace
 }  // namespace shilmandb::parallel

@@ -56,6 +56,7 @@ struct AggInfo {
 // What every table of one aggregate shares: key types and the aggregates.
 struct GroupShape {
     std::vector<VType> keys;
+    std::vector<size_t> double_keys;  // indexes of the DOUBLE keys
     std::vector<AggInfo> aggs;
     bool global{false};
 };
@@ -89,6 +90,12 @@ using detail::WideBits;
 // Equal as group keys: by value, NaN equal to NaN.
 inline bool SameDouble(double a, double b) {
     return a == b || (std::isnan(a) && std::isnan(b));
+}
+
+// Of two equal DOUBLE keys a group keeps the smaller in a total order:
+// -0.0 over +0.0, the NaN with the smallest bits. Any merge order agrees.
+inline void KeepSmallerKey(double& kept, double seen) {
+    if (TotalOrder(seen, kept) < 0) kept = seen;
 }
 
 // Folds key k of every active row into hashes[0..n).
@@ -377,7 +384,9 @@ void MergeGroup(GroupTable& t, const GroupShape& shape, const GroupTable& from, 
             CopyStates(t, shape, from, g);
         },
         added);
-    if (!added) MergeStates(t, into, shape, from, g);
+    if (added) return;
+    for (size_t k : shape.double_keys) KeepSmallerKey(t.keys[k].f64[into], from.keys[k].f64[g]);
+    MergeStates(t, into, shape, from, g);
 }
 
 // Every table merged into the biggest, which keeps its own arena.
@@ -554,6 +563,8 @@ private:
                     AddFreshStates(t, shape);
                 },
                 added);
+            if (added) continue;
+            for (size_t k : shape.double_keys) KeepSmallerKey(t.keys[k].f64[l.group_of[i]], l.key_values[k].F64()[row]);
         }
     }
 
@@ -818,6 +829,7 @@ std::pair<std::unique_ptr<Sink>, std::unique_ptr<Source>> MakeHashAggregate(Aggr
     for (size_t k = 0; k < spec.keys.size(); ++k) {
         shape->keys.push_back(spec.keys[k]->Type());
         if (spec.out_types[k] != shape->keys.back()) throw DatabaseException("the parallel executor's aggregate key types don't match");
+        if (ArrayOf(shape->keys.back()) == ValueArray::F64) shape->double_keys.push_back(k);
     }
     for (size_t a = 0; a < spec.funcs.size(); ++a) {
         const CompiledExpr* arg = spec.funcs[a] == Aggregate::Func::COUNT ? nullptr : spec.args[a].get();
