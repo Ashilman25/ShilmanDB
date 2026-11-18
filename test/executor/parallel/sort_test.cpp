@@ -327,7 +327,7 @@ protected:
     }
 
     // Runs sql in the given mode; threads matters only for PARALLEL.
-    QueryResult Run(const std::string& sql, ExecutionMode mode, unsigned threads = 0) {
+    QueryResult Run(const std::string& sql, ExecutionMode mode, unsigned threads = 1) {
         QueryOptions options;
         options.mode = mode;
         options.threads = threads;
@@ -411,9 +411,9 @@ TEST_F(ParallelSortTest, TiesBrokenByRemainingColumns) {
                 << ")";
         }
 
-        // The same rows loaded in another order, and another thread count, give the same rows.
+        // The same rows loaded in another order, and other thread counts, give the same rows.
         EXPECT_EQ(OrderedDifference(Run(sql("t2"), ExecutionMode::PARALLEL), got), "") << c.sql;
-        EXPECT_EQ(OrderedDifference(Run(sql("t1"), ExecutionMode::PARALLEL, 1), got), "") << c.sql;
+        EXPECT_EQ(OrderedDifference(Run(sql("t1"), ExecutionMode::PARALLEL, 18), got), "") << c.sql;
         EXPECT_EQ(OrderedDifference(Run(sql("t2"), ExecutionMode::PARALLEL, 3), got), "") << c.sql;
     }
 }

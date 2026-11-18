@@ -296,7 +296,7 @@ protected:
     }
 
     // Runs sql on db in one mode, maybe with a forced join order.
-    static QueryResult RunOn(Database& db, const std::string& sql, ExecutionMode mode, unsigned threads = 0,
+    static QueryResult RunOn(Database& db, const std::string& sql, ExecutionMode mode, unsigned threads = 1,
                              std::optional<std::vector<int>> order = std::nullopt) {
         QueryOptions options;
         options.mode = mode;
@@ -306,7 +306,7 @@ protected:
     }
 
     // The same on this test's database.
-    QueryResult Run(const std::string& sql, ExecutionMode mode, unsigned threads = 0, std::optional<std::vector<int>> order = std::nullopt) {
+    QueryResult Run(const std::string& sql, ExecutionMode mode, unsigned threads = 1, std::optional<std::vector<int>> order = std::nullopt) {
         return RunOn(*db_, sql, mode, threads, std::move(order));
     }
 
@@ -314,7 +314,7 @@ protected:
     size_t Check(const std::string& sql) {
         const QueryResult want = Run(sql, ExecutionMode::VECTORIZED);
         for (const std::vector<int>& order : {std::vector<int>{0, 1}, std::vector<int>{1, 0}}) {
-            for (const unsigned threads : {0u, 1u}) {
+            for (const unsigned threads : {1u, 18u}) {
                 EXPECT_EQ(Difference(Run(sql, ExecutionMode::PARALLEL, threads, order), want), "") << sql << ", order " << order[0];
             }
         }
@@ -411,7 +411,7 @@ TEST_F(ParallelHashJoinTest, DuplicatesOnBothSides) {
     const std::string sql = "SELECT l_k, l_v, l_s, r_k, r_w, r_t FROM l JOIN r ON l_k = r_k";
     EXPECT_EQ(RowsDifference(SortedRows(Run(sql, ExecutionMode::VECTORIZED)), want), "");
     for (const std::vector<int>& order : {std::vector<int>{0, 1}, std::vector<int>{1, 0}}) {
-        for (const unsigned threads : {0u, 1u, 3u}) {
+        for (const unsigned threads : {1u, 3u, 18u}) {
             const QueryResult got = Run(sql, ExecutionMode::PARALLEL, threads, order);
             EXPECT_EQ(got.profile.join.order, order);
             EXPECT_EQ(RowsDifference(SortedRows(got), want), "") << "order " << order[0] << ", threads " << threads;
@@ -668,7 +668,7 @@ TEST_F(ParallelHashJoinTest, SameSideEqualityIsSkippedAnIntendedDifference) {
     const QueryResult want = Run("SELECT l_k, l_j, l_m, r_t FROM l JOIN r ON l_k = r_k WHERE l_j = l_m", ExecutionMode::VECTORIZED);
     ASSERT_GT(want.tuples.size(), 100u);
     for (const std::vector<int>& order : {std::vector<int>{0, 1}, std::vector<int>{1, 0}}) {
-        EXPECT_EQ(Difference(Run(sql, ExecutionMode::PARALLEL, 0, order), want), "") << "order " << order[0];
+        EXPECT_EQ(Difference(Run(sql, ExecutionMode::PARALLEL, 1, order), want), "") << "order " << order[0];
     }
     EXPECT_TRUE(RunPlan(*Plan(sql)).top.has_residual);
 }
@@ -746,14 +746,14 @@ TEST_F(ParallelHashJoinTest, MixedIntegerKeysMatchByValueAnIntendedDifference) {
     const QueryResult same_type = Run("SELECT ka_i, kb_i FROM ka JOIN kb ON ka_i = kb_i", ExecutionMode::VECTORIZED);
     ASSERT_EQ(same_type.tuples.size(), 20u);
     for (const std::vector<int>& order : {std::vector<int>{0, 1}, std::vector<int>{1, 0}}) {
-        EXPECT_EQ(Difference(Run(mixed, ExecutionMode::PARALLEL, 0, order), same_type), "") << "order " << order[0];
+        EXPECT_EQ(Difference(Run(mixed, ExecutionMode::PARALLEL, 1, order), same_type), "") << "order " << order[0];
     }
 
     // An integer against a decimal meets r.00, by value (today: never).
     const std::string to_decimal = "SELECT ka_i, kb_m FROM ka JOIN kb ON ka_i = kb_m";
     EXPECT_TRUE(Run(to_decimal, ExecutionMode::VECTORIZED).tuples.empty());
     for (const std::vector<int>& order : {std::vector<int>{0, 1}, std::vector<int>{1, 0}}) {
-        const QueryResult got = Run(to_decimal, ExecutionMode::PARALLEL, 0, order);
+        const QueryResult got = Run(to_decimal, ExecutionMode::PARALLEL, 1, order);
         ASSERT_EQ(got.tuples.size(), 20u) << "order " << order[0];
         for (const Tuple& t : got.tuples) EXPECT_EQ(static_cast<double>(t.GetValue(got.schema, 0).integer_), t.GetValue(got.schema, 1).decimal_);
     }
@@ -763,7 +763,7 @@ TEST_F(ParallelHashJoinTest, MixedIntegerKeysMatchByValueAnIntendedDifference) {
     const std::string to_double = "SELECT ka_f, kb_i FROM ka JOIN kb ON ka_f = kb_i";
     EXPECT_TRUE(Run(to_double, ExecutionMode::VECTORIZED).tuples.empty());
     for (const std::vector<int>& order : {std::vector<int>{0, 1}, std::vector<int>{1, 0}}) {
-        const QueryResult got = Run(to_double, ExecutionMode::PARALLEL, 0, order);
+        const QueryResult got = Run(to_double, ExecutionMode::PARALLEL, 1, order);
         ASSERT_EQ(got.tuples.size(), 10u) << "order " << order[0];
         for (const Tuple& t : got.tuples) EXPECT_EQ(t.GetValue(got.schema, 0).decimal_, static_cast<double>(t.GetValue(got.schema, 1).integer_));
     }
@@ -802,13 +802,13 @@ TEST_F(ParallelHashJoinTest, DecimalDoubleDateAndStringKeys) {
     EXPECT_GT(Check("SELECT ka_s, kb_s, ka_i, kb_i FROM ka JOIN kb ON ka_s = kb_s"), 30u);
 
     // Keys that can't compare are refused before anything runs, left side's type first.
-    EXPECT_EQ(ErrorOf([&] { (void)Run("SELECT ka_i FROM ka JOIN kb ON ka_d = kb_s", ExecutionMode::PARALLEL, 0, std::vector<int>{0, 1}); }),
+    EXPECT_EQ(ErrorOf([&] { (void)Run("SELECT ka_i FROM ka JOIN kb ON ka_d = kb_s", ExecutionMode::PARALLEL, 1, std::vector<int>{0, 1}); }),
               "the parallel executor can't join keys of types DATE and STRING");
-    EXPECT_EQ(ErrorOf([&] { (void)Run("SELECT ka_i FROM ka JOIN kb ON ka_d = kb_s", ExecutionMode::PARALLEL, 0, std::vector<int>{1, 0}); }),
+    EXPECT_EQ(ErrorOf([&] { (void)Run("SELECT ka_i FROM ka JOIN kb ON ka_d = kb_s", ExecutionMode::PARALLEL, 1, std::vector<int>{1, 0}); }),
               "the parallel executor can't join keys of types STRING and DATE");
-    EXPECT_EQ(ErrorOf([&] { (void)Run("SELECT ka_i FROM ka JOIN kb ON ka_s = kb_i", ExecutionMode::PARALLEL, 0, std::vector<int>{0, 1}); }),
+    EXPECT_EQ(ErrorOf([&] { (void)Run("SELECT ka_i FROM ka JOIN kb ON ka_s = kb_i", ExecutionMode::PARALLEL, 1, std::vector<int>{0, 1}); }),
               "the parallel executor can't join keys of types STRING and INTEGER");
-    EXPECT_EQ(ErrorOf([&] { (void)Run("SELECT ka_i FROM ka JOIN kb ON ka_d = kb_i", ExecutionMode::PARALLEL, 0, std::vector<int>{0, 1}); }),
+    EXPECT_EQ(ErrorOf([&] { (void)Run("SELECT ka_i FROM ka JOIN kb ON ka_d = kb_i", ExecutionMode::PARALLEL, 1, std::vector<int>{0, 1}); }),
               "the parallel executor can't join keys of types DATE and INTEGER");
 }
 
@@ -1060,7 +1060,7 @@ TEST_F(ParallelHashJoinTest, Q3AndQ5ShapeAnswers) {
         const std::string sql = tpch::FindQuery(tag)->sql;
         const QueryResult want = RunOn(*tpch, sql, ExecutionMode::VECTORIZED);
         ASSERT_GT(want.tuples.size(), 0u) << tag;
-        for (const unsigned threads : {0u, 1u}) {
+        for (const unsigned threads : {1u, 18u}) {
             const QueryResult got = RunOn(*tpch, sql, ExecutionMode::PARALLEL, threads);
             EXPECT_TRUE(tpch::SameResult(got, want)) << tag << ", threads " << threads << ": " << Difference(got, want);
         }
@@ -1099,7 +1099,7 @@ TEST_F(ParallelHashJoinTest, Q10BuildsOrdersSide) {
     const QueryResult want = RunOn(*tpch, q10, ExecutionMode::VECTORIZED);
     ASSERT_EQ(want.tuples.size(), 20u);
     EXPECT_TRUE(tpch::SameResult(c.result, want)) << Difference(c.result, want);
-    for (const unsigned threads : {0u, 1u}) {
+    for (const unsigned threads : {1u, 18u}) {
         const QueryResult got = RunOn(*tpch, q10, ExecutionMode::PARALLEL, threads);
         EXPECT_TRUE(tpch::SameResult(got, want)) << "threads " << threads << ": " << Difference(got, want);
     }

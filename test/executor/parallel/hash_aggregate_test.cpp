@@ -462,12 +462,12 @@ protected:
     }
 
     // Runs sql in the given mode; threads matters only for PARALLEL.
-    QueryResult Run(const std::string& sql, ExecutionMode mode, unsigned threads = 0) {
+    QueryResult Run(const std::string& sql, ExecutionMode mode, unsigned threads = 1) {
         return RunOn(*db_, sql, mode, threads);
     }
 
     // Runs sql on db in one mode.
-    static QueryResult RunOn(Database& db, const std::string& sql, ExecutionMode mode, unsigned threads = 0) {
+    static QueryResult RunOn(Database& db, const std::string& sql, ExecutionMode mode, unsigned threads = 1) {
         QueryOptions options;
         options.mode = mode;
         options.threads = threads;
@@ -578,7 +578,7 @@ TEST_F(ParallelHashAggregateTest, Q6ExactSum) {
     const std::string q6 = tpch::FindQuery("Q6")->sql;
     const QueryResult today = RunOn(*tpch, q6, ExecutionMode::VECTORIZED);
     ASSERT_EQ(today.tuples.size(), 1u);
-    for (const unsigned threads : {0u, 1u, 3u}) {
+    for (const unsigned threads : {1u, 3u, 18u}) {
         const QueryResult got = RunOn(*tpch, q6, ExecutionMode::PARALLEL, threads);
         ASSERT_EQ(got.tuples.size(), 1u);
         ASSERT_EQ(got.schema.GetColumn(0).type, TypeId::DECIMAL);
@@ -625,7 +625,7 @@ TEST_F(ParallelHashAggregateTest, Q1ShapeExactSums) {
         EXPECT_EQ(t.GetValue(got.schema, 5).integer_, entry.second.count);
     }
     EXPECT_EQ(OrderedDifference(got, RunOn(*tpch, q1, ExecutionMode::VECTORIZED)), "");
-    EXPECT_EQ(OrderedDifference(RunOn(*tpch, q1, ExecutionMode::PARALLEL, 1), got), "");
+    EXPECT_EQ(OrderedDifference(RunOn(*tpch, q1, ExecutionMode::PARALLEL, 18), got), "");
 }
 
 //  Many groups
@@ -681,7 +681,7 @@ TEST_F(ParallelHashAggregateTest, EmptyInputGlobalRow) {
     const std::string first = "SELECT COUNT(*), SUM(x), MIN(x)" + none;
     const QueryResult want = Run(first, ExecutionMode::VECTORIZED);
     ASSERT_EQ(want.tuples.size(), 1u);
-    for (const unsigned threads : {0u, 1u, 3u}) {
+    for (const unsigned threads : {1u, 3u, 18u}) {
         const QueryResult got = Run(first, ExecutionMode::PARALLEL, threads);
         ASSERT_EQ(got.tuples.size(), 1u);
         EXPECT_EQ(got.schema.GetColumn(0).type, TypeId::INTEGER);
@@ -857,7 +857,7 @@ TEST_F(ParallelHashAggregateTest, AvgAndMinMaxMatchTupleMode) {
         const QueryResult want = Run(sql, ExecutionMode::TUPLE);
         ASSERT_FALSE(want.tuples.empty()) << sql;
         EXPECT_EQ(Difference(Run(sql, ExecutionMode::PARALLEL), want), "") << sql;
-        EXPECT_EQ(Difference(Run(sql, ExecutionMode::PARALLEL, 1), want), "") << sql;
+        EXPECT_EQ(Difference(Run(sql, ExecutionMode::PARALLEL, 18), want), "") << sql;
     }
 
     // A sort above the groups, with and without a top n.

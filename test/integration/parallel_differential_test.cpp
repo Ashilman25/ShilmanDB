@@ -1284,11 +1284,12 @@ struct Outcome {
     bool threw{false};
 };
 
-// Runs sql in one mode, catching what it throws.
-Outcome RunQuery(Database& db, const std::string& sql, ExecutionMode mode) {
+// Runs sql in one mode, catching what it throws; the parallel executor on `threads` threads.
+Outcome RunQuery(Database& db, const std::string& sql, ExecutionMode mode, unsigned threads = 1) {
     Outcome out;
     QueryOptions options;
     options.mode = mode;
+    options.threads = threads;
     try {
         out.result = db.ExecuteSQL(sql, options);
     } catch (const std::exception& e) {

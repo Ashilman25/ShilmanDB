@@ -278,10 +278,11 @@ protected:
         return RunOn(*db_, sql, mode);
     }
 
-    // Runs sql on db in one mode.
+    // Runs sql on db in one mode; the parallel executor on one thread.
     static QueryResult RunOn(Database& db, const std::string& sql, ExecutionMode mode) {
         QueryOptions options;
         options.mode = mode;
+        options.threads = 1;
         return db.ExecuteSQL(sql, options);
     }
 

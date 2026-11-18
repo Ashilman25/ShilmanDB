@@ -196,7 +196,7 @@ protected:
     }
 
     // Runs sql in the given mode; threads matters only for PARALLEL.
-    QueryResult Run(const std::string& sql, ExecutionMode mode, unsigned threads = 0) {
+    QueryResult Run(const std::string& sql, ExecutionMode mode, unsigned threads = 1) {
         QueryOptions options;
         options.mode = mode;
         options.threads = threads;
@@ -261,6 +261,7 @@ TEST_F(ParallelNestedLoopJoinTest, ManyMorselsOnOneSide) {
     for (const std::vector<int>& order : {std::vector<int>{0, 1}, std::vector<int>{1, 0}}) {
         QueryOptions options;
         options.mode = ExecutionMode::PARALLEL;
+        options.threads = 1;
         options.forced_join_order = order;
         const QueryResult got = db_->ExecuteSQL(sql, options);
         EXPECT_EQ(got.profile.join.order, order);

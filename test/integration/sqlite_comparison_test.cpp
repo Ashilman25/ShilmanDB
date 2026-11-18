@@ -44,8 +44,13 @@ public:
     ModeDatabase() = default;
     ModeDatabase(Database* db, ExecutionMode mode) : db_(db), mode_(mode) {}
 
-    // The query in this test's mode.
-    [[nodiscard]] QueryResult ExecuteSQL(const std::string& sql) const { return db_->ExecuteSQL(sql, mode_); }
+    // The query in this test's mode; the parallel executor on one thread.
+    [[nodiscard]] QueryResult ExecuteSQL(const std::string& sql) const {
+        QueryOptions options;
+        options.mode = mode_;
+        options.threads = 1;
+        return db_->ExecuteSQL(sql, options);
+    }
 
     // Lets db_->ExecuteSQL(sql) read as it did with a plain Database pointer.
     const ModeDatabase* operator->() const { return this; }

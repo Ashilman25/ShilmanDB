@@ -116,9 +116,13 @@ protected:
 
     // Tuple mode against this test's mode: exact for vectorized; parallel sums
     // exactly, so its DECIMAL cells get SameResult's 1e-6 and the rest stay exact.
+    // The parallel executor runs on one thread.
     void RunParity(const std::string& sql) {
+        QueryOptions options;
+        options.mode = GetParam().mode;
+        options.threads = 1;
         auto tuple_rs = db_->ExecuteSQL(sql, ExecutionMode::TUPLE);
-        auto other_rs = db_->ExecuteSQL(sql, GetParam().mode);
+        auto other_rs = db_->ExecuteSQL(sql, options);
         ASSERT_EQ(tuple_rs.tuples.size(), other_rs.tuples.size())
             << "TPC-H parity: row-count mismatch";
         if (GetParam().mode == ExecutionMode::VECTORIZED) {

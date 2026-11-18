@@ -197,7 +197,7 @@ protected:
     }
 
     // Runs sql in the given mode; threads matters only for PARALLEL.
-    QueryResult Run(const std::string& sql, ExecutionMode mode, unsigned threads = 0) {
+    QueryResult Run(const std::string& sql, ExecutionMode mode, unsigned threads = 1) {
         QueryOptions options;
         options.mode = mode;
         options.threads = threads;
@@ -474,6 +474,7 @@ TEST_F(ParallelBasicTest, ErrorLeavesNothingPinned) {
 TEST_F(ParallelBasicTest, AnalyzeLeavesTheProfileEmpty) {
     QueryOptions options;
     options.mode = ExecutionMode::PARALLEL;
+    options.threads = 1;
     options.analyze = true;
     const QueryResult r = db_->ExecuteSQL("SELECT a FROM t WHERE a < 10", options);
     EXPECT_EQ(r.tuples.size(), 10u);

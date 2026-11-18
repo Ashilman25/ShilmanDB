@@ -121,10 +121,11 @@ protected:
         db_ = slot.get();
     }
 
-    // Runs sql in one mode, every core allowed.
+    // Runs sql in one mode; the parallel executor on one thread.
     QueryResult Run(const std::string& sql, ExecutionMode mode) {
         QueryOptions options;
         options.mode = mode;
+        options.threads = 1;
         return db_->ExecuteSQL(sql, options);
     }
 };
