@@ -82,20 +82,58 @@ void InsertSorted(std::vector<uint32_t>& columns, uint32_t c) {
     if (at == columns.end() || *at != c) columns.insert(at, c);
 }
 
-// The first EQ of two bound columns on opposite sides, searching ANDs left first.
-// left_count splits the join's columns into its two sides.
-const BinaryOp* FindJoinKey(const Expression& e, uint32_t left_count) {
-    if (e.type != ExprType::BINARY_OP) return nullptr;
+// A hash join's key: its equality and the column it reads on each child.
+struct JoinKey {
+    const BinaryOp* eq{nullptr};
+    uint32_t left{0};   // a left child column
+    uint32_t right{0};  // a right child column, numbered as the right child does
+};
+
+// The first column with this name, as today's hash join looks it up.
+std::optional<uint32_t> FirstNamed(const Schema& schema, const std::string& name) {
+    for (uint32_t i = 0; i < schema.GetColumnCount(); ++i) {
+        if (schema.GetColumn(i).name == name) return i;
+    }
+    return std::nullopt;
+}
+
+// Today's rule: a column found on one side only decides; else a qualified
+// column, a before b, is taken as the left one; else a left, b right.
+std::optional<std::pair<uint32_t, uint32_t>> ResolveKeyColumns(const ColumnRef& a, const ColumnRef& b, const Schema& left, const Schema& right) {
+    const std::optional<uint32_t> a_left = FirstNamed(left, a.column_name);
+    const std::optional<uint32_t> a_right = FirstNamed(right, a.column_name);
+    const std::optional<uint32_t> b_left = FirstNamed(left, b.column_name);
+    const std::optional<uint32_t> b_right = FirstNamed(right, b.column_name);
+    if (a_left && !a_right && b_right && !b_left) return std::make_pair(*a_left, *b_right);
+    if (b_left && !b_right && a_right && !a_left) return std::make_pair(*b_left, *a_right);
+    if (a_left && b_right && a.table_name) return std::make_pair(*a_left, *b_right);
+    if (b_left && a_right && b.table_name) return std::make_pair(*b_left, *a_right);
+    if (a_left && b_right) return std::make_pair(*a_left, *b_right);
+    if (b_left && a_right) return std::make_pair(*b_left, *a_right);
+    return std::nullopt;
+}
+
+// The first EQ of two columns that resolves to one column per child, searching
+// ANDs left first. Columns resolve by name in each child's schema, not by binding.
+std::optional<JoinKey> FindJoinKey(const Expression& e, const Schema& left, const Schema& right) {
+    if (e.type != ExprType::BINARY_OP) return std::nullopt;
     const auto& b = static_cast<const BinaryOp&>(e);
     if (b.op == BinaryOp::Op::AND) {
-        if (const BinaryOp* found = FindJoinKey(*b.left, left_count)) return found;
-        return FindJoinKey(*b.right, left_count);
+        if (std::optional<JoinKey> found = FindJoinKey(*b.left, left, right)) return found;
+        return FindJoinKey(*b.right, left, right);
     }
-    if (b.op != BinaryOp::Op::EQ || b.left->type != ExprType::COLUMN_REF || b.right->type != ExprType::COLUMN_REF) return nullptr;
-    const auto& l = static_cast<const ColumnRef&>(*b.left);
-    const auto& r = static_cast<const ColumnRef&>(*b.right);
-    if (!l.bound_index || !r.bound_index) return nullptr;
-    return (*l.bound_index < left_count) != (*r.bound_index < left_count) ? &b : nullptr;
+    if (b.op != BinaryOp::Op::EQ || b.left->type != ExprType::COLUMN_REF || b.right->type != ExprType::COLUMN_REF) return std::nullopt;
+    const auto columns = ResolveKeyColumns(static_cast<const ColumnRef&>(*b.left), static_cast<const ColumnRef&>(*b.right), left, right);
+    if (!columns) return std::nullopt;
+    return JoinKey{&b, columns->first, columns->second};
+}
+
+// A column reference bound to column c, for compiling a key found by name.
+ColumnRef BoundColumn(const std::string& name, uint32_t c) {
+    ColumnRef ref;
+    ref.column_name = name;
+    ref.bound_index = c;
+    return ref;
 }
 
 // Makes slot `slot` of from the next slot of out, holding out's column c.
@@ -467,14 +505,13 @@ private:
         const uint32_t join_count = join.output_schema.GetColumnCount();
         assert(join_count == left_count + right.output_schema.GetColumnCount());
 
-        const BinaryOp* key = join.join_predicate ? FindJoinKey(*join.join_predicate, left_count) : nullptr;
-        if (key == nullptr) throw DatabaseException("HashJoinExecutor: no equi-join predicate found");
-        const bool key_left_first = *static_cast<const ColumnRef&>(*key->left).bound_index < left_count;
-        const Expression& left_key = key_left_first ? *key->left : *key->right;
-        const Expression& right_key = key_left_first ? *key->right : *key->left;
+        const std::optional<JoinKey> key = join.join_predicate ? FindJoinKey(*join.join_predicate, left.output_schema, right.output_schema) : std::nullopt;
+        if (!key) throw DatabaseException("HashJoinExecutor: no equi-join predicate found");
+        const ColumnRef left_key = BoundColumn(left.output_schema.GetColumn(key->left).name, key->left);
+        const ColumnRef right_key = BoundColumn(right.output_schema.GetColumn(key->right).name, left_count + key->right);
         std::vector<const Expression*> rest;
         SplitAnd(*join.join_predicate, rest);
-        rest.erase(std::remove(rest.begin(), rest.end(), key), rest.end());
+        rest.erase(std::remove(rest.begin(), rest.end(), key->eq), rest.end());
 
         // Each side hands up its output and residual columns, plus its key.
         std::vector<uint32_t> columns = needed;
@@ -482,8 +519,8 @@ private:
         const JoinSides sides = SplitSides(columns, left_count);
         std::vector<uint32_t> left_read = sides.left;
         std::vector<uint32_t> right_read = sides.right;
-        InsertSorted(left_read, *static_cast<const ColumnRef&>(left_key).bound_index);
-        InsertSorted(right_read, *static_cast<const ColumnRef&>(right_key).bound_index - left_count);
+        InsertSorted(left_read, key->left);
+        InsertSorted(right_read, key->right);
 
         // The build side gets a pipeline of its own, closed once the join is made.
         const bool build_left = join.est_left_rows >= 0 && join.est_right_rows >= 0 && join.est_left_rows < join.est_right_rows;

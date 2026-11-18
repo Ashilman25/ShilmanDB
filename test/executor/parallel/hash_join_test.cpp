@@ -673,6 +673,44 @@ TEST_F(ParallelHashJoinTest, SameSideEqualityIsSkippedAnIntendedDifference) {
     EXPECT_TRUE(RunPlan(*Plan(sql)).top.has_residual);
 }
 
+TEST_F(ParallelHashJoinTest, SharedColumnNameKeysResolveByName) {
+    // Both tables have a column k. Binding ignores qualifiers, so ka.k and kb.k
+    // both bind to the left child's k; the key is found by name in each child.
+    Load("ka", Schema({Column("k", ColumnType::Integer()), Column("x", ColumnType::Integer())}), "1|5|\n2|5|\n3|6|\n");
+    Load("kb", Schema({Column("k", ColumnType::Integer()), Column("y", ColumnType::Integer())}), "1|5|\n3|6|\n4|5|\n");
+    struct Case {
+        std::string sql;
+        size_t rows;
+    };
+    const std::vector<Case> cases = {
+        {"SELECT x, y FROM ka JOIN kb ON ka.k = kb.k AND ka.x = kb.y", 2},
+        {"SELECT x, y FROM ka JOIN kb ON ka.k = kb.k", 2},
+        {"SELECT x, y FROM ka, kb WHERE ka.k = kb.k AND x = y", 2},
+        // All modes give 5, the same wrong answer: x = y is the key, and the
+        // residual's ka.k = kb.k reads one column twice (binding ignores qualifiers).
+        {"SELECT x, y FROM ka JOIN kb ON ka.x = kb.y AND ka.k = kb.k", 5},
+    };
+    for (const Case& c : cases) {
+        SCOPED_TRACE(c.sql);
+        const QueryResult want = Run(c.sql, ExecutionMode::VECTORIZED, 1);
+        EXPECT_EQ(want.tuples.size(), c.rows);
+        // How a run differs from want, or what it threw.
+        const auto differs = [&](auto run) {
+            try {
+                return Difference(run(), want);
+            } catch (const std::exception& e) {
+                return std::string("threw: ") + e.what();
+            }
+        };
+        for (const std::vector<int>& order : {std::vector<int>{0, 1}, std::vector<int>{1, 0}}) {
+            EXPECT_EQ(differs([&] { return Run(c.sql, ExecutionMode::PARALLEL, 1, order); }), "") << "order " << order[0];
+        }
+        for (const bool build_left : {false, true}) {
+            EXPECT_EQ(differs([&] { return RunPlan(*PlanBuilding(c.sql, build_left)).result; }), "") << "build_left " << build_left;
+        }
+    }
+}
+
 TEST_F(ParallelHashJoinTest, NoEquiKeyIsRefused) {
     // Only the same-side equality left: no key, today's error text.
     auto root = Plan("SELECT l_k, r_k FROM l JOIN r ON l_j = l_m AND l_k = r_k");
