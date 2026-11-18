@@ -85,17 +85,31 @@ uint32_t ColumnarTable::RowGroupRows(size_t group) const {
     return meta_.row_groups[group].row_count;
 }
 
-const ChunkMeta& ColumnarTable::Chunk(size_t group, uint32_t column, const ColumnVector& out) const {
+const ChunkMeta& ColumnarTable::ChunkAt(size_t group, uint32_t column) const {
     if (group >= meta_.row_groups.size()) {
         throw DatabaseException(meta_.name + ": no row group " + std::to_string(group));
     }
     if (column >= meta_.columns.size()) {
         throw DatabaseException(meta_.name + ": no column " + std::to_string(column));
     }
+    return meta_.row_groups[group].chunks[column];
+}
+
+const ChunkMeta& ColumnarTable::Chunk(size_t group, uint32_t column, const ColumnVector& out) const {
+    const ChunkMeta& chunk = ChunkAt(group, column);
     if (out.Type() != meta_.columns[column].type) {
         throw DatabaseException(meta_.name + ": column " + meta_.columns[column].name + " is " + ColumnTypeName(meta_.columns[column].type) + ", not " + ColumnTypeName(out.Type()));
     }
-    return meta_.row_groups[group].chunks[column];
+    return chunk;
+}
+
+const ChunkMeta& ColumnarTable::ChunkOfKind(size_t group, uint32_t column, PhysicalKind kind) const {
+    const ChunkMeta& chunk = ChunkAt(group, column);
+    const ColumnMeta& c = meta_.columns[column];
+    if (PhysicalKindOf(c.type) != kind) {
+        throw DatabaseException(meta_.name + ": column " + c.name + " is " + ColumnTypeName(c.type) + ", which doesn't read as " + PhysicalKindWords(kind));
+    }
+    return chunk;
 }
 
 void ColumnarTable::ReadChunk(size_t group, uint32_t column, ColumnVector& out) const {
@@ -111,6 +125,49 @@ void ColumnarTable::ReadValue(RowPosition pos, uint32_t column, ColumnVector& ou
     }
     PoolPages pages(bpm_, chunk, meta_.name);
     DecodeValue(chunk, pages, pos.offset, out);
+}
+
+const ChunkMeta& ColumnarTable::DictionaryChunk(size_t group, uint32_t column, const ChunkMeta& chunk) const {
+    if (chunk.encoding != Encoding::DICTIONARY) {
+        throw DatabaseException(meta_.name + ": column " + meta_.columns[column].name + " has no dictionary in row group " + std::to_string(group));
+    }
+    return chunk;
+}
+
+void ColumnarTable::ReadRows(size_t group, uint32_t column, const uint32_t* rows, uint32_t n, int64_t* out) const {
+    const ChunkMeta& chunk = ChunkOfKind(group, column, PhysicalKind::INT64);
+    PoolPages pages(bpm_, chunk, meta_.name);
+    DecodeRows(chunk, pages, meta_.columns[column].type, rows, n, out);
+}
+
+void ColumnarTable::ReadRows(size_t group, uint32_t column, const uint32_t* rows, uint32_t n, __int128* out) const {
+    const ChunkMeta& chunk = ChunkOfKind(group, column, PhysicalKind::INT128);
+    PoolPages pages(bpm_, chunk, meta_.name);
+    DecodeRows(chunk, pages, meta_.columns[column].type, rows, n, out);
+}
+
+void ColumnarTable::ReadRows(size_t group, uint32_t column, const uint32_t* rows, uint32_t n, double* out) const {
+    const ChunkMeta& chunk = ChunkOfKind(group, column, PhysicalKind::DOUBLE);
+    PoolPages pages(bpm_, chunk, meta_.name);
+    DecodeRows(chunk, pages, meta_.columns[column].type, rows, n, out);
+}
+
+void ColumnarTable::ReadRows(size_t group, uint32_t column, const uint32_t* rows, uint32_t n, StringRef* out, StringArena& arena) const {
+    const ChunkMeta& chunk = ChunkOfKind(group, column, PhysicalKind::STRING);
+    PoolPages pages(bpm_, chunk, meta_.name);
+    DecodeRows(chunk, pages, meta_.columns[column].type, rows, n, out, arena);
+}
+
+void ColumnarTable::ReadCodes(size_t group, uint32_t column, const uint32_t* rows, uint32_t n, uint32_t* out) const {
+    const ChunkMeta& chunk = DictionaryChunk(group, column, ChunkAt(group, column));
+    PoolPages pages(bpm_, chunk, meta_.name);
+    DecodeCodes(chunk, pages, rows, n, out);
+}
+
+void ColumnarTable::ReadDictionary(size_t group, uint32_t column, std::vector<StringRef>& out, StringArena& arena) const {
+    const ChunkMeta& chunk = DictionaryChunk(group, column, ChunkOfKind(group, column, PhysicalKind::STRING));
+    PoolPages pages(bpm_, chunk, meta_.name);
+    DecodeDictionary(chunk, pages, meta_.columns[column].type, out, arena);
 }
 
 std::unordered_map<std::string, MinMax> ColumnarTable::GroupRanges(size_t group) const {

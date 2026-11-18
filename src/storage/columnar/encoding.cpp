@@ -2,10 +2,12 @@
 #include "common/exception.hpp"
 #include "storage/columnar/crc32c.hpp"
 #include <algorithm>
+#include <cassert>
 #include <cmath>
 #include <cstring>
 #include <functional>
 #include <string_view>
+#include <type_traits>
 
 namespace shilmandb {
 namespace {
@@ -934,6 +936,381 @@ void DecodeValue(const ChunkMeta& meta, ChunkPages& pages, uint32_t row, ColumnV
     const uint32_t entry = code - entries[j];
     if (entry >= view.header.value_count) ThrowDamaged("entry " + std::to_string(code) + " past its page");
     AppendPlain(view, entry, width, out);
+}
+
+// A few words for a physical kind, for error messages.
+const char* PhysicalKindWords(PhysicalKind kind) {
+    switch (kind) {
+        case PhysicalKind::INT64:  return "64-bit integers";
+        case PhysicalKind::INT128: return "128-bit integers";
+        case PhysicalKind::DOUBLE: return "doubles";
+        case PhysicalKind::STRING: return "strings";
+    }
+    return "values";
+}
+
+namespace {
+
+//  reading rows into typed arrays
+
+// The physical kind each output array of DecodeRows holds.
+template <typename T>
+constexpr PhysicalKind OutputKind() {
+    if constexpr (std::is_same_v<T, int64_t>) return PhysicalKind::INT64;
+    else if constexpr (std::is_same_v<T, __int128>) return PhysicalKind::INT128;
+    else if constexpr (std::is_same_v<T, double>) return PhysicalKind::DOUBLE;
+    else return PhysicalKind::STRING;
+}
+
+// Refuses an output array that doesn't match the column type's kind.
+void RequireKind(const ColumnType& type, PhysicalKind kind) {
+    if (PhysicalKindOf(type) != kind) {
+        throw DatabaseException(ColumnTypeName(type) + " doesn't decode as " + PhysicalKindWords(kind));
+    }
+}
+
+// Callers refuse chunks with NULLs first, so reaching one means the chunk is wrong.
+[[noreturn]] void ThrowNullRow(uint32_t row) {
+    throw DatabaseException("damaged column chunk: row " + std::to_string(row) + " is NULL");
+}
+
+// Checks the requested rows are ascending and inside the chunk.
+void CheckRows(const ChunkMeta& meta, const uint32_t* rows, uint32_t n) {
+    if (n == 0) return;
+    if (rows != nullptr) {
+        for (uint32_t k = 1; k < n; ++k) {
+            if (rows[k] < rows[k - 1]) {
+                throw DatabaseException("rows must be ascending: row " + std::to_string(rows[k]) + " comes after row " + std::to_string(rows[k - 1]));
+            }
+        }
+    }
+    const uint32_t last = rows != nullptr ? rows[n - 1] : n - 1;
+    if (last >= meta.value_count) {
+        throw DatabaseException("row " + std::to_string(last) + " is past the chunk's " + std::to_string(meta.value_count) + " values");
+    }
+}
+
+// Starts begin at 0, rise, and stay below total: every value on exactly one page.
+void CheckStarts(const std::vector<uint32_t>& starts, uint32_t total, const char* what) {
+    if (total > 0 && starts.empty()) ThrowDamaged(std::string("no ") + what + " pages for " + std::to_string(total) + " values");
+    for (size_t p = 0; p < starts.size(); ++p) {
+        const bool rises = p == 0 ? starts[0] == 0 : starts[p] > starts[p - 1];
+        if (!rises || starts[p] >= total) ThrowDamaged(std::string(what) + " page starts are out of order");
+    }
+}
+
+// The page lists add up to the chunk's pages, every value on exactly one page.
+void CheckPageLists(const ChunkMeta& meta) {
+    if (meta.dict_page_first_entries.size() != meta.dict_page_count) ThrowDamaged("dictionary page list doesn't match its page count");
+    if (meta.dict_page_count + meta.page_first_rows.size() != meta.page_count) ThrowDamaged("page lists don't match the chunk's page count");
+    CheckStarts(meta.page_first_rows, meta.value_count, "data");
+    CheckStarts(meta.dict_page_first_entries, meta.dict_size, "dictionary");
+}
+
+// Calls fn(k, slot) for requested rows k0..k1-1 of a page starting at row first.
+template <typename Fn>
+void ForEachSlot(const uint32_t* rows, uint32_t first, uint32_t k0, uint32_t k1, Fn fn) {
+    if (rows == nullptr) {
+        for (uint32_t k = k0; k < k1; ++k) fn(k, k - first);
+    } else {
+        for (uint32_t k = k0; k < k1; ++k) fn(k, rows[k] - first);
+    }
+}
+
+// Throws for the first requested row on this page that is NULL.
+void RequireNoNulls(const PageView& view, const uint32_t* rows, uint32_t first, uint32_t k0, uint32_t k1) {
+    if (view.null_bits == nullptr) return;
+    ForEachSlot(rows, first, k0, k1, [&](uint32_t, uint32_t slot) {
+        if (view.IsNull(slot)) ThrowNullRow(first + slot);
+    });
+}
+
+// Walks the data pages holding a requested row, in order, pinning each once.
+// visit(view, first, k0, k1) gets requested rows k0..k1-1, all on that page.
+template <typename Visit>
+void WalkDataPages(const ChunkMeta& meta, ChunkPages& pages, const ColumnType& type, const uint32_t* rows, uint32_t n, Visit visit) {
+    const auto& firsts = meta.page_first_rows;
+    uint32_t k = 0;
+    for (uint32_t p = 0; p < firsts.size() && k < n; ++p) {
+        const uint32_t first = firsts[p];
+        const uint32_t end = PageEnd(firsts, p, meta.value_count);
+        const uint32_t k0 = k;
+        if (rows == nullptr) {
+            k = std::min(end, n);
+        } else {
+            while (k < n && rows[k] < end) ++k;
+        }
+        if (k == k0) continue;  // no requested row here, so the page is never pinned
+
+        PinnedPage pin(pages, meta.dict_page_count + p);
+        const PageView view = OpenPage(pin.Data(), PageKind::DATA, meta.encoding, first, type);
+        if (view.header.value_count != end - first) {
+            ThrowDamaged("page holds " + std::to_string(view.header.value_count) + " values, the chunk says " + std::to_string(end - first));
+        }
+        RequireNoNulls(view, rows, first, k0, k);
+        visit(view, first, k0, k);
+    }
+}
+
+// Walks the dictionary pages where wanted(e0, e1) holds, pinning each once.
+// visit(view, e0, e1) gets the page's entries e0..e1-1.
+template <typename Wanted, typename Visit>
+void WalkDictionaryPages(const ChunkMeta& meta, ChunkPages& pages, const ColumnType& type, Wanted wanted, Visit visit) {
+    const auto& entries = meta.dict_page_first_entries;
+    for (uint32_t j = 0; j < entries.size(); ++j) {
+        const uint32_t e0 = entries[j];
+        const uint32_t e1 = PageEnd(entries, j, meta.dict_size);
+        if (!wanted(e0, e1)) continue;
+
+        PinnedPage pin(pages, j);
+        const PageView view = OpenPage(pin.Data(), PageKind::DICTIONARY, Encoding::PLAIN, e0, type);
+        if (view.header.value_count != e1 - e0) {
+            ThrowDamaged("page holds " + std::to_string(view.header.value_count) + " values, the chunk says " + std::to_string(e1 - e0));
+        }
+        visit(view, e0, e1);
+    }
+}
+
+// Unpacks the packed values of slots s0..s1-1 of a page, calling emit(slot, value).
+// Slots whose nine bytes sit inside the page skip ReadPacked's bounds checks.
+template <typename Emit>
+void UnpackSlots(const PageView& view, uint32_t s0, uint32_t s1, Emit emit) {
+    const uint32_t bits = view.header.bit_width;
+    if (bits == 0) {
+        for (uint32_t s = s0; s < s1; ++s) emit(s, uint64_t{0});
+        return;
+    }
+
+    const size_t base = view.DataBit();
+    const uint64_t mask = bits == 64 ? ~uint64_t{0} : (uint64_t{1} << bits) - 1;
+    constexpr size_t kLastFastBit = (PAGE_SIZE - 9) * 8 + 7;  // its word and spill byte end inside the page
+    uint32_t fast_end = s0;
+    if (base + static_cast<size_t>(s0) * bits <= kLastFastBit) {
+        fast_end = static_cast<uint32_t>(std::min<size_t>(s1, (kLastFastBit - base) / bits + 1));
+    }
+
+    for (uint32_t s = s0; s < fast_end; ++s) {
+        const size_t bit = base + static_cast<size_t>(s) * bits;
+        const size_t byte = bit >> 3;
+        const uint32_t shift = bit & 7;
+        assert(byte + 9 <= PAGE_SIZE && "the fast path reads nine bytes inside the page");
+
+        uint64_t word;
+        std::memcpy(&word, view.page + byte, sizeof(word));
+        uint64_t value = word >> shift;
+        if (shift + bits > 64) value |= static_cast<uint64_t>(static_cast<unsigned char>(view.page[byte + 8])) << (64 - shift);
+        emit(s, value & mask);
+    }
+    for (uint32_t s = fast_end; s < s1; ++s) emit(s, ReadPacked(view.page, base + static_cast<size_t>(s) * bits, bits));
+}
+
+// PLAIN slots stored as Stored, widened into out[k].
+template <typename Stored, typename T>
+void ReadFixedSlots(const PageView& view, const uint32_t* rows, uint32_t first, uint32_t k0, uint32_t k1, T* out) {
+    const char* data = view.data;
+    ForEachSlot(rows, first, k0, k1, [&](uint32_t k, uint32_t slot) {
+        Stored x;
+        std::memcpy(&x, data + static_cast<size_t>(slot) * sizeof(Stored), sizeof(Stored));
+        out[k] = static_cast<T>(x);
+    });
+}
+
+// Entry i of a PLAIN string page's offset table.
+uint16_t StringOffset(const PageView& view, uint32_t i) {
+    uint16_t x;
+    std::memcpy(&x, view.data + 2 * static_cast<size_t>(i), sizeof(x));
+    return x;
+}
+
+// PLAIN string slots s0..s1-1: one arena copy of their bytes, then a ref each.
+void CopyStringRun(const PageView& view, uint32_t s0, uint32_t s1, StringRef* out, StringArena& arena) {
+    if (s0 == s1) return;
+    const uint16_t start = StringOffset(view, s0);
+    if (start < view.strings_start) {
+        ThrowDamaged("string starts at byte " + std::to_string(start) + ", before the strings at byte " + std::to_string(view.strings_start));
+    }
+    uint16_t end = start;
+    for (uint32_t s = s0; s < s1; ++s) {
+        const uint16_t to = StringOffset(view, s + 1);
+        if (to < end || to > PAGE_SIZE) ThrowDamaged("string offsets out of order");
+        end = to;
+    }
+    const StringRef bytes = arena.Copy(std::string_view(view.page + start, end - start));
+    uint16_t from = start;
+    for (uint32_t s = s0; s < s1; ++s) {
+        const uint16_t to = StringOffset(view, s + 1);
+        out[s - s0] = StringRef{bytes.data + (from - start), static_cast<uint32_t>(to - from)};
+        from = to;
+    }
+}
+
+// PLAIN string slots into out[k]: a run copied at once, a list string by string.
+void ReadStringSlots(const PageView& view, const uint32_t* rows, uint32_t first, uint32_t k0, uint32_t k1, StringRef* out, StringArena& arena) {
+    if (rows == nullptr) {
+        CopyStringRun(view, k0 - first, k1 - first, out + k0, arena);
+        return;
+    }
+    for (uint32_t k = k0; k < k1; ++k) CopyStringRun(view, rows[k] - first, rows[k] - first + 1, out + k, arena);
+}
+
+// PLAIN slots of a data or dictionary page into out[k], for each output kind.
+template <typename T>
+void ReadPlainSlots(const PageView& view, const ColumnType& type, const uint32_t* rows, uint32_t first, uint32_t k0, uint32_t k1, T* out, StringArena* arena) {
+    if constexpr (std::is_same_v<T, int64_t>) {
+        switch (PlainWidth(type)) {
+            case 1:  ReadFixedSlots<int8_t>(view, rows, first, k0, k1, out); break;
+            case 2:  ReadFixedSlots<int16_t>(view, rows, first, k0, k1, out); break;
+            case 4:  ReadFixedSlots<int32_t>(view, rows, first, k0, k1, out); break;
+            default: ReadFixedSlots<int64_t>(view, rows, first, k0, k1, out); break;
+        }
+    } else if constexpr (std::is_same_v<T, StringRef>) {
+        ReadStringSlots(view, rows, first, k0, k1, out, *arena);
+    } else {
+        ReadFixedSlots<T>(view, rows, first, k0, k1, out);
+    }
+}
+
+// Adds a packed offset to the page's frame, wrapping as the writer's subtraction did.
+int64_t AddOffset(int64_t frame, uint64_t offset) {
+    return static_cast<int64_t>(static_cast<uint64_t>(frame) + offset);
+}
+__int128 AddOffset(__int128 frame, uint64_t offset) {
+    return static_cast<__int128>(static_cast<unsigned __int128>(frame) + offset);
+}
+
+// BITPACK slots into out[k]: a run unpacked in one pass, a list one ReadPacked each.
+template <typename T>
+void ReadPackedSlots(const PageView& view, const uint32_t* rows, uint32_t first, uint32_t k0, uint32_t k1, T* out) {
+    T frame;
+    std::memcpy(&frame, view.header.fields, sizeof(frame));
+    if (rows == nullptr) {
+        UnpackSlots(view, k0 - first, k1 - first, [&](uint32_t slot, uint64_t offset) { out[first + slot] = AddOffset(frame, offset); });
+        return;
+    }
+    const uint32_t bits = view.header.bit_width;
+    for (uint32_t k = k0; k < k1; ++k) {
+        const size_t bit = view.DataBit() + static_cast<size_t>(rows[k] - first) * bits;
+        out[k] = AddOffset(frame, ReadPacked(view.page, bit, bits));
+    }
+}
+
+// The codes of the requested rows; each must fall inside the dictionary.
+void ReadAllCodes(const ChunkMeta& meta, ChunkPages& pages, const ColumnType& type, const uint32_t* rows, uint32_t n, uint32_t* out) {
+    WalkDataPages(meta, pages, type, rows, n, [&](const PageView& view, uint32_t first, uint32_t k0, uint32_t k1) {
+        if (rows != nullptr) {
+            for (uint32_t k = k0; k < k1; ++k) out[k] = ReadCode(view, rows[k] - first, meta.dict_size);
+            return;
+        }
+        UnpackSlots(view, k0 - first, k1 - first, [&](uint32_t slot, uint64_t code) {
+            if (code >= meta.dict_size) ThrowDamaged("dictionary code " + std::to_string(code) + " past the dictionary");
+            out[first + slot] = static_cast<uint32_t>(code);
+        });
+    });
+}
+
+// A DICTIONARY chunk's rows: their codes, then only the dictionary pages they use.
+template <typename T>
+void DecodeDictionaryRows(const ChunkMeta& meta, ChunkPages& pages, const ColumnType& type, const uint32_t* rows, uint32_t n, T* out, StringArena* arena) {
+    std::vector<uint32_t> codes(n);
+    ReadAllCodes(meta, pages, type, rows, n, codes.data());
+    std::vector<uint8_t> used(meta.dict_size, 0);
+    for (uint32_t code : codes) used[code] = 1;
+
+    std::vector<T> entries(meta.dict_size);
+    WalkDictionaryPages(
+        meta, pages, type,
+        [&](uint32_t e0, uint32_t e1) { return std::find(used.begin() + e0, used.begin() + e1, uint8_t{1}) != used.begin() + e1; },
+        [&](const PageView& view, uint32_t e0, uint32_t e1) { ReadPlainSlots(view, type, nullptr, e0, e0, e1, entries.data(), arena); }
+    );
+    for (uint32_t k = 0; k < n; ++k) out[k] = entries[codes[k]];
+}
+
+// A CONSTANT chunk's value as one output element; a string is copied into arena.
+template <typename T>
+T ConstantValue(const ChunkMeta& meta, uint32_t first_row, StringArena* arena) {
+    if (!meta.constant.has_value()) ThrowNullRow(first_row);
+    if constexpr (std::is_same_v<T, StringRef>) {
+        const auto* s = std::get_if<std::string>(&*meta.constant);
+        if (s == nullptr) throw DatabaseException("damaged column chunk: constant of the wrong kind");
+        return arena->Copy(*s);
+    } else {
+        const auto* v = std::get_if<T>(&*meta.constant);
+        if (v == nullptr) throw DatabaseException("damaged column chunk: constant of the wrong kind");
+        return *v;
+    }
+}
+
+// The body of the four DecodeRows overloads; arena is null except for strings.
+template <typename T>
+void DecodeTypedRows(const ChunkMeta& meta, ChunkPages& pages, const ColumnType& type, const uint32_t* rows, uint32_t n, T* out, StringArena* arena) {
+    RequireKind(type, OutputKind<T>());
+    CheckRows(meta, rows, n);
+    if (n == 0) return;
+    if (meta.encoding == Encoding::CONSTANT) {
+        std::fill(out, out + n, ConstantValue<T>(meta, rows != nullptr ? rows[0] : 0, arena));
+        return;
+    }
+    CheckPageLists(meta);
+    switch (meta.encoding) {
+        case Encoding::PLAIN:
+            WalkDataPages(meta, pages, type, rows, n, [&](const PageView& view, uint32_t first, uint32_t k0, uint32_t k1) {
+                ReadPlainSlots(view, type, rows, first, k0, k1, out, arena);
+            });
+            return;
+        case Encoding::BITPACK:
+            if constexpr (std::is_same_v<T, int64_t> || std::is_same_v<T, __int128>) {
+                WalkDataPages(meta, pages, type, rows, n, [&](const PageView& view, uint32_t first, uint32_t k0, uint32_t k1) {
+                    ReadPackedSlots(view, rows, first, k0, k1, out);
+                });
+                return;
+            }
+            ThrowDamaged("BITPACK on a column that isn't an integer");
+        case Encoding::DICTIONARY:
+            DecodeDictionaryRows(meta, pages, type, rows, n, out, arena);
+            return;
+        case Encoding::CONSTANT: return;  // filled above
+    }
+    ThrowDamaged("unknown encoding " + std::to_string(static_cast<int>(meta.encoding)));
+}
+
+}  // namespace
+
+// The four overloads share one body; each picks its output kind.
+void DecodeRows(const ChunkMeta& meta, ChunkPages& pages, const ColumnType& type, const uint32_t* rows, uint32_t n, int64_t* out) {
+    DecodeTypedRows(meta, pages, type, rows, n, out, nullptr);
+}
+
+void DecodeRows(const ChunkMeta& meta, ChunkPages& pages, const ColumnType& type, const uint32_t* rows, uint32_t n, __int128* out) {
+    DecodeTypedRows(meta, pages, type, rows, n, out, nullptr);
+}
+
+void DecodeRows(const ChunkMeta& meta, ChunkPages& pages, const ColumnType& type, const uint32_t* rows, uint32_t n, double* out) {
+    DecodeTypedRows(meta, pages, type, rows, n, out, nullptr);
+}
+
+void DecodeRows(const ChunkMeta& meta, ChunkPages& pages, const ColumnType& type, const uint32_t* rows, uint32_t n, StringRef* out, StringArena& arena) {
+    DecodeTypedRows(meta, pages, type, rows, n, out, &arena);
+}
+
+// Reads only the data pages; the dictionary is never pinned.
+void DecodeCodes(const ChunkMeta& meta, ChunkPages& pages, const uint32_t* rows, uint32_t n, uint32_t* out) {
+    if (meta.encoding != Encoding::DICTIONARY) throw DatabaseException("only a DICTIONARY chunk has codes");
+    CheckRows(meta, rows, n);
+    if (n == 0) return;
+    CheckPageLists(meta);
+    ReadAllCodes(meta, pages, ColumnType::BigInt(), rows, n, out);
+}
+
+// Reads each dictionary page once, in order; the data pages are never pinned.
+void DecodeDictionary(const ChunkMeta& meta, ChunkPages& pages, const ColumnType& type, std::vector<StringRef>& out, StringArena& arena) {
+    RequireKind(type, PhysicalKind::STRING);
+    if (meta.encoding != Encoding::DICTIONARY) throw DatabaseException("only a DICTIONARY chunk has a dictionary");
+    CheckPageLists(meta);
+    out.assign(meta.dict_size, StringRef{});
+    WalkDictionaryPages(
+        meta, pages, type, [](uint32_t, uint32_t) { return true; },
+        [&](const PageView& view, uint32_t e0, uint32_t e1) { CopyStringRun(view, 0, e1 - e0, out.data() + e0, arena); }
+    );
 }
 
 }  // namespace shilmandb
