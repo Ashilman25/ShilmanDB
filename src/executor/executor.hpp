@@ -9,7 +9,8 @@ namespace shilmandb {
 
 enum class ExecutionMode { 
     TUPLE, 
-    VECTORIZED 
+    VECTORIZED,
+    PARALLEL  // the push-based executor for columnar tables; never built by ExecutorFactory
 };
 
 class Executor {

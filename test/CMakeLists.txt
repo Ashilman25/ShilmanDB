@@ -104,6 +104,7 @@ shilmandb_add_test(parallel_vector_test executor/parallel/vector_test.cpp)
 shilmandb_add_test(parallel_decimal_test executor/parallel/decimal_test.cpp)
 shilmandb_add_test(parallel_expression_test executor/parallel/expression_test.cpp)
 shilmandb_add_test(parallel_expression_differential_test executor/parallel/expression_differential_test.cpp)
+shilmandb_add_test(parallel_pipeline_test executor/parallel/pipeline_test.cpp)
 
 # Integration tests
 shilmandb_add_test(end_to_end_test integration/end_to_end_test.cpp)
@@ -124,6 +125,7 @@ shilmandb_add_test(columnar_database_test integration/columnar_database_test.cpp
 shilmandb_add_test(columnar_index_test integration/columnar_index_test.cpp)
 shilmandb_add_test(columnar_tpch_test integration/columnar_tpch_test.cpp)
 target_include_directories(columnar_tpch_test PRIVATE ${CMAKE_SOURCE_DIR}/bench)
+shilmandb_add_test(parallel_basic_test integration/parallel_basic_test.cpp)
 shilmandb_add_test(page_owners_test integration/page_owners_test.cpp)
 target_include_directories(page_owners_test PRIVATE ${CMAKE_SOURCE_DIR}/bench)
 shilmandb_add_test(eviction_sim_test integration/eviction_sim_test.cpp)

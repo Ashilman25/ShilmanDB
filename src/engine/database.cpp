@@ -4,6 +4,7 @@
 #include "planner/planner.hpp"
 #include "executor/executor_factory.hpp"
 #include "executor/executor_context.hpp"
+#include "executor/parallel/parallel_executor.hpp"
 #include "common/exception.hpp"
 #include "storage/columnar/bulk_loader.hpp"
 
@@ -144,6 +145,15 @@ QueryResult Database::ExecuteSQL(const std::string& sql, const QueryOptions& opt
 
     auto planner = MakePlanner(options);
     auto plan = planner.Plan(std::move(*stmt));
+
+    // The parallel executor runs columnar plans itself; analyze leaves its profile empty for now.
+    if (options.mode == ExecutionMode::PARALLEL) {
+        parallel::QueryContext ctx{bpm_.get(), catalog_.get(), parallel::ResolveThreads(options.threads)};
+        std::vector<Tuple> tuples = parallel::RunParallelQuery(*plan, ctx);
+        QueryProfile profile;
+        profile.join = planner.GetJoinOrderInfo();
+        return QueryResult{std::move(plan->output_schema), std::move(tuples), std::move(profile)};
+    }
 
     // Declared before the executor so the profilers' pointers into it outlive them.
     OperatorStatsMap op_stats;

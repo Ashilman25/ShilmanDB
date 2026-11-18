@@ -61,6 +61,8 @@ namespace {
                     return std::make_unique<VectorizedSeqScanExecutor>(plan, ctx);
                 case ExecutionMode::TUPLE:
                     return std::make_unique<SeqScanExecutor>(plan, ctx);
+                case ExecutionMode::PARALLEL:
+                    break;
             }
             throw DatabaseException("Unknown execution mode");
         }
@@ -71,6 +73,8 @@ namespace {
                     [[fallthrough]];
                 case ExecutionMode::TUPLE:
                     return std::make_unique<IndexScanExecutor>(plan, ctx);
+                case ExecutionMode::PARALLEL:
+                    break;
             }
             throw DatabaseException("Unknown execution mode");
         }
@@ -82,6 +86,8 @@ namespace {
                     return std::make_unique<VectorizedFilterExecutor>(plan, ctx, std::move(child));
                 case ExecutionMode::TUPLE:
                     return std::make_unique<FilterExecutor>(plan, ctx, std::move(child));
+                case ExecutionMode::PARALLEL:
+                    break;
             }
             throw DatabaseException("Unknown execution mode");
         }
@@ -115,6 +121,8 @@ namespace {
                     return std::make_unique<VectorizedAggregateExecutor>(plan, ctx, std::move(child));
                 case ExecutionMode::TUPLE:
                     return std::make_unique<AggregateExecutor>(plan, ctx, std::move(child));
+                case ExecutionMode::PARALLEL:
+                    break;
             }
             throw DatabaseException("Unknown execution mode");
         }
@@ -126,6 +134,8 @@ namespace {
                     return std::make_unique<VectorizedProjectionExecutor>(plan, ctx, std::move(child));
                 case ExecutionMode::TUPLE:
                     return std::make_unique<ProjectionExecutor>(plan, ctx, std::move(child));
+                case ExecutionMode::PARALLEL:
+                    break;
             }
             throw DatabaseException("Unknown execution mode");
         }
