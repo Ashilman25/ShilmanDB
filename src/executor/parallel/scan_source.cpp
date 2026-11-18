@@ -80,19 +80,6 @@ void FillSlot(const ColumnValues& col, uint32_t from, uint32_t n, Vector& slot) 
     }
 }
 
-// Appends the parts of an AND tree, left first.
-void SplitAnd(const Expression& e, std::vector<const Expression*>& out) {
-    if (e.type == ExprType::BINARY_OP) {
-        const auto& b = static_cast<const BinaryOp&>(e);
-        if (b.op == BinaryOp::Op::AND && b.left && b.right) {
-            SplitAnd(*b.left, out);
-            SplitAnd(*b.right, out);
-            return;
-        }
-    }
-    out.push_back(&e);
-}
-
 }  // namespace
 
 // A worker's morsel: where the survivors sit and each column's values for them.

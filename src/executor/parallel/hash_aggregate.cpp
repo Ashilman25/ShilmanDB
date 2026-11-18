@@ -81,32 +81,10 @@ struct GroupTable {
 
 //  Hashing
 
+using detail::DoubleBits;
 using detail::FoldKey;
-using detail::HashMix;
-using detail::kKeySeed;
-
-// A string's bytes, eight at a time.
-uint64_t HashBytes(std::string_view s) {
-    uint64_t h = kKeySeed ^ s.size();
-    size_t i = 0;
-    for (; i + 8 <= s.size(); i += 8) {
-        uint64_t word = 0;
-        std::memcpy(&word, s.data() + i, 8);
-        h = HashMix(h ^ word);
-    }
-    uint64_t tail = 0;
-    if (i < s.size()) std::memcpy(&tail, s.data() + i, s.size() - i);
-    return HashMix(h ^ tail);
-}
-
-// A double by value: -0.0 as +0.0 and every NaN alike, as one group each.
-uint64_t DoubleBits(double d) {
-    if (d == 0.0) d = 0.0;
-    if (std::isnan(d)) d = std::numeric_limits<double>::quiet_NaN();
-    uint64_t bits = 0;
-    std::memcpy(&bits, &d, sizeof(bits));
-    return bits;
-}
+using detail::HashBytes;
+using detail::WideBits;
 
 // Equal as group keys: by value, NaN equal to NaN.
 inline bool SameDouble(double a, double b) {
@@ -123,10 +101,7 @@ void HashKey(const Vector& v, const Selection& sel, uint32_t n, uint64_t* hashes
         }
         case ValueArray::I128: {
             const __int128* a = v.I128();
-            for (uint32_t i = 0; i < n; ++i) {
-                const auto u = static_cast<unsigned __int128>(a[sel[i]]);
-                hashes[i] = FoldKey(hashes[i], static_cast<uint64_t>(u) ^ HashMix(static_cast<uint64_t>(u >> 64)));
-            }
+            for (uint32_t i = 0; i < n; ++i) hashes[i] = FoldKey(hashes[i], WideBits(a[sel[i]]));
             break;
         }
         case ValueArray::F64: {
@@ -504,8 +479,7 @@ void UpdateExtremes(const T* x, const Selection& sel, uint32_t n, const uint32_t
 // Groups rows per worker and merges the workers' tables in Finalize.
 class AggregateSink final : public Sink {
 public:
-    AggregateSink(AggregateSpec spec, std::shared_ptr<const GroupShape> shape, std::shared_ptr<MergedGroups> out)
-        : spec_(std::move(spec)), shape_(std::move(shape)), out_(std::move(out)) {}
+    AggregateSink(AggregateSpec spec, std::shared_ptr<const GroupShape> shape, std::shared_ptr<MergedGroups> out) : spec_(std::move(spec)), shape_(std::move(shape)), out_(std::move(out)) {}
 
     // A global local starts with its one group, so empty input still gives a row.
     [[nodiscard]] std::unique_ptr<LocalState> MakeLocal() const override {
@@ -641,8 +615,7 @@ private:
 
     // MIN / MAX. A winning string stays the batch's own bytes until the batch
     // ends, then is copied once into the worker's arena.
-    static void UpdateExtreme(const AggInfo& info, const Vector& v, const Selection& sel, uint32_t n, const uint32_t* group,
-                              StateColumn& s, AggLocal& l) {
+    static void UpdateExtreme(const AggInfo& info, const Vector& v, const Selection& sel, uint32_t n, const uint32_t* group, StateColumn& s, AggLocal& l) {
         const bool min = info.kind == StateKind::MIN;
         switch (ArrayOf(info.arg)) {
             case ValueArray::I64: UpdateExtremes(v.I64(), sel, n, group, s.extreme.i64, s.seen, min); break;

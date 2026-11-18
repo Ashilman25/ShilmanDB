@@ -1,5 +1,6 @@
 #pragma once
 #include "executor/parallel/expression.hpp"
+#include "executor/parallel/key_hash.hpp"
 #include "executor/parallel/pipeline.hpp"
 #include "executor/parallel/vector.hpp"
 #include "parser/ast.hpp"
@@ -10,28 +11,6 @@
 #include <vector>
 
 namespace shilmandb::parallel {
-
-namespace detail {
-
-// Added before mixing each key, so a zero key still moves the hash.
-inline constexpr uint64_t kKeySeed = 0x9e3779b97f4a7c15ULL;
-
-// Spreads 64 bits over the whole word (murmur3's finalizer); a bijection.
-[[nodiscard]] constexpr uint64_t HashMix(uint64_t x) {
-    x ^= x >> 33;
-    x *= 0xff51afd7ed558ccdULL;
-    x ^= x >> 33;
-    x *= 0xc4ceb9fe1a85ec53ULL;
-    x ^= x >> 33;
-    return x;
-}
-
-// Folds one key's bits into a row's hash, which starts at 0; key order matters.
-[[nodiscard]] constexpr uint64_t FoldKey(uint64_t h, uint64_t bits) {
-    return HashMix(h ^ (bits + kKeySeed));
-}
-
-}  // namespace detail
 
 // Worker tables merge into one up to this many groups in all, else by partition.
 inline constexpr size_t kMergeIntoOneMaxGroups = 100000;

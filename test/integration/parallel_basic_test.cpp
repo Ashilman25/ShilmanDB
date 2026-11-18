@@ -315,15 +315,16 @@ TEST_F(ParallelBasicTest, RowStoreTableIsRefused) {
     db_->LoadTable("r", Schema({Column("ra", TypeId::INTEGER)}), WriteTbl("r", "1\n2\n"));
     const std::string want = "the parallel executor reads only columnar tables: r";
     EXPECT_EQ(ErrorOf([&] { (void)Run("SELECT ra FROM r", ExecutionMode::PARALLEL); }), want);
-    // Checked before anything else, even under a node this executor can't run yet.
+    // Checked before anything else compiles, here under a join.
     EXPECT_EQ(ErrorOf([&] { (void)Run("SELECT a FROM t, r WHERE a = ra", ExecutionMode::PARALLEL); }), want);
     EXPECT_EQ(Run("SELECT ra FROM r", ExecutionMode::TUPLE).tuples.size(), 2u);
 }
 
 TEST_F(ParallelBasicTest, UnsupportedNodeIsRefused) {
-    db_->LoadTable("u", Schema({Column("ua", ColumnType::Integer())}), WriteTbl("u", "1\n2\n"), Columnar());
-    EXPECT_EQ(ErrorOf([&] { (void)Run("SELECT a FROM t, u WHERE a = ua", ExecutionMode::PARALLEL); }),
-              "the parallel executor can't run HASH_JOIN yet");
+    // A point lookup on an indexed column plans an index scan.
+    (void)db_->GetCatalog()->CreateIndex("t_a", "t", "a");
+    EXPECT_EQ(ErrorOf([&] { (void)Run("SELECT a FROM t WHERE a = 5", ExecutionMode::PARALLEL); }),
+              "the parallel executor can't run INDEX_SCAN yet");
 }
 
 TEST_F(ParallelBasicTest, NullIsRefused) {

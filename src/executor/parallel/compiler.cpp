@@ -4,6 +4,7 @@
 #include "executor/parallel/basic_operators.hpp"
 #include "executor/parallel/expression.hpp"
 #include "executor/parallel/hash_aggregate.hpp"
+#include "executor/parallel/hash_join.hpp"
 #include "executor/parallel/nested_loop_join.hpp"
 #include "executor/parallel/scan_source.hpp"
 #include "executor/parallel/sort.hpp"
@@ -66,11 +67,82 @@ uint8_t PrecisionOf(const Expression* expr, const InputLayout& in) {
     return in.slot_precision[static_cast<size_t>(slot)];
 }
 
+// A child's layout from its join's side: column c is child column c - offset.
+InputLayout ShiftLayout(const InputLayout& child, uint32_t offset, uint32_t join_columns) {
+    InputLayout out = child;
+    out.slot_of_column.assign(join_columns, -1);
+    for (size_t c = 0; c < child.slot_of_column.size() && c + offset < join_columns; ++c) out.slot_of_column[c + offset] = child.slot_of_column[c];
+    return out;
+}
+
+// Adds c to a sorted list unless it's there.
+void InsertSorted(std::vector<uint32_t>& columns, uint32_t c) {
+    const auto at = std::lower_bound(columns.begin(), columns.end(), c);
+    if (at == columns.end() || *at != c) columns.insert(at, c);
+}
+
+// The first EQ of two bound columns on opposite sides, searching ANDs left first.
+// left_count splits the join's columns into its two sides.
+const BinaryOp* FindJoinKey(const Expression& e, uint32_t left_count) {
+    if (e.type != ExprType::BINARY_OP) return nullptr;
+    const auto& b = static_cast<const BinaryOp&>(e);
+    if (b.op == BinaryOp::Op::AND) {
+        if (const BinaryOp* found = FindJoinKey(*b.left, left_count)) return found;
+        return FindJoinKey(*b.right, left_count);
+    }
+    if (b.op != BinaryOp::Op::EQ || b.left->type != ExprType::COLUMN_REF || b.right->type != ExprType::COLUMN_REF) return nullptr;
+    const auto& l = static_cast<const ColumnRef&>(*b.left);
+    const auto& r = static_cast<const ColumnRef&>(*b.right);
+    if (!l.bound_index || !r.bound_index) return nullptr;
+    return (*l.bound_index < left_count) != (*r.bound_index < left_count) ? &b : nullptr;
+}
+
 // Makes slot `slot` of from the next slot of out, holding out's column c.
 void AddSlot(InputLayout& out, uint32_t c, const InputLayout& from, uint32_t slot) {
     out.slot_of_column[c] = static_cast<int>(out.slot_types.size());
     out.slot_types.push_back(from.slot_types[slot]);
     out.slot_precision.push_back(slot < from.slot_precision.size() ? from.slot_precision[slot] : 0);
+}
+
+// A join's columns read above it or by its predicate, split by side.
+struct JoinSides {
+    std::vector<uint32_t> left;   // left child columns, sorted
+    std::vector<uint32_t> right;  // right child columns, numbered as the right child does, sorted
+};
+
+// Splits sorted join columns at the left child's column count.
+JoinSides SplitSides(const std::vector<uint32_t>& columns, uint32_t left_count) {
+    JoinSides sides;
+    for (uint32_t c : columns) {
+        if (c < left_count) {
+            sides.left.push_back(c);
+        } else {
+            sides.right.push_back(c - left_count);
+        }
+    }
+    return sides;
+}
+
+// Where a join's output columns sit, and which child slot each one copies.
+struct JoinOutput {
+    InputLayout layout;
+    std::vector<uint32_t> left_slots;   // per left column: its slot in left batches
+    std::vector<uint32_t> right_slots;  // per right column: its slot in right batches
+};
+
+// Every join hands up the left side's columns first, then the right side's.
+JoinOutput LayOutJoin(const JoinSides& sides, uint32_t join_count, uint32_t left_count, const InputLayout& left_in, const InputLayout& right_in) {
+    JoinOutput out;
+    out.layout.slot_of_column.assign(join_count, -1);
+    for (uint32_t c : sides.left) {
+        out.left_slots.push_back(SlotOf(left_in, c));
+        AddSlot(out.layout, c, left_in, out.left_slots.back());
+    }
+    for (uint32_t c : sides.right) {
+        out.right_slots.push_back(SlotOf(right_in, c));
+        AddSlot(out.layout, c + left_count, right_in, out.right_slots.back());
+    }
+    return out;
 }
 
 // A pipeline being built, the limits inside it, and its operators that may
@@ -145,6 +217,8 @@ private:
                 return Sort(static_cast<const SortPlanNode&>(node), needed, std::nullopt);
             case PlanNodeType::NESTED_LOOP_JOIN:
                 return NestedLoopJoin(static_cast<const NestedLoopJoinPlanNode&>(node), needed);
+            case PlanNodeType::HASH_JOIN:
+                return HashJoin(static_cast<const HashJoinPlanNode&>(node), needed);
             case PlanNodeType::AGGREGATE:
                 return HashAggregate(static_cast<const AggregatePlanNode&>(node));
             default:
@@ -305,44 +379,83 @@ private:
 
         std::vector<uint32_t> columns = needed;
         if (join.predicate) CollectColumns(*join.predicate, columns);
-        std::vector<uint32_t> left_needed;
-        std::vector<uint32_t> right_needed;
-        for (uint32_t c : columns) {
-            if (c < left_count) {
-                left_needed.push_back(c);
-            } else {
-                right_needed.push_back(c - left_count);
-            }
-        }
+        const JoinSides sides = SplitSides(columns, left_count);
 
         // The right side gets a pipeline of its own; it closes once the join's
         // predicate, which needs both sides' layouts, is compiled.
         Building outer = std::exchange(current_, Building{});
-        const InputLayout right_in = Build(right, right_needed);
+        const InputLayout right_in = Build(right, sides.right);
         Building right_side = std::exchange(current_, std::move(outer));
-        const InputLayout left_in = Build(left, left_needed);
+        const InputLayout left_in = Build(left, sides.left);
 
+        JoinOutput out = LayOutJoin(sides, join.output_schema.GetColumnCount(), left_count, left_in, right_in);
         NestedLoopSpec spec;
-        InputLayout out;
-        out.slot_of_column.assign(join.output_schema.GetColumnCount(), -1);
-        for (uint32_t c : left_needed) {
-            const uint32_t slot = SlotOf(left_in, c);
-            spec.left_slots.push_back(slot);
-            AddSlot(out, c, left_in, slot);
-        }
-        for (uint32_t c : right_needed) {
-            const uint32_t slot = SlotOf(right_in, c);
-            spec.right_slots.push_back(slot);
-            AddSlot(out, c + left_count, right_in, slot);
-        }
-        spec.types = out.slot_types;
-        if (join.predicate) spec.predicate = CompiledExpr::Compile(*join.predicate, out);
+        spec.left_slots = std::move(out.left_slots);
+        spec.right_slots = std::move(out.right_slots);
+        spec.types = out.layout.slot_types;
+        if (join.predicate) spec.predicate = CompiledExpr::Compile(*join.predicate, out.layout);
 
         auto parts = MakeNestedLoopJoin(std::move(spec));
         current_.pipeline.depends_on.push_back(Close(std::move(right_side), Own(std::move(parts.first))));
         current_.expanding.push_back(parts.second.get());
         AddOperator(std::move(parts.second));
-        return out;
+        return std::move(out.layout);
+    }
+
+    // The build child runs first, into the join's sink; probe batches stream through
+    // the join. The smaller known estimate builds; a tie or an unknown builds the right.
+    // Output slots: the needed and residual columns, left ones first.
+    InputLayout HashJoin(const HashJoinPlanNode& join, const std::vector<uint32_t>& needed) {
+        const PlanNode& left = *join.children[0];
+        const PlanNode& right = *join.children[1];
+        const uint32_t left_count = left.output_schema.GetColumnCount();
+        const uint32_t join_count = join.output_schema.GetColumnCount();
+        assert(join_count == left_count + right.output_schema.GetColumnCount());
+
+        const BinaryOp* key = join.join_predicate ? FindJoinKey(*join.join_predicate, left_count) : nullptr;
+        if (key == nullptr) throw DatabaseException("HashJoinExecutor: no equi-join predicate found");
+        const bool key_left_first = *static_cast<const ColumnRef&>(*key->left).bound_index < left_count;
+        const Expression& left_key = key_left_first ? *key->left : *key->right;
+        const Expression& right_key = key_left_first ? *key->right : *key->left;
+        std::vector<const Expression*> rest;
+        SplitAnd(*join.join_predicate, rest);
+        rest.erase(std::remove(rest.begin(), rest.end(), key), rest.end());
+
+        // Each side hands up its output and residual columns, plus its key.
+        std::vector<uint32_t> columns = needed;
+        for (const Expression* e : rest) CollectColumns(*e, columns);
+        const JoinSides sides = SplitSides(columns, left_count);
+        std::vector<uint32_t> left_read = sides.left;
+        std::vector<uint32_t> right_read = sides.right;
+        InsertSorted(left_read, *static_cast<const ColumnRef&>(left_key).bound_index);
+        InsertSorted(right_read, *static_cast<const ColumnRef&>(right_key).bound_index - left_count);
+
+        // The build side gets a pipeline of its own, closed once the join is made.
+        const bool build_left = join.est_left_rows >= 0 && join.est_right_rows >= 0 && join.est_left_rows < join.est_right_rows;
+        Building outer = std::exchange(current_, Building{});
+        const InputLayout build_in = Build(build_left ? left : right, build_left ? left_read : right_read);
+        Building build_side = std::exchange(current_, std::move(outer));
+        const InputLayout probe_in = Build(build_left ? right : left, build_left ? right_read : left_read);
+        const InputLayout& left_in = build_left ? build_in : probe_in;
+        const InputLayout& right_in = build_left ? probe_in : build_in;
+
+        JoinOutput out = LayOutJoin(sides, join_count, left_count, left_in, right_in);
+        JoinSpec spec;
+        auto left_expr = CompiledExpr::Compile(left_key, ShiftLayout(left_in, 0, join_count));
+        auto right_expr = CompiledExpr::Compile(right_key, ShiftLayout(right_in, left_count, join_count));
+        spec.build_key = std::move(build_left ? left_expr : right_expr);
+        spec.probe_key = std::move(build_left ? right_expr : left_expr);
+        spec.build_payload = build_left ? out.left_slots : out.right_slots;
+        spec.probe_slots = build_left ? out.right_slots : out.left_slots;
+        spec.types = out.layout.slot_types;
+        spec.residual = CompiledExpr::CompileAnd(rest, out.layout);
+        spec.build_left = build_left;
+
+        auto parts = MakeHashJoin(std::move(spec));
+        current_.pipeline.depends_on.push_back(Close(std::move(build_side), Own(std::move(parts.first))));
+        current_.expanding.push_back(parts.second.get());
+        AddOperator(std::move(parts.second));
+        return std::move(out.layout);
     }
 
     // The pipeline being built gets its one source.

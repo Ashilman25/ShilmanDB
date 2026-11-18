@@ -33,6 +33,10 @@ public:
     // the layout, and anything today's executor would reject on every row.
     [[nodiscard]] static std::unique_ptr<CompiledExpr> Compile(const Expression& expr, const InputLayout& in);
 
+    // The AND of several expressions as one tree, left first; nullptr for none.
+    // Each part throws as Compile would.
+    [[nodiscard]] static std::unique_ptr<CompiledExpr> CompileAnd(const std::vector<const Expression*>& parts, const InputLayout& in);
+
     virtual ~CompiledExpr() = default;
 
     // The type of every value this expression writes.
@@ -48,5 +52,8 @@ public:
 
 // Adds the columns (plan schema indexes) an expression reads to out, kept sorted and unique.
 void CollectColumns(const Expression& expr, std::vector<uint32_t>& out);
+
+// Appends the parts of an AND tree, left first.
+void SplitAnd(const Expression& expr, std::vector<const Expression*>& out);
 
 }  // namespace shilmandb::parallel

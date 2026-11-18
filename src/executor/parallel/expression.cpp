@@ -1828,11 +1828,33 @@ std::unique_ptr<CompiledExpr> CompiledExpr::Compile(const Expression& expr, cons
     return Compiler(in).Build(expr);
 }
 
+// A left-deep chain of AND nodes: each part runs only on rows the ones before passed.
+std::unique_ptr<CompiledExpr> CompiledExpr::CompileAnd(const std::vector<const Expression*>& parts, const InputLayout& in) {
+    if (parts.empty()) return nullptr;
+    Compiler compiler(in);
+    NodePtr tree = compiler.Build(*parts[0]);
+    for (size_t i = 1; i < parts.size(); ++i) tree = Fold(std::make_unique<AndNode>(std::move(tree), compiler.Build(*parts[i])));
+    return tree;
+}
+
 // Collects, then sorts and drops repeats across everything in out.
 void CollectColumns(const Expression& expr, std::vector<uint32_t>& out) {
     Collect(expr, out);
     std::sort(out.begin(), out.end());
     out.erase(std::unique(out.begin(), out.end()), out.end());
+}
+
+// An AND missing a side stays whole.
+void SplitAnd(const Expression& expr, std::vector<const Expression*>& out) {
+    if (expr.type == ExprType::BINARY_OP) {
+        const auto& b = static_cast<const BinaryOp&>(expr);
+        if (b.op == BinaryOp::Op::AND && b.left && b.right) {
+            SplitAnd(*b.left, out);
+            SplitAnd(*b.right, out);
+            return;
+        }
+    }
+    out.push_back(&expr);
 }
 
 }  // namespace shilmandb::parallel
