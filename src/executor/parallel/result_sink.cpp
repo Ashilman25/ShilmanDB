@@ -1,6 +1,7 @@
 #include "executor/parallel/result_sink.hpp"
 #include "common/exception.hpp"
 #include "executor/parallel/basic_operators.hpp"
+#include "executor/parallel/column_buffer.hpp"
 #include "executor/parallel/decimal.hpp"
 #include "storage/columnar/string_arena.hpp"
 #include <algorithm>
@@ -11,43 +12,12 @@ namespace shilmandb::parallel {
 
 namespace {
 
-// One output column's values from one worker, in the array its type uses.
-struct ColumnBuffer {
-    std::vector<int64_t> i64;
-    std::vector<__int128> i128;
-    std::vector<double> f64;
-    std::vector<StringRef> str;
-};
-
 // A worker's copy of its result rows; its strings live in its own arena.
 struct ResultLocal : LocalState {
     std::vector<ColumnBuffer> columns;
     StringArena arena;
     size_t rows{0};
 };
-
-// Calls fn(row) for every active row.
-template <typename Fn>
-void ForActive(const Selection& sel, Fn fn) {
-    for (uint32_t k = 0; k < sel.Size(); ++k) fn(static_cast<uint32_t>(sel[k]));
-}
-
-// Appends one slot's active rows; strings are copied, since the morsel's bytes won't last.
-void Append(const Vector& v, const Selection& sel, ColumnBuffer& buf, StringArena& arena) {
-    const VType& t = v.Type();
-    if (t.kind == Kind::STRING) {
-        ForActive(sel, [&](uint32_t i) { buf.str.push_back(arena.Copy(View(v.StrAt(i)))); });
-    } else if (t.kind == Kind::DOUBLE) {
-        const double* a = v.F64();
-        ForActive(sel, [&](uint32_t i) { buf.f64.push_back(a[i]); });
-    } else if (t.kind == Kind::DECIMAL && t.wide) {
-        const __int128* a = v.I128();
-        ForActive(sel, [&](uint32_t i) { buf.i128.push_back(a[i]); });
-    } else {
-        const int64_t* a = v.I64();
-        ForActive(sel, [&](uint32_t i) { buf.i64.push_back(a[i]); });
-    }
-}
 
 // Row r as the Value today's columnar scan would give, built with its type's constructor.
 Value MakeValue(const VType& t, const ColumnBuffer& buf, size_t r) {

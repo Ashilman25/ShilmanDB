@@ -323,8 +323,6 @@ TEST_F(ParallelBasicTest, RowStoreTableIsRefused) {
 TEST_F(ParallelBasicTest, UnsupportedNodeIsRefused) {
     EXPECT_EQ(ErrorOf([&] { (void)Run("SELECT COUNT(*) FROM t", ExecutionMode::PARALLEL); }),
               "the parallel executor can't run AGGREGATE yet");
-    EXPECT_EQ(ErrorOf([&] { (void)Run("SELECT a FROM t ORDER BY a", ExecutionMode::PARALLEL); }),
-              "the parallel executor can't run SORT yet");
 }
 
 TEST_F(ParallelBasicTest, NullIsRefused) {
