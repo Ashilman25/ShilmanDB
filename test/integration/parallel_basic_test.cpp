@@ -19,6 +19,8 @@
 #include "catalog/catalog.hpp"
 #include "common/exception.hpp"
 #include "engine/database.hpp"
+#include "parser/parser.hpp"
+#include "planner/planner.hpp"
 
 namespace shilmandb {
 namespace {
@@ -202,6 +204,16 @@ protected:
         return db_->ExecuteSQL(sql, options);
     }
 
+    // The plan ExecuteSQL would run for sql in this mode.
+    std::unique_ptr<PlanNode> PlanFor(const std::string& sql, ExecutionMode mode) {
+        Parser parser(sql);
+        auto stmt = parser.Parse();
+        QueryOptions options;
+        options.mode = mode;
+        Planner planner = db_->MakePlanner(options);
+        return planner.Plan(std::move(*stmt));
+    }
+
     // Pages of the listed columns of t in row groups [from, to).
     uint64_t PagesOf(const std::vector<uint32_t>& columns, size_t from, size_t to) {
         const auto& meta = db_->GetCatalog()->GetTable("t")->columnar->Meta();
@@ -320,11 +332,116 @@ TEST_F(ParallelBasicTest, RowStoreTableIsRefused) {
     EXPECT_EQ(Run("SELECT ra FROM r", ExecutionMode::TUPLE).tuples.size(), 2u);
 }
 
-TEST_F(ParallelBasicTest, UnsupportedNodeIsRefused) {
-    // A point lookup on an indexed column plans an index scan.
+TEST_F(ParallelBasicTest, IndexScanReadsTheIndexRange) {
     (void)db_->GetCatalog()->CreateIndex("t_a", "t", "a");
-    EXPECT_EQ(ErrorOf([&] { (void)Run("SELECT a FROM t WHERE a = 5", ExecutionMode::PARALLEL); }),
-              "the parallel executor can't run INDEX_SCAN yet");
+    (void)db_->GetCatalog()->CreateIndex("t_g", "t", "g");
+    (void)db_->GetCatalog()->CreateIndex("t_d", "t", "d");
+    struct Case {
+        std::string sql;
+        bool low;
+        bool high;
+        size_t rows;
+    };
+    // Group 1 holds a = 65536 .. 131071, group 2 starts at 131072.
+    const std::vector<Case> cases = {
+        {"SELECT a, i FROM t WHERE a >= 199990", true, false, 10},
+        {"SELECT a, i FROM t WHERE a <= 9", false, true, 10},
+        {"SELECT a, k FROM t WHERE a >= 70000 AND a <= 70020", true, true, 21},
+        {"SELECT c, j FROM t WHERE a >= 131060 AND a <= 131080", true, true, 21},  // the key isn't read above
+        {"SELECT a FROM t WHERE a = 5", true, true, 1},
+        {"SELECT a, b FROM t WHERE a > 199990", true, false, 9},  // the strict bound stays in a filter above
+        {"SELECT a FROM t WHERE a >= 10 AND a <= 5", true, true, 0},
+        {"SELECT a, g FROM t WHERE g >= '1998-11-01' AND g <= '1998-12-31'", true, true, 4761},  // a DATE key
+        {"SELECT a, d FROM t WHERE d >= 150000 AND d <= 2150006", true, true, 3},  // a BIGINT key: a = 50000 .. 50002
+        {"SELECT COUNT(*) FROM t WHERE a >= 199990", true, false, 1},  // hands up no column
+        {"SELECT COUNT(*) FROM t WHERE d >= 150000 AND d <= 2150006", true, true, 1},
+    };
+    for (const Case& c : cases) {
+        SCOPED_TRACE(c.sql);
+        for (ExecutionMode mode : {ExecutionMode::VECTORIZED, ExecutionMode::PARALLEL}) {
+            const IndexScanPlanNode* scan = nullptr;
+            const auto plan = PlanFor(c.sql, mode);
+            std::vector<const PlanNode*> stack{plan.get()};
+            while (!stack.empty()) {
+                const PlanNode* node = stack.back();
+                stack.pop_back();
+                if (node->type == PlanNodeType::INDEX_SCAN) scan = static_cast<const IndexScanPlanNode*>(node);
+                for (const auto& child : node->children) stack.push_back(child.get());
+            }
+            ASSERT_NE(scan, nullptr) << "no index scan planned";
+            EXPECT_EQ(scan->low_key.has_value(), c.low);
+            EXPECT_EQ(scan->high_key.has_value(), c.high);
+        }
+        const QueryResult want = Run(c.sql, ExecutionMode::VECTORIZED);
+        EXPECT_EQ(want.tuples.size(), c.rows);
+        EXPECT_EQ(Difference(Run(c.sql, ExecutionMode::PARALLEL), want), "");
+    }
+    // The counts themselves, so both modes can't be wrong the same way.
+    const QueryResult count = Run("SELECT COUNT(*) FROM t WHERE d >= 150000 AND d <= 2150006", ExecutionMode::PARALLEL);
+    EXPECT_EQ(count.tuples[0].GetValue(count.schema, 0).integer_, 3);
+    const QueryResult tail = Run("SELECT COUNT(*) FROM t WHERE a >= 199990", ExecutionMode::PARALLEL);
+    EXPECT_EQ(tail.tuples[0].GetValue(tail.schema, 0).integer_, 10);
+}
+
+TEST_F(ParallelBasicTest, IntendedDifferenceIntegerBigintCaseIsBigint) {
+    // A CASE with an INTEGER and a BIGINT result is BIGINT for every row. Today's
+    // executor keeps each row's own branch type, so its INTEGER rows come back as
+    // garbage; the new mode gives the right values.
+    for (const std::string then : {"a", "7"}) {
+        SCOPED_TRACE(then);
+        const std::string sql = "SELECT a, c, d, CASE WHEN c < 500 THEN " + then + " ELSE d END FROM t WHERE a < 2000";
+        const QueryResult got = Run(sql, ExecutionMode::PARALLEL);
+        ASSERT_EQ(got.tuples.size(), 2000u);
+        ASSERT_EQ(got.schema.GetColumn(3).type, TypeId::BIGINT);
+        for (const Tuple& row : got.tuples) {
+            const int32_t a = row.GetValue(got.schema, 0).integer_;
+            const int64_t want = row.GetValue(got.schema, 1).integer_ < 500 ? (then == "a" ? a : 7) : row.GetValue(got.schema, 2).bigint_;
+            ASSERT_EQ(row.GetValue(got.schema, 3).bigint_, want) << "a = " << a;
+        }
+    }
+}
+
+TEST_F(ParallelBasicTest, IntendedDifferenceSelectStarJoinColumnOrder) {
+    // SELECT * over a join lists columns in the join's order. The cross-product
+    // pricing today's planning gives WHERE joins starts with ja and jb (10 x 1,000
+    // beats 1,000 x 100); parallel planning counts the keys and starts with jb and
+    // jc (100 rows beat ja and jb's 10,000). Same columns and rows, another order.
+    std::string ja;
+    std::string jb;
+    std::string jc;
+    for (int r = 0; r < 10; ++r) ja += "1|ja" + std::to_string(r) + "\n";
+    for (int r = 0; r < 1000; ++r) jb += "1|" + std::to_string(r) + "\n";
+    for (int r = 0; r < 100; ++r) jc += std::to_string(r * 10) + "|jc" + std::to_string(r) + "\n";
+    db_->LoadTable("ja", Schema({Column("ja_k", ColumnType::Integer()), Column("ja_v", ColumnType::Text())}), WriteTbl("ja", ja), Columnar());
+    db_->LoadTable("jb", Schema({Column("jb_k", ColumnType::Integer()), Column("jb_s", ColumnType::Integer())}), WriteTbl("jb", jb), Columnar());
+    db_->LoadTable("jc", Schema({Column("jc_s", ColumnType::Integer()), Column("jc_v", ColumnType::Text())}), WriteTbl("jc", jc), Columnar());
+
+    const std::string sql = "SELECT * FROM ja, jb, jc WHERE ja_k = jb_k AND jb_s = jc_s";
+    const QueryResult want = Run(sql, ExecutionMode::VECTORIZED);
+    const QueryResult got = Run(sql, ExecutionMode::PARALLEL);
+    ASSERT_EQ(want.tuples.size(), 1000u);
+
+    const auto names = [](const Schema& s) {
+        std::vector<std::string> out;
+        for (const auto& c : s.GetColumns()) out.push_back(c.name);
+        return out;
+    };
+    std::vector<std::string> got_names = names(got.schema);
+    std::vector<std::string> want_names = names(want.schema);
+    EXPECT_EQ(want_names, names(Run(sql, ExecutionMode::TUPLE).schema));
+    EXPECT_NE(got_names, want_names) << "the two modes now list the columns alike";
+    std::sort(got_names.begin(), got_names.end());
+    std::sort(want_names.begin(), want_names.end());
+    ASSERT_EQ(got_names, want_names);
+
+    // Matched by name, the answers are the same.
+    QueryResult reordered{want.schema, {}, {}};
+    for (const Tuple& t : got.tuples) {
+        std::vector<Value> values;
+        for (const auto& column : want.schema.GetColumns()) values.push_back(t.GetValue(got.schema, got.schema.GetColumnIndex(column.name)));
+        reordered.tuples.emplace_back(std::move(values), want.schema);
+    }
+    EXPECT_EQ(Difference(reordered, want), "");
 }
 
 TEST_F(ParallelBasicTest, NullIsRefused) {

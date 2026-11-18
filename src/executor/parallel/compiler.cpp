@@ -196,6 +196,8 @@ private:
         switch (node.type) {
             case PlanNodeType::SEQ_SCAN:
                 return Scan(static_cast<const SeqScanPlanNode&>(node), nullptr, needed);
+            case PlanNodeType::INDEX_SCAN:
+                return IndexRange(static_cast<const IndexScanPlanNode&>(node), needed);
             case PlanNodeType::FILTER: {
                 const auto& filter = static_cast<const FilterPlanNode&>(node);
                 const PlanNode& child = *filter.children[0];
@@ -248,6 +250,49 @@ private:
             for (uint32_t c : read) {
                 const bool listed = std::find(scan.read_columns->begin(), scan.read_columns->end(), c) != scan.read_columns->end();
                 assert(listed && "a scan reads a column its plan doesn't list");
+            }
+        }
+#endif
+
+        SetSource(MakeScanSource(std::move(spec)));
+        return ScanLayout(*table, needed);
+    }
+
+    // For now an index scan reads the whole table and filters to the index range.
+    // [low, high] is inclusive, as today's index scan reads it; rows come in table order.
+    InputLayout IndexRange(const IndexScanPlanNode& scan, const std::vector<uint32_t>& needed) {
+        const IndexInfo* index = ctx_.catalog->GetIndex(scan.index_name);
+        if (index == nullptr) throw DatabaseException("IndexScanExecutor: index not found: " + scan.index_name);
+        const ColumnarTable* table = ctx_.catalog->GetTable(scan.table_name)->columnar.get();
+        if (scan.output_schema.GetColumnCount() != table->Meta().columns.size()) {
+            throw DatabaseException("the parallel executor: the plan's columns don't match table " + scan.table_name);
+        }
+
+        ScanSpec spec;
+        spec.table = scan.table_name;
+        spec.columns = needed;
+        const uint32_t key = index->col_idx;
+        const auto add_bound = [&](BinaryOp::Op op, const Value& bound) {
+            BinaryOp test;
+            test.op = op;
+            auto column = std::make_unique<ColumnRef>();
+            column->column_name = index->column_name;
+            column->bound_index = key;
+            auto literal = std::make_unique<Literal>();
+            literal->value = bound;
+            test.left = std::move(column);
+            test.right = std::move(literal);
+            spec.single.push_back(CompiledExpr::Compile(test, ScanLayout(*table, {key})));
+            spec.single_column.push_back(key);
+        };
+        if (scan.low_key) add_bound(BinaryOp::Op::GTE, *scan.low_key);
+        if (scan.high_key) add_bound(BinaryOp::Op::LTE, *scan.high_key);
+#ifndef NDEBUG
+        // The key may be unlisted when the index used up its predicate.
+        if (scan.read_columns) {
+            for (uint32_t c : needed) {
+                const bool listed = std::find(scan.read_columns->begin(), scan.read_columns->end(), c) != scan.read_columns->end();
+                assert(listed && "an index scan hands up a column its plan doesn't list");
             }
         }
 #endif
@@ -333,6 +378,7 @@ private:
         if (agg.aggregate_exprs.size() != agg_count || agg.output_schema.GetColumnCount() != key_count + agg_count) {
             throw DatabaseException("the parallel executor groups only by plain columns");
         }
+
         const auto reads_arg = [&](size_t i) { return agg.aggregate_funcs[i] != Aggregate::Func::COUNT && agg.aggregate_exprs[i] != nullptr; };
         std::vector<uint32_t> child_needed;
         for (const auto& key : agg.group_by_exprs) CollectColumns(*key, child_needed);
@@ -349,6 +395,7 @@ private:
             spec.out_types.push_back(spec.keys.back()->Type());
             out.slot_precision.push_back(PrecisionOf(key.get(), in));
         }
+
         for (size_t i = 0; i < agg_count; ++i) {
             const Aggregate::Func func = agg.aggregate_funcs[i];
             spec.funcs.push_back(func);
@@ -357,6 +404,7 @@ private:
             const bool extreme = func == Aggregate::Func::MIN || func == Aggregate::Func::MAX;
             out.slot_precision.push_back(extreme ? PrecisionOf(agg.aggregate_exprs[i].get(), in) : 0);
         }
+        
         spec.global = key_count == 0;
         out.slot_of_column.resize(key_count + agg_count);
         std::iota(out.slot_of_column.begin(), out.slot_of_column.end(), 0);

@@ -5,6 +5,7 @@
 #include "tpch/tpch_workload.hpp"
 #include "executor/vectorized_parity_harness.hpp"
 
+#include <cstdio>
 #include <filesystem>
 #include <memory>
 #include <string>
@@ -32,7 +33,13 @@ static std::vector<IndexDesc> BuildIndexDescs() {
 
 // ── Fixture: load TPC-H SF=0.01 once per storage for the whole suite ─
 
-class VectorizedTpchParityTest : public ::testing::TestWithParam<StorageKind> {
+// A storage and the mode each query is compared with tuple mode in.
+struct StorageMode {
+    StorageKind storage;
+    ExecutionMode mode;
+};
+
+class VectorizedTpchParityTest : public ::testing::TestWithParam<StorageMode> {
 protected:
     static std::unique_ptr<Database> row_db_;
     static std::unique_ptr<Database> columnar_db_;
@@ -101,18 +108,55 @@ protected:
             GTEST_SKIP() << "TPC-H SF=0.01 data not found. "
                             "Run bench/tpch/generate_tpch_data.sh first.";
         }
-        const bool row = GetParam() == StorageKind::ROW;
+        const bool row = GetParam().storage == StorageKind::ROW;
         auto& slot = row ? row_db_ : columnar_db_;
-        if (!slot) slot = Load(row ? row_file_ : columnar_file_, data_dir_, GetParam());
+        if (!slot) slot = Load(row ? row_file_ : columnar_file_, data_dir_, GetParam().storage);
         db_ = slot.get();
     }
 
+    // Tuple mode against this test's mode: exact for vectorized; parallel sums
+    // exactly, so its DECIMAL cells get SameResult's 1e-6 and the rest stay exact.
     void RunParity(const std::string& sql) {
         auto tuple_rs = db_->ExecuteSQL(sql, ExecutionMode::TUPLE);
-        auto vec_rs   = db_->ExecuteSQL(sql, ExecutionMode::VECTORIZED);
-        ASSERT_EQ(tuple_rs.tuples.size(), vec_rs.tuples.size())
+        auto other_rs = db_->ExecuteSQL(sql, GetParam().mode);
+        ASSERT_EQ(tuple_rs.tuples.size(), other_rs.tuples.size())
             << "TPC-H parity: row-count mismatch";
-        test::ExpectRowsEqual(tuple_rs.tuples, vec_rs.tuples, tuple_rs.schema);
+        if (GetParam().mode == ExecutionMode::VECTORIZED) {
+            test::ExpectRowsEqual(tuple_rs.tuples, other_rs.tuples, tuple_rs.schema);
+            return;
+        }
+        ASSERT_EQ(tuple_rs.schema.GetColumnCount(), other_rs.schema.GetColumnCount());
+        for (uint32_t c = 0; c < tuple_rs.schema.GetColumnCount(); ++c) {
+            ASSERT_EQ(tuple_rs.schema.GetColumn(c).type, other_rs.schema.GetColumn(c).type) << "parity: col " << c << " type";
+        }
+        EXPECT_TRUE(tpch::SameResult(tuple_rs, other_rs)) << "parity: " << FirstDifference(tuple_rs, other_rs);
+    }
+
+    // The first row SameResult rejects, both sides as text, for the failure message.
+    static std::string FirstDifference(const QueryResult& a, const QueryResult& b) {
+        for (size_t r = 0; r < a.tuples.size(); ++r) {
+            const QueryResult x{a.schema, {a.tuples[r]}, {}};
+            const QueryResult y{b.schema, {b.tuples[r]}, {}};
+            if (!tpch::SameResult(x, y)) return "row " + std::to_string(r) + ": " + RowText(x) + "vs " + RowText(y);
+        }
+        return "none";
+    }
+
+    // A one-row result's cells; decimals with every digit.
+    static std::string RowText(const QueryResult& one) {
+        std::string out;
+        for (uint32_t c = 0; c < one.schema.GetColumnCount(); ++c) {
+            const Value v = one.tuples[0].GetValue(one.schema, c);
+            if (v.type_ == TypeId::DECIMAL) {
+                char buf[40];
+                std::snprintf(buf, sizeof(buf), "%.17g", v.decimal_);
+                out += buf;
+            } else {
+                out += v.ToString();
+            }
+            out += " | ";
+        }
+        return out;
     }
 };
 
@@ -122,16 +166,22 @@ std::string VectorizedTpchParityTest::row_file_;
 std::string VectorizedTpchParityTest::columnar_file_;
 std::string VectorizedTpchParityTest::data_dir_;
 
-// Names the storage in test output, so ctest shows /Row and /Columnar.
-static void PrintTo(StorageKind storage, std::ostream* os) {
-    *os << (storage == StorageKind::ROW ? "Row" : "Columnar");
+// Row, Columnar or Columnar_Parallel; the row store never runs in parallel mode.
+static std::string NameOf(const StorageMode& p) {
+    const std::string storage = p.storage == StorageKind::ROW ? "Row" : "Columnar";
+    return p.mode == ExecutionMode::PARALLEL ? storage + "_Parallel" : storage;
+}
+
+// Names the pair in test output, so ctest shows /Row, /Columnar and /Columnar_Parallel.
+static void PrintTo(const StorageMode& p, std::ostream* os) {
+    *os << NameOf(p);
 }
 
 INSTANTIATE_TEST_SUITE_P(Storage, VectorizedTpchParityTest,
-                         ::testing::Values(StorageKind::ROW, StorageKind::COLUMNAR),
-                         [](const ::testing::TestParamInfo<StorageKind>& info) {
-                             return std::string(info.param == StorageKind::ROW ? "Row" : "Columnar");
-                         });
+                         ::testing::Values(StorageMode{StorageKind::ROW, ExecutionMode::VECTORIZED},
+                                           StorageMode{StorageKind::COLUMNAR, ExecutionMode::VECTORIZED},
+                                           StorageMode{StorageKind::COLUMNAR, ExecutionMode::PARALLEL}),
+                         [](const ::testing::TestParamInfo<StorageMode>& info) { return NameOf(info.param); });
 
 // ── Q1: Pricing Summary ─────────────────────────────────────────────
 
