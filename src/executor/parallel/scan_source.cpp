@@ -174,6 +174,15 @@ void ScanSource::Prepare(QueryContext& ctx) {
     std::sort(read_.begin(), read_.end());
     read_.erase(std::unique(read_.begin(), read_.end()), read_.end());
 
+    // The listed columns first, so the error names the column today's scan names.
+    refused_ = spec_.refuse_nulls;
+    for (uint32_t c : refused_) {
+        if (c >= n) throw DatabaseException(spec_.table + ": no column " + std::to_string(c) + " to read");
+    }
+    for (uint32_t c : read_) {
+        if (std::find(refused_.begin(), refused_.end(), c) == refused_.end()) refused_.push_back(c);
+    }
+
     // A skipped row group never becomes a morsel, so it costs no page read.
     groups_.clear();
     for (size_t g = 0; g < table_->RowGroupCount(); ++g) {
@@ -211,8 +220,8 @@ void ScanSource::StartMorsel(size_t morsel, LocalState& local) {
     auto& l = static_cast<Local&>(local);
     const size_t group = groups_[morsel];
 
-    // Refused before any read, with today's message.
-    for (uint32_t c : read_) {
+    // Refused before any read, with today's message, whether or not c is decoded.
+    for (uint32_t c : refused_) {
         if (table_->ChunkAt(group, c).null_count > 0) throw DatabaseException(ColumnarNullError(table_->Meta().columns[c].name));
     }
 

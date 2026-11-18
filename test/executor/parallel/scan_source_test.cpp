@@ -705,5 +705,59 @@ TEST_F(ParallelScanSourceTest, NullInFilterColumnIsRefused) {
     EXPECT_NO_THROW(db_->GetBufferPoolManager()->DropAllPages());
 }
 
+TEST_F(ParallelScanSourceTest, CountOfANullColumnIsRefused) {
+    const std::string tbl = TempPath("_cn.tbl");
+    std::ofstream(tbl, std::ios::binary) << "1|5\n|6\n3|7\n";
+    extra_files_.push_back(tbl);
+    LoadOptions options;
+    options.storage = StorageKind::COLUMNAR;
+    options.null_text = "";
+    db_->LoadTable("cn", Schema({Column("x", ColumnType::Integer(), true), Column("y", ColumnType::Integer())}), tbl, options);
+
+    // COUNT never reads its argument, but the plan lists x, so its NULL is refused.
+    const std::string today = "column 'x' holds NULLs, which queries can't read yet";
+    for (const std::string sql : {"SELECT COUNT(x) FROM cn", "SELECT COUNT(x + 1) FROM cn", "SELECT y, COUNT(x) FROM cn GROUP BY y"}) {
+        EXPECT_EQ(ErrorOf([&] { (void)Run(sql, ExecutionMode::VECTORIZED); }), today) << sql;
+        EXPECT_EQ(ErrorOf([&] { (void)Run(sql, ExecutionMode::PARALLEL); }), today) << sql;
+    }
+    const QueryResult all = Run("SELECT COUNT(*) FROM cn", ExecutionMode::PARALLEL);
+    ASSERT_EQ(all.tuples.size(), 1u);
+    EXPECT_EQ(all.tuples[0].GetValue(all.schema, 0).integer_, 3);
+    EXPECT_NO_THROW(db_->GetBufferPoolManager()->DropAllPages());
+}
+
+TEST_F(ParallelScanSourceTest, IndexScanRefusesNullsInListedColumns) {
+    // y is the row number; x is too, except a NULL at y = 995.
+    std::string text;
+    for (int r = 0; r < 1000; ++r) text += (r == 995 ? std::string() : std::to_string(r)) + "|" + std::to_string(r) + "\n";
+    const std::string tbl = TempPath("_in.tbl");
+    std::ofstream(tbl, std::ios::binary) << text;
+    extra_files_.push_back(tbl);
+    LoadOptions options;
+    options.storage = StorageKind::COLUMNAR;
+    options.null_text = "";
+    db_->LoadTable("ix", Schema({Column("x", ColumnType::Integer(), true), Column("y", ColumnType::Integer())}), tbl, options);
+    (void)db_->GetCatalog()->CreateIndex("ix_y", "ix", "y");
+
+    const std::string sql = "SELECT COUNT(x) FROM ix WHERE y >= 990";
+    for (ExecutionMode mode : {ExecutionMode::VECTORIZED, ExecutionMode::PARALLEL}) {
+        QueryOptions plan_options;
+        plan_options.mode = mode;
+        const auto plan = db_->MakePlanner(plan_options).Plan(std::move(*Parser(sql).Parse()));
+        bool index_scan = false;
+        for (const PlanNode* n = plan.get(); n != nullptr; n = n->children.empty() ? nullptr : n->children[0].get()) {
+            index_scan = index_scan || n->type == PlanNodeType::INDEX_SCAN;
+        }
+        ASSERT_TRUE(index_scan) << "no index scan planned";
+    }
+    const std::string today = "column 'x' holds NULLs, which queries can't read yet";
+    EXPECT_EQ(ErrorOf([&] { (void)Run(sql, ExecutionMode::VECTORIZED); }), today);
+    EXPECT_EQ(ErrorOf([&] { (void)Run(sql, ExecutionMode::PARALLEL); }), today);
+    const QueryResult all = Run("SELECT COUNT(*) FROM ix WHERE y >= 990", ExecutionMode::PARALLEL);
+    ASSERT_EQ(all.tuples.size(), 1u);
+    EXPECT_EQ(all.tuples[0].GetValue(all.schema, 0).integer_, 10);
+    EXPECT_NO_THROW(db_->GetBufferPoolManager()->DropAllPages());
+}
+
 }  // namespace
 }  // namespace shilmandb::parallel

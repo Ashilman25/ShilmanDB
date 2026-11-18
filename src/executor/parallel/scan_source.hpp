@@ -26,6 +26,7 @@ struct ScanSpec {
     std::vector<std::unique_ptr<CompiledExpr>> multi;    // conjuncts reading several columns, or none
     std::vector<std::vector<uint32_t>> multi_columns;    // the columns each one reads, sorted
     std::vector<const Expression*> skip_conjuncts;       // from the plan, which must outlive the scan
+    std::vector<uint32_t> refuse_nulls;                  // columns whose NULLs are refused even if never read
     double dense_fraction{kDenseFraction};
 };
 
@@ -58,7 +59,7 @@ public:
     // Needs Prepare first, which finds the table.
     [[nodiscard]] std::unique_ptr<LocalState> MakeLocal() const override;
 
-    // Refuses NULLs, then filters the row group and decodes what's handed up.
+    // Refuses NULLs from chunk metadata, then filters the row group and decodes what's handed up.
     void StartMorsel(size_t morsel, LocalState& local) override;
 
     // Hands up the next kBatchSize survivors, every row active.
@@ -84,6 +85,7 @@ private:
     std::vector<VType> types_;       // per table column
     std::vector<VType> slot_types_;  // per handed-up slot
     std::vector<uint32_t> read_;     // every column the scan reads, sorted
+    std::vector<uint32_t> refused_;  // refuse_nulls in its order, then any other column read
     std::vector<bool> handed_;       // per table column: handed up
     std::vector<size_t> last_use_;   // per table column: the last conjunct step reading it, 0 for none
     std::vector<size_t> groups_;     // the row groups to read, one per morsel

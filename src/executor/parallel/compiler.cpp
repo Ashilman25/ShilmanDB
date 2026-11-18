@@ -1,6 +1,7 @@
 #include "executor/parallel/compiler.hpp"
 #include "catalog/catalog.hpp"
 #include "common/exception.hpp"
+#include "executor/columnar_scan_executor.hpp"
 #include "executor/parallel/basic_operators.hpp"
 #include "executor/parallel/expression.hpp"
 #include "executor/parallel/hash_aggregate.hpp"
@@ -231,8 +232,10 @@ private:
 
     // Slot k holds needed[k]; NUMERIC slots carry their precision so sums can stay narrow.
     // A fused predicate's columns are read inside the scan and never handed up.
+    // NULLs are refused in every column the plan lists, as today's scan does.
     InputLayout Scan(const SeqScanPlanNode& scan, const Expression* predicate, const std::vector<uint32_t>& needed) {
-        const ColumnarTable* table = ctx_.catalog->GetTable(scan.table_name)->columnar.get();
+        const TableInfo& info = *ctx_.catalog->GetTable(scan.table_name);
+        const ColumnarTable* table = info.columnar.get();
         if (scan.output_schema.GetColumnCount() != table->Meta().columns.size()) {
             throw DatabaseException("the parallel executor: the plan's columns don't match table " + scan.table_name);
         }
@@ -240,6 +243,7 @@ private:
         ScanSpec spec;
         spec.table = scan.table_name;
         spec.columns = needed;
+        spec.refuse_nulls = ColumnarReadColumns(info, scan.read_columns);
         for (const auto& conj : scan.skip_conjuncts) spec.skip_conjuncts.push_back(conj.get());
         if (predicate != nullptr) AddConjuncts(spec, *table, *predicate);
 #ifndef NDEBUG
@@ -260,10 +264,12 @@ private:
 
     // For now an index scan reads the whole table and filters to the index range.
     // [low, high] is inclusive, as today's index scan reads it; rows come in table order.
+    // NULLs are refused in every column the plan lists.
     InputLayout IndexRange(const IndexScanPlanNode& scan, const std::vector<uint32_t>& needed) {
         const IndexInfo* index = ctx_.catalog->GetIndex(scan.index_name);
         if (index == nullptr) throw DatabaseException("IndexScanExecutor: index not found: " + scan.index_name);
-        const ColumnarTable* table = ctx_.catalog->GetTable(scan.table_name)->columnar.get();
+        const TableInfo& info = *ctx_.catalog->GetTable(scan.table_name);
+        const ColumnarTable* table = info.columnar.get();
         if (scan.output_schema.GetColumnCount() != table->Meta().columns.size()) {
             throw DatabaseException("the parallel executor: the plan's columns don't match table " + scan.table_name);
         }
@@ -271,6 +277,7 @@ private:
         ScanSpec spec;
         spec.table = scan.table_name;
         spec.columns = needed;
+        spec.refuse_nulls = ColumnarReadColumns(info, scan.read_columns);
         const uint32_t key = index->col_idx;
         const auto add_bound = [&](BinaryOp::Op op, const Value& bound) {
             BinaryOp test;
