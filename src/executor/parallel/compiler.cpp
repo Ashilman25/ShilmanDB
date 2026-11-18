@@ -69,9 +69,15 @@ private:
     InputLayout Build(const PlanNode& node, const std::vector<uint32_t>& needed) {
         switch (node.type) {
             case PlanNodeType::SEQ_SCAN:
-                return Scan(static_cast<const SeqScanPlanNode&>(node), needed);
-            case PlanNodeType::FILTER:
-                return Filter(static_cast<const FilterPlanNode&>(node), needed);
+                return Scan(static_cast<const SeqScanPlanNode&>(node), nullptr, needed);
+            case PlanNodeType::FILTER: {
+                const auto& filter = static_cast<const FilterPlanNode&>(node);
+                const PlanNode& child = *filter.children[0];
+                if (child.type == PlanNodeType::SEQ_SCAN) {
+                    return Scan(static_cast<const SeqScanPlanNode&>(child), filter.predicate.get(), needed);
+                }
+                return Filter(filter, needed);
+            }
             case PlanNodeType::PROJECTION:
                 return Projection(static_cast<const ProjectionPlanNode&>(node), needed);
             case PlanNodeType::LIMIT:
@@ -83,35 +89,34 @@ private:
     }
 
     // Slot k holds needed[k]; NUMERIC slots carry their precision so sums can stay narrow.
-    InputLayout Scan(const SeqScanPlanNode& scan, const std::vector<uint32_t>& needed) {
+    // A fused predicate's columns are read inside the scan and never handed up.
+    InputLayout Scan(const SeqScanPlanNode& scan, const Expression* predicate, const std::vector<uint32_t>& needed) {
         const ColumnarTable* table = ctx_.catalog->GetTable(scan.table_name)->columnar.get();
-        const auto& columns = table->Meta().columns;
-        if (scan.output_schema.GetColumnCount() != columns.size()) {
+        if (scan.output_schema.GetColumnCount() != table->Meta().columns.size()) {
             throw DatabaseException("the parallel executor: the plan's columns don't match table " + scan.table_name);
         }
+
+        ScanSpec spec;
+        spec.table = scan.table_name;
+        spec.columns = needed;
+        for (const auto& conj : scan.skip_conjuncts) spec.skip_conjuncts.push_back(conj.get());
+        if (predicate != nullptr) AddConjuncts(spec, *table, *predicate);
 #ifndef NDEBUG
         if (scan.read_columns) {
-            for (uint32_t c : needed) {
-                assert(std::find(scan.read_columns->begin(), scan.read_columns->end(), c) != scan.read_columns->end() && "a scan hands up a column its plan doesn't list");
+            std::vector<uint32_t> read = needed;
+            read.insert(read.end(), spec.single_column.begin(), spec.single_column.end());
+            for (const auto& columns : spec.multi_columns) read.insert(read.end(), columns.begin(), columns.end());
+            for (uint32_t c : read) {
+                const bool listed = std::find(scan.read_columns->begin(), scan.read_columns->end(), c) != scan.read_columns->end();
+                assert(listed && "a scan reads a column its plan doesn't list");
             }
         }
 #endif
 
-        std::vector<const Expression*> skip;
-        for (const auto& conj : scan.skip_conjuncts) skip.push_back(conj.get());
-        auto source = std::make_unique<ScanSource>(table, needed, std::move(skip));
-
-        InputLayout layout;
-        layout.slot_of_column.assign(columns.size(), -1);
-        for (size_t k = 0; k < needed.size(); ++k) {
-            const ColumnType& type = columns[needed[k]].type;
-            layout.slot_of_column[needed[k]] = static_cast<int>(k);
-            layout.slot_types.push_back(source->SlotTypes()[k]);
-            layout.slot_precision.push_back(type.id == ColumnTypeId::NUMERIC ? type.precision : 0);
-        }
+        auto source = MakeScanSource(std::move(spec));
         pipeline_.source = source.get();
         plan_.sources.push_back(std::move(source));
-        return layout;
+        return ScanLayout(*table, needed);
     }
 
     // The batch passes through, so the filter's layout is its child's.

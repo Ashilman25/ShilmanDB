@@ -105,6 +105,8 @@ shilmandb_add_test(parallel_decimal_test executor/parallel/decimal_test.cpp)
 shilmandb_add_test(parallel_expression_test executor/parallel/expression_test.cpp)
 shilmandb_add_test(parallel_expression_differential_test executor/parallel/expression_differential_test.cpp)
 shilmandb_add_test(parallel_pipeline_test executor/parallel/pipeline_test.cpp)
+shilmandb_add_test(parallel_scan_source_test executor/parallel/scan_source_test.cpp)
+target_include_directories(parallel_scan_source_test PRIVATE ${CMAKE_SOURCE_DIR}/bench)
 
 # Integration tests
 shilmandb_add_test(end_to_end_test integration/end_to_end_test.cpp)
