@@ -39,14 +39,14 @@ public:
 
     std::unique_ptr<LocalState> MakeLocal() const override { return std::make_unique<Local>(); }
 
-    void StartMorsel(size_t morsel, LocalState& local) override {
+    void StartMorsel(size_t morsel, LocalState& local) const override {
         auto& l = static_cast<Local&>(local);
         l.morsel = morsel;
         l.emitted = 0;
         started.push_back(morsel);
     }
 
-    bool NextBatch(LocalState& local, Batch& out) override {
+    bool NextBatch(LocalState& local, Batch& out) const override {
         auto& l = static_cast<Local&>(local);
         if (l.emitted == batches_) return false;
         ShapeBatch(out, {VType{}});
@@ -59,8 +59,9 @@ public:
         return true;
     }
 
+    // Test records, written from const calls; these fakes run on one thread.
     int prepared{0};
-    std::vector<size_t> started;
+    mutable std::vector<size_t> started;
 
 private:
     size_t morsels_;
@@ -76,7 +77,7 @@ public:
 
     std::unique_ptr<LocalState> MakeLocal() const override { return std::make_unique<Local>(); }
 
-    OpResult Execute(Batch& in, Batch& out, LocalState* local) override {
+    OpResult Execute(Batch& in, Batch& out, LocalState* local) const override {
         auto& l = static_cast<Local&>(*local);
         ShapeBatch(out, {VType{}});
         out.Reset(in.Active());
@@ -88,7 +89,7 @@ public:
         return l.second ? OpResult::HAVE_MORE_OUTPUT : OpResult::NEED_INPUT;
     }
 
-    int calls{0};
+    mutable int calls{0};  // written from const Execute; one thread only
 };
 
 // Keeps every value it sees and counts how often each step runs.
@@ -103,7 +104,7 @@ public:
         return std::make_unique<Local>();
     }
 
-    void Consume(Batch& in, LocalState& local) override {
+    void Consume(Batch& in, LocalState& local) const override {
         EXPECT_EQ(combines, 0) << "Consume after Combine";
         auto& l = static_cast<Local&>(local);
         const int64_t* v = in.slots[0].I64();
@@ -125,7 +126,7 @@ public:
     mutable int locals{0};
     int combines{0};
     int finalizes{0};
-    size_t batches{0};
+    mutable size_t batches{0};  // written from const Consume; one thread only
     size_t stop_after{0};  // 0: never done
     std::vector<int64_t> values;
 };

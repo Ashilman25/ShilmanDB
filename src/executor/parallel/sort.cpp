@@ -95,7 +95,7 @@ public:
     }
 
     // Evaluates the keys, then copies keys and kept columns for the active rows.
-    void Consume(Batch& in, LocalState& local) override {
+    void Consume(Batch& in, LocalState& local) const override {
         auto& l = static_cast<SortLocal&>(local);
         for (size_t i = 0; i < spec_.keys.size(); ++i) {
             spec_.keys[i]->Evaluate(in, in.sel, l.key_values[i], l.scratch);
@@ -200,10 +200,10 @@ public:
     [[nodiscard]] std::unique_ptr<LocalState> MakeLocal() const override { return std::make_unique<SortSourceLocal>(); }
 
     // Starts from the first sorted row.
-    void StartMorsel(size_t, LocalState& local) override { static_cast<SortSourceLocal&>(local).next = 0; }
+    void StartMorsel(size_t, LocalState& local) const override { static_cast<SortSourceLocal&>(local).next = 0; }
 
     // The next rows in order, as plain vectors; strings point into the sink's arenas.
-    bool NextBatch(LocalState& local, Batch& out) override {
+    bool NextBatch(LocalState& local, Batch& out) const override {
         auto& l = static_cast<SortSourceLocal&>(local);
         const std::vector<uint32_t>& order = rows_->order;
         if (l.next >= order.size()) return false;

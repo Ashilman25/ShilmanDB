@@ -503,7 +503,7 @@ public:
     }
 
     // Finds each active row's group, then folds the rows into every aggregate.
-    void Consume(Batch& in, LocalState& local) override {
+    void Consume(Batch& in, LocalState& local) const override {
         auto& l = static_cast<AggLocal&>(local);
         const uint32_t n = in.Active();
         if (n == 0) return;
@@ -706,7 +706,7 @@ public:
     }
 
     // Points the worker at one range.
-    void StartMorsel(size_t morsel, LocalState& local) override {
+    void StartMorsel(size_t morsel, LocalState& local) const override {
         auto& l = static_cast<AggSourceLocal&>(local);
         l.range = ranges_[morsel];
         l.done = false;
@@ -714,7 +714,7 @@ public:
     }
 
     // The range's keys, then each aggregate's value; strings point into the merged arenas.
-    bool NextBatch(LocalState& local, Batch& out) override {
+    bool NextBatch(LocalState& local, Batch& out) const override {
         auto& l = static_cast<AggSourceLocal&>(local);
         if (l.done) return false;
         l.done = true;

@@ -35,7 +35,7 @@ public:
     }
 
     // Rows count even with no slots kept, so a cross product still has its size.
-    void Consume(Batch& in, LocalState& local) override {
+    void Consume(Batch& in, LocalState& local) const override {
         auto& l = static_cast<RightLocal&>(local);
         for (size_t k = 0; k < slots_.size(); ++k) Append(in.slots[slots_[k]], in.sel, l.store.columns[k], l.store.arena);
         l.store.rows += in.Active();
@@ -84,7 +84,7 @@ public:
 
     // Candidate b * active + k: active left row k, right row next + b.
     // HAVE_MORE_OUTPUT while right rows remain for this batch; in is left untouched.
-    OpResult Execute(Batch& in, Batch& out, LocalState* local) override {
+    OpResult Execute(Batch& in, Batch& out, LocalState* local) const override {
         assert(right_->ready && "the right side must be finalized before the join runs");
         auto& l = static_cast<JoinLocal&>(*local);
         ShapeBatch(out, spec_.types);

@@ -14,7 +14,7 @@ public:
     explicit FilterOperator(std::unique_ptr<CompiledExpr> predicate);
 
     [[nodiscard]] std::unique_ptr<LocalState> MakeLocal() const override;
-    OpResult Execute(Batch& in, Batch& out, LocalState* local) override;
+    OpResult Execute(Batch& in, Batch& out, LocalState* local) const override;
 
 private:
     std::unique_ptr<CompiledExpr> predicate_;
@@ -29,7 +29,7 @@ public:
     [[nodiscard]] const std::vector<VType>& OutputTypes() const { return types_; }
 
     [[nodiscard]] std::unique_ptr<LocalState> MakeLocal() const override;
-    OpResult Execute(Batch& in, Batch& out, LocalState* local) override;
+    OpResult Execute(Batch& in, Batch& out, LocalState* local) const override;
 
 private:
     std::vector<std::unique_ptr<CompiledExpr>> expressions_;
@@ -42,14 +42,15 @@ public:
     explicit LimitCounter(uint64_t limit) : limit_(limit) {}
 
     // Takes up to `wanted` of the rows left and returns how many it got.
-    [[nodiscard]] uint64_t Reserve(uint64_t wanted);
+    // Const, so a shared operator can call it; the count is atomic.
+    [[nodiscard]] uint64_t Reserve(uint64_t wanted) const;
 
     // True once every row the limit allows is taken.
     [[nodiscard]] bool Reached() const { return taken_.load(std::memory_order_relaxed) >= limit_; }
 
 private:
     const uint64_t limit_;
-    std::atomic<uint64_t> taken_{0};
+    mutable std::atomic<uint64_t> taken_{0};
 };
 
 // Passes on rows until its counter is used up; the pipeline's sink watches the counter.
@@ -59,7 +60,7 @@ public:
 
     [[nodiscard]] const LimitCounter& Counter() const { return counter_; }
 
-    OpResult Execute(Batch& in, Batch& out, LocalState* local) override;
+    OpResult Execute(Batch& in, Batch& out, LocalState* local) const override;
 
 private:
     LimitCounter counter_;

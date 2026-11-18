@@ -63,7 +63,7 @@ std::unique_ptr<LocalState> ResultSink::MakeLocal() const {
 }
 
 // Copies the active rows into this worker's buffers.
-void ResultSink::Consume(Batch& in, LocalState& local) {
+void ResultSink::Consume(Batch& in, LocalState& local) const {
     auto& l = static_cast<ResultLocal&>(local);
     for (size_t c = 0; c < slots_.size(); ++c) Append(in.slots[slots_[c]], in.sel, l.columns[c], l.arena);
     l.rows += in.Active();

@@ -32,7 +32,7 @@ std::unique_ptr<LocalState> FilterOperator::MakeLocal() const {
 }
 
 // Narrows the input's selection in place, then hands the batch on by swapping.
-OpResult FilterOperator::Execute(Batch& in, Batch& out, LocalState* local) {
+OpResult FilterOperator::Execute(Batch& in, Batch& out, LocalState* local) const {
     predicate_->Select(in, in.sel, static_cast<ScratchLocal*>(local)->scratch);
     std::swap(in, out);
     return OpResult::NEED_INPUT;
@@ -50,7 +50,7 @@ std::unique_ptr<LocalState> ProjectionOperator::MakeLocal() const {
 }
 
 // Output rows keep the input's physical positions and selection.
-OpResult ProjectionOperator::Execute(Batch& in, Batch& out, LocalState* local) {
+OpResult ProjectionOperator::Execute(Batch& in, Batch& out, LocalState* local) const {
     EvalScratch& scratch = static_cast<ScratchLocal*>(local)->scratch;
     ShapeBatch(out, types_);
     out.Reset(in.rows);
@@ -60,7 +60,7 @@ OpResult ProjectionOperator::Execute(Batch& in, Batch& out, LocalState* local) {
 }
 
 // A compare-and-swap loop, so racing workers never take more than the limit.
-uint64_t LimitCounter::Reserve(uint64_t wanted) {
+uint64_t LimitCounter::Reserve(uint64_t wanted) const {
     uint64_t taken = taken_.load(std::memory_order_relaxed);
     for (;;) {
         if (taken >= limit_) return 0;
@@ -70,7 +70,7 @@ uint64_t LimitCounter::Reserve(uint64_t wanted) {
 }
 
 // Keeps the first rows the counter grants, then hands the batch on by swapping.
-OpResult LimitOperator::Execute(Batch& in, Batch& out, LocalState*) {
+OpResult LimitOperator::Execute(Batch& in, Batch& out, LocalState*) const {
     const uint32_t active = in.Active();
     const auto granted = static_cast<uint32_t>(counter_.Reserve(active));
     if (granted < active) {

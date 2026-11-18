@@ -60,10 +60,10 @@ public:
     [[nodiscard]] std::unique_ptr<LocalState> MakeLocal() const override;
 
     // Refuses NULLs from chunk metadata, then filters the row group and decodes what's handed up.
-    void StartMorsel(size_t morsel, LocalState& local) override;
+    void StartMorsel(size_t morsel, LocalState& local) const override;
 
     // Hands up the next kBatchSize survivors, every row active.
-    bool NextBatch(LocalState& local, Batch& out) override;
+    bool NextBatch(LocalState& local, Batch& out) const override;
 
     // A snapshot of the counts since Prepare.
     [[nodiscard]] ScanCounters Counters() const;
@@ -89,10 +89,13 @@ private:
     std::vector<bool> handed_;       // per table column: handed up
     std::vector<size_t> last_use_;   // per table column: the last conjunct step reading it, 0 for none
     std::vector<size_t> groups_;     // the row groups to read, one per morsel
-    std::atomic<uint64_t> groups_skipped_{0};
-    std::atomic<uint64_t> rows_considered_{0};
-    std::atomic<uint64_t> rows_passed_{0};
-    std::vector<std::atomic<uint64_t>> rows_decoded_;  // per table column
+
+    // Counts every worker adds to from const StartMorsel, so atomic and mutable.
+    // Prepare sizes rows_decoded_; workers never resize it.
+    mutable std::atomic<uint64_t> groups_skipped_{0};
+    mutable std::atomic<uint64_t> rows_considered_{0};
+    mutable std::atomic<uint64_t> rows_passed_{0};
+    mutable std::vector<std::atomic<uint64_t>> rows_decoded_;  // per table column
 };
 
 // The source for one scan.

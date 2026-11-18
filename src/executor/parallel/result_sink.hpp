@@ -22,7 +22,7 @@ public:
     void WatchLimit(const LimitCounter* counter) { limits_.push_back(counter); }
 
     [[nodiscard]] std::unique_ptr<LocalState> MakeLocal() const override;
-    void Consume(Batch& in, LocalState& local) override;
+    void Consume(Batch& in, LocalState& local) const override;
     void Combine(std::unique_ptr<LocalState> local) override;
     void Finalize(QueryContext& ctx) override;
     [[nodiscard]] bool Done() const override;

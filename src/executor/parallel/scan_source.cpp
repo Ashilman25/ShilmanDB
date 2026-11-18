@@ -216,7 +216,7 @@ std::unique_ptr<LocalState> ScanSource::MakeLocal() const {
 // Every single-column conjunct runs before every multi-column one, whatever the
 // written order; each narrows the survivors. Then the handed-up columns, survivors only.
 // Counts are added once per morsel, so several workers can share them.
-void ScanSource::StartMorsel(size_t morsel, LocalState& local) {
+void ScanSource::StartMorsel(size_t morsel, LocalState& local) const {
     auto& l = static_cast<Local&>(local);
     const size_t group = groups_[morsel];
 
@@ -353,7 +353,7 @@ void ScanSource::Narrow(Local& l, size_t step) const {
 }
 
 // With no columns to hand up, a batch still carries its row count.
-bool ScanSource::NextBatch(LocalState& local, Batch& out) {
+bool ScanSource::NextBatch(LocalState& local, Batch& out) const {
     auto& l = static_cast<Local&>(local);
     if (l.cursor >= l.count) return false;
     const uint32_t n = std::min(kBatchSize, l.count - l.cursor);

@@ -257,7 +257,7 @@ public:
     }
 
     // A row whose key equals nothing is dropped; every other row is kept whole.
-    void Consume(Batch& in, LocalState& local) override {
+    void Consume(Batch& in, LocalState& local) const override {
         auto& l = static_cast<BuildLocal&>(local);
         const uint32_t n = in.Active();
         if (n == 0) return;
@@ -341,7 +341,7 @@ public:
     [[nodiscard]] std::unique_ptr<LocalState> MakeLocal() const override { return std::make_unique<ProbeLocal>(key_->Type(), rule_.form); }
 
     // HAVE_MORE_OUTPUT while pairs may remain for this input; in is left untouched.
-    OpResult Execute(Batch& in, Batch& out, LocalState* local) override {
+    OpResult Execute(Batch& in, Batch& out, LocalState* local) const override {
         assert(table_->ready && "the build side must be finalized before the join runs");
         auto& l = static_cast<ProbeLocal&>(*local);
         ShapeBatch(out, types_);

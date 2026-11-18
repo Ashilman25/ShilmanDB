@@ -27,6 +27,7 @@ struct LocalState {
 enum class OpResult { NEED_INPUT, HAVE_MORE_OUTPUT };
 
 // Hands out a pipeline's rows in morsels; several workers may read different morsels at once.
+// Worker calls are const: a worker's own state goes in its LocalState.
 class Source {
 public:
     virtual ~Source() = default;
@@ -40,10 +41,10 @@ public:
     [[nodiscard]] virtual std::unique_ptr<LocalState> MakeLocal() const = 0;
 
     // Starts reading one morsel into this worker's state.
-    virtual void StartMorsel(size_t morsel, LocalState& local) = 0;
+    virtual void StartMorsel(size_t morsel, LocalState& local) const = 0;
 
     // Fills out with the next rows of the morsel; false when it's done.
-    virtual bool NextBatch(LocalState& local, Batch& out) = 0;
+    virtual bool NextBatch(LocalState& local, Batch& out) const = 0;
 };
 
 // A streaming step between a source and a sink, shared by every worker.
@@ -57,7 +58,8 @@ public:
 
     // HAVE_MORE_OUTPUT: call again with the same input after `out` is passed on.
     // An operator that answers NEED_INPUT may swap in and out instead of copying.
-    virtual OpResult Execute(Batch& in, Batch& out, LocalState* local) = 0;
+    // Const, since workers share the operator; their own state goes in local.
+    virtual OpResult Execute(Batch& in, Batch& out, LocalState* local) const = 0;
 };
 
 // Where a pipeline's rows end up: each worker fills its own local, then they're combined.
@@ -67,7 +69,8 @@ public:
 
     [[nodiscard]] virtual std::unique_ptr<LocalState> MakeLocal() const = 0;
 
-    virtual void Consume(Batch& in, LocalState& local) = 0;
+    // Workers call this at the same time, so it writes only their local.
+    virtual void Consume(Batch& in, LocalState& local) const = 0;
 
     // Once per worker, on the calling thread, after the last morsel.
     virtual void Combine(std::unique_ptr<LocalState> local) = 0;
