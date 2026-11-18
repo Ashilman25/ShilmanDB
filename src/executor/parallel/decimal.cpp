@@ -1,5 +1,6 @@
 #include "executor/parallel/decimal.hpp"
 #include "common/exception.hpp"
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -25,35 +26,59 @@ constexpr size_t kTextBytes = 32;
 // The most digits a double's round-trip text needs.
 constexpr int kMaxRoundTripDigits = 17;
 
-// The exact value of a %g text like "-0.055" or "1e-05", at its smallest scale.
-std::optional<DecimalLiteral> ParseShortText(const char* text) {
-    const char* p = text;
-    const bool negative = *p == '-';
-    if (negative) ++p;
+// A larger exponent never gives a decimal of 38 digits; the cap stops overflow.
+constexpr int kMaxExponent = 1000;
 
-    int64_t digits = 0;  // at most 17 significant digits, so it fits
+// The exact value of a text like "-0.055", "120.50" or "1e-05", at its smallest scale.
+// Trailing zeros are held back, so they never overflow the 38 digits kept.
+std::optional<DecimalLiteral> ParseDecimalText(std::string_view text) {
+    size_t i = 0;
+    const bool negative = i < text.size() && text[i] == '-';
+    if (negative) ++i;
+
+    __int128 digits = 0;  // the significant digits so far, without trailing zeros
     int digit_count = 0;
-    int exponent = 0;    // the value is digits * 10^exponent
+    int zeros = 0;        // zeros after the last non-zero digit
+    int exponent = 0;     // the value is digits * 10^(exponent + zeros)
+    bool any_digit = false;
     bool after_point = false;
-    for (; *p != '\0' && *p != 'e' && *p != 'E'; ++p) {
-        if (*p >= '0' && *p <= '9') {
-            if (digits != 0 || *p != '0') {
-                digits = digits * 10 + (*p - '0');
-                ++digit_count;
-            }
-            if (after_point) --exponent;
-        } else {
-            after_point = true;  // '.', since the engine never sets a locale
+    for (; i < text.size() && text[i] != 'e' && text[i] != 'E'; ++i) {
+        const char c = text[i];
+        if (c == '.') {
+            if (after_point) return std::nullopt;
+            after_point = true;
+            continue;
         }
+        if (c < '0' || c > '9') return std::nullopt;
+        any_digit = true;
+        if (after_point) --exponent;
+        if (c == '0') {
+            if (digits != 0) ++zeros;
+            continue;
+        }
+        if (digit_count + zeros + 1 > kMaxDecimalDigits) return std::nullopt;
+        digits = digits * Pow10(static_cast<uint8_t>(zeros + 1)) + (c - '0');
+        digit_count += zeros + 1;
+        zeros = 0;
     }
-    if (*p != '\0') exponent += std::atoi(p + 1);
-    assert(digits != 0 && "the caller handles zero");
+    if (!any_digit) return std::nullopt;
 
-    while (digits % 10 == 0) {
-        digits /= 10;
-        --digit_count;
-        ++exponent;
+    // An exponent: e, maybe a sign, then digits.
+    if (i < text.size()) {
+        ++i;
+        bool exponent_negative = false;
+        if (i < text.size() && (text[i] == '+' || text[i] == '-')) exponent_negative = text[i++] == '-';
+        if (i == text.size()) return std::nullopt;
+        int e = 0;
+        for (; i < text.size(); ++i) {
+            if (text[i] < '0' || text[i] > '9' || e > kMaxExponent) return std::nullopt;
+            e = e * 10 + (text[i] - '0');
+        }
+        exponent += exponent_negative ? -e : e;
     }
+    if (digits == 0) return DecimalLiteral{};
+
+    exponent += zeros;
     if (-exponent > kMaxDecimalDigits) return std::nullopt;
     if (exponent > 0 && digit_count + exponent > kMaxDecimalDigits) return std::nullopt;
 
@@ -75,17 +100,22 @@ void ThrowTooWide() {
 
 }  // namespace detail
 
-// Tries 1 to 17 significant digits; the first text strtod reads back as v wins.
-std::optional<DecimalLiteral> DecimalFromDouble(double v) {
+// Tries 1 to max_digits significant digits; the first text strtod reads back as v wins.
+std::optional<DecimalLiteral> DecimalFromDouble(double v, int max_digits) {
     if (!std::isfinite(v)) return std::nullopt;
     if (v == 0.0) return DecimalLiteral{};  // -0.0 as well
 
     char text[kTextBytes];
-    for (int precision = 1; precision <= kMaxRoundTripDigits; ++precision) {
+    for (int precision = 1; precision <= std::min(max_digits, kMaxRoundTripDigits); ++precision) {
         std::snprintf(text, sizeof(text), "%.*g", precision, v);
-        if (std::strtod(text, nullptr) == v) break;
+        if (std::strtod(text, nullptr) == v) return ParseDecimalText(text);
     }
-    return ParseShortText(text);
+    return std::nullopt;
+}
+
+// Written text, so it holds digits a double would round away.
+std::optional<DecimalLiteral> DecimalFromText(std::string_view text) {
+    return ParseDecimalText(text);
 }
 
 // One exact division while |v| <= 2^53 and scale <= 22, else strtod of the text.

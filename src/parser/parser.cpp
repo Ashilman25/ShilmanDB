@@ -395,6 +395,7 @@ std::unique_ptr<Expression> Parser::ParsePrimary() {
         } catch (const std::out_of_range&) {
             throw ParseException("Float literal out of range: " + current_token_.value, current_token_.line, current_token_.column);
         }
+        node->text = current_token_.value;
         
         Advance();
         return node;

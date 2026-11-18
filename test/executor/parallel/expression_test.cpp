@@ -1,6 +1,8 @@
 #include <gtest/gtest.h>
+#include <unistd.h>
 #include "catalog/schema.hpp"
 #include "common/exception.hpp"
+#include "engine/database.hpp"
 #include "executor/expression_evaluator.hpp"
 #include "executor/parallel/batch.hpp"
 #include "executor/parallel/decimal.hpp"
@@ -13,6 +15,8 @@
 #include <algorithm>
 #include <cstdint>
 #include <deque>
+#include <filesystem>
+#include <fstream>
 #include <limits>
 #include <memory>
 #include <random>
@@ -44,9 +48,12 @@ ExprPtr Lit(Value v) {
     return l;
 }
 
-// A decimal literal read the way the parser reads one.
+// A decimal literal read the way the parser reads one, text kept.
 ExprPtr Dec(const std::string& text) {
-    return Lit(Value(std::stod(text)));
+    auto l = std::make_unique<Literal>();
+    l->value = Value(std::stod(text));
+    l->text = text;
+    return l;
 }
 
 ExprPtr Int(int32_t v) { return Lit(Value(v)); }
@@ -957,6 +964,100 @@ TEST(ParallelExpressionTest, ConstantsFoldExactly) {
     EXPECT_EQ(Selected(*truth, t).size(), 6u);
     auto never = Compile(*Dec("1.5"), t);
     EXPECT_TRUE(Selected(*never, t).empty());  // only a non-zero INTEGER is true
+}
+
+TEST(ParallelExpressionTest, DecimalLiteralsAreExactFromTheirText) {
+    // The parser's text is exact up to 38 digits; the double alone only up to 15.
+    const InputLayout none;
+    const auto type_of = [&](const Expression& e) { return CompiledExpr::Compile(e, none)->Type(); };
+    const VType written = type_of(*Dec("1234567890123456.78"));
+    EXPECT_EQ(written.kind, Kind::DECIMAL);
+    EXPECT_EQ(written.scale, 2);
+    EXPECT_EQ(type_of(*Lit(Value(1234567890123456.78))).kind, Kind::DOUBLE);  // no text: today's double
+    EXPECT_EQ(type_of(*Lit(Value(9007199254740993.0))).kind, Kind::DOUBLE);
+    const VType short_value = type_of(*Lit(Value(0.055)));
+    EXPECT_EQ(short_value.kind, Kind::DECIMAL);
+    EXPECT_EQ(short_value.scale, 3);
+
+    // Past 38 digits the text gives up, and the value is a double.
+    EXPECT_EQ(type_of(*Dec(std::string(39, '9') + ".5")).kind, Kind::DOUBLE);
+
+    // A value that no longer matches its text (the binder changed it) ignores the text.
+    auto changed = std::make_unique<Literal>();
+    changed->value = Value(2.5);
+    changed->text = "1234567890123456.78";
+    const VType rewritten = type_of(*changed);
+    EXPECT_EQ(rewritten.kind, Kind::DECIMAL);
+    EXPECT_EQ(rewritten.scale, 1);
+
+    // A Clone keeps the text.
+    const auto clone = Dec("1234567890123456.78")->Clone();
+    EXPECT_EQ(static_cast<const Literal&>(*clone).text, std::optional<std::string>("1234567890123456.78"));
+}
+
+// A columnar table whose values need 16 to 18 digits.
+class ParallelDecimalLiteralTest : public ::testing::Test {
+protected:
+    std::string db_file_;
+    std::string tbl_;
+    std::unique_ptr<Database> db_;
+
+    void SetUp() override {
+        db_file_ = TempPath(".db");
+        tbl_ = TempPath(".tbl");
+        std::filesystem::remove(db_file_);
+        std::ofstream(tbl_, std::ios::binary) << "1|123456789012345678|1234567890123456.78|9007199254740993|\n2|5|0.05|7|\n";
+        db_ = std::make_unique<Database>(db_file_);
+        LoadOptions options;
+        options.storage = StorageKind::COLUMNAR;
+        options.threads = 1;
+        db_->LoadTable("t", Schema({Column("id", ColumnType::Integer()), Column("n18", ColumnType::Numeric(18, 0)),
+                                    Column("m18", ColumnType::Numeric(18, 2)), Column("big", ColumnType::BigInt())}),
+                       tbl_, options);
+    }
+
+    void TearDown() override {
+        db_.reset();
+        std::filesystem::remove(db_file_);
+        std::filesystem::remove(tbl_);
+    }
+
+    // A temp path unique to this process.
+    static std::string TempPath(const std::string& suffix) {
+        return (std::filesystem::temp_directory_path() /
+                ("shilmandb_parallel_expression_test_" + std::to_string(::getpid()) + suffix)).string();
+    }
+
+    // The ids of the rows this WHERE keeps, sorted.
+    std::vector<int32_t> Ids(const std::string& where, ExecutionMode mode) {
+        QueryOptions options;
+        options.mode = mode;
+        options.threads = 1;
+        const QueryResult r = db_->ExecuteSQL("SELECT id FROM t WHERE " + where, options);
+        std::vector<int32_t> ids;
+        for (const Tuple& row : r.tuples) ids.push_back(row.GetValue(r.schema, 0).integer_);
+        std::sort(ids.begin(), ids.end());
+        return ids;
+    }
+};
+
+TEST_F(ParallelDecimalLiteralTest, FullPrecisionLiteralsFindTheirRow) {
+    for (const std::string where : {"m18 = 1234567890123456.78", "m18 >= 1234567890123456.78", "m18 IN (1234567890123456.78, 3)",
+                                    "n18 = 123456789012345678.0", "n18 >= 123456789012345678.0", "n18 IN (123456789012345678.0, 3)",
+                                    "big = 9007199254740993.0", "big >= 9007199254740993.0", "big IN (9007199254740993.0, 3)"}) {
+        EXPECT_EQ(Ids(where, ExecutionMode::PARALLEL), std::vector<int32_t>{1}) << where;
+        EXPECT_EQ(Ids(where, ExecutionMode::VECTORIZED), std::vector<int32_t>{1}) << where;
+    }
+}
+
+TEST_F(ParallelDecimalLiteralTest, IntendedDifferenceNeighbouringLiteralsDontMatch) {
+    // Today both sides become the same double, so a neighbour matches too.
+    // The new mode compares the exact values and finds nothing.
+    for (const std::string where : {"m18 = 1234567890123456.77", "m18 >= 1234567890123456.79", "m18 IN (1234567890123456.77, 3)",
+                                    "n18 = 123456789012345677.0", "big = 9007199254740992.0"}) {
+        EXPECT_EQ(Ids(where, ExecutionMode::PARALLEL), std::vector<int32_t>{}) << where;
+        EXPECT_EQ(Ids(where, ExecutionMode::VECTORIZED), std::vector<int32_t>{1}) << where;
+    }
 }
 
 TEST(ParallelExpressionTest, CollectColumnsSortedAndUnique) {

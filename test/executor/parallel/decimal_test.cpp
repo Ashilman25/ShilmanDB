@@ -74,6 +74,14 @@ void ExpectLiteral(double v, __int128 value, uint8_t scale) {
     EXPECT_EQ(static_cast<int>(got->scale), static_cast<int>(scale));
 }
 
+// Checks a text's exact value and scale.
+void ExpectText(const std::string& text, __int128 value, uint8_t scale) {
+    const std::optional<DecimalLiteral> got = DecimalFromText(text);
+    ASSERT_TRUE(got.has_value()) << "no decimal for " << text;
+    EXPECT_TRUE(got->value == value) << text << ": value " << Str(got->value) << ", expected " << Str(value);
+    EXPECT_EQ(static_cast<int>(got->scale), static_cast<int>(scale)) << text;
+}
+
 // Runs fn and checks it throws the too-wide error.
 template <typename Fn>
 void ExpectTooWide(Fn fn) {
@@ -143,6 +151,64 @@ TEST(ParallelDecimalTest, LiteralRoundTripsTextOfFifteenDigits) {
         ExpectLiteral(d, n, static_cast<uint8_t>(scale));
         if (::testing::Test::HasFailure()) break;
     }
+}
+
+TEST(ParallelDecimalTest, TextConvertsExactly) {
+    // Past 15 digits a double can't hold these; their text still can.
+    ExpectText("1234567890123456.78", 123456789012345678, 2);
+    ExpectText("123456789012345678.0", 123456789012345678, 0);
+    ExpectText("9007199254740993.0", 9007199254740993, 0);
+    ExpectText("0.055", 55, 3);
+    ExpectText("120.50", 1205, 1);
+    ExpectText("-12.5", -125, 1);
+    ExpectText("0.0", 0, 0);
+    ExpectText("007.000", 7, 0);
+    ExpectText(std::string(38, '9') + ".0", MaxNumeric(), 0);
+    ExpectText("0." + std::string(38, '9'), MaxNumeric(), 38);
+    ExpectText("1" + std::string(37, '0') + ".0", TenTo(37), 0);
+    ExpectText("1." + std::string(45, '0'), 1, 0);  // trailing zeros past 38 digits
+    ExpectText("1e-05", 1, 5);                      // the %g form
+    ExpectText("1.5e+20", 15 * TenTo(19), 0);
+
+    EXPECT_FALSE(DecimalFromText(std::string(39, '9') + ".0").has_value());        // 39 digits
+    EXPECT_FALSE(DecimalFromText("1" + std::string(38, '0') + ".0").has_value());  // 10^38
+    EXPECT_FALSE(DecimalFromText("0." + std::string(38, '0') + "1").has_value());  // scale 39
+    for (const char* bad : {"", ".", "-", "1.2.3", "12a", "e5", "1e", "1e+"}) {
+        EXPECT_FALSE(DecimalFromText(bad).has_value()) << "'" << bad << "'";
+    }
+
+    // Random texts of 1 to 38 digits come back exactly, at their smallest scale.
+    std::mt19937_64 rng(20261118);
+    for (int i = 0; i < 20000; ++i) {
+        const int digits = 1 + static_cast<int>(rng() % 38);
+        __int128 n = 0;
+        for (int d = 0; d < digits; ++d) n = n * 10 + static_cast<int>(rng() % 10);
+        if (rng() % 2 == 0) n = -n;
+        int scale = static_cast<int>(rng() % 39);
+        const std::string text = ExactText(n, scale);
+        while (n != 0 && n % 10 == 0 && scale > 0) {
+            n /= 10;
+            --scale;
+        }
+        if (n == 0) scale = 0;
+        ExpectText(text, n, static_cast<uint8_t>(scale));
+        if (::testing::Test::HasFailure()) break;
+    }
+}
+
+TEST(ParallelDecimalTest, RoundTripWithinADigitLimit) {
+    // With a limit of 15 digits, a double whose shortest text needs more has none.
+    const std::optional<DecimalLiteral> fifteen = DecimalFromDouble(123456789012345.0, kExactDoubleDigits);
+    ASSERT_TRUE(fifteen.has_value());
+    EXPECT_TRUE(fifteen->value == 123456789012345);
+    const std::optional<DecimalLiteral> small = DecimalFromDouble(0.055, kExactDoubleDigits);
+    ASSERT_TRUE(small.has_value());
+    EXPECT_TRUE(small->value == 55);
+    EXPECT_EQ(static_cast<int>(small->scale), 3);
+    EXPECT_FALSE(DecimalFromDouble(1234567890123456.78, kExactDoubleDigits).has_value());
+    EXPECT_FALSE(DecimalFromDouble(9007199254740993.0, kExactDoubleDigits).has_value());
+    EXPECT_FALSE(DecimalFromDouble(0.1 + 0.2, kExactDoubleDigits).has_value());
+    EXPECT_TRUE(DecimalFromDouble(0.1 + 0.2).has_value());  // 17 digits by default
 }
 
 TEST(ParallelDecimalTest, Pow10Table) {

@@ -3,11 +3,15 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <string_view>
 
 namespace shilmandb::parallel {
 
 // The most digits a NUMERIC holds, so the widest exact decimal here.
 inline constexpr uint8_t kMaxDecimalDigits = 38;
+
+// Any decimal text of at most this many digits survives a trip through a double.
+inline constexpr int kExactDoubleDigits = 15;
 
 // An exact decimal: value / 10^scale.
 struct DecimalLiteral {
@@ -45,9 +49,13 @@ constexpr bool FitsDecimal(__int128 v) {
 
 }  // namespace detail
 
-// The exact value of the shortest text that round-trips v (tries %.1g to %.17g).
-// nullopt for NaN, infinity, a scale over 38 or more than 38 digits.
-[[nodiscard]] std::optional<DecimalLiteral> DecimalFromDouble(double v);
+// The exact value of the shortest text that round-trips v (tries %.1g to %.<max_digits>g).
+// nullopt for NaN, infinity, no such text, a scale over 38 or more than 38 digits.
+[[nodiscard]] std::optional<DecimalLiteral> DecimalFromDouble(double v, int max_digits = 17);
+
+// The exact value of a text like "-123.45", "0.055" or "1e-05", at its smallest scale.
+// nullopt for other text, more than 38 significant digits or a scale over 38.
+[[nodiscard]] std::optional<DecimalLiteral> DecimalFromText(std::string_view text);
 
 // 10^n as an exact integer, for n <= 38.
 [[nodiscard]] inline __int128 Pow10(uint8_t n) {

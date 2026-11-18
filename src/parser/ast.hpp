@@ -38,11 +38,13 @@ struct ColumnRef : Expression {
 
 struct Literal : Expression {
     Value value;
+    std::optional<std::string> text;  // a decimal literal as written; only the parallel executor reads it
     Literal() : Expression(ExprType::LITERAL) {}
 
     [[nodiscard]] std::unique_ptr<Expression> Clone() const override {
         auto c = std::make_unique<Literal>();
         c->value = value;
+        c->text = text;
         return c;
     }
 };

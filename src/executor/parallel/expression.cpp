@@ -3,6 +3,7 @@
 #include "executor/parallel/decimal.hpp"
 #include <algorithm>
 #include <cassert>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <optional>
@@ -1574,7 +1575,7 @@ public:
             case ExprType::COLUMN_REF:
                 return Column(static_cast<const ColumnRef&>(e));
             case ExprType::LITERAL:
-                return Constant(static_cast<const Literal&>(e).value);
+                return Constant(static_cast<const Literal&>(e));
             case ExprType::BINARY_OP:
                 return Binary(static_cast<const BinaryOp&>(e));
             case ExprType::UNARY_OP:
@@ -1611,15 +1612,18 @@ private:
         return std::make_unique<ColumnNode>(static_cast<uint32_t>(slot), t, p);
     }
 
-    // A decimal literal is the exact decimal of its shortest text, else a double.
-    static NodePtr Constant(const Value& v) {
+    // A decimal literal is exact from its written text while its value still matches it,
+    // else exact from a round-trip text of at most 15 digits, else a double.
+    static NodePtr Constant(const Literal& lit) {
+        const Value& v = lit.value;
         switch (v.type_) {
             case TypeId::INTEGER:
                 return MakeInteger(v.integer_, TypeId::INTEGER);
             case TypeId::BIGINT:
                 return MakeInteger(v.bigint_, TypeId::BIGINT);
             case TypeId::DECIMAL: {
-                const std::optional<DecimalLiteral> d = DecimalFromDouble(v.decimal_);
+                const std::optional<DecimalLiteral> d =
+                    WrittenTextMatches(lit) ? DecimalFromText(*lit.text) : DecimalFromDouble(v.decimal_, kExactDoubleDigits);
                 return d ? MakeDecimal(d->value, d->scale) : MakeDouble(v.decimal_);
             }
             case TypeId::VARCHAR:
@@ -1630,6 +1634,15 @@ private:
                 break;
         }
         throw DatabaseException("NULL literals aren't supported here");
+    }
+
+    // True when the literal's text is set and the binder left its value alone.
+    static bool WrittenTextMatches(const Literal& lit) {
+        if (!lit.text || lit.value.type_ != TypeId::DECIMAL) return false;
+        const char* begin = lit.text->c_str();
+        char* end = nullptr;
+        const double parsed = std::strtod(begin, &end);
+        return end == begin + lit.text->size() && parsed == lit.value.decimal_;
     }
 
     // AND, OR (maybe an IN list), LIKE, arithmetic and comparisons.
@@ -1669,7 +1682,7 @@ private:
         for (const InLeaf& leaf : leaves) {
             NodePtr col = Column(*leaf.column);
             const Node* raw = col.get();
-            Prepared p = PrepareCompare(std::move(col), Constant(leaf.literal->value));  // today's type errors
+            Prepared p = PrepareCompare(std::move(col), Constant(*leaf.literal));  // today's type errors
             if (p.domain == Domain::WIDE || !p.r->IsConstant()) return nullptr;
             if (p.l.get() != raw) {
                 // An exact literal with more decimals than the column can never match.
