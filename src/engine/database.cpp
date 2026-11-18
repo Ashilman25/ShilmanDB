@@ -202,6 +202,7 @@ Planner Database::MakePlanner(const QueryOptions& options) const {
         planner.SetForcedJoinOrder(*options.forced_join_order);
     }
     planner.SetScanCosts(GetScanCosts());
+    planner.SetParallelPlanning(options.mode == ExecutionMode::PARALLEL);
     return planner;
 }
 

@@ -89,6 +89,9 @@ public:
     // Parses and plans the query without running it, and returns how its joins were ordered.
     [[nodiscard]] JoinOrderInfo ExplainJoinOrder(const std::string& sql, const QueryOptions& options = {});
 
+    // Builds the planner ExecuteSQL and ExplainJoinOrder use for these options.
+    [[nodiscard]] Planner MakePlanner(const QueryOptions& options) const;
+
     void LoadTable(const std::string& table_name, const Schema& schema, const std::string& tbl_file_path, char delimiter = '|');
 
     // Loads into the row store or, committed to the file, as a columnar table.
@@ -104,9 +107,6 @@ public:
     void SetScanCosts(std::optional<ScanCosts> costs) { scan_costs_ = costs; }
 
 private:
-    // A planner with the join model (if wanted and loaded) and any forced order set.
-    [[nodiscard]] Planner MakePlanner(const QueryOptions& options) const;
-
     std::optional<ScanCosts> scan_costs_;
     std::unique_ptr<DiskManager> disk_manager_;
     std::unique_ptr<BufferPoolManager> bpm_;

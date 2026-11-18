@@ -51,12 +51,16 @@ struct FilterPlanNode : PlanNode {
 
 struct HashJoinPlanNode : PlanNode {
     std::unique_ptr<Expression> join_predicate;
+    double est_left_rows{-1.0};   // the planner's row estimate for children[0]; -1 when unknown
+    double est_right_rows{-1.0};  // the same for children[1]
     // The executor builds from whichever child turns out smaller, output is always left columns, then right
     HashJoinPlanNode(Schema schema, std::unique_ptr<Expression> pred) : PlanNode(PlanNodeType::HASH_JOIN, std::move(schema)), join_predicate(std::move(pred)) {}
 };
 
 struct NestedLoopJoinPlanNode : PlanNode {
     std::unique_ptr<Expression> predicate;
+    double est_left_rows{-1.0};   // the planner's row estimate for children[0]; -1 when unknown
+    double est_right_rows{-1.0};  // the same for children[1]
     NestedLoopJoinPlanNode(Schema schema, std::unique_ptr<Expression> pred) : PlanNode(PlanNodeType::NESTED_LOOP_JOIN, std::move(schema)), predicate(std::move(pred)) {}
 };
 

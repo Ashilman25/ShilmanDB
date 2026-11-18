@@ -76,6 +76,9 @@ shilmandb_add_test(nested_aggregate_test planner/nested_aggregate_test.cpp)
 shilmandb_add_test(read_columns_test planner/read_columns_test.cpp)
 target_include_directories(read_columns_test PRIVATE ${CMAKE_SOURCE_DIR}/bench)
 shilmandb_add_test(may_match_test planner/may_match_test.cpp)
+shilmandb_add_test(plan_dump_test planner/plan_dump_test.cpp)
+target_include_directories(plan_dump_test PRIVATE ${CMAKE_SOURCE_DIR}/bench)
+target_compile_definitions(plan_dump_test PRIVATE PLAN_DUMP_GOLDEN_PATH="${CMAKE_SOURCE_DIR}/test/planner/golden/tpch_plans.txt")
 
 # Executor tests
 shilmandb_add_test(seq_scan_executor_test executor/seq_scan_executor_test.cpp)

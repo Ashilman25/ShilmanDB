@@ -58,6 +58,9 @@ public:
     // What scans cost when choosing between a table scan and an index (default: cached reads).
     void SetScanCosts(const ScanCosts& costs) { scan_costs_ = costs; }
 
+    // For the parallel executor: two-table WHERE equalities also count as joins when pricing orders.
+    void SetParallelPlanning(bool on) { parallel_planning_ = on; }
+
     [[nodiscard]] auto GetJoinOrderInfo() const -> const JoinOrderInfo& { return join_info_; }
 
     // Raw pointers into the last plan, so they're only valid while that plan lives.
@@ -72,6 +75,7 @@ private:
 
     Catalog* catalog_;
     ScanCosts scan_costs_{};
+    bool parallel_planning_{false};
 
 #ifdef SHILMANDB_HAS_LIBTORCH
     LearnedJoinOptimizer* learned_optimizer_{nullptr};

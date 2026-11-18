@@ -1,0 +1,972 @@
+=== row no-indexes Q1 ===
+Sort
+| schema: l_returnflag VARCHAR, l_linestatus VARCHAR, sum_l_quantity DECIMAL, sum_l_extendedprice DECIMAL, sum_l_discount DECIMAL, count_star INTEGER
+| keys: l_returnflag@0 ASC, l_linestatus@1 ASC
+  Projection
+  | schema: l_returnflag VARCHAR, l_linestatus VARCHAR, sum_l_quantity DECIMAL, sum_l_extendedprice DECIMAL, sum_l_discount DECIMAL, count_star INTEGER
+  | exprs: l_returnflag@0, l_linestatus@1, sum_l_quantity@2, sum_l_extendedprice@3, sum_l_discount@4, count_star@5
+    Aggregate
+    | schema: l_returnflag VARCHAR, l_linestatus VARCHAR, sum_l_quantity DECIMAL, sum_l_extendedprice DECIMAL, sum_l_discount DECIMAL, count_star INTEGER
+    | group_by: l_returnflag@8, l_linestatus@9
+    | aggregates: SUM(l_quantity@4), SUM(l_extendedprice@5), SUM(l_discount@6), COUNT(*)
+      Filter
+      | schema: l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR
+      | predicate: (l_shipdate@10 <= DATE:1998-09-02)
+        SeqScan lineitem
+        | schema: l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR
+        | read_columns: [4, 5, 6, 8, 9, 10]
+        | skip_conjuncts: (l_shipdate@? <= VARCHAR:'1998-09-02')
+
+=== row no-indexes Q6 ===
+Projection
+| schema: sum_expr_0 DECIMAL
+| exprs: sum_expr_0@0
+  Aggregate
+  | schema: sum_expr_0 DECIMAL
+  | group_by: none
+  | aggregates: SUM((l_extendedprice@5 * l_discount@6))
+    Filter
+    | schema: l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR
+    | predicate: ((l_shipdate@10 >= DATE:1994-01-01) AND ((l_shipdate@10 < DATE:1995-01-01) AND ((l_discount@6 >= DECIMAL:0.050000000000000003) AND ((l_discount@6 <= DECIMAL:0.070000000000000007) AND (l_quantity@4 < DECIMAL:24)))))
+      SeqScan lineitem
+      | schema: l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR
+      | read_columns: [4, 5, 6, 10]
+      | skip_conjuncts: (l_shipdate@? >= VARCHAR:'1994-01-01'), (l_shipdate@? < VARCHAR:'1995-01-01'), (l_discount@? >= DECIMAL:0.050000000000000003), (l_discount@? <= DECIMAL:0.070000000000000007), (l_quantity@? < INTEGER:24)
+
+=== row no-indexes Q3 ===
+Limit
+| schema: l_orderkey BIGINT, sum_expr_0 DECIMAL, o_orderdate DATE, o_shippriority INTEGER
+| limit: 10
+  Sort
+  | schema: l_orderkey BIGINT, sum_expr_0 DECIMAL, o_orderdate DATE, o_shippriority INTEGER
+  | keys: sum_expr_0@1 DESC
+    Projection
+    | schema: l_orderkey BIGINT, sum_expr_0 DECIMAL, o_orderdate DATE, o_shippriority INTEGER
+    | exprs: l_orderkey@0, sum_expr_0@3, o_orderdate@1, o_shippriority@2
+      Aggregate
+      | schema: l_orderkey BIGINT, o_orderdate DATE, o_shippriority INTEGER, sum_expr_0 DECIMAL
+      | group_by: l_orderkey@17, o_orderdate@12, o_shippriority@15
+      | aggregates: SUM((l_extendedprice@22 * (INTEGER:1 - l_discount@23)))
+        HashJoin
+        | schema: c_custkey BIGINT, c_name VARCHAR, c_address VARCHAR, c_nationkey BIGINT, c_phone VARCHAR, c_acctbal DECIMAL, c_mktsegment VARCHAR, c_comment VARCHAR, o_orderkey BIGINT, o_custkey BIGINT, o_orderstatus VARCHAR, o_totalprice DECIMAL, o_orderdate DATE, o_orderpriority VARCHAR, o_clerk VARCHAR, o_shippriority INTEGER, o_comment VARCHAR, l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR
+        | predicate: (l.l_orderkey@17 = o.o_orderkey@8)
+          HashJoin
+          | schema: c_custkey BIGINT, c_name VARCHAR, c_address VARCHAR, c_nationkey BIGINT, c_phone VARCHAR, c_acctbal DECIMAL, c_mktsegment VARCHAR, c_comment VARCHAR, o_orderkey BIGINT, o_custkey BIGINT, o_orderstatus VARCHAR, o_totalprice DECIMAL, o_orderdate DATE, o_orderpriority VARCHAR, o_clerk VARCHAR, o_shippriority INTEGER, o_comment VARCHAR
+          | predicate: (c.c_custkey@0 = o.o_custkey@9)
+            Filter
+            | schema: c_custkey BIGINT, c_name VARCHAR, c_address VARCHAR, c_nationkey BIGINT, c_phone VARCHAR, c_acctbal DECIMAL, c_mktsegment VARCHAR, c_comment VARCHAR
+            | predicate: (c.c_mktsegment@6 = VARCHAR:'BUILDING')
+              SeqScan customer
+              | schema: c_custkey BIGINT, c_name VARCHAR, c_address VARCHAR, c_nationkey BIGINT, c_phone VARCHAR, c_acctbal DECIMAL, c_mktsegment VARCHAR, c_comment VARCHAR
+              | read_columns: [0, 6]
+              | skip_conjuncts: (c.c_mktsegment@? = VARCHAR:'BUILDING')
+            Filter
+            | schema: o_orderkey BIGINT, o_custkey BIGINT, o_orderstatus VARCHAR, o_totalprice DECIMAL, o_orderdate DATE, o_orderpriority VARCHAR, o_clerk VARCHAR, o_shippriority INTEGER, o_comment VARCHAR
+            | predicate: (o.o_orderdate@4 < DATE:1995-03-15)
+              SeqScan orders
+              | schema: o_orderkey BIGINT, o_custkey BIGINT, o_orderstatus VARCHAR, o_totalprice DECIMAL, o_orderdate DATE, o_orderpriority VARCHAR, o_clerk VARCHAR, o_shippriority INTEGER, o_comment VARCHAR
+              | read_columns: [0, 1, 4, 7]
+              | skip_conjuncts: (o.o_orderdate@? < VARCHAR:'1995-03-15')
+          Filter
+          | schema: l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR
+          | predicate: (l.l_shipdate@10 > DATE:1995-03-15)
+            SeqScan lineitem
+            | schema: l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR
+            | read_columns: [0, 5, 6, 10]
+            | skip_conjuncts: (l.l_shipdate@? > VARCHAR:'1995-03-15')
+
+=== row no-indexes Q5 ===
+Sort
+| schema: n_name VARCHAR, sum_expr_0 DECIMAL
+| keys: sum_expr_0@1 DESC
+  Projection
+  | schema: n_name VARCHAR, sum_expr_0 DECIMAL
+  | exprs: n_name@0, sum_expr_0@1
+    Aggregate
+    | schema: n_name VARCHAR, sum_expr_0 DECIMAL
+    | group_by: n_name@41
+    | aggregates: SUM((l_extendedprice@22 * (INTEGER:1 - l_discount@23)))
+      HashJoin
+      | schema: c_custkey BIGINT, c_name VARCHAR, c_address VARCHAR, c_nationkey BIGINT, c_phone VARCHAR, c_acctbal DECIMAL, c_mktsegment VARCHAR, c_comment VARCHAR, o_orderkey BIGINT, o_custkey BIGINT, o_orderstatus VARCHAR, o_totalprice DECIMAL, o_orderdate DATE, o_orderpriority VARCHAR, o_clerk VARCHAR, o_shippriority INTEGER, o_comment VARCHAR, l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR, s_suppkey BIGINT, s_name VARCHAR, s_address VARCHAR, s_nationkey BIGINT, s_phone VARCHAR, s_acctbal DECIMAL, s_comment VARCHAR, n_nationkey BIGINT, n_name VARCHAR, n_regionkey BIGINT, n_comment VARCHAR
+      | predicate: (s.s_nationkey@36 = n.n_nationkey@40)
+        HashJoin
+        | schema: c_custkey BIGINT, c_name VARCHAR, c_address VARCHAR, c_nationkey BIGINT, c_phone VARCHAR, c_acctbal DECIMAL, c_mktsegment VARCHAR, c_comment VARCHAR, o_orderkey BIGINT, o_custkey BIGINT, o_orderstatus VARCHAR, o_totalprice DECIMAL, o_orderdate DATE, o_orderpriority VARCHAR, o_clerk VARCHAR, o_shippriority INTEGER, o_comment VARCHAR, l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR, s_suppkey BIGINT, s_name VARCHAR, s_address VARCHAR, s_nationkey BIGINT, s_phone VARCHAR, s_acctbal DECIMAL, s_comment VARCHAR
+        | predicate: (l.l_suppkey@19 = s.s_suppkey@33)
+          HashJoin
+          | schema: c_custkey BIGINT, c_name VARCHAR, c_address VARCHAR, c_nationkey BIGINT, c_phone VARCHAR, c_acctbal DECIMAL, c_mktsegment VARCHAR, c_comment VARCHAR, o_orderkey BIGINT, o_custkey BIGINT, o_orderstatus VARCHAR, o_totalprice DECIMAL, o_orderdate DATE, o_orderpriority VARCHAR, o_clerk VARCHAR, o_shippriority INTEGER, o_comment VARCHAR, l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR
+          | predicate: (l.l_orderkey@17 = o.o_orderkey@8)
+            HashJoin
+            | schema: c_custkey BIGINT, c_name VARCHAR, c_address VARCHAR, c_nationkey BIGINT, c_phone VARCHAR, c_acctbal DECIMAL, c_mktsegment VARCHAR, c_comment VARCHAR, o_orderkey BIGINT, o_custkey BIGINT, o_orderstatus VARCHAR, o_totalprice DECIMAL, o_orderdate DATE, o_orderpriority VARCHAR, o_clerk VARCHAR, o_shippriority INTEGER, o_comment VARCHAR
+            | predicate: (c.c_custkey@0 = o.o_custkey@9)
+              SeqScan customer
+              | schema: c_custkey BIGINT, c_name VARCHAR, c_address VARCHAR, c_nationkey BIGINT, c_phone VARCHAR, c_acctbal DECIMAL, c_mktsegment VARCHAR, c_comment VARCHAR
+              | read_columns: [0]
+              | skip_conjuncts: none
+              Filter
+              | schema: o_orderkey BIGINT, o_custkey BIGINT, o_orderstatus VARCHAR, o_totalprice DECIMAL, o_orderdate DATE, o_orderpriority VARCHAR, o_clerk VARCHAR, o_shippriority INTEGER, o_comment VARCHAR
+              | predicate: ((o.o_orderdate@4 >= DATE:1994-01-01) AND (o.o_orderdate@4 < DATE:1995-01-01))
+                SeqScan orders
+                | schema: o_orderkey BIGINT, o_custkey BIGINT, o_orderstatus VARCHAR, o_totalprice DECIMAL, o_orderdate DATE, o_orderpriority VARCHAR, o_clerk VARCHAR, o_shippriority INTEGER, o_comment VARCHAR
+                | read_columns: [0, 1, 4]
+                | skip_conjuncts: (o.o_orderdate@? >= VARCHAR:'1994-01-01'), (o.o_orderdate@? < VARCHAR:'1995-01-01')
+            SeqScan lineitem
+            | schema: l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR
+            | read_columns: [0, 2, 5, 6]
+            | skip_conjuncts: none
+          SeqScan supplier
+          | schema: s_suppkey BIGINT, s_name VARCHAR, s_address VARCHAR, s_nationkey BIGINT, s_phone VARCHAR, s_acctbal DECIMAL, s_comment VARCHAR
+          | read_columns: [0, 3]
+          | skip_conjuncts: none
+        SeqScan nation
+        | schema: n_nationkey BIGINT, n_name VARCHAR, n_regionkey BIGINT, n_comment VARCHAR
+        | read_columns: [0, 1]
+        | skip_conjuncts: none
+
+=== row no-indexes Q10 ===
+Limit
+| schema: c_custkey BIGINT, c_name VARCHAR, sum_expr_0 DECIMAL, c_acctbal DECIMAL, n_name VARCHAR, c_address VARCHAR, c_phone VARCHAR, c_comment VARCHAR
+| limit: 20
+  Sort
+  | schema: c_custkey BIGINT, c_name VARCHAR, sum_expr_0 DECIMAL, c_acctbal DECIMAL, n_name VARCHAR, c_address VARCHAR, c_phone VARCHAR, c_comment VARCHAR
+  | keys: sum_expr_0@2 DESC
+    Projection
+    | schema: c_custkey BIGINT, c_name VARCHAR, sum_expr_0 DECIMAL, c_acctbal DECIMAL, n_name VARCHAR, c_address VARCHAR, c_phone VARCHAR, c_comment VARCHAR
+    | exprs: c_custkey@0, c_name@1, sum_expr_0@7, c_acctbal@2, n_name@4, c_address@5, c_phone@3, c_comment@6
+      Aggregate
+      | schema: c_custkey BIGINT, c_name VARCHAR, c_acctbal DECIMAL, c_phone VARCHAR, n_name VARCHAR, c_address VARCHAR, c_comment VARCHAR, sum_expr_0 DECIMAL
+      | group_by: c_custkey@4, c_name@5, c_acctbal@9, c_phone@8, n_name@1, c_address@6, c_comment@11
+      | aggregates: SUM((l_extendedprice@26 * (INTEGER:1 - l_discount@27)))
+        HashJoin
+        | schema: n_nationkey BIGINT, n_name VARCHAR, n_regionkey BIGINT, n_comment VARCHAR, c_custkey BIGINT, c_name VARCHAR, c_address VARCHAR, c_nationkey BIGINT, c_phone VARCHAR, c_acctbal DECIMAL, c_mktsegment VARCHAR, c_comment VARCHAR, o_orderkey BIGINT, o_custkey BIGINT, o_orderstatus VARCHAR, o_totalprice DECIMAL, o_orderdate DATE, o_orderpriority VARCHAR, o_clerk VARCHAR, o_shippriority INTEGER, o_comment VARCHAR, l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR
+        | predicate: (l_orderkey@21 = o_orderkey@12)
+          HashJoin
+          | schema: n_nationkey BIGINT, n_name VARCHAR, n_regionkey BIGINT, n_comment VARCHAR, c_custkey BIGINT, c_name VARCHAR, c_address VARCHAR, c_nationkey BIGINT, c_phone VARCHAR, c_acctbal DECIMAL, c_mktsegment VARCHAR, c_comment VARCHAR, o_orderkey BIGINT, o_custkey BIGINT, o_orderstatus VARCHAR, o_totalprice DECIMAL, o_orderdate DATE, o_orderpriority VARCHAR, o_clerk VARCHAR, o_shippriority INTEGER, o_comment VARCHAR
+          | predicate: (c_custkey@4 = o_custkey@13)
+            HashJoin
+            | schema: n_nationkey BIGINT, n_name VARCHAR, n_regionkey BIGINT, n_comment VARCHAR, c_custkey BIGINT, c_name VARCHAR, c_address VARCHAR, c_nationkey BIGINT, c_phone VARCHAR, c_acctbal DECIMAL, c_mktsegment VARCHAR, c_comment VARCHAR
+            | predicate: (c_nationkey@7 = n_nationkey@0)
+              SeqScan nation
+              | schema: n_nationkey BIGINT, n_name VARCHAR, n_regionkey BIGINT, n_comment VARCHAR
+              | read_columns: [0, 1]
+              | skip_conjuncts: none
+              SeqScan customer
+              | schema: c_custkey BIGINT, c_name VARCHAR, c_address VARCHAR, c_nationkey BIGINT, c_phone VARCHAR, c_acctbal DECIMAL, c_mktsegment VARCHAR, c_comment VARCHAR
+              | read_columns: [0, 1, 2, 3, 4, 5, 7]
+              | skip_conjuncts: none
+            Filter
+            | schema: o_orderkey BIGINT, o_custkey BIGINT, o_orderstatus VARCHAR, o_totalprice DECIMAL, o_orderdate DATE, o_orderpriority VARCHAR, o_clerk VARCHAR, o_shippriority INTEGER, o_comment VARCHAR
+            | predicate: ((o_orderdate@4 >= DATE:1993-10-01) AND (o_orderdate@4 < DATE:1994-01-01))
+              SeqScan orders
+              | schema: o_orderkey BIGINT, o_custkey BIGINT, o_orderstatus VARCHAR, o_totalprice DECIMAL, o_orderdate DATE, o_orderpriority VARCHAR, o_clerk VARCHAR, o_shippriority INTEGER, o_comment VARCHAR
+              | read_columns: [0, 1, 4]
+              | skip_conjuncts: (o_orderdate@? >= VARCHAR:'1993-10-01'), (o_orderdate@? < VARCHAR:'1994-01-01')
+          Filter
+          | schema: l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR
+          | predicate: (l_returnflag@8 = VARCHAR:'R')
+            SeqScan lineitem
+            | schema: l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR
+            | read_columns: [0, 5, 6, 8]
+            | skip_conjuncts: (l_returnflag@? = VARCHAR:'R')
+
+=== row no-indexes Q12 ===
+Sort
+| schema: l_shipmode VARCHAR, sum_expr_0 DECIMAL, sum_expr_1 DECIMAL
+| keys: l_shipmode@0 ASC
+  Projection
+  | schema: l_shipmode VARCHAR, sum_expr_0 DECIMAL, sum_expr_1 DECIMAL
+  | exprs: l_shipmode@0, sum_expr_0@1, sum_expr_1@2
+    Aggregate
+    | schema: l_shipmode VARCHAR, sum_expr_0 DECIMAL, sum_expr_1 DECIMAL
+    | group_by: l_shipmode@14
+    | aggregates: SUM(CASE WHEN ((o_orderpriority@21 = VARCHAR:'1-URGENT') OR (o_orderpriority@21 = VARCHAR:'2-HIGH')) THEN INTEGER:1 ELSE INTEGER:0 END), SUM(CASE WHEN ((o_orderpriority@21 <> VARCHAR:'1-URGENT') AND (o_orderpriority@21 <> VARCHAR:'2-HIGH')) THEN INTEGER:1 ELSE INTEGER:0 END)
+      HashJoin
+      | schema: l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR, o_orderkey BIGINT, o_custkey BIGINT, o_orderstatus VARCHAR, o_totalprice DECIMAL, o_orderdate DATE, o_orderpriority VARCHAR, o_clerk VARCHAR, o_shippriority INTEGER, o_comment VARCHAR
+      | predicate: (o_orderkey@16 = l_orderkey@0)
+        Filter
+        | schema: l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR
+        | predicate: (((l_shipmode@14 = VARCHAR:'MAIL') OR (l_shipmode@14 = VARCHAR:'SHIP')) AND ((l_commitdate@11 < l_receiptdate@12) AND ((l_shipdate@10 < l_commitdate@11) AND ((l_receiptdate@12 >= DATE:1994-01-01) AND (l_receiptdate@12 < DATE:1995-01-01)))))
+          SeqScan lineitem
+          | schema: l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR
+          | read_columns: [0, 10, 11, 12, 14]
+          | skip_conjuncts: ((l_shipmode@? = VARCHAR:'MAIL') OR (l_shipmode@? = VARCHAR:'SHIP')), (l_commitdate@? < l_receiptdate@?), (l_shipdate@? < l_commitdate@?), (l_receiptdate@? >= VARCHAR:'1994-01-01'), (l_receiptdate@? < VARCHAR:'1995-01-01')
+        SeqScan orders
+        | schema: o_orderkey BIGINT, o_custkey BIGINT, o_orderstatus VARCHAR, o_totalprice DECIMAL, o_orderdate DATE, o_orderpriority VARCHAR, o_clerk VARCHAR, o_shippriority INTEGER, o_comment VARCHAR
+        | read_columns: [0, 5]
+        | skip_conjuncts: none
+
+=== row no-indexes Q14 ===
+Projection
+| schema: expr DECIMAL
+| exprs: ((DECIMAL:100 * sum_expr_0@0) / sum_expr_1@1)
+  Aggregate
+  | schema: sum_expr_0 DECIMAL, sum_expr_1 DECIMAL
+  | group_by: none
+  | aggregates: SUM(CASE WHEN (p_type@20 LIKE VARCHAR:'PROMO%') THEN (l_extendedprice@5 * (INTEGER:1 - l_discount@6)) ELSE INTEGER:0 END), SUM((l_extendedprice@5 * (INTEGER:1 - l_discount@6)))
+    HashJoin
+    | schema: l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR, p_partkey BIGINT, p_name VARCHAR, p_mfgr VARCHAR, p_brand VARCHAR, p_type VARCHAR, p_size INTEGER, p_container VARCHAR, p_retailprice DECIMAL, p_comment VARCHAR
+    | predicate: (l_partkey@1 = p_partkey@16)
+      Filter
+      | schema: l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR
+      | predicate: ((l_shipdate@10 >= DATE:1995-09-01) AND (l_shipdate@10 < DATE:1995-10-01))
+        SeqScan lineitem
+        | schema: l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR
+        | read_columns: [1, 5, 6, 10]
+        | skip_conjuncts: (l_shipdate@? >= VARCHAR:'1995-09-01'), (l_shipdate@? < VARCHAR:'1995-10-01')
+      SeqScan part
+      | schema: p_partkey BIGINT, p_name VARCHAR, p_mfgr VARCHAR, p_brand VARCHAR, p_type VARCHAR, p_size INTEGER, p_container VARCHAR, p_retailprice DECIMAL, p_comment VARCHAR
+      | read_columns: [0, 4]
+      | skip_conjuncts: none
+
+=== row no-indexes Q19 ===
+Projection
+| schema: sum_expr_0 DECIMAL
+| exprs: sum_expr_0@0
+  Aggregate
+  | schema: sum_expr_0 DECIMAL
+  | group_by: none
+  | aggregates: SUM((l_extendedprice@14 * (INTEGER:1 - l_discount@15)))
+    Filter
+    | schema: p_partkey BIGINT, p_name VARCHAR, p_mfgr VARCHAR, p_brand VARCHAR, p_type VARCHAR, p_size INTEGER, p_container VARCHAR, p_retailprice DECIMAL, p_comment VARCHAR, l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR
+    | predicate: (((((((((p_brand@3 = VARCHAR:'Brand#12') AND ((p_container@6 = VARCHAR:'SM CASE') OR ((p_container@6 = VARCHAR:'SM BOX') OR ((p_container@6 = VARCHAR:'SM PACK') OR (p_container@6 = VARCHAR:'SM PKG'))))) AND (l_quantity@13 >= DECIMAL:1)) AND (l_quantity@13 <= DECIMAL:11)) AND ((p_size@5 >= INTEGER:1) AND (p_size@5 <= INTEGER:5))) AND ((l_shipmode@23 = VARCHAR:'AIR') OR (l_shipmode@23 = VARCHAR:'AIR REG'))) AND (l_shipinstruct@22 = VARCHAR:'DELIVER IN PERSON')) OR (((((((p_brand@3 = VARCHAR:'Brand#23') AND ((p_container@6 = VARCHAR:'MED BAG') OR ((p_container@6 = VARCHAR:'MED BOX') OR ((p_container@6 = VARCHAR:'MED PKG') OR (p_container@6 = VARCHAR:'MED PACK'))))) AND (l_quantity@13 >= DECIMAL:10)) AND (l_quantity@13 <= DECIMAL:20)) AND ((p_size@5 >= INTEGER:1) AND (p_size@5 <= INTEGER:10))) AND ((l_shipmode@23 = VARCHAR:'AIR') OR (l_shipmode@23 = VARCHAR:'AIR REG'))) AND (l_shipinstruct@22 = VARCHAR:'DELIVER IN PERSON'))) OR (((((((p_brand@3 = VARCHAR:'Brand#34') AND ((p_container@6 = VARCHAR:'LG CASE') OR ((p_container@6 = VARCHAR:'LG BOX') OR ((p_container@6 = VARCHAR:'LG PACK') OR (p_container@6 = VARCHAR:'LG PKG'))))) AND (l_quantity@13 >= DECIMAL:20)) AND (l_quantity@13 <= DECIMAL:30)) AND ((p_size@5 >= INTEGER:1) AND (p_size@5 <= INTEGER:15))) AND ((l_shipmode@23 = VARCHAR:'AIR') OR (l_shipmode@23 = VARCHAR:'AIR REG'))) AND (l_shipinstruct@22 = VARCHAR:'DELIVER IN PERSON')))
+      HashJoin
+      | schema: p_partkey BIGINT, p_name VARCHAR, p_mfgr VARCHAR, p_brand VARCHAR, p_type VARCHAR, p_size INTEGER, p_container VARCHAR, p_retailprice DECIMAL, p_comment VARCHAR, l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR
+      | predicate: (p_partkey@0 = l_partkey@10)
+        SeqScan part
+        | schema: p_partkey BIGINT, p_name VARCHAR, p_mfgr VARCHAR, p_brand VARCHAR, p_type VARCHAR, p_size INTEGER, p_container VARCHAR, p_retailprice DECIMAL, p_comment VARCHAR
+        | read_columns: [0, 3, 5, 6]
+        | skip_conjuncts: none
+        SeqScan lineitem
+        | schema: l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR
+        | read_columns: [1, 4, 5, 6, 13, 14]
+        | skip_conjuncts: none
+
+=== row indexes Q1 ===
+Sort
+| schema: l_returnflag VARCHAR, l_linestatus VARCHAR, sum_l_quantity DECIMAL, sum_l_extendedprice DECIMAL, sum_l_discount DECIMAL, count_star INTEGER
+| keys: l_returnflag@0 ASC, l_linestatus@1 ASC
+  Projection
+  | schema: l_returnflag VARCHAR, l_linestatus VARCHAR, sum_l_quantity DECIMAL, sum_l_extendedprice DECIMAL, sum_l_discount DECIMAL, count_star INTEGER
+  | exprs: l_returnflag@0, l_linestatus@1, sum_l_quantity@2, sum_l_extendedprice@3, sum_l_discount@4, count_star@5
+    Aggregate
+    | schema: l_returnflag VARCHAR, l_linestatus VARCHAR, sum_l_quantity DECIMAL, sum_l_extendedprice DECIMAL, sum_l_discount DECIMAL, count_star INTEGER
+    | group_by: l_returnflag@8, l_linestatus@9
+    | aggregates: SUM(l_quantity@4), SUM(l_extendedprice@5), SUM(l_discount@6), COUNT(*)
+      Filter
+      | schema: l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR
+      | predicate: (l_shipdate@10 <= DATE:1998-09-02)
+        SeqScan lineitem
+        | schema: l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR
+        | read_columns: [4, 5, 6, 8, 9, 10]
+        | skip_conjuncts: (l_shipdate@? <= VARCHAR:'1998-09-02')
+
+=== row indexes Q6 ===
+Projection
+| schema: sum_expr_0 DECIMAL
+| exprs: sum_expr_0@0
+  Aggregate
+  | schema: sum_expr_0 DECIMAL
+  | group_by: none
+  | aggregates: SUM((l_extendedprice@5 * l_discount@6))
+    Filter
+    | schema: l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR
+    | predicate: ((l_shipdate@10 >= DATE:1994-01-01) AND ((l_shipdate@10 < DATE:1995-01-01) AND ((l_discount@6 >= DECIMAL:0.050000000000000003) AND ((l_discount@6 <= DECIMAL:0.070000000000000007) AND (l_quantity@4 < DECIMAL:24)))))
+      SeqScan lineitem
+      | schema: l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR
+      | read_columns: [4, 5, 6, 10]
+      | skip_conjuncts: (l_shipdate@? >= VARCHAR:'1994-01-01'), (l_shipdate@? < VARCHAR:'1995-01-01'), (l_discount@? >= DECIMAL:0.050000000000000003), (l_discount@? <= DECIMAL:0.070000000000000007), (l_quantity@? < INTEGER:24)
+
+=== row indexes Q3 ===
+Limit
+| schema: l_orderkey BIGINT, sum_expr_0 DECIMAL, o_orderdate DATE, o_shippriority INTEGER
+| limit: 10
+  Sort
+  | schema: l_orderkey BIGINT, sum_expr_0 DECIMAL, o_orderdate DATE, o_shippriority INTEGER
+  | keys: sum_expr_0@1 DESC
+    Projection
+    | schema: l_orderkey BIGINT, sum_expr_0 DECIMAL, o_orderdate DATE, o_shippriority INTEGER
+    | exprs: l_orderkey@0, sum_expr_0@3, o_orderdate@1, o_shippriority@2
+      Aggregate
+      | schema: l_orderkey BIGINT, o_orderdate DATE, o_shippriority INTEGER, sum_expr_0 DECIMAL
+      | group_by: l_orderkey@17, o_orderdate@12, o_shippriority@15
+      | aggregates: SUM((l_extendedprice@22 * (INTEGER:1 - l_discount@23)))
+        HashJoin
+        | schema: c_custkey BIGINT, c_name VARCHAR, c_address VARCHAR, c_nationkey BIGINT, c_phone VARCHAR, c_acctbal DECIMAL, c_mktsegment VARCHAR, c_comment VARCHAR, o_orderkey BIGINT, o_custkey BIGINT, o_orderstatus VARCHAR, o_totalprice DECIMAL, o_orderdate DATE, o_orderpriority VARCHAR, o_clerk VARCHAR, o_shippriority INTEGER, o_comment VARCHAR, l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR
+        | predicate: (l.l_orderkey@17 = o.o_orderkey@8)
+          HashJoin
+          | schema: c_custkey BIGINT, c_name VARCHAR, c_address VARCHAR, c_nationkey BIGINT, c_phone VARCHAR, c_acctbal DECIMAL, c_mktsegment VARCHAR, c_comment VARCHAR, o_orderkey BIGINT, o_custkey BIGINT, o_orderstatus VARCHAR, o_totalprice DECIMAL, o_orderdate DATE, o_orderpriority VARCHAR, o_clerk VARCHAR, o_shippriority INTEGER, o_comment VARCHAR
+          | predicate: (c.c_custkey@0 = o.o_custkey@9)
+            Filter
+            | schema: c_custkey BIGINT, c_name VARCHAR, c_address VARCHAR, c_nationkey BIGINT, c_phone VARCHAR, c_acctbal DECIMAL, c_mktsegment VARCHAR, c_comment VARCHAR
+            | predicate: (c.c_mktsegment@6 = VARCHAR:'BUILDING')
+              SeqScan customer
+              | schema: c_custkey BIGINT, c_name VARCHAR, c_address VARCHAR, c_nationkey BIGINT, c_phone VARCHAR, c_acctbal DECIMAL, c_mktsegment VARCHAR, c_comment VARCHAR
+              | read_columns: [0, 6]
+              | skip_conjuncts: (c.c_mktsegment@? = VARCHAR:'BUILDING')
+            Filter
+            | schema: o_orderkey BIGINT, o_custkey BIGINT, o_orderstatus VARCHAR, o_totalprice DECIMAL, o_orderdate DATE, o_orderpriority VARCHAR, o_clerk VARCHAR, o_shippriority INTEGER, o_comment VARCHAR
+            | predicate: (o.o_orderdate@4 < DATE:1995-03-15)
+              SeqScan orders
+              | schema: o_orderkey BIGINT, o_custkey BIGINT, o_orderstatus VARCHAR, o_totalprice DECIMAL, o_orderdate DATE, o_orderpriority VARCHAR, o_clerk VARCHAR, o_shippriority INTEGER, o_comment VARCHAR
+              | read_columns: [0, 1, 4, 7]
+              | skip_conjuncts: (o.o_orderdate@? < VARCHAR:'1995-03-15')
+          Filter
+          | schema: l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR
+          | predicate: (l.l_shipdate@10 > DATE:1995-03-15)
+            SeqScan lineitem
+            | schema: l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR
+            | read_columns: [0, 5, 6, 10]
+            | skip_conjuncts: (l.l_shipdate@? > VARCHAR:'1995-03-15')
+
+=== row indexes Q5 ===
+Sort
+| schema: n_name VARCHAR, sum_expr_0 DECIMAL
+| keys: sum_expr_0@1 DESC
+  Projection
+  | schema: n_name VARCHAR, sum_expr_0 DECIMAL
+  | exprs: n_name@0, sum_expr_0@1
+    Aggregate
+    | schema: n_name VARCHAR, sum_expr_0 DECIMAL
+    | group_by: n_name@41
+    | aggregates: SUM((l_extendedprice@22 * (INTEGER:1 - l_discount@23)))
+      HashJoin
+      | schema: c_custkey BIGINT, c_name VARCHAR, c_address VARCHAR, c_nationkey BIGINT, c_phone VARCHAR, c_acctbal DECIMAL, c_mktsegment VARCHAR, c_comment VARCHAR, o_orderkey BIGINT, o_custkey BIGINT, o_orderstatus VARCHAR, o_totalprice DECIMAL, o_orderdate DATE, o_orderpriority VARCHAR, o_clerk VARCHAR, o_shippriority INTEGER, o_comment VARCHAR, l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR, s_suppkey BIGINT, s_name VARCHAR, s_address VARCHAR, s_nationkey BIGINT, s_phone VARCHAR, s_acctbal DECIMAL, s_comment VARCHAR, n_nationkey BIGINT, n_name VARCHAR, n_regionkey BIGINT, n_comment VARCHAR
+      | predicate: (s.s_nationkey@36 = n.n_nationkey@40)
+        HashJoin
+        | schema: c_custkey BIGINT, c_name VARCHAR, c_address VARCHAR, c_nationkey BIGINT, c_phone VARCHAR, c_acctbal DECIMAL, c_mktsegment VARCHAR, c_comment VARCHAR, o_orderkey BIGINT, o_custkey BIGINT, o_orderstatus VARCHAR, o_totalprice DECIMAL, o_orderdate DATE, o_orderpriority VARCHAR, o_clerk VARCHAR, o_shippriority INTEGER, o_comment VARCHAR, l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR, s_suppkey BIGINT, s_name VARCHAR, s_address VARCHAR, s_nationkey BIGINT, s_phone VARCHAR, s_acctbal DECIMAL, s_comment VARCHAR
+        | predicate: (l.l_suppkey@19 = s.s_suppkey@33)
+          HashJoin
+          | schema: c_custkey BIGINT, c_name VARCHAR, c_address VARCHAR, c_nationkey BIGINT, c_phone VARCHAR, c_acctbal DECIMAL, c_mktsegment VARCHAR, c_comment VARCHAR, o_orderkey BIGINT, o_custkey BIGINT, o_orderstatus VARCHAR, o_totalprice DECIMAL, o_orderdate DATE, o_orderpriority VARCHAR, o_clerk VARCHAR, o_shippriority INTEGER, o_comment VARCHAR, l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR
+          | predicate: (l.l_orderkey@17 = o.o_orderkey@8)
+            HashJoin
+            | schema: c_custkey BIGINT, c_name VARCHAR, c_address VARCHAR, c_nationkey BIGINT, c_phone VARCHAR, c_acctbal DECIMAL, c_mktsegment VARCHAR, c_comment VARCHAR, o_orderkey BIGINT, o_custkey BIGINT, o_orderstatus VARCHAR, o_totalprice DECIMAL, o_orderdate DATE, o_orderpriority VARCHAR, o_clerk VARCHAR, o_shippriority INTEGER, o_comment VARCHAR
+            | predicate: (c.c_custkey@0 = o.o_custkey@9)
+              SeqScan customer
+              | schema: c_custkey BIGINT, c_name VARCHAR, c_address VARCHAR, c_nationkey BIGINT, c_phone VARCHAR, c_acctbal DECIMAL, c_mktsegment VARCHAR, c_comment VARCHAR
+              | read_columns: [0]
+              | skip_conjuncts: none
+              Filter
+              | schema: o_orderkey BIGINT, o_custkey BIGINT, o_orderstatus VARCHAR, o_totalprice DECIMAL, o_orderdate DATE, o_orderpriority VARCHAR, o_clerk VARCHAR, o_shippriority INTEGER, o_comment VARCHAR
+              | predicate: ((o.o_orderdate@4 >= DATE:1994-01-01) AND (o.o_orderdate@4 < DATE:1995-01-01))
+                SeqScan orders
+                | schema: o_orderkey BIGINT, o_custkey BIGINT, o_orderstatus VARCHAR, o_totalprice DECIMAL, o_orderdate DATE, o_orderpriority VARCHAR, o_clerk VARCHAR, o_shippriority INTEGER, o_comment VARCHAR
+                | read_columns: [0, 1, 4]
+                | skip_conjuncts: (o.o_orderdate@? >= VARCHAR:'1994-01-01'), (o.o_orderdate@? < VARCHAR:'1995-01-01')
+            SeqScan lineitem
+            | schema: l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR
+            | read_columns: [0, 2, 5, 6]
+            | skip_conjuncts: none
+          SeqScan supplier
+          | schema: s_suppkey BIGINT, s_name VARCHAR, s_address VARCHAR, s_nationkey BIGINT, s_phone VARCHAR, s_acctbal DECIMAL, s_comment VARCHAR
+          | read_columns: [0, 3]
+          | skip_conjuncts: none
+        SeqScan nation
+        | schema: n_nationkey BIGINT, n_name VARCHAR, n_regionkey BIGINT, n_comment VARCHAR
+        | read_columns: [0, 1]
+        | skip_conjuncts: none
+
+=== row indexes Q10 ===
+Limit
+| schema: c_custkey BIGINT, c_name VARCHAR, sum_expr_0 DECIMAL, c_acctbal DECIMAL, n_name VARCHAR, c_address VARCHAR, c_phone VARCHAR, c_comment VARCHAR
+| limit: 20
+  Sort
+  | schema: c_custkey BIGINT, c_name VARCHAR, sum_expr_0 DECIMAL, c_acctbal DECIMAL, n_name VARCHAR, c_address VARCHAR, c_phone VARCHAR, c_comment VARCHAR
+  | keys: sum_expr_0@2 DESC
+    Projection
+    | schema: c_custkey BIGINT, c_name VARCHAR, sum_expr_0 DECIMAL, c_acctbal DECIMAL, n_name VARCHAR, c_address VARCHAR, c_phone VARCHAR, c_comment VARCHAR
+    | exprs: c_custkey@0, c_name@1, sum_expr_0@7, c_acctbal@2, n_name@4, c_address@5, c_phone@3, c_comment@6
+      Aggregate
+      | schema: c_custkey BIGINT, c_name VARCHAR, c_acctbal DECIMAL, c_phone VARCHAR, n_name VARCHAR, c_address VARCHAR, c_comment VARCHAR, sum_expr_0 DECIMAL
+      | group_by: c_custkey@4, c_name@5, c_acctbal@9, c_phone@8, n_name@1, c_address@6, c_comment@11
+      | aggregates: SUM((l_extendedprice@26 * (INTEGER:1 - l_discount@27)))
+        HashJoin
+        | schema: n_nationkey BIGINT, n_name VARCHAR, n_regionkey BIGINT, n_comment VARCHAR, c_custkey BIGINT, c_name VARCHAR, c_address VARCHAR, c_nationkey BIGINT, c_phone VARCHAR, c_acctbal DECIMAL, c_mktsegment VARCHAR, c_comment VARCHAR, o_orderkey BIGINT, o_custkey BIGINT, o_orderstatus VARCHAR, o_totalprice DECIMAL, o_orderdate DATE, o_orderpriority VARCHAR, o_clerk VARCHAR, o_shippriority INTEGER, o_comment VARCHAR, l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR
+        | predicate: (l_orderkey@21 = o_orderkey@12)
+          HashJoin
+          | schema: n_nationkey BIGINT, n_name VARCHAR, n_regionkey BIGINT, n_comment VARCHAR, c_custkey BIGINT, c_name VARCHAR, c_address VARCHAR, c_nationkey BIGINT, c_phone VARCHAR, c_acctbal DECIMAL, c_mktsegment VARCHAR, c_comment VARCHAR, o_orderkey BIGINT, o_custkey BIGINT, o_orderstatus VARCHAR, o_totalprice DECIMAL, o_orderdate DATE, o_orderpriority VARCHAR, o_clerk VARCHAR, o_shippriority INTEGER, o_comment VARCHAR
+          | predicate: (c_custkey@4 = o_custkey@13)
+            HashJoin
+            | schema: n_nationkey BIGINT, n_name VARCHAR, n_regionkey BIGINT, n_comment VARCHAR, c_custkey BIGINT, c_name VARCHAR, c_address VARCHAR, c_nationkey BIGINT, c_phone VARCHAR, c_acctbal DECIMAL, c_mktsegment VARCHAR, c_comment VARCHAR
+            | predicate: (c_nationkey@7 = n_nationkey@0)
+              SeqScan nation
+              | schema: n_nationkey BIGINT, n_name VARCHAR, n_regionkey BIGINT, n_comment VARCHAR
+              | read_columns: [0, 1]
+              | skip_conjuncts: none
+              SeqScan customer
+              | schema: c_custkey BIGINT, c_name VARCHAR, c_address VARCHAR, c_nationkey BIGINT, c_phone VARCHAR, c_acctbal DECIMAL, c_mktsegment VARCHAR, c_comment VARCHAR
+              | read_columns: [0, 1, 2, 3, 4, 5, 7]
+              | skip_conjuncts: none
+            Filter
+            | schema: o_orderkey BIGINT, o_custkey BIGINT, o_orderstatus VARCHAR, o_totalprice DECIMAL, o_orderdate DATE, o_orderpriority VARCHAR, o_clerk VARCHAR, o_shippriority INTEGER, o_comment VARCHAR
+            | predicate: (o_orderdate@4 < DATE:1994-01-01)
+              IndexScan orders idx_orders_orderdate
+              | schema: o_orderkey BIGINT, o_custkey BIGINT, o_orderstatus VARCHAR, o_totalprice DECIMAL, o_orderdate DATE, o_orderpriority VARCHAR, o_clerk VARCHAR, o_shippriority INTEGER, o_comment VARCHAR
+              | low: DATE:1993-10-01
+              | high: DATE:1994-01-01
+              | read_columns: [0, 1, 4]
+          Filter
+          | schema: l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR
+          | predicate: (l_returnflag@8 = VARCHAR:'R')
+            SeqScan lineitem
+            | schema: l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR
+            | read_columns: [0, 5, 6, 8]
+            | skip_conjuncts: (l_returnflag@? = VARCHAR:'R')
+
+=== row indexes Q12 ===
+Sort
+| schema: l_shipmode VARCHAR, sum_expr_0 DECIMAL, sum_expr_1 DECIMAL
+| keys: l_shipmode@0 ASC
+  Projection
+  | schema: l_shipmode VARCHAR, sum_expr_0 DECIMAL, sum_expr_1 DECIMAL
+  | exprs: l_shipmode@0, sum_expr_0@1, sum_expr_1@2
+    Aggregate
+    | schema: l_shipmode VARCHAR, sum_expr_0 DECIMAL, sum_expr_1 DECIMAL
+    | group_by: l_shipmode@14
+    | aggregates: SUM(CASE WHEN ((o_orderpriority@21 = VARCHAR:'1-URGENT') OR (o_orderpriority@21 = VARCHAR:'2-HIGH')) THEN INTEGER:1 ELSE INTEGER:0 END), SUM(CASE WHEN ((o_orderpriority@21 <> VARCHAR:'1-URGENT') AND (o_orderpriority@21 <> VARCHAR:'2-HIGH')) THEN INTEGER:1 ELSE INTEGER:0 END)
+      HashJoin
+      | schema: l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR, o_orderkey BIGINT, o_custkey BIGINT, o_orderstatus VARCHAR, o_totalprice DECIMAL, o_orderdate DATE, o_orderpriority VARCHAR, o_clerk VARCHAR, o_shippriority INTEGER, o_comment VARCHAR
+      | predicate: (o_orderkey@16 = l_orderkey@0)
+        Filter
+        | schema: l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR
+        | predicate: (((l_shipmode@14 = VARCHAR:'MAIL') OR (l_shipmode@14 = VARCHAR:'SHIP')) AND ((l_commitdate@11 < l_receiptdate@12) AND ((l_shipdate@10 < l_commitdate@11) AND ((l_receiptdate@12 >= DATE:1994-01-01) AND (l_receiptdate@12 < DATE:1995-01-01)))))
+          SeqScan lineitem
+          | schema: l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR
+          | read_columns: [0, 10, 11, 12, 14]
+          | skip_conjuncts: ((l_shipmode@? = VARCHAR:'MAIL') OR (l_shipmode@? = VARCHAR:'SHIP')), (l_commitdate@? < l_receiptdate@?), (l_shipdate@? < l_commitdate@?), (l_receiptdate@? >= VARCHAR:'1994-01-01'), (l_receiptdate@? < VARCHAR:'1995-01-01')
+        SeqScan orders
+        | schema: o_orderkey BIGINT, o_custkey BIGINT, o_orderstatus VARCHAR, o_totalprice DECIMAL, o_orderdate DATE, o_orderpriority VARCHAR, o_clerk VARCHAR, o_shippriority INTEGER, o_comment VARCHAR
+        | read_columns: [0, 5]
+        | skip_conjuncts: none
+
+=== row indexes Q14 ===
+Projection
+| schema: expr DECIMAL
+| exprs: ((DECIMAL:100 * sum_expr_0@0) / sum_expr_1@1)
+  Aggregate
+  | schema: sum_expr_0 DECIMAL, sum_expr_1 DECIMAL
+  | group_by: none
+  | aggregates: SUM(CASE WHEN (p_type@20 LIKE VARCHAR:'PROMO%') THEN (l_extendedprice@5 * (INTEGER:1 - l_discount@6)) ELSE INTEGER:0 END), SUM((l_extendedprice@5 * (INTEGER:1 - l_discount@6)))
+    HashJoin
+    | schema: l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR, p_partkey BIGINT, p_name VARCHAR, p_mfgr VARCHAR, p_brand VARCHAR, p_type VARCHAR, p_size INTEGER, p_container VARCHAR, p_retailprice DECIMAL, p_comment VARCHAR
+    | predicate: (l_partkey@1 = p_partkey@16)
+      Filter
+      | schema: l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR
+      | predicate: (l_shipdate@10 < DATE:1995-10-01)
+        IndexScan lineitem idx_lineitem_shipdate
+        | schema: l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR
+        | low: DATE:1995-09-01
+        | high: DATE:1995-10-01
+        | read_columns: [1, 5, 6, 10]
+      SeqScan part
+      | schema: p_partkey BIGINT, p_name VARCHAR, p_mfgr VARCHAR, p_brand VARCHAR, p_type VARCHAR, p_size INTEGER, p_container VARCHAR, p_retailprice DECIMAL, p_comment VARCHAR
+      | read_columns: [0, 4]
+      | skip_conjuncts: none
+
+=== row indexes Q19 ===
+Projection
+| schema: sum_expr_0 DECIMAL
+| exprs: sum_expr_0@0
+  Aggregate
+  | schema: sum_expr_0 DECIMAL
+  | group_by: none
+  | aggregates: SUM((l_extendedprice@14 * (INTEGER:1 - l_discount@15)))
+    Filter
+    | schema: p_partkey BIGINT, p_name VARCHAR, p_mfgr VARCHAR, p_brand VARCHAR, p_type VARCHAR, p_size INTEGER, p_container VARCHAR, p_retailprice DECIMAL, p_comment VARCHAR, l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR
+    | predicate: (((((((((p_brand@3 = VARCHAR:'Brand#12') AND ((p_container@6 = VARCHAR:'SM CASE') OR ((p_container@6 = VARCHAR:'SM BOX') OR ((p_container@6 = VARCHAR:'SM PACK') OR (p_container@6 = VARCHAR:'SM PKG'))))) AND (l_quantity@13 >= DECIMAL:1)) AND (l_quantity@13 <= DECIMAL:11)) AND ((p_size@5 >= INTEGER:1) AND (p_size@5 <= INTEGER:5))) AND ((l_shipmode@23 = VARCHAR:'AIR') OR (l_shipmode@23 = VARCHAR:'AIR REG'))) AND (l_shipinstruct@22 = VARCHAR:'DELIVER IN PERSON')) OR (((((((p_brand@3 = VARCHAR:'Brand#23') AND ((p_container@6 = VARCHAR:'MED BAG') OR ((p_container@6 = VARCHAR:'MED BOX') OR ((p_container@6 = VARCHAR:'MED PKG') OR (p_container@6 = VARCHAR:'MED PACK'))))) AND (l_quantity@13 >= DECIMAL:10)) AND (l_quantity@13 <= DECIMAL:20)) AND ((p_size@5 >= INTEGER:1) AND (p_size@5 <= INTEGER:10))) AND ((l_shipmode@23 = VARCHAR:'AIR') OR (l_shipmode@23 = VARCHAR:'AIR REG'))) AND (l_shipinstruct@22 = VARCHAR:'DELIVER IN PERSON'))) OR (((((((p_brand@3 = VARCHAR:'Brand#34') AND ((p_container@6 = VARCHAR:'LG CASE') OR ((p_container@6 = VARCHAR:'LG BOX') OR ((p_container@6 = VARCHAR:'LG PACK') OR (p_container@6 = VARCHAR:'LG PKG'))))) AND (l_quantity@13 >= DECIMAL:20)) AND (l_quantity@13 <= DECIMAL:30)) AND ((p_size@5 >= INTEGER:1) AND (p_size@5 <= INTEGER:15))) AND ((l_shipmode@23 = VARCHAR:'AIR') OR (l_shipmode@23 = VARCHAR:'AIR REG'))) AND (l_shipinstruct@22 = VARCHAR:'DELIVER IN PERSON')))
+      HashJoin
+      | schema: p_partkey BIGINT, p_name VARCHAR, p_mfgr VARCHAR, p_brand VARCHAR, p_type VARCHAR, p_size INTEGER, p_container VARCHAR, p_retailprice DECIMAL, p_comment VARCHAR, l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR
+      | predicate: (p_partkey@0 = l_partkey@10)
+        SeqScan part
+        | schema: p_partkey BIGINT, p_name VARCHAR, p_mfgr VARCHAR, p_brand VARCHAR, p_type VARCHAR, p_size INTEGER, p_container VARCHAR, p_retailprice DECIMAL, p_comment VARCHAR
+        | read_columns: [0, 3, 5, 6]
+        | skip_conjuncts: none
+        SeqScan lineitem
+        | schema: l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR
+        | read_columns: [1, 4, 5, 6, 13, 14]
+        | skip_conjuncts: none
+
+=== columnar no-indexes Q1 ===
+Sort
+| schema: l_returnflag VARCHAR, l_linestatus VARCHAR, sum_l_quantity DECIMAL, sum_l_extendedprice DECIMAL, sum_l_discount DECIMAL, count_star INTEGER
+| keys: l_returnflag@0 ASC, l_linestatus@1 ASC
+  Projection
+  | schema: l_returnflag VARCHAR, l_linestatus VARCHAR, sum_l_quantity DECIMAL, sum_l_extendedprice DECIMAL, sum_l_discount DECIMAL, count_star INTEGER
+  | exprs: l_returnflag@0, l_linestatus@1, sum_l_quantity@2, sum_l_extendedprice@3, sum_l_discount@4, count_star@5
+    Aggregate
+    | schema: l_returnflag VARCHAR, l_linestatus VARCHAR, sum_l_quantity DECIMAL, sum_l_extendedprice DECIMAL, sum_l_discount DECIMAL, count_star INTEGER
+    | group_by: l_returnflag@8, l_linestatus@9
+    | aggregates: SUM(l_quantity@4), SUM(l_extendedprice@5), SUM(l_discount@6), COUNT(*)
+      Filter
+      | schema: l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR
+      | predicate: (l_shipdate@10 <= DATE:1998-09-02)
+        SeqScan lineitem
+        | schema: l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR
+        | read_columns: [4, 5, 6, 8, 9, 10]
+        | skip_conjuncts: (l_shipdate@? <= VARCHAR:'1998-09-02')
+
+=== columnar no-indexes Q6 ===
+Projection
+| schema: sum_expr_0 DECIMAL
+| exprs: sum_expr_0@0
+  Aggregate
+  | schema: sum_expr_0 DECIMAL
+  | group_by: none
+  | aggregates: SUM((l_extendedprice@5 * l_discount@6))
+    Filter
+    | schema: l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR
+    | predicate: ((l_shipdate@10 >= DATE:1994-01-01) AND ((l_shipdate@10 < DATE:1995-01-01) AND ((l_discount@6 >= DECIMAL:0.050000000000000003) AND ((l_discount@6 <= DECIMAL:0.070000000000000007) AND (l_quantity@4 < DECIMAL:24)))))
+      SeqScan lineitem
+      | schema: l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR
+      | read_columns: [4, 5, 6, 10]
+      | skip_conjuncts: (l_shipdate@? >= VARCHAR:'1994-01-01'), (l_shipdate@? < VARCHAR:'1995-01-01'), (l_discount@? >= DECIMAL:0.050000000000000003), (l_discount@? <= DECIMAL:0.070000000000000007), (l_quantity@? < INTEGER:24)
+
+=== columnar no-indexes Q3 ===
+Limit
+| schema: l_orderkey BIGINT, sum_expr_0 DECIMAL, o_orderdate DATE, o_shippriority INTEGER
+| limit: 10
+  Sort
+  | schema: l_orderkey BIGINT, sum_expr_0 DECIMAL, o_orderdate DATE, o_shippriority INTEGER
+  | keys: sum_expr_0@1 DESC
+    Projection
+    | schema: l_orderkey BIGINT, sum_expr_0 DECIMAL, o_orderdate DATE, o_shippriority INTEGER
+    | exprs: l_orderkey@0, sum_expr_0@3, o_orderdate@1, o_shippriority@2
+      Aggregate
+      | schema: l_orderkey BIGINT, o_orderdate DATE, o_shippriority INTEGER, sum_expr_0 DECIMAL
+      | group_by: l_orderkey@17, o_orderdate@12, o_shippriority@15
+      | aggregates: SUM((l_extendedprice@22 * (INTEGER:1 - l_discount@23)))
+        HashJoin
+        | schema: c_custkey BIGINT, c_name VARCHAR, c_address VARCHAR, c_nationkey BIGINT, c_phone VARCHAR, c_acctbal DECIMAL, c_mktsegment VARCHAR, c_comment VARCHAR, o_orderkey BIGINT, o_custkey BIGINT, o_orderstatus VARCHAR, o_totalprice DECIMAL, o_orderdate DATE, o_orderpriority VARCHAR, o_clerk VARCHAR, o_shippriority INTEGER, o_comment VARCHAR, l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR
+        | predicate: (l.l_orderkey@17 = o.o_orderkey@8)
+          HashJoin
+          | schema: c_custkey BIGINT, c_name VARCHAR, c_address VARCHAR, c_nationkey BIGINT, c_phone VARCHAR, c_acctbal DECIMAL, c_mktsegment VARCHAR, c_comment VARCHAR, o_orderkey BIGINT, o_custkey BIGINT, o_orderstatus VARCHAR, o_totalprice DECIMAL, o_orderdate DATE, o_orderpriority VARCHAR, o_clerk VARCHAR, o_shippriority INTEGER, o_comment VARCHAR
+          | predicate: (c.c_custkey@0 = o.o_custkey@9)
+            Filter
+            | schema: c_custkey BIGINT, c_name VARCHAR, c_address VARCHAR, c_nationkey BIGINT, c_phone VARCHAR, c_acctbal DECIMAL, c_mktsegment VARCHAR, c_comment VARCHAR
+            | predicate: (c.c_mktsegment@6 = VARCHAR:'BUILDING')
+              SeqScan customer
+              | schema: c_custkey BIGINT, c_name VARCHAR, c_address VARCHAR, c_nationkey BIGINT, c_phone VARCHAR, c_acctbal DECIMAL, c_mktsegment VARCHAR, c_comment VARCHAR
+              | read_columns: [0, 6]
+              | skip_conjuncts: (c.c_mktsegment@? = VARCHAR:'BUILDING')
+            Filter
+            | schema: o_orderkey BIGINT, o_custkey BIGINT, o_orderstatus VARCHAR, o_totalprice DECIMAL, o_orderdate DATE, o_orderpriority VARCHAR, o_clerk VARCHAR, o_shippriority INTEGER, o_comment VARCHAR
+            | predicate: (o.o_orderdate@4 < DATE:1995-03-15)
+              SeqScan orders
+              | schema: o_orderkey BIGINT, o_custkey BIGINT, o_orderstatus VARCHAR, o_totalprice DECIMAL, o_orderdate DATE, o_orderpriority VARCHAR, o_clerk VARCHAR, o_shippriority INTEGER, o_comment VARCHAR
+              | read_columns: [0, 1, 4, 7]
+              | skip_conjuncts: (o.o_orderdate@? < VARCHAR:'1995-03-15')
+          Filter
+          | schema: l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR
+          | predicate: (l.l_shipdate@10 > DATE:1995-03-15)
+            SeqScan lineitem
+            | schema: l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR
+            | read_columns: [0, 5, 6, 10]
+            | skip_conjuncts: (l.l_shipdate@? > VARCHAR:'1995-03-15')
+
+=== columnar no-indexes Q5 ===
+Sort
+| schema: n_name VARCHAR, sum_expr_0 DECIMAL
+| keys: sum_expr_0@1 DESC
+  Projection
+  | schema: n_name VARCHAR, sum_expr_0 DECIMAL
+  | exprs: n_name@0, sum_expr_0@1
+    Aggregate
+    | schema: n_name VARCHAR, sum_expr_0 DECIMAL
+    | group_by: n_name@41
+    | aggregates: SUM((l_extendedprice@22 * (INTEGER:1 - l_discount@23)))
+      HashJoin
+      | schema: c_custkey BIGINT, c_name VARCHAR, c_address VARCHAR, c_nationkey BIGINT, c_phone VARCHAR, c_acctbal DECIMAL, c_mktsegment VARCHAR, c_comment VARCHAR, o_orderkey BIGINT, o_custkey BIGINT, o_orderstatus VARCHAR, o_totalprice DECIMAL, o_orderdate DATE, o_orderpriority VARCHAR, o_clerk VARCHAR, o_shippriority INTEGER, o_comment VARCHAR, l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR, s_suppkey BIGINT, s_name VARCHAR, s_address VARCHAR, s_nationkey BIGINT, s_phone VARCHAR, s_acctbal DECIMAL, s_comment VARCHAR, n_nationkey BIGINT, n_name VARCHAR, n_regionkey BIGINT, n_comment VARCHAR
+      | predicate: (s.s_nationkey@36 = n.n_nationkey@40)
+        HashJoin
+        | schema: c_custkey BIGINT, c_name VARCHAR, c_address VARCHAR, c_nationkey BIGINT, c_phone VARCHAR, c_acctbal DECIMAL, c_mktsegment VARCHAR, c_comment VARCHAR, o_orderkey BIGINT, o_custkey BIGINT, o_orderstatus VARCHAR, o_totalprice DECIMAL, o_orderdate DATE, o_orderpriority VARCHAR, o_clerk VARCHAR, o_shippriority INTEGER, o_comment VARCHAR, l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR, s_suppkey BIGINT, s_name VARCHAR, s_address VARCHAR, s_nationkey BIGINT, s_phone VARCHAR, s_acctbal DECIMAL, s_comment VARCHAR
+        | predicate: (l.l_suppkey@19 = s.s_suppkey@33)
+          HashJoin
+          | schema: c_custkey BIGINT, c_name VARCHAR, c_address VARCHAR, c_nationkey BIGINT, c_phone VARCHAR, c_acctbal DECIMAL, c_mktsegment VARCHAR, c_comment VARCHAR, o_orderkey BIGINT, o_custkey BIGINT, o_orderstatus VARCHAR, o_totalprice DECIMAL, o_orderdate DATE, o_orderpriority VARCHAR, o_clerk VARCHAR, o_shippriority INTEGER, o_comment VARCHAR, l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR
+          | predicate: (l.l_orderkey@17 = o.o_orderkey@8)
+            HashJoin
+            | schema: c_custkey BIGINT, c_name VARCHAR, c_address VARCHAR, c_nationkey BIGINT, c_phone VARCHAR, c_acctbal DECIMAL, c_mktsegment VARCHAR, c_comment VARCHAR, o_orderkey BIGINT, o_custkey BIGINT, o_orderstatus VARCHAR, o_totalprice DECIMAL, o_orderdate DATE, o_orderpriority VARCHAR, o_clerk VARCHAR, o_shippriority INTEGER, o_comment VARCHAR
+            | predicate: (c.c_custkey@0 = o.o_custkey@9)
+              SeqScan customer
+              | schema: c_custkey BIGINT, c_name VARCHAR, c_address VARCHAR, c_nationkey BIGINT, c_phone VARCHAR, c_acctbal DECIMAL, c_mktsegment VARCHAR, c_comment VARCHAR
+              | read_columns: [0]
+              | skip_conjuncts: none
+              Filter
+              | schema: o_orderkey BIGINT, o_custkey BIGINT, o_orderstatus VARCHAR, o_totalprice DECIMAL, o_orderdate DATE, o_orderpriority VARCHAR, o_clerk VARCHAR, o_shippriority INTEGER, o_comment VARCHAR
+              | predicate: ((o.o_orderdate@4 >= DATE:1994-01-01) AND (o.o_orderdate@4 < DATE:1995-01-01))
+                SeqScan orders
+                | schema: o_orderkey BIGINT, o_custkey BIGINT, o_orderstatus VARCHAR, o_totalprice DECIMAL, o_orderdate DATE, o_orderpriority VARCHAR, o_clerk VARCHAR, o_shippriority INTEGER, o_comment VARCHAR
+                | read_columns: [0, 1, 4]
+                | skip_conjuncts: (o.o_orderdate@? >= VARCHAR:'1994-01-01'), (o.o_orderdate@? < VARCHAR:'1995-01-01')
+            SeqScan lineitem
+            | schema: l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR
+            | read_columns: [0, 2, 5, 6]
+            | skip_conjuncts: none
+          SeqScan supplier
+          | schema: s_suppkey BIGINT, s_name VARCHAR, s_address VARCHAR, s_nationkey BIGINT, s_phone VARCHAR, s_acctbal DECIMAL, s_comment VARCHAR
+          | read_columns: [0, 3]
+          | skip_conjuncts: none
+        SeqScan nation
+        | schema: n_nationkey BIGINT, n_name VARCHAR, n_regionkey BIGINT, n_comment VARCHAR
+        | read_columns: [0, 1]
+        | skip_conjuncts: none
+
+=== columnar no-indexes Q10 ===
+Limit
+| schema: c_custkey BIGINT, c_name VARCHAR, sum_expr_0 DECIMAL, c_acctbal DECIMAL, n_name VARCHAR, c_address VARCHAR, c_phone VARCHAR, c_comment VARCHAR
+| limit: 20
+  Sort
+  | schema: c_custkey BIGINT, c_name VARCHAR, sum_expr_0 DECIMAL, c_acctbal DECIMAL, n_name VARCHAR, c_address VARCHAR, c_phone VARCHAR, c_comment VARCHAR
+  | keys: sum_expr_0@2 DESC
+    Projection
+    | schema: c_custkey BIGINT, c_name VARCHAR, sum_expr_0 DECIMAL, c_acctbal DECIMAL, n_name VARCHAR, c_address VARCHAR, c_phone VARCHAR, c_comment VARCHAR
+    | exprs: c_custkey@0, c_name@1, sum_expr_0@7, c_acctbal@2, n_name@4, c_address@5, c_phone@3, c_comment@6
+      Aggregate
+      | schema: c_custkey BIGINT, c_name VARCHAR, c_acctbal DECIMAL, c_phone VARCHAR, n_name VARCHAR, c_address VARCHAR, c_comment VARCHAR, sum_expr_0 DECIMAL
+      | group_by: c_custkey@4, c_name@5, c_acctbal@9, c_phone@8, n_name@1, c_address@6, c_comment@11
+      | aggregates: SUM((l_extendedprice@26 * (INTEGER:1 - l_discount@27)))
+        HashJoin
+        | schema: n_nationkey BIGINT, n_name VARCHAR, n_regionkey BIGINT, n_comment VARCHAR, c_custkey BIGINT, c_name VARCHAR, c_address VARCHAR, c_nationkey BIGINT, c_phone VARCHAR, c_acctbal DECIMAL, c_mktsegment VARCHAR, c_comment VARCHAR, o_orderkey BIGINT, o_custkey BIGINT, o_orderstatus VARCHAR, o_totalprice DECIMAL, o_orderdate DATE, o_orderpriority VARCHAR, o_clerk VARCHAR, o_shippriority INTEGER, o_comment VARCHAR, l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR
+        | predicate: (l_orderkey@21 = o_orderkey@12)
+          HashJoin
+          | schema: n_nationkey BIGINT, n_name VARCHAR, n_regionkey BIGINT, n_comment VARCHAR, c_custkey BIGINT, c_name VARCHAR, c_address VARCHAR, c_nationkey BIGINT, c_phone VARCHAR, c_acctbal DECIMAL, c_mktsegment VARCHAR, c_comment VARCHAR, o_orderkey BIGINT, o_custkey BIGINT, o_orderstatus VARCHAR, o_totalprice DECIMAL, o_orderdate DATE, o_orderpriority VARCHAR, o_clerk VARCHAR, o_shippriority INTEGER, o_comment VARCHAR
+          | predicate: (c_custkey@4 = o_custkey@13)
+            HashJoin
+            | schema: n_nationkey BIGINT, n_name VARCHAR, n_regionkey BIGINT, n_comment VARCHAR, c_custkey BIGINT, c_name VARCHAR, c_address VARCHAR, c_nationkey BIGINT, c_phone VARCHAR, c_acctbal DECIMAL, c_mktsegment VARCHAR, c_comment VARCHAR
+            | predicate: (c_nationkey@7 = n_nationkey@0)
+              SeqScan nation
+              | schema: n_nationkey BIGINT, n_name VARCHAR, n_regionkey BIGINT, n_comment VARCHAR
+              | read_columns: [0, 1]
+              | skip_conjuncts: none
+              SeqScan customer
+              | schema: c_custkey BIGINT, c_name VARCHAR, c_address VARCHAR, c_nationkey BIGINT, c_phone VARCHAR, c_acctbal DECIMAL, c_mktsegment VARCHAR, c_comment VARCHAR
+              | read_columns: [0, 1, 2, 3, 4, 5, 7]
+              | skip_conjuncts: none
+            Filter
+            | schema: o_orderkey BIGINT, o_custkey BIGINT, o_orderstatus VARCHAR, o_totalprice DECIMAL, o_orderdate DATE, o_orderpriority VARCHAR, o_clerk VARCHAR, o_shippriority INTEGER, o_comment VARCHAR
+            | predicate: ((o_orderdate@4 >= DATE:1993-10-01) AND (o_orderdate@4 < DATE:1994-01-01))
+              SeqScan orders
+              | schema: o_orderkey BIGINT, o_custkey BIGINT, o_orderstatus VARCHAR, o_totalprice DECIMAL, o_orderdate DATE, o_orderpriority VARCHAR, o_clerk VARCHAR, o_shippriority INTEGER, o_comment VARCHAR
+              | read_columns: [0, 1, 4]
+              | skip_conjuncts: (o_orderdate@? >= VARCHAR:'1993-10-01'), (o_orderdate@? < VARCHAR:'1994-01-01')
+          Filter
+          | schema: l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR
+          | predicate: (l_returnflag@8 = VARCHAR:'R')
+            SeqScan lineitem
+            | schema: l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR
+            | read_columns: [0, 5, 6, 8]
+            | skip_conjuncts: (l_returnflag@? = VARCHAR:'R')
+
+=== columnar no-indexes Q12 ===
+Sort
+| schema: l_shipmode VARCHAR, sum_expr_0 DECIMAL, sum_expr_1 DECIMAL
+| keys: l_shipmode@0 ASC
+  Projection
+  | schema: l_shipmode VARCHAR, sum_expr_0 DECIMAL, sum_expr_1 DECIMAL
+  | exprs: l_shipmode@0, sum_expr_0@1, sum_expr_1@2
+    Aggregate
+    | schema: l_shipmode VARCHAR, sum_expr_0 DECIMAL, sum_expr_1 DECIMAL
+    | group_by: l_shipmode@14
+    | aggregates: SUM(CASE WHEN ((o_orderpriority@21 = VARCHAR:'1-URGENT') OR (o_orderpriority@21 = VARCHAR:'2-HIGH')) THEN INTEGER:1 ELSE INTEGER:0 END), SUM(CASE WHEN ((o_orderpriority@21 <> VARCHAR:'1-URGENT') AND (o_orderpriority@21 <> VARCHAR:'2-HIGH')) THEN INTEGER:1 ELSE INTEGER:0 END)
+      HashJoin
+      | schema: l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR, o_orderkey BIGINT, o_custkey BIGINT, o_orderstatus VARCHAR, o_totalprice DECIMAL, o_orderdate DATE, o_orderpriority VARCHAR, o_clerk VARCHAR, o_shippriority INTEGER, o_comment VARCHAR
+      | predicate: (o_orderkey@16 = l_orderkey@0)
+        Filter
+        | schema: l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR
+        | predicate: (((l_shipmode@14 = VARCHAR:'MAIL') OR (l_shipmode@14 = VARCHAR:'SHIP')) AND ((l_commitdate@11 < l_receiptdate@12) AND ((l_shipdate@10 < l_commitdate@11) AND ((l_receiptdate@12 >= DATE:1994-01-01) AND (l_receiptdate@12 < DATE:1995-01-01)))))
+          SeqScan lineitem
+          | schema: l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR
+          | read_columns: [0, 10, 11, 12, 14]
+          | skip_conjuncts: ((l_shipmode@? = VARCHAR:'MAIL') OR (l_shipmode@? = VARCHAR:'SHIP')), (l_commitdate@? < l_receiptdate@?), (l_shipdate@? < l_commitdate@?), (l_receiptdate@? >= VARCHAR:'1994-01-01'), (l_receiptdate@? < VARCHAR:'1995-01-01')
+        SeqScan orders
+        | schema: o_orderkey BIGINT, o_custkey BIGINT, o_orderstatus VARCHAR, o_totalprice DECIMAL, o_orderdate DATE, o_orderpriority VARCHAR, o_clerk VARCHAR, o_shippriority INTEGER, o_comment VARCHAR
+        | read_columns: [0, 5]
+        | skip_conjuncts: none
+
+=== columnar no-indexes Q14 ===
+Projection
+| schema: expr DECIMAL
+| exprs: ((DECIMAL:100 * sum_expr_0@0) / sum_expr_1@1)
+  Aggregate
+  | schema: sum_expr_0 DECIMAL, sum_expr_1 DECIMAL
+  | group_by: none
+  | aggregates: SUM(CASE WHEN (p_type@20 LIKE VARCHAR:'PROMO%') THEN (l_extendedprice@5 * (INTEGER:1 - l_discount@6)) ELSE INTEGER:0 END), SUM((l_extendedprice@5 * (INTEGER:1 - l_discount@6)))
+    HashJoin
+    | schema: l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR, p_partkey BIGINT, p_name VARCHAR, p_mfgr VARCHAR, p_brand VARCHAR, p_type VARCHAR, p_size INTEGER, p_container VARCHAR, p_retailprice DECIMAL, p_comment VARCHAR
+    | predicate: (l_partkey@1 = p_partkey@16)
+      Filter
+      | schema: l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR
+      | predicate: ((l_shipdate@10 >= DATE:1995-09-01) AND (l_shipdate@10 < DATE:1995-10-01))
+        SeqScan lineitem
+        | schema: l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR
+        | read_columns: [1, 5, 6, 10]
+        | skip_conjuncts: (l_shipdate@? >= VARCHAR:'1995-09-01'), (l_shipdate@? < VARCHAR:'1995-10-01')
+      SeqScan part
+      | schema: p_partkey BIGINT, p_name VARCHAR, p_mfgr VARCHAR, p_brand VARCHAR, p_type VARCHAR, p_size INTEGER, p_container VARCHAR, p_retailprice DECIMAL, p_comment VARCHAR
+      | read_columns: [0, 4]
+      | skip_conjuncts: none
+
+=== columnar no-indexes Q19 ===
+Projection
+| schema: sum_expr_0 DECIMAL
+| exprs: sum_expr_0@0
+  Aggregate
+  | schema: sum_expr_0 DECIMAL
+  | group_by: none
+  | aggregates: SUM((l_extendedprice@14 * (INTEGER:1 - l_discount@15)))
+    Filter
+    | schema: p_partkey BIGINT, p_name VARCHAR, p_mfgr VARCHAR, p_brand VARCHAR, p_type VARCHAR, p_size INTEGER, p_container VARCHAR, p_retailprice DECIMAL, p_comment VARCHAR, l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR
+    | predicate: (((((((((p_brand@3 = VARCHAR:'Brand#12') AND ((p_container@6 = VARCHAR:'SM CASE') OR ((p_container@6 = VARCHAR:'SM BOX') OR ((p_container@6 = VARCHAR:'SM PACK') OR (p_container@6 = VARCHAR:'SM PKG'))))) AND (l_quantity@13 >= DECIMAL:1)) AND (l_quantity@13 <= DECIMAL:11)) AND ((p_size@5 >= INTEGER:1) AND (p_size@5 <= INTEGER:5))) AND ((l_shipmode@23 = VARCHAR:'AIR') OR (l_shipmode@23 = VARCHAR:'AIR REG'))) AND (l_shipinstruct@22 = VARCHAR:'DELIVER IN PERSON')) OR (((((((p_brand@3 = VARCHAR:'Brand#23') AND ((p_container@6 = VARCHAR:'MED BAG') OR ((p_container@6 = VARCHAR:'MED BOX') OR ((p_container@6 = VARCHAR:'MED PKG') OR (p_container@6 = VARCHAR:'MED PACK'))))) AND (l_quantity@13 >= DECIMAL:10)) AND (l_quantity@13 <= DECIMAL:20)) AND ((p_size@5 >= INTEGER:1) AND (p_size@5 <= INTEGER:10))) AND ((l_shipmode@23 = VARCHAR:'AIR') OR (l_shipmode@23 = VARCHAR:'AIR REG'))) AND (l_shipinstruct@22 = VARCHAR:'DELIVER IN PERSON'))) OR (((((((p_brand@3 = VARCHAR:'Brand#34') AND ((p_container@6 = VARCHAR:'LG CASE') OR ((p_container@6 = VARCHAR:'LG BOX') OR ((p_container@6 = VARCHAR:'LG PACK') OR (p_container@6 = VARCHAR:'LG PKG'))))) AND (l_quantity@13 >= DECIMAL:20)) AND (l_quantity@13 <= DECIMAL:30)) AND ((p_size@5 >= INTEGER:1) AND (p_size@5 <= INTEGER:15))) AND ((l_shipmode@23 = VARCHAR:'AIR') OR (l_shipmode@23 = VARCHAR:'AIR REG'))) AND (l_shipinstruct@22 = VARCHAR:'DELIVER IN PERSON')))
+      HashJoin
+      | schema: p_partkey BIGINT, p_name VARCHAR, p_mfgr VARCHAR, p_brand VARCHAR, p_type VARCHAR, p_size INTEGER, p_container VARCHAR, p_retailprice DECIMAL, p_comment VARCHAR, l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR
+      | predicate: (p_partkey@0 = l_partkey@10)
+        SeqScan part
+        | schema: p_partkey BIGINT, p_name VARCHAR, p_mfgr VARCHAR, p_brand VARCHAR, p_type VARCHAR, p_size INTEGER, p_container VARCHAR, p_retailprice DECIMAL, p_comment VARCHAR
+        | read_columns: [0, 3, 5, 6]
+        | skip_conjuncts: none
+        SeqScan lineitem
+        | schema: l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR
+        | read_columns: [1, 4, 5, 6, 13, 14]
+        | skip_conjuncts: none
+
+=== columnar indexes Q1 ===
+Sort
+| schema: l_returnflag VARCHAR, l_linestatus VARCHAR, sum_l_quantity DECIMAL, sum_l_extendedprice DECIMAL, sum_l_discount DECIMAL, count_star INTEGER
+| keys: l_returnflag@0 ASC, l_linestatus@1 ASC
+  Projection
+  | schema: l_returnflag VARCHAR, l_linestatus VARCHAR, sum_l_quantity DECIMAL, sum_l_extendedprice DECIMAL, sum_l_discount DECIMAL, count_star INTEGER
+  | exprs: l_returnflag@0, l_linestatus@1, sum_l_quantity@2, sum_l_extendedprice@3, sum_l_discount@4, count_star@5
+    Aggregate
+    | schema: l_returnflag VARCHAR, l_linestatus VARCHAR, sum_l_quantity DECIMAL, sum_l_extendedprice DECIMAL, sum_l_discount DECIMAL, count_star INTEGER
+    | group_by: l_returnflag@8, l_linestatus@9
+    | aggregates: SUM(l_quantity@4), SUM(l_extendedprice@5), SUM(l_discount@6), COUNT(*)
+      Filter
+      | schema: l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR
+      | predicate: (l_shipdate@10 <= DATE:1998-09-02)
+        SeqScan lineitem
+        | schema: l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR
+        | read_columns: [4, 5, 6, 8, 9, 10]
+        | skip_conjuncts: (l_shipdate@? <= VARCHAR:'1998-09-02')
+
+=== columnar indexes Q6 ===
+Projection
+| schema: sum_expr_0 DECIMAL
+| exprs: sum_expr_0@0
+  Aggregate
+  | schema: sum_expr_0 DECIMAL
+  | group_by: none
+  | aggregates: SUM((l_extendedprice@5 * l_discount@6))
+    Filter
+    | schema: l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR
+    | predicate: ((l_shipdate@10 >= DATE:1994-01-01) AND ((l_shipdate@10 < DATE:1995-01-01) AND ((l_discount@6 >= DECIMAL:0.050000000000000003) AND ((l_discount@6 <= DECIMAL:0.070000000000000007) AND (l_quantity@4 < DECIMAL:24)))))
+      SeqScan lineitem
+      | schema: l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR
+      | read_columns: [4, 5, 6, 10]
+      | skip_conjuncts: (l_shipdate@? >= VARCHAR:'1994-01-01'), (l_shipdate@? < VARCHAR:'1995-01-01'), (l_discount@? >= DECIMAL:0.050000000000000003), (l_discount@? <= DECIMAL:0.070000000000000007), (l_quantity@? < INTEGER:24)
+
+=== columnar indexes Q3 ===
+Limit
+| schema: l_orderkey BIGINT, sum_expr_0 DECIMAL, o_orderdate DATE, o_shippriority INTEGER
+| limit: 10
+  Sort
+  | schema: l_orderkey BIGINT, sum_expr_0 DECIMAL, o_orderdate DATE, o_shippriority INTEGER
+  | keys: sum_expr_0@1 DESC
+    Projection
+    | schema: l_orderkey BIGINT, sum_expr_0 DECIMAL, o_orderdate DATE, o_shippriority INTEGER
+    | exprs: l_orderkey@0, sum_expr_0@3, o_orderdate@1, o_shippriority@2
+      Aggregate
+      | schema: l_orderkey BIGINT, o_orderdate DATE, o_shippriority INTEGER, sum_expr_0 DECIMAL
+      | group_by: l_orderkey@17, o_orderdate@12, o_shippriority@15
+      | aggregates: SUM((l_extendedprice@22 * (INTEGER:1 - l_discount@23)))
+        HashJoin
+        | schema: c_custkey BIGINT, c_name VARCHAR, c_address VARCHAR, c_nationkey BIGINT, c_phone VARCHAR, c_acctbal DECIMAL, c_mktsegment VARCHAR, c_comment VARCHAR, o_orderkey BIGINT, o_custkey BIGINT, o_orderstatus VARCHAR, o_totalprice DECIMAL, o_orderdate DATE, o_orderpriority VARCHAR, o_clerk VARCHAR, o_shippriority INTEGER, o_comment VARCHAR, l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR
+        | predicate: (l.l_orderkey@17 = o.o_orderkey@8)
+          HashJoin
+          | schema: c_custkey BIGINT, c_name VARCHAR, c_address VARCHAR, c_nationkey BIGINT, c_phone VARCHAR, c_acctbal DECIMAL, c_mktsegment VARCHAR, c_comment VARCHAR, o_orderkey BIGINT, o_custkey BIGINT, o_orderstatus VARCHAR, o_totalprice DECIMAL, o_orderdate DATE, o_orderpriority VARCHAR, o_clerk VARCHAR, o_shippriority INTEGER, o_comment VARCHAR
+          | predicate: (c.c_custkey@0 = o.o_custkey@9)
+            Filter
+            | schema: c_custkey BIGINT, c_name VARCHAR, c_address VARCHAR, c_nationkey BIGINT, c_phone VARCHAR, c_acctbal DECIMAL, c_mktsegment VARCHAR, c_comment VARCHAR
+            | predicate: (c.c_mktsegment@6 = VARCHAR:'BUILDING')
+              SeqScan customer
+              | schema: c_custkey BIGINT, c_name VARCHAR, c_address VARCHAR, c_nationkey BIGINT, c_phone VARCHAR, c_acctbal DECIMAL, c_mktsegment VARCHAR, c_comment VARCHAR
+              | read_columns: [0, 6]
+              | skip_conjuncts: (c.c_mktsegment@? = VARCHAR:'BUILDING')
+            Filter
+            | schema: o_orderkey BIGINT, o_custkey BIGINT, o_orderstatus VARCHAR, o_totalprice DECIMAL, o_orderdate DATE, o_orderpriority VARCHAR, o_clerk VARCHAR, o_shippriority INTEGER, o_comment VARCHAR
+            | predicate: (o.o_orderdate@4 < DATE:1995-03-15)
+              SeqScan orders
+              | schema: o_orderkey BIGINT, o_custkey BIGINT, o_orderstatus VARCHAR, o_totalprice DECIMAL, o_orderdate DATE, o_orderpriority VARCHAR, o_clerk VARCHAR, o_shippriority INTEGER, o_comment VARCHAR
+              | read_columns: [0, 1, 4, 7]
+              | skip_conjuncts: (o.o_orderdate@? < VARCHAR:'1995-03-15')
+          Filter
+          | schema: l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR
+          | predicate: (l.l_shipdate@10 > DATE:1995-03-15)
+            SeqScan lineitem
+            | schema: l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR
+            | read_columns: [0, 5, 6, 10]
+            | skip_conjuncts: (l.l_shipdate@? > VARCHAR:'1995-03-15')
+
+=== columnar indexes Q5 ===
+Sort
+| schema: n_name VARCHAR, sum_expr_0 DECIMAL
+| keys: sum_expr_0@1 DESC
+  Projection
+  | schema: n_name VARCHAR, sum_expr_0 DECIMAL
+  | exprs: n_name@0, sum_expr_0@1
+    Aggregate
+    | schema: n_name VARCHAR, sum_expr_0 DECIMAL
+    | group_by: n_name@41
+    | aggregates: SUM((l_extendedprice@22 * (INTEGER:1 - l_discount@23)))
+      HashJoin
+      | schema: c_custkey BIGINT, c_name VARCHAR, c_address VARCHAR, c_nationkey BIGINT, c_phone VARCHAR, c_acctbal DECIMAL, c_mktsegment VARCHAR, c_comment VARCHAR, o_orderkey BIGINT, o_custkey BIGINT, o_orderstatus VARCHAR, o_totalprice DECIMAL, o_orderdate DATE, o_orderpriority VARCHAR, o_clerk VARCHAR, o_shippriority INTEGER, o_comment VARCHAR, l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR, s_suppkey BIGINT, s_name VARCHAR, s_address VARCHAR, s_nationkey BIGINT, s_phone VARCHAR, s_acctbal DECIMAL, s_comment VARCHAR, n_nationkey BIGINT, n_name VARCHAR, n_regionkey BIGINT, n_comment VARCHAR
+      | predicate: (s.s_nationkey@36 = n.n_nationkey@40)
+        HashJoin
+        | schema: c_custkey BIGINT, c_name VARCHAR, c_address VARCHAR, c_nationkey BIGINT, c_phone VARCHAR, c_acctbal DECIMAL, c_mktsegment VARCHAR, c_comment VARCHAR, o_orderkey BIGINT, o_custkey BIGINT, o_orderstatus VARCHAR, o_totalprice DECIMAL, o_orderdate DATE, o_orderpriority VARCHAR, o_clerk VARCHAR, o_shippriority INTEGER, o_comment VARCHAR, l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR, s_suppkey BIGINT, s_name VARCHAR, s_address VARCHAR, s_nationkey BIGINT, s_phone VARCHAR, s_acctbal DECIMAL, s_comment VARCHAR
+        | predicate: (l.l_suppkey@19 = s.s_suppkey@33)
+          HashJoin
+          | schema: c_custkey BIGINT, c_name VARCHAR, c_address VARCHAR, c_nationkey BIGINT, c_phone VARCHAR, c_acctbal DECIMAL, c_mktsegment VARCHAR, c_comment VARCHAR, o_orderkey BIGINT, o_custkey BIGINT, o_orderstatus VARCHAR, o_totalprice DECIMAL, o_orderdate DATE, o_orderpriority VARCHAR, o_clerk VARCHAR, o_shippriority INTEGER, o_comment VARCHAR, l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR
+          | predicate: (l.l_orderkey@17 = o.o_orderkey@8)
+            HashJoin
+            | schema: c_custkey BIGINT, c_name VARCHAR, c_address VARCHAR, c_nationkey BIGINT, c_phone VARCHAR, c_acctbal DECIMAL, c_mktsegment VARCHAR, c_comment VARCHAR, o_orderkey BIGINT, o_custkey BIGINT, o_orderstatus VARCHAR, o_totalprice DECIMAL, o_orderdate DATE, o_orderpriority VARCHAR, o_clerk VARCHAR, o_shippriority INTEGER, o_comment VARCHAR
+            | predicate: (c.c_custkey@0 = o.o_custkey@9)
+              SeqScan customer
+              | schema: c_custkey BIGINT, c_name VARCHAR, c_address VARCHAR, c_nationkey BIGINT, c_phone VARCHAR, c_acctbal DECIMAL, c_mktsegment VARCHAR, c_comment VARCHAR
+              | read_columns: [0]
+              | skip_conjuncts: none
+              Filter
+              | schema: o_orderkey BIGINT, o_custkey BIGINT, o_orderstatus VARCHAR, o_totalprice DECIMAL, o_orderdate DATE, o_orderpriority VARCHAR, o_clerk VARCHAR, o_shippriority INTEGER, o_comment VARCHAR
+              | predicate: ((o.o_orderdate@4 >= DATE:1994-01-01) AND (o.o_orderdate@4 < DATE:1995-01-01))
+                SeqScan orders
+                | schema: o_orderkey BIGINT, o_custkey BIGINT, o_orderstatus VARCHAR, o_totalprice DECIMAL, o_orderdate DATE, o_orderpriority VARCHAR, o_clerk VARCHAR, o_shippriority INTEGER, o_comment VARCHAR
+                | read_columns: [0, 1, 4]
+                | skip_conjuncts: (o.o_orderdate@? >= VARCHAR:'1994-01-01'), (o.o_orderdate@? < VARCHAR:'1995-01-01')
+            SeqScan lineitem
+            | schema: l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR
+            | read_columns: [0, 2, 5, 6]
+            | skip_conjuncts: none
+          SeqScan supplier
+          | schema: s_suppkey BIGINT, s_name VARCHAR, s_address VARCHAR, s_nationkey BIGINT, s_phone VARCHAR, s_acctbal DECIMAL, s_comment VARCHAR
+          | read_columns: [0, 3]
+          | skip_conjuncts: none
+        SeqScan nation
+        | schema: n_nationkey BIGINT, n_name VARCHAR, n_regionkey BIGINT, n_comment VARCHAR
+        | read_columns: [0, 1]
+        | skip_conjuncts: none
+
+=== columnar indexes Q10 ===
+Limit
+| schema: c_custkey BIGINT, c_name VARCHAR, sum_expr_0 DECIMAL, c_acctbal DECIMAL, n_name VARCHAR, c_address VARCHAR, c_phone VARCHAR, c_comment VARCHAR
+| limit: 20
+  Sort
+  | schema: c_custkey BIGINT, c_name VARCHAR, sum_expr_0 DECIMAL, c_acctbal DECIMAL, n_name VARCHAR, c_address VARCHAR, c_phone VARCHAR, c_comment VARCHAR
+  | keys: sum_expr_0@2 DESC
+    Projection
+    | schema: c_custkey BIGINT, c_name VARCHAR, sum_expr_0 DECIMAL, c_acctbal DECIMAL, n_name VARCHAR, c_address VARCHAR, c_phone VARCHAR, c_comment VARCHAR
+    | exprs: c_custkey@0, c_name@1, sum_expr_0@7, c_acctbal@2, n_name@4, c_address@5, c_phone@3, c_comment@6
+      Aggregate
+      | schema: c_custkey BIGINT, c_name VARCHAR, c_acctbal DECIMAL, c_phone VARCHAR, n_name VARCHAR, c_address VARCHAR, c_comment VARCHAR, sum_expr_0 DECIMAL
+      | group_by: c_custkey@4, c_name@5, c_acctbal@9, c_phone@8, n_name@1, c_address@6, c_comment@11
+      | aggregates: SUM((l_extendedprice@26 * (INTEGER:1 - l_discount@27)))
+        HashJoin
+        | schema: n_nationkey BIGINT, n_name VARCHAR, n_regionkey BIGINT, n_comment VARCHAR, c_custkey BIGINT, c_name VARCHAR, c_address VARCHAR, c_nationkey BIGINT, c_phone VARCHAR, c_acctbal DECIMAL, c_mktsegment VARCHAR, c_comment VARCHAR, o_orderkey BIGINT, o_custkey BIGINT, o_orderstatus VARCHAR, o_totalprice DECIMAL, o_orderdate DATE, o_orderpriority VARCHAR, o_clerk VARCHAR, o_shippriority INTEGER, o_comment VARCHAR, l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR
+        | predicate: (l_orderkey@21 = o_orderkey@12)
+          HashJoin
+          | schema: n_nationkey BIGINT, n_name VARCHAR, n_regionkey BIGINT, n_comment VARCHAR, c_custkey BIGINT, c_name VARCHAR, c_address VARCHAR, c_nationkey BIGINT, c_phone VARCHAR, c_acctbal DECIMAL, c_mktsegment VARCHAR, c_comment VARCHAR, o_orderkey BIGINT, o_custkey BIGINT, o_orderstatus VARCHAR, o_totalprice DECIMAL, o_orderdate DATE, o_orderpriority VARCHAR, o_clerk VARCHAR, o_shippriority INTEGER, o_comment VARCHAR
+          | predicate: (c_custkey@4 = o_custkey@13)
+            HashJoin
+            | schema: n_nationkey BIGINT, n_name VARCHAR, n_regionkey BIGINT, n_comment VARCHAR, c_custkey BIGINT, c_name VARCHAR, c_address VARCHAR, c_nationkey BIGINT, c_phone VARCHAR, c_acctbal DECIMAL, c_mktsegment VARCHAR, c_comment VARCHAR
+            | predicate: (c_nationkey@7 = n_nationkey@0)
+              SeqScan nation
+              | schema: n_nationkey BIGINT, n_name VARCHAR, n_regionkey BIGINT, n_comment VARCHAR
+              | read_columns: [0, 1]
+              | skip_conjuncts: none
+              SeqScan customer
+              | schema: c_custkey BIGINT, c_name VARCHAR, c_address VARCHAR, c_nationkey BIGINT, c_phone VARCHAR, c_acctbal DECIMAL, c_mktsegment VARCHAR, c_comment VARCHAR
+              | read_columns: [0, 1, 2, 3, 4, 5, 7]
+              | skip_conjuncts: none
+            Filter
+            | schema: o_orderkey BIGINT, o_custkey BIGINT, o_orderstatus VARCHAR, o_totalprice DECIMAL, o_orderdate DATE, o_orderpriority VARCHAR, o_clerk VARCHAR, o_shippriority INTEGER, o_comment VARCHAR
+            | predicate: (o_orderdate@4 < DATE:1994-01-01)
+              IndexScan orders idx_orders_orderdate
+              | schema: o_orderkey BIGINT, o_custkey BIGINT, o_orderstatus VARCHAR, o_totalprice DECIMAL, o_orderdate DATE, o_orderpriority VARCHAR, o_clerk VARCHAR, o_shippriority INTEGER, o_comment VARCHAR
+              | low: DATE:1993-10-01
+              | high: DATE:1994-01-01
+              | read_columns: [0, 1, 4]
+          Filter
+          | schema: l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR
+          | predicate: (l_returnflag@8 = VARCHAR:'R')
+            SeqScan lineitem
+            | schema: l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR
+            | read_columns: [0, 5, 6, 8]
+            | skip_conjuncts: (l_returnflag@? = VARCHAR:'R')
+
+=== columnar indexes Q12 ===
+Sort
+| schema: l_shipmode VARCHAR, sum_expr_0 DECIMAL, sum_expr_1 DECIMAL
+| keys: l_shipmode@0 ASC
+  Projection
+  | schema: l_shipmode VARCHAR, sum_expr_0 DECIMAL, sum_expr_1 DECIMAL
+  | exprs: l_shipmode@0, sum_expr_0@1, sum_expr_1@2
+    Aggregate
+    | schema: l_shipmode VARCHAR, sum_expr_0 DECIMAL, sum_expr_1 DECIMAL
+    | group_by: l_shipmode@14
+    | aggregates: SUM(CASE WHEN ((o_orderpriority@21 = VARCHAR:'1-URGENT') OR (o_orderpriority@21 = VARCHAR:'2-HIGH')) THEN INTEGER:1 ELSE INTEGER:0 END), SUM(CASE WHEN ((o_orderpriority@21 <> VARCHAR:'1-URGENT') AND (o_orderpriority@21 <> VARCHAR:'2-HIGH')) THEN INTEGER:1 ELSE INTEGER:0 END)
+      HashJoin
+      | schema: l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR, o_orderkey BIGINT, o_custkey BIGINT, o_orderstatus VARCHAR, o_totalprice DECIMAL, o_orderdate DATE, o_orderpriority VARCHAR, o_clerk VARCHAR, o_shippriority INTEGER, o_comment VARCHAR
+      | predicate: (o_orderkey@16 = l_orderkey@0)
+        Filter
+        | schema: l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR
+        | predicate: (((l_shipmode@14 = VARCHAR:'MAIL') OR (l_shipmode@14 = VARCHAR:'SHIP')) AND ((l_commitdate@11 < l_receiptdate@12) AND ((l_shipdate@10 < l_commitdate@11) AND ((l_receiptdate@12 >= DATE:1994-01-01) AND (l_receiptdate@12 < DATE:1995-01-01)))))
+          SeqScan lineitem
+          | schema: l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR
+          | read_columns: [0, 10, 11, 12, 14]
+          | skip_conjuncts: ((l_shipmode@? = VARCHAR:'MAIL') OR (l_shipmode@? = VARCHAR:'SHIP')), (l_commitdate@? < l_receiptdate@?), (l_shipdate@? < l_commitdate@?), (l_receiptdate@? >= VARCHAR:'1994-01-01'), (l_receiptdate@? < VARCHAR:'1995-01-01')
+        SeqScan orders
+        | schema: o_orderkey BIGINT, o_custkey BIGINT, o_orderstatus VARCHAR, o_totalprice DECIMAL, o_orderdate DATE, o_orderpriority VARCHAR, o_clerk VARCHAR, o_shippriority INTEGER, o_comment VARCHAR
+        | read_columns: [0, 5]
+        | skip_conjuncts: none
+
+=== columnar indexes Q14 ===
+Projection
+| schema: expr DECIMAL
+| exprs: ((DECIMAL:100 * sum_expr_0@0) / sum_expr_1@1)
+  Aggregate
+  | schema: sum_expr_0 DECIMAL, sum_expr_1 DECIMAL
+  | group_by: none
+  | aggregates: SUM(CASE WHEN (p_type@20 LIKE VARCHAR:'PROMO%') THEN (l_extendedprice@5 * (INTEGER:1 - l_discount@6)) ELSE INTEGER:0 END), SUM((l_extendedprice@5 * (INTEGER:1 - l_discount@6)))
+    HashJoin
+    | schema: l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR, p_partkey BIGINT, p_name VARCHAR, p_mfgr VARCHAR, p_brand VARCHAR, p_type VARCHAR, p_size INTEGER, p_container VARCHAR, p_retailprice DECIMAL, p_comment VARCHAR
+    | predicate: (l_partkey@1 = p_partkey@16)
+      Filter
+      | schema: l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR
+      | predicate: (l_shipdate@10 < DATE:1995-10-01)
+        IndexScan lineitem idx_lineitem_shipdate
+        | schema: l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR
+        | low: DATE:1995-09-01
+        | high: DATE:1995-10-01
+        | read_columns: [1, 5, 6, 10]
+      SeqScan part
+      | schema: p_partkey BIGINT, p_name VARCHAR, p_mfgr VARCHAR, p_brand VARCHAR, p_type VARCHAR, p_size INTEGER, p_container VARCHAR, p_retailprice DECIMAL, p_comment VARCHAR
+      | read_columns: [0, 4]
+      | skip_conjuncts: none
+
+=== columnar indexes Q19 ===
+Projection
+| schema: sum_expr_0 DECIMAL
+| exprs: sum_expr_0@0
+  Aggregate
+  | schema: sum_expr_0 DECIMAL
+  | group_by: none
+  | aggregates: SUM((l_extendedprice@14 * (INTEGER:1 - l_discount@15)))
+    Filter
+    | schema: p_partkey BIGINT, p_name VARCHAR, p_mfgr VARCHAR, p_brand VARCHAR, p_type VARCHAR, p_size INTEGER, p_container VARCHAR, p_retailprice DECIMAL, p_comment VARCHAR, l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR
+    | predicate: (((((((((p_brand@3 = VARCHAR:'Brand#12') AND ((p_container@6 = VARCHAR:'SM CASE') OR ((p_container@6 = VARCHAR:'SM BOX') OR ((p_container@6 = VARCHAR:'SM PACK') OR (p_container@6 = VARCHAR:'SM PKG'))))) AND (l_quantity@13 >= DECIMAL:1)) AND (l_quantity@13 <= DECIMAL:11)) AND ((p_size@5 >= INTEGER:1) AND (p_size@5 <= INTEGER:5))) AND ((l_shipmode@23 = VARCHAR:'AIR') OR (l_shipmode@23 = VARCHAR:'AIR REG'))) AND (l_shipinstruct@22 = VARCHAR:'DELIVER IN PERSON')) OR (((((((p_brand@3 = VARCHAR:'Brand#23') AND ((p_container@6 = VARCHAR:'MED BAG') OR ((p_container@6 = VARCHAR:'MED BOX') OR ((p_container@6 = VARCHAR:'MED PKG') OR (p_container@6 = VARCHAR:'MED PACK'))))) AND (l_quantity@13 >= DECIMAL:10)) AND (l_quantity@13 <= DECIMAL:20)) AND ((p_size@5 >= INTEGER:1) AND (p_size@5 <= INTEGER:10))) AND ((l_shipmode@23 = VARCHAR:'AIR') OR (l_shipmode@23 = VARCHAR:'AIR REG'))) AND (l_shipinstruct@22 = VARCHAR:'DELIVER IN PERSON'))) OR (((((((p_brand@3 = VARCHAR:'Brand#34') AND ((p_container@6 = VARCHAR:'LG CASE') OR ((p_container@6 = VARCHAR:'LG BOX') OR ((p_container@6 = VARCHAR:'LG PACK') OR (p_container@6 = VARCHAR:'LG PKG'))))) AND (l_quantity@13 >= DECIMAL:20)) AND (l_quantity@13 <= DECIMAL:30)) AND ((p_size@5 >= INTEGER:1) AND (p_size@5 <= INTEGER:15))) AND ((l_shipmode@23 = VARCHAR:'AIR') OR (l_shipmode@23 = VARCHAR:'AIR REG'))) AND (l_shipinstruct@22 = VARCHAR:'DELIVER IN PERSON')))
+      HashJoin
+      | schema: p_partkey BIGINT, p_name VARCHAR, p_mfgr VARCHAR, p_brand VARCHAR, p_type VARCHAR, p_size INTEGER, p_container VARCHAR, p_retailprice DECIMAL, p_comment VARCHAR, l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR
+      | predicate: (p_partkey@0 = l_partkey@10)
+        SeqScan part
+        | schema: p_partkey BIGINT, p_name VARCHAR, p_mfgr VARCHAR, p_brand VARCHAR, p_type VARCHAR, p_size INTEGER, p_container VARCHAR, p_retailprice DECIMAL, p_comment VARCHAR
+        | read_columns: [0, 3, 5, 6]
+        | skip_conjuncts: none
+        SeqScan lineitem
+        | schema: l_orderkey BIGINT, l_partkey BIGINT, l_suppkey BIGINT, l_linenumber INTEGER, l_quantity DECIMAL, l_extendedprice DECIMAL, l_discount DECIMAL, l_tax DECIMAL, l_returnflag VARCHAR, l_linestatus VARCHAR, l_shipdate DATE, l_commitdate DATE, l_receiptdate DATE, l_shipinstruct VARCHAR, l_shipmode VARCHAR, l_comment VARCHAR
+        | read_columns: [1, 4, 5, 6, 13, 14]
+        | skip_conjuncts: none
+
