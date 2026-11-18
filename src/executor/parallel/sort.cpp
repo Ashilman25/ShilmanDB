@@ -5,9 +5,7 @@
 #include "storage/columnar/string_arena.hpp"
 #include <algorithm>
 #include <cassert>
-#include <cmath>
 #include <cstddef>
-#include <cstring>
 #include <limits>
 #include <numeric>
 
@@ -43,23 +41,6 @@ int CompareAt(const ColumnBuffer& buf, const VType& t, uint32_t a, uint32_t b) {
             return Order(buf.i64[a], buf.i64[b]);
     }
     return 0;
-}
-
-// A total order on doubles: as < where it decides, then -0.0 first, NaN last.
-int TotalOrder(double a, double b) {
-    const bool a_nan = std::isnan(a);
-    const bool b_nan = std::isnan(b);
-    if (a_nan != b_nan) return a_nan ? 1 : -1;
-    if (a_nan) {
-        // NaNs among themselves by their bits, so even they never tie by accident.
-        uint64_t x = 0;
-        uint64_t y = 0;
-        std::memcpy(&x, &a, sizeof(a));
-        std::memcpy(&y, &b, sizeof(b));
-        return Order(x, y);
-    }
-    const int c = Order(a, b);
-    return c != 0 ? c : Order(std::signbit(b), std::signbit(a));
 }
 
 // CompareAt for breaking ties: doubles in a total order, so ties never keep input order.

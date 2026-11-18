@@ -3,6 +3,7 @@
 #include "common/exception.hpp"
 #include "executor/parallel/basic_operators.hpp"
 #include "executor/parallel/expression.hpp"
+#include "executor/parallel/hash_aggregate.hpp"
 #include "executor/parallel/nested_loop_join.hpp"
 #include "executor/parallel/scan_source.hpp"
 #include "executor/parallel/sort.hpp"
@@ -53,6 +54,16 @@ uint32_t SlotOf(const InputLayout& layout, uint32_t c) {
         throw DatabaseException("the parallel executor lost column " + std::to_string(c) + " of a child");
     }
     return static_cast<uint32_t>(slot);
+}
+
+// A plain column's slot precision in the layout, else 0 (the widest its type allows).
+uint8_t PrecisionOf(const Expression* expr, const InputLayout& in) {
+    const auto* ref = dynamic_cast<const ColumnRef*>(expr);
+    if (ref == nullptr || !ref->bound_index) return 0;
+    const uint32_t c = *ref->bound_index;
+    const int slot = c < in.slot_of_column.size() ? in.slot_of_column[c] : -1;
+    if (slot < 0 || static_cast<size_t>(slot) >= in.slot_precision.size()) return 0;
+    return in.slot_precision[static_cast<size_t>(slot)];
 }
 
 // Makes slot `slot` of from the next slot of out, holding out's column c.
@@ -134,6 +145,8 @@ private:
                 return Sort(static_cast<const SortPlanNode&>(node), needed, std::nullopt);
             case PlanNodeType::NESTED_LOOP_JOIN:
                 return NestedLoopJoin(static_cast<const NestedLoopJoinPlanNode&>(node), needed);
+            case PlanNodeType::AGGREGATE:
+                return HashAggregate(static_cast<const AggregatePlanNode&>(node));
             default:
                 break;
         }
@@ -234,6 +247,51 @@ private:
         const size_t sorted = Close(Own(std::move(parts.first)));
         SetSource(std::move(parts.second));
         current_.pipeline.depends_on.push_back(sorted);
+        return out;
+    }
+
+    // A breaker: the child's pipeline ends in the aggregate's sink, and the next
+    // pipeline starts from its source, which emits output column c as slot c.
+    // COUNT never reads its argument, so its columns aren't asked for.
+    InputLayout HashAggregate(const AggregatePlanNode& agg) {
+        const size_t key_count = agg.group_by_exprs.size();
+        const size_t agg_count = agg.aggregate_funcs.size();
+        if (agg.aggregate_exprs.size() != agg_count || agg.output_schema.GetColumnCount() != key_count + agg_count) {
+            throw DatabaseException("the parallel executor groups only by plain columns");
+        }
+        const auto reads_arg = [&](size_t i) { return agg.aggregate_funcs[i] != Aggregate::Func::COUNT && agg.aggregate_exprs[i] != nullptr; };
+        std::vector<uint32_t> child_needed;
+        for (const auto& key : agg.group_by_exprs) CollectColumns(*key, child_needed);
+        for (size_t i = 0; i < agg_count; ++i) {
+            if (reads_arg(i)) CollectColumns(*agg.aggregate_exprs[i], child_needed);
+        }
+        const InputLayout in = Build(*agg.children[0], child_needed);
+
+        // Plain-column keys and MIN / MAX keep their precision; sums are wide, checked.
+        AggregateSpec spec;
+        InputLayout out;
+        for (const auto& key : agg.group_by_exprs) {
+            spec.keys.push_back(CompiledExpr::Compile(*key, in));
+            spec.out_types.push_back(spec.keys.back()->Type());
+            out.slot_precision.push_back(PrecisionOf(key.get(), in));
+        }
+        for (size_t i = 0; i < agg_count; ++i) {
+            const Aggregate::Func func = agg.aggregate_funcs[i];
+            spec.funcs.push_back(func);
+            spec.args.push_back(reads_arg(i) ? CompiledExpr::Compile(*agg.aggregate_exprs[i], in) : nullptr);
+            spec.out_types.push_back(AggregateOutputType(func, spec.args.back().get()));
+            const bool extreme = func == Aggregate::Func::MIN || func == Aggregate::Func::MAX;
+            out.slot_precision.push_back(extreme ? PrecisionOf(agg.aggregate_exprs[i].get(), in) : 0);
+        }
+        spec.global = key_count == 0;
+        out.slot_of_column.resize(key_count + agg_count);
+        std::iota(out.slot_of_column.begin(), out.slot_of_column.end(), 0);
+        out.slot_types = spec.out_types;
+
+        auto parts = MakeHashAggregate(std::move(spec));
+        const size_t grouped = Close(Own(std::move(parts.first)));
+        SetSource(std::move(parts.second));
+        current_.pipeline.depends_on.push_back(grouped);
         return out;
     }
 

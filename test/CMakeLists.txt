@@ -109,6 +109,8 @@ shilmandb_add_test(parallel_scan_source_test executor/parallel/scan_source_test.
 target_include_directories(parallel_scan_source_test PRIVATE ${CMAKE_SOURCE_DIR}/bench)
 shilmandb_add_test(parallel_sort_test executor/parallel/sort_test.cpp)
 shilmandb_add_test(parallel_nested_loop_join_test executor/parallel/nested_loop_join_test.cpp)
+shilmandb_add_test(parallel_hash_aggregate_test executor/parallel/hash_aggregate_test.cpp)
+target_include_directories(parallel_hash_aggregate_test PRIVATE ${CMAKE_SOURCE_DIR}/bench)
 
 # Integration tests
 shilmandb_add_test(end_to_end_test integration/end_to_end_test.cpp)

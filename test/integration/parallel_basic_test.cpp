@@ -321,8 +321,9 @@ TEST_F(ParallelBasicTest, RowStoreTableIsRefused) {
 }
 
 TEST_F(ParallelBasicTest, UnsupportedNodeIsRefused) {
-    EXPECT_EQ(ErrorOf([&] { (void)Run("SELECT COUNT(*) FROM t", ExecutionMode::PARALLEL); }),
-              "the parallel executor can't run AGGREGATE yet");
+    db_->LoadTable("u", Schema({Column("ua", ColumnType::Integer())}), WriteTbl("u", "1\n2\n"), Columnar());
+    EXPECT_EQ(ErrorOf([&] { (void)Run("SELECT a FROM t, u WHERE a = ua", ExecutionMode::PARALLEL); }),
+              "the parallel executor can't run HASH_JOIN yet");
 }
 
 TEST_F(ParallelBasicTest, NullIsRefused) {

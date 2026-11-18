@@ -8,6 +8,25 @@
 
 namespace shilmandb::parallel {
 
+// The array a type's values sit in, in a Vector or a ColumnBuffer.
+enum class ValueArray : uint8_t { I64, I128, F64, STR };
+
+// INTEGER, DATE and narrow DECIMAL share the 64-bit array; wide DECIMAL uses 128 bits.
+[[nodiscard]] inline ValueArray ArrayOf(const VType& t) {
+    switch (t.kind) {
+        case Kind::STRING: return ValueArray::STR;
+        case Kind::DOUBLE: return ValueArray::F64;
+        case Kind::DECIMAL: return t.wide ? ValueArray::I128 : ValueArray::I64;
+        case Kind::INTEGER:
+        case Kind::DATE: return ValueArray::I64;
+    }
+    return ValueArray::I64;
+}
+
+// A total order on doubles: as < where it decides, then -0.0 first, NaN last.
+// Returns -1, 0 or 1; NaNs order among themselves by their bits.
+[[nodiscard]] int TotalOrder(double a, double b);
+
 // One column's values kept past their batch, in the array its type uses.
 // Strings point into an arena that whoever owns the buffer keeps alive.
 struct ColumnBuffer {
