@@ -22,12 +22,17 @@
 #include <utility>
 #include <vector>
 
+// Random expression trees: compiled kernels against today's EvaluateExpression.
+// Every draw comes from mt19937_64's raw output (fixed by the standard) through
+// the helpers below, and no expression leaves the order of its draws open,
+// so every platform and compiler checks the same trees on the same data.
 namespace shilmandb::parallel {
 
 namespace {
 
 using ExprPtr = std::unique_ptr<Expression>;
 using Op = BinaryOp::Op;
+using Rng = std::mt19937_64;
 
 constexpr uint32_t kSeeds = 200;
 constexpr uint32_t kRows = 1000;
@@ -38,6 +43,39 @@ constexpr double kUnit = 2.3e-16;     // a little over one rounding of a double
 constexpr double kBudget = 2e-13;     // most any value may drift from the real one
 constexpr int kMaxFailures = 25;      // stop printing after this many
 constexpr uint64_t kMaxForgivenFlips = 20;  // near-tie flips forgiven over all seeds
+
+// ---- Portable draws ----
+
+// An integer in [lo, hi]; the tiny modulo bias doesn't matter here.
+int64_t Between(Rng& rng, int64_t lo, int64_t hi) {
+    const uint64_t span = static_cast<uint64_t>(hi - lo) + 1;
+    return lo + static_cast<int64_t>(rng() % span);
+}
+
+// An index below n (n > 0).
+size_t Pick(Rng& rng, size_t n) { return static_cast<size_t>(rng() % n); }
+
+// True with probability p, from the top 53 bits of one draw.
+bool Chance(Rng& rng, double p) { return static_cast<double>(rng() >> 11) * 0x1.0p-53 < p; }
+
+// A double in [-10, 10]: k * 2^-49 is exact, so nothing rounds.
+double Real10(Rng& rng) {
+    constexpr int64_t kSteps = int64_t{10} << 49;
+    return static_cast<double>(Between(rng, -kSteps, kSteps)) * 0x1.0p-49;
+}
+
+// 10^n as a double, by repeated multiplication rather than libm's pow.
+double TenTo(int n) {
+    double x = 1.0;
+    for (int k = 0; k < n; ++k) x *= 10.0;
+    return x;
+}
+
+// Fisher-Yates, so the order doesn't depend on the standard library.
+template <typename V>
+void Shuffle(std::vector<V>& v, Rng& rng) {
+    for (size_t i = v.size(); i > 1; --i) std::swap(v[i - 1], v[Pick(rng, i)]);
+}
 
 // The schema's columns, in plan order.
 enum ColumnId : uint32_t { kI, kJ, kB, kN, kM, kD, kDt, kS, kColumnCount };
@@ -164,8 +202,8 @@ struct Data {
 };
 
 // Small magnitudes keep today's double rounding far below the tolerance.
-Data MakeData(std::mt19937& rng) {
-    auto between = [&rng](int64_t lo, int64_t hi) { return std::uniform_int_distribution<int64_t>(lo, hi)(rng); };
+Data MakeData(Rng& rng) {
+    auto between = [&rng](int64_t lo, int64_t hi) { return Between(rng, lo, hi); };
     static const char* const kPieces[] = {"a", "b", "c", "%", "_", "\xC3\xA9"};  // the last is a two-byte é
     Data data;
     for (uint32_t r = 0; r < kRows; ++r) {
@@ -182,7 +220,7 @@ Data MakeData(std::mt19937& rng) {
                 data.d.push_back(static_cast<double>(between(-1000, 1000)) / 100.0);
                 break;
             case 2:
-                data.d.push_back(std::uniform_real_distribution<double>(-10.0, 10.0)(rng));
+                data.d.push_back(Real10(rng));
                 break;
             default:
                 data.d.push_back(between(0, 1) == 0 ? 0.0 : -0.0);
@@ -222,10 +260,10 @@ struct Fixture {
 };
 
 // Columns go to shuffled slots; the string column is a dictionary when asked.
-void MakeBatch(const Data& data, std::mt19937& rng, bool dictionary, Fixture& fx) {
+void MakeBatch(const Data& data, Rng& rng, bool dictionary, Fixture& fx) {
     std::vector<uint32_t> slot_of(kColumnCount);
     std::iota(slot_of.begin(), slot_of.end(), 0u);
-    std::shuffle(slot_of.begin(), slot_of.end(), rng);
+    Shuffle(slot_of, rng);
     std::vector<uint32_t> column_at(kColumnCount);
     for (uint32_t c = 0; c < kColumnCount; ++c) column_at[slot_of[c]] = c;
 
@@ -290,7 +328,7 @@ struct Gen {
     bool terminal{false};   // a fractional quotient: no more arithmetic on it
     int scale{0};           // NUM only, an upper bound
     bool div_safe{true};    // no CASE inside mixes integer and fractional rows
-    bool truth_safe{true};  // no CASE inside mixes INTEGER rows with other types
+    bool truth_safe{true};  // no INTEGER rows (a branch, or a missing ELSE's 0) under another CASE type
     bool type_exact{true};  // every row's TypeId today is the compiled result TypeId
 };
 
@@ -345,26 +383,29 @@ bool Allowed(Branches b, G g) {
 // Builds random, well-typed trees whose answers both engines agree on within the rules.
 class TreeGen {
 public:
-    TreeGen(std::mt19937& rng, const Schema& schema) : rng_(rng), schema_(schema) {}
+    TreeGen(Rng& rng, const Schema& schema) : rng_(rng), schema_(schema) {}
 
     Gen Root() {
         const int pick = Pick(20);
-        if (pick < 9) return Numeric(kRootDepth, false, Chance(0.5));
+        if (pick < 9) {
+            const bool truth_safe = Chance(0.5);
+            return Numeric(kRootDepth, false, truth_safe);
+        }
         if (pick < 16) return Bool(kRootDepth);
         if (pick < 18) return Date(kRootDepth);
         return Str(kRootDepth);
     }
 
 private:
-    int Pick(int n) { return std::uniform_int_distribution<int>(0, n - 1)(rng_); }
-    bool Chance(double p) { return std::uniform_real_distribution<double>(0.0, 1.0)(rng_) < p; }
+    int Pick(int n) { return static_cast<int>(parallel::Pick(rng_, static_cast<size_t>(n))); }
+    bool Chance(double p) { return parallel::Chance(rng_, p); }
 
     // A decimal literal such as 3.125, read the way the parser reads one.
     Gen DecimalLiteral(int max_scale, int64_t max_units) {
         const int scale = Pick(max_scale + 1);
         int64_t pow = 1;
         for (int k = 0; k < scale; ++k) pow *= 10;
-        const int64_t units = std::uniform_int_distribution<int64_t>(0, max_units * pow)(rng_);
+        const int64_t units = Between(rng_, 0, max_units * pow);
         std::string text = std::to_string(units / pow) + ".";
         if (scale == 0) {
             text += "0";
@@ -501,8 +542,11 @@ private:
     ExprPtr Guarded() {
         static const Op kCmp[] = {Op::EQ, Op::NEQ, Op::LT, Op::GT, Op::LTE, Op::GTE};
         const uint32_t c = Divisor();
-        ExprPtr test = BinE(kCmp[Pick(6)], BinE(Op::DIV, Numerator(Chance(0.3)), ColE(c)),
-                            LitE(Value(static_cast<int32_t>(Pick(9) - 4))));
+        const Op cmp = kCmp[Pick(6)];
+        const bool big = Chance(0.3);
+        ExprPtr numerator = Numerator(big);
+        const int32_t k = Pick(9) - 4;
+        ExprPtr test = BinE(cmp, BinE(Op::DIV, std::move(numerator), ColE(c)), LitE(Value(k)));
         const bool use_and = Chance(0.5);
         ExprPtr guard = BinE(use_and ? Op::NEQ : Op::EQ, ColE(c), LitE(Value(int32_t{0})));
         if (Chance(0.2)) std::swap(guard, test);
@@ -561,13 +605,26 @@ private:
             out.bound = op == Op::MUL ? a.bound * b.bound : a.bound + b.bound;
             if (out.type == G::INT && out.bound > 1e9) return false;   // int32 must not overflow today
             if (out.type == G::BIG && out.bound > 1e17) return false;
+            // A CASE's INTEGER rows still compute in int32 today, whatever its type.
+            if ((!a.truth_safe || !b.truth_safe) && out.bound > 1e9) return false;
             if (!IsIntFamily(out.type)) {
-                out.err = op == Op::MUL ? a.bound * b.err + b.bound * a.err + a.err * b.err + out.bound * kUnit
-                                        : a.err + b.err + out.bound * kUnit;
+                // One multiply or add per statement, so no compiler fuses them:
+                // every platform keeps and drops the same trees.
+                const double own = out.bound * kUnit;
+                if (op == Op::MUL) {
+                    const double ab = a.bound * b.err;
+                    const double ba = b.bound * a.err;
+                    const double both = a.err * b.err;
+                    out.err = ab + ba;
+                    out.err = out.err + both;
+                } else {
+                    out.err = a.err + b.err;
+                }
+                out.err = out.err + own;
                 if (out.err > kBudget) return false;
                 out.same = out.type == G::DBL && a.same && b.same;
                 out.scale = op == Op::MUL ? a.scale + b.scale : std::max(a.scale, b.scale);
-                if (out.scale > 24 || out.bound * std::pow(10.0, out.scale) > 1e28) return false;
+                if (out.scale > 24 || out.bound * TenTo(out.scale) > 1e28) return false;
             }
         }
         out.div_safe = a.div_safe && b.div_safe;
@@ -607,8 +664,10 @@ private:
             results.push_back(branch());
             c->when_clauses.emplace_back(std::move(cond), std::move(results.back().e));
         }
-        // A missing ELSE gives today's INTEGER 0, so a dividing fractional CASE keeps one.
-        const bool has_else = allowed == Branches::FRACTIONAL || Chance(0.7);
+        // A missing ELSE gives today's INTEGER 0. So a dividing fractional CASE keeps one,
+        // and so does a truth-safe CASE whose type isn't INTEGER.
+        const bool needs_else = allowed == Branches::FRACTIONAL || (need_truth_safe && allowed != Branches::INT_ONLY);
+        const bool has_else = needs_else || Chance(0.7);
         if (has_else) {
             results.push_back(branch());
             c->else_clause = std::move(results.back().e);
@@ -632,7 +691,7 @@ private:
         out.type = any_dbl ? G::DBL : any_num ? G::NUM : any_big ? G::BIG : G::INT;
         const bool int_rows = any_int || any_big || !has_else;
         if (int_rows && (any_num || any_dbl)) out.div_safe = false;
-        if (any_int && out.type != G::INT) out.truth_safe = false;
+        if ((any_int || !has_else) && out.type != G::INT) out.truth_safe = false;
         // Today each row keeps its result's type; a missing ELSE is an INTEGER 0.
         for (const Gen& r : results) {
             out.type_exact = out.type_exact && r.type_exact && TypeIdOf(r.type) == TypeIdOf(out.type);
@@ -668,9 +727,13 @@ private:
                 g.e = Chance(0.5) ? InList() : Guarded();
                 break;
             case 6:
-            case 7:
-                g.e = BinE(Chance(0.5) ? Op::AND : Op::OR, Condition(depth - 1), Condition(depth - 1));
+            case 7: {
+                const Op op = Chance(0.5) ? Op::AND : Op::OR;
+                ExprPtr l = Condition(depth - 1);
+                ExprPtr r = Condition(depth - 1);
+                g.e = BinE(op, std::move(l), std::move(r));
                 break;
+            }
             default:
                 g.e = UnE(UnaryOp::Op::NOT, Condition(depth - 1));
                 break;
@@ -800,7 +863,11 @@ private:
         }
         auto c = std::make_unique<CaseExpression>();
         const int whens = 1 + Pick(2);
-        for (int w = 0; w < whens; ++w) c->when_clauses.emplace_back(Condition(depth - 1), Date(depth - 1).e);
+        for (int w = 0; w < whens; ++w) {
+            ExprPtr cond = Condition(depth - 1);
+            ExprPtr result = Date(depth - 1).e;
+            c->when_clauses.emplace_back(std::move(cond), std::move(result));
+        }
         c->else_clause = Date(depth - 1).e;
         g.e = std::move(c);
         return g;
@@ -822,13 +889,17 @@ private:
         }
         auto c = std::make_unique<CaseExpression>();
         const int whens = 1 + Pick(2);
-        for (int w = 0; w < whens; ++w) c->when_clauses.emplace_back(Condition(depth - 1), Str(depth - 1).e);
+        for (int w = 0; w < whens; ++w) {
+            ExprPtr cond = Condition(depth - 1);
+            ExprPtr result = Str(depth - 1).e;
+            c->when_clauses.emplace_back(std::move(cond), std::move(result));
+        }
         c->else_clause = Str(depth - 1).e;
         g.e = std::move(c);
         return g;
     }
 
-    std::mt19937& rng_;
+    Rng& rng_;
     const Schema& schema_;
 };
 
@@ -921,8 +992,8 @@ G FamilyOf(const Expression& e) {
                     return G::INT;
                 case TypeId::BIGINT:
                     return G::BIG;
-                case TypeId::DECIMAL:
-                    return DecimalFromDouble(v.decimal_) ? G::NUM : G::DBL;
+                case TypeId::DECIMAL:  // the compiler's rule for a literal without its text
+                    return DecimalFromDouble(v.decimal_, kExactDoubleDigits) ? G::NUM : G::DBL;
                 case TypeId::DATE:
                     return G::DATE;
                 default:
@@ -950,6 +1021,86 @@ G FamilyOf(const Expression& e) {
         }
         default:
             return G::INT;
+    }
+}
+
+// True when this CASE has INTEGER rows today (an INTEGER result, or a missing
+// ELSE's 0) though its static type isn't INTEGER.
+bool CaseHidesIntegers(const CaseExpression& c) {
+    if (FamilyOf(c) == G::INT) return false;
+    if (!c.else_clause || FamilyOf(*c.else_clause) == G::INT) return true;
+    return std::any_of(c.when_clauses.begin(), c.when_clauses.end(), [](const auto& w) { return FamilyOf(*w.second) == G::INT; });
+}
+
+// True when some CASE anywhere in the tree hides INTEGER rows.
+bool HidesIntegerRows(const Expression& e) {
+    switch (e.type) {
+        case ExprType::BINARY_OP: {
+            const auto& b = static_cast<const BinaryOp&>(e);
+            return HidesIntegerRows(*b.left) || HidesIntegerRows(*b.right);
+        }
+        case ExprType::UNARY_OP:
+            return HidesIntegerRows(*static_cast<const UnaryOp&>(e).operand);
+        case ExprType::CASE: {
+            const auto& c = static_cast<const CaseExpression&>(e);
+            if (CaseHidesIntegers(c)) return true;
+            for (const auto& [cond, result] : c.when_clauses) {
+                if (HidesIntegerRows(*cond) || HidesIntegerRows(*result)) return true;
+            }
+            return c.else_clause && HidesIntegerRows(*c.else_clause);
+        }
+        default:
+            return false;
+    }
+}
+
+// True when a row of e may be INTEGER today though e's static type isn't.
+bool ValueMayHideIntegers(const Expression& e) {
+    switch (e.type) {
+        case ExprType::BINARY_OP: {
+            const auto& b = static_cast<const BinaryOp&>(e);
+            return IsArithmetic(b.op) && (ValueMayHideIntegers(*b.left) || ValueMayHideIntegers(*b.right));
+        }
+        case ExprType::UNARY_OP: {
+            const auto& u = static_cast<const UnaryOp&>(e);
+            return u.op == UnaryOp::Op::NEGATE && ValueMayHideIntegers(*u.operand);
+        }
+        case ExprType::CASE: {
+            const auto& c = static_cast<const CaseExpression&>(e);
+            if (CaseHidesIntegers(c)) return true;
+            for (const auto& [cond, result] : c.when_clauses) {
+                if (ValueMayHideIntegers(*result)) return true;
+            }
+            return c.else_clause && ValueMayHideIntegers(*c.else_clause);
+        }
+        default:
+            return false;
+    }
+}
+
+// True when AND, OR, NOT or WHEN tests a value that may hide INTEGER rows.
+bool TruthSeesHiddenIntegers(const Expression& e) {
+    switch (e.type) {
+        case ExprType::BINARY_OP: {
+            const auto& b = static_cast<const BinaryOp&>(e);
+            const bool tests = b.op == Op::AND || b.op == Op::OR;
+            if (tests && (ValueMayHideIntegers(*b.left) || ValueMayHideIntegers(*b.right))) return true;
+            return TruthSeesHiddenIntegers(*b.left) || TruthSeesHiddenIntegers(*b.right);
+        }
+        case ExprType::UNARY_OP: {
+            const auto& u = static_cast<const UnaryOp&>(e);
+            if (u.op == UnaryOp::Op::NOT && ValueMayHideIntegers(*u.operand)) return true;
+            return TruthSeesHiddenIntegers(*u.operand);
+        }
+        case ExprType::CASE: {
+            const auto& c = static_cast<const CaseExpression&>(e);
+            for (const auto& [cond, result] : c.when_clauses) {
+                if (ValueMayHideIntegers(*cond) || TruthSeesHiddenIntegers(*cond) || TruthSeesHiddenIntegers(*result)) return true;
+            }
+            return c.else_clause && TruthSeesHiddenIntegers(*c.else_clause);
+        }
+        default:
+            return false;
     }
 }
 
@@ -1011,6 +1162,8 @@ struct Stats {
     uint64_t compared{0};         // row checks, values and errors
     uint64_t errors{0};           // rows where today throws
     uint64_t selects{0};          // rows checked through Select
+    uint64_t hiding_trees{0};     // trees with a CASE whose INTEGER rows sit under another type
+    uint64_t select_skipped{0};   // of those, trees whose root such a CASE reaches: values only
     uint64_t tolerant_values{0};  // doubles accepted as close rather than equal
     uint64_t forgiven_flips{0};   // mismatches explained by a comparison flipped at a near tie
     double max_gap{0};            // the largest |compiled - today| accepted
@@ -1063,6 +1216,14 @@ public:
         same_ = tree.same;
         drift_ = 2 * tree.err;
         type_exact_ = tree.type_exact;
+
+        // Today's INTEGER rows are truthy where the static type never is, so
+        // the generator keeps such a CASE away from every truth test.
+        if (TruthSeesHiddenIntegers(*expr_) || (tree.truth_safe && ValueMayHideIntegers(*expr_))) {
+            Fail(0, "a CASE's INTEGER rows reach a truth test");
+        }
+        if (HidesIntegerRows(*expr_)) ++stats_.hiding_trees;
+        if (!tree.truth_safe) ++stats_.select_skipped;
 
         std::vector<uint16_t> all(kRows);
         std::iota(all.begin(), all.end(), uint16_t{0});
@@ -1251,7 +1412,7 @@ TEST(ParallelExpressionDifferentialTest, CompiledMatchesEvaluateExpression) {
     const Schema schema = MakeSchema();
     Stats stats;
     for (uint32_t seed = 1; seed <= kSeeds; ++seed) {
-        std::mt19937 rng(seed);
+        Rng rng(seed);
         const Data data = MakeData(rng);
         const std::vector<Tuple> tuples = MakeTuples(data, schema);
         Fixture fx;
@@ -1271,11 +1432,13 @@ TEST(ParallelExpressionDifferentialTest, CompiledMatchesEvaluateExpression) {
     }
 
     std::printf("[ differential ] %llu trees, %llu row checks (%llu today errors), %llu Select rows, "
-                "%llu tolerant values (largest gap %.3g, %.3g of its bound), %llu forgiven flips\n",
+                "%llu tolerant values (largest gap %.3g, %.3g of its bound), %llu forgiven flips, "
+                "%llu trees hiding INTEGER rows in a CASE (%llu without a Select check)\n",
                 static_cast<unsigned long long>(stats.trees), static_cast<unsigned long long>(stats.compared),
                 static_cast<unsigned long long>(stats.errors), static_cast<unsigned long long>(stats.selects),
                 static_cast<unsigned long long>(stats.tolerant_values), stats.max_gap, stats.max_gap_share,
-                static_cast<unsigned long long>(stats.forgiven_flips));
+                static_cast<unsigned long long>(stats.forgiven_flips), static_cast<unsigned long long>(stats.hiding_trees),
+                static_cast<unsigned long long>(stats.select_skipped));
     EXPECT_EQ(stats.failures, 0);
     EXPECT_GT(stats.errors, 0u);  // the error path ran
     EXPECT_LE(stats.forgiven_flips, kMaxForgivenFlips);
