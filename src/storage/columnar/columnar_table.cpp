@@ -4,6 +4,8 @@
 #include "storage/columnar/field_parser.hpp"
 #include "storage/disk_manager.hpp"
 #include "storage/page.hpp"
+#include <algorithm>
+#include <cassert>
 #include <utility>
 
 namespace shilmandb {
@@ -56,6 +58,92 @@ private:
     BufferPoolManager* bpm_;
     const ChunkMeta& chunk_;
     const std::string& table_;
+};
+
+// Pins the pages a walk expects in batches, one pool call per batch.
+// Pages are used one at a time; a batch stays pinned until the next one.
+class BatchPoolPages : public ChunkPages {
+public:
+    BatchPoolPages(BufferPoolManager* bpm, const ChunkMeta& chunk, const std::string& table) : bpm_(bpm), chunk_(chunk), table_(table), limit_(PinLimit(*bpm)) {}
+    ~BatchPoolPages() override {
+        try {
+            Release();
+        } catch (...) {
+            // nothing to do from a destructor
+        }
+    }
+    BatchPoolPages(const BatchPoolPages&) = delete;
+    BatchPoolPages& operator=(const BatchPoolPages&) = delete;
+
+    // A new walk: the last one is done with its pages.
+    void Expect(const uint32_t* indexes, size_t n) override {
+        Release();
+        expected_.assign(indexes, indexes + n);
+        next_ = 0;
+    }
+
+    const char* Pin(uint32_t index) override {
+        assert(!in_use_ && "one page at a time");
+        if (index >= chunk_.page_count) {
+            throw DatabaseException(table_ + ": page " + std::to_string(index) + " is past the chunk's " + std::to_string(chunk_.page_count));
+        }
+        const page_id_t pid = chunk_.first_page + index;
+        if (cursor_ >= held_ || batch_[cursor_] != pid) Load(index);
+        Page* page = pages_[cursor_];
+        if (!page->IsVerified()) {
+            if (!VerifyPage(page->GetData(), pid)) throw DatabaseException(table_ + ": page " + std::to_string(pid) + " failed its checksum");
+            page->MarkVerified();
+        }
+        in_use_ = true;
+        return page->GetData();
+    }
+
+    // The page stays pinned with its batch; the walk moves on.
+    void Unpin(uint32_t) override {
+        assert(in_use_ && "Unpin without Pin");
+        in_use_ = false;
+        ++cursor_;
+    }
+
+private:
+    // At most kPinBatch, and the workers' batches together never pass half the pool.
+    static size_t PinLimit(const BufferPoolManager& bpm) {
+        const size_t share = bpm.GetPoolSize() / (2 * static_cast<size_t>(bpm.ConcurrentWorkers()));
+        return std::clamp<size_t>(share, 1, kPinBatch);
+    }
+
+    // Releases the held batch, then pins the expected pages from index on, or index alone.
+    void Load(uint32_t index) {
+        Release();
+        const bool expected = next_ < expected_.size() && expected_[next_] == index;
+        const size_t count = expected ? std::min(limit_, expected_.size() - next_) : 1;
+        batch_.resize(count);
+        pages_.resize(count);
+        for (size_t i = 0; i < count; ++i) batch_[i] = chunk_.first_page + (expected ? expected_[next_ + i] : index);
+        held_ = bpm_->FetchPages(batch_.data(), count, pages_.data());
+        if (held_ == 0) throw DatabaseException(table_ + ": no free frame for page " + std::to_string(batch_[0]));
+        if (expected) next_ += held_;
+    }
+
+    // Unpins the held batch in one pool call.
+    void Release() {
+        const size_t held = held_;
+        held_ = 0;
+        cursor_ = 0;
+        if (held > 0) bpm_->UnpinPages(batch_.data(), held);
+    }
+
+    BufferPoolManager* bpm_;
+    const ChunkMeta& chunk_;
+    const std::string& table_;
+    const size_t limit_;
+    std::vector<uint32_t> expected_;  // the walk's page indexes
+    size_t next_{0};                  // the first expected page not yet pinned
+    std::vector<page_id_t> batch_;    // the batch asked for; the first held_ are pinned
+    std::vector<Page*> pages_;
+    size_t held_{0};
+    size_t cursor_{0};                // the batch entry the walk is on
+    bool in_use_{false};
 };
 
 }  // namespace
@@ -153,37 +241,37 @@ const ChunkMeta& ColumnarTable::DictionaryChunk(size_t group, uint32_t column, c
 
 void ColumnarTable::ReadRows(size_t group, uint32_t column, const uint32_t* rows, uint32_t n, int64_t* out) const {
     const ChunkMeta& chunk = ChunkOfKind(group, column, PhysicalKind::INT64);
-    PoolPages pages(bpm_, chunk, meta_.name);
+    BatchPoolPages pages(bpm_, chunk, meta_.name);
     DecodeRows(chunk, pages, meta_.columns[column].type, rows, n, out);
 }
 
 void ColumnarTable::ReadRows(size_t group, uint32_t column, const uint32_t* rows, uint32_t n, __int128* out) const {
     const ChunkMeta& chunk = ChunkOfKind(group, column, PhysicalKind::INT128);
-    PoolPages pages(bpm_, chunk, meta_.name);
+    BatchPoolPages pages(bpm_, chunk, meta_.name);
     DecodeRows(chunk, pages, meta_.columns[column].type, rows, n, out);
 }
 
 void ColumnarTable::ReadRows(size_t group, uint32_t column, const uint32_t* rows, uint32_t n, double* out) const {
     const ChunkMeta& chunk = ChunkOfKind(group, column, PhysicalKind::DOUBLE);
-    PoolPages pages(bpm_, chunk, meta_.name);
+    BatchPoolPages pages(bpm_, chunk, meta_.name);
     DecodeRows(chunk, pages, meta_.columns[column].type, rows, n, out);
 }
 
 void ColumnarTable::ReadRows(size_t group, uint32_t column, const uint32_t* rows, uint32_t n, StringRef* out, StringArena& arena) const {
     const ChunkMeta& chunk = ChunkOfKind(group, column, PhysicalKind::STRING);
-    PoolPages pages(bpm_, chunk, meta_.name);
+    BatchPoolPages pages(bpm_, chunk, meta_.name);
     DecodeRows(chunk, pages, meta_.columns[column].type, rows, n, out, arena);
 }
 
 void ColumnarTable::ReadCodes(size_t group, uint32_t column, const uint32_t* rows, uint32_t n, uint32_t* out) const {
     const ChunkMeta& chunk = DictionaryChunk(group, column, ChunkAt(group, column));
-    PoolPages pages(bpm_, chunk, meta_.name);
+    BatchPoolPages pages(bpm_, chunk, meta_.name);
     DecodeCodes(chunk, pages, rows, n, out);
 }
 
 void ColumnarTable::ReadDictionary(size_t group, uint32_t column, std::vector<StringRef>& out, StringArena& arena) const {
     const ChunkMeta& chunk = DictionaryChunk(group, column, ChunkOfKind(group, column, PhysicalKind::STRING));
-    PoolPages pages(bpm_, chunk, meta_.name);
+    BatchPoolPages pages(bpm_, chunk, meta_.name);
     DecodeDictionary(chunk, pages, meta_.columns[column].type, out, arena);
 }
 

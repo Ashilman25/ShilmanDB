@@ -15,6 +15,10 @@ namespace shilmandb {
 class BufferPoolManager;
 class DiskManager;
 
+// The most pages ReadRows, ReadCodes and ReadDictionary pin at once.
+// Each keeps to its share of half the pool, so workers can't run it dry.
+inline constexpr size_t kPinBatch = 16;
+
 // Where a row sits in a columnar table: its row group and its offset there.
 struct RowPosition {
     uint32_t row_group{0};

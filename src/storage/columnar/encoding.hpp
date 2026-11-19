@@ -82,6 +82,13 @@ public:
     virtual ~ChunkPages() = default;
     [[nodiscard]] virtual const char* Pin(uint32_t index) = 0;
     virtual void Unpin(uint32_t index) = 0;
+
+    // Before a walk: the page indexes it will pin, in order, one at a time.
+    // Lets a reader pin them in batches; ignoring it is fine.
+    virtual void Expect(const uint32_t* indexes, size_t n) {
+        (void)indexes;
+        (void)n;
+    }
 };
 
 // Appends all value_count values, holding at most one page at a time.

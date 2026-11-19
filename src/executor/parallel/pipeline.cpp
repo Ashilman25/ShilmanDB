@@ -58,8 +58,8 @@ void RunMorsels(Pipeline& p, Worker& w, std::atomic<size_t>& next, const std::at
 // Turns the buffer pool's concurrent mode on, and off again on every exit.
 class ConcurrentScope {
 public:
-    explicit ConcurrentScope(BufferPoolManager* bpm) : bpm_(bpm) {
-        if (bpm_ != nullptr) bpm_->SetConcurrent(true);
+    ConcurrentScope(BufferPoolManager* bpm, unsigned workers) : bpm_(bpm) {
+        if (bpm_ != nullptr) bpm_->SetConcurrent(true, workers);
     }
     ~ConcurrentScope() {
         if (bpm_ != nullptr) bpm_->SetConcurrent(false);
@@ -111,7 +111,7 @@ void RunPipeline(Pipeline& p, QueryContext& ctx) {
     if (workers == 1) {
         RunMorsels(p, locals[0], next, stop, morsels, started[0]);
     } else {
-        ConcurrentScope concurrent(ctx.bpm);
+        ConcurrentScope concurrent(ctx.bpm, workers);
         ctx.pool->Run(workers, [&](unsigned w) {
             try {
                 RunMorsels(p, locals[w], next, stop, morsels, started[w]);

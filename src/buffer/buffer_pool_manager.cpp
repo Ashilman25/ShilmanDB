@@ -1,6 +1,7 @@
 #include "buffer/buffer_pool_manager.hpp"
 #include "common/exception.hpp"
 #include <algorithm>
+#include <exception>
 #include <string>
 
 namespace shilmandb {
@@ -337,9 +338,10 @@ void BufferPoolManager::DisableTracing() {
 //  Concurrent mode 
 
 // Only the calling thread switches it, with no worker inside, so no latch
-void BufferPoolManager::SetConcurrent(bool on) {
+void BufferPoolManager::SetConcurrent(bool on, unsigned workers) {
     owner_ = std::this_thread::get_id();
     concurrent_ = on;
+    workers_ = on ? std::max(1u, workers) : 1u;
 }
 
 std::chrono::nanoseconds BufferPoolManager::GetLatchWaitTime() const {
@@ -442,6 +444,171 @@ void BufferPoolManager::AbandonLoad(page_id_t page_id, frame_id_t frame_id) {
     free_list_.push_back(frame_id);
     loading_[frame_id] = false;
     load_done_.notify_all();
+}
+
+//  Batches of pages
+
+// Off, a loop of FetchPage that gives its pins back if a fetch throws
+size_t BufferPoolManager::FetchPages(const page_id_t* ids, size_t n, Page** out) {
+    if (concurrent_) return FetchPagesConcurrent(ids, n, out);
+    size_t got = 0;
+    try {
+        for (; got < n; ++got) {
+            Page* page = FetchPage(ids[got]);
+            if (page == nullptr) break;
+            out[got] = page;
+        }
+    } catch (...) {
+        for (size_t i = 0; i < got; ++i) (void)UnpinPage(ids[i], false);
+        throw;
+    }
+    return got;
+}
+
+// Off, a loop of UnpinPage; on, the same work in one latch hold
+void BufferPoolManager::UnpinPages(const page_id_t* ids, size_t n) {
+    if (concurrent_) {
+        auto lock = Latch();
+        UnpinBatch(ids, n);
+        return;
+    }
+    for (size_t i = 0; i < n; ++i) (void)UnpinPage(ids[i], false);
+}
+
+// UnpinPage(id, false) for each page, for callers that hold the latch
+void BufferPoolManager::UnpinBatch(const page_id_t* ids, size_t n) {
+    for (size_t i = 0; i < n; ++i) UnpinClean(ids[i]);
+}
+
+// UnpinPage(page_id, false) for callers that hold the latch
+void BufferPoolManager::UnpinClean(page_id_t page_id) {
+    auto it = page_table_.find(page_id);
+    if (it == page_table_.end()) return;
+    auto& frame = pages_[it->second];
+    if (frame.GetPinCount() == 0) return;
+    frame.Unpin();
+    if (frame.GetPinCount() == 0) policy_->SetEvictable(it->second, true);
+}
+
+// One hold pins the batch with FetchPage's policy calls; one counts it after the reads.
+// A page being read ends the walk; the rest go singly. No frame: a prefix.
+size_t BufferPoolManager::FetchPagesConcurrent(const page_id_t* ids, size_t n, Page** out) {
+    struct Pinned {
+        frame_id_t frame;
+        bool miss;
+    };
+    std::vector<Pinned> pinned;
+    pinned.reserve(n);
+    bool out_of_frames = false;
+    bool any_miss = false;
+
+    // Gives back the batch's pins; loads from index `from` on are dropped
+    auto give_back = [&](size_t from) {
+        for (size_t i = 0; i < pinned.size(); ++i) {
+            if (i >= from && pinned[i].miss) {
+                AbandonLoad(ids[i], pinned[i].frame);
+            } else {
+                UnpinClean(ids[i]);
+            }
+        }
+        load_done_.notify_all();
+    };
+
+    auto lock = Latch();
+    try {
+        for (size_t i = 0; i < n; ++i) {
+            const page_id_t page_id = ids[i];
+            if (auto it = page_table_.find(page_id); it != page_table_.end()) {
+                const frame_id_t frame_id = it->second;
+                if (loading_[frame_id]) break;  // another thread's read, or this batch's own
+                pages_[frame_id].Pin();
+                pinned.push_back({frame_id, false});
+                RecordPolicyAccess(frame_id, page_id, false);
+                policy_->SetEvictable(frame_id, false);
+                continue;
+            }
+
+            // A miss, set up as FetchPageConcurrent does before its read
+            frame_id_t frame_id;
+            if (!FindVictimFrame(page_id, &frame_id)) {
+                out_of_frames = true;
+                break;
+            }
+            auto& frame = pages_[frame_id];
+            if (frame.GetPageId() != INVALID_PAGE_ID) {
+                if (frame.IsDirty()) {
+                    disk_manager_->WritePage(frame.GetPageId(), frame.GetData());
+                }
+                page_table_.erase(frame.GetPageId());
+            }
+            frame.ClearMetadata();
+            frame.SetPageId(page_id);
+            frame.Pin();
+            page_table_[page_id] = frame_id;
+            loading_[frame_id] = true;
+            pinned.push_back({frame_id, true});
+            any_miss = true;
+            RecordPolicyAccess(frame_id, page_id, true);
+            policy_->SetEvictable(frame_id, false);
+        }
+    } catch (...) {
+        give_back(0);
+        throw;
+    }
+
+    // Read the misses with the latch released, stopping at the first failure
+    const size_t walked = pinned.size();
+    size_t failed = walked;
+    std::exception_ptr error;
+    if (any_miss) {
+        lock.unlock();
+        for (size_t i = 0; i < walked; ++i) {
+            if (!pinned[i].miss) continue;
+            try {
+                disk_manager_->ReadPage(ids[i], pages_[pinned[i].frame].GetData());
+            } catch (...) {
+                error = std::current_exception();
+                failed = i;
+                break;
+            }
+        }
+        lock = Latch();
+    }
+
+    // The pages before any failure are ready, and counted in order
+    for (size_t i = 0; i < failed; ++i) {
+        const frame_id_t frame_id = pinned[i].frame;
+        if (pinned[i].miss) {
+            loading_[frame_id] = false;
+            ++miss_count_;
+        } else {
+            ++hit_count_;
+        }
+        RecordVisit(ids[i], frame_id, pinned[i].miss);
+        if (trace_enabled_) TraceFetch(ids[i]);
+        out[i] = &pages_[frame_id];
+    }
+    if (error) {
+        give_back(failed);
+        std::rethrow_exception(error);
+    }
+    if (any_miss) load_done_.notify_all();
+    lock.unlock();
+
+    // The rest, after a page being read in, one at a time
+    size_t got = walked;
+    if (out_of_frames) return got;
+    try {
+        for (; got < n; ++got) {
+            Page* page = FetchPageConcurrent(ids[got]);
+            if (page == nullptr) break;
+            out[got] = page;
+        }
+    } catch (...) {
+        UnpinPages(ids, got);
+        throw;
+    }
+    return got;
 }
 
 // FlushPage under the latch, after any read of the page has finished

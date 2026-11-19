@@ -7,13 +7,16 @@
 #include "storage/columnar/string_arena.hpp"
 #include "storage/disk_manager.hpp"
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <limits>
 #include <memory>
 #include <random>
 #include <set>
 #include <string>
+#include <thread>
 #include <unistd.h>
 #include <utility>
 #include <vector>
@@ -390,6 +393,144 @@ ColumnVector DistinctBigInts(int n) {
     ColumnVector v(ColumnType::BigInt());
     for (int i = 0; i < n; ++i) v.AppendInt(i * 1000003LL * 1000003LL);
     return v;
+}
+
+// Records the order a decoder pins pages in; pages come from memory.
+class OrderPages : public ChunkPages {
+public:
+    explicit OrderPages(const EncodedChunk& chunk) : chunk_(chunk) {}
+    const char* Pin(uint32_t index) override {
+        order_.push_back(index);
+        return chunk_.pages.data() + static_cast<size_t>(index) * PAGE_SIZE;
+    }
+    void Unpin(uint32_t) override {}
+    [[nodiscard]] const std::vector<uint32_t>& Order() const { return order_; }
+
+private:
+    const EncodedChunk& chunk_;
+    std::vector<uint32_t> order_;
+};
+
+// A temp file name for this process.
+std::string TempPath(const std::string& name) {
+    return (std::filesystem::temp_directory_path() / ("shilmandb_encoding_rows_" + name + "_" + std::to_string(::getpid()))).string();
+}
+
+constexpr uint32_t kBatchRows = 100000;
+constexpr uint32_t kBatchId = 0, kBatchWide = 1, kBatchRate = 2, kBatchNote = 3, kBatchWord = 4;
+constexpr uint32_t kBatchNullRow = 7500;
+constexpr size_t kBatchPool = 64 * kPinBatch;  // full batches, and the whole table fits
+
+// One row group with chunks longer than a pin batch, and its values.
+struct BatchTable {
+    ColumnarTableMeta meta;
+    std::vector<ColumnVector> values;
+};
+
+// Writes the table; with a NULL, b_rate holds one at kBatchNullRow.
+BatchTable MakeBatchTable(DiskManager& disk, std::mt19937_64& rng, bool with_null = false) {
+    BatchTable t;
+    t.meta.oid = 1;
+    t.meta.name = "batch";
+    t.meta.columns = {{"b_id", 1, ColumnType::BigInt(), false},
+                      {"b_wide", 2, ColumnType::Numeric(38, 6), false},
+                      {"b_rate", 3, ColumnType::Double(), with_null},
+                      {"b_note", 4, ColumnType::Text(), false},
+                      {"b_word", 5, ColumnType::Text(), false}};
+    for (uint32_t c = 0; c < kBatchWord; ++c) t.values.push_back(MakeVector(t.meta.columns[c].type, kBatchRows, Shape::RANDOM, rng));
+    if (with_null) {
+        ColumnVector rate(ColumnType::Double());
+        for (uint32_t r = 0; r < kBatchRows; ++r) {
+            if (r == kBatchNullRow) {
+                rate.AppendNull();
+            } else {
+                AppendRow(t.values[kBatchRate], r, rate);
+            }
+        }
+        t.values[kBatchRate] = std::move(rate);
+    }
+
+    // 4,000 long words: a dictionary over several pages
+    std::vector<std::string> words;
+    for (int i = 0; i < 4000; ++i) words.push_back("word_" + std::to_string(i) + std::string(25, static_cast<char>('a' + i % 26)));
+    ColumnVector word(ColumnType::Text());
+    for (uint32_t r = 0; r < kBatchRows; ++r) word.AppendString(words[rng() % words.size()]);
+    t.values.push_back(std::move(word));
+
+    RowGroupMeta group;
+    group.row_count = kBatchRows;
+    for (const ColumnVector& col : t.values) group.chunks.push_back(WriteChunk(&disk, col));
+    t.meta.row_count = kBatchRows;
+    t.meta.row_groups.push_back(std::move(group));
+    return t;
+}
+
+// ReadRows for the column's kind, as a vector; rows null means 0..n-1.
+ColumnVector ReadRowsToVector(const ColumnarTable& table, uint32_t column, const uint32_t* rows, uint32_t n, StringArena& arena) {
+    const ColumnType& type = table.Meta().columns[column].type;
+    ColumnVector got(type);
+    switch (PhysicalKindOf(type)) {
+        case PhysicalKind::INT64: {
+            std::vector<int64_t> v(n);
+            table.ReadRows(0, column, rows, n, v.data());
+            for (int64_t x : v) got.AppendInt(x);
+            break;
+        }
+        case PhysicalKind::INT128: {
+            std::vector<__int128> v(n);
+            table.ReadRows(0, column, rows, n, v.data());
+            for (__int128 x : v) got.AppendWide(x);
+            break;
+        }
+        case PhysicalKind::DOUBLE: {
+            std::vector<double> v(n);
+            table.ReadRows(0, column, rows, n, v.data());
+            for (double x : v) got.AppendDouble(x);
+            break;
+        }
+        case PhysicalKind::STRING: {
+            std::vector<StringRef> v(n);
+            table.ReadRows(0, column, rows, n, v.data(), arena);
+            for (StringRef s : v) got.AppendString(View(s));
+            break;
+        }
+    }
+    return got;
+}
+
+// The listed rows of src, or all of them when rows is empty.
+ColumnVector RowsOf(const ColumnVector& src, const std::vector<uint32_t>& rows) {
+    ColumnVector out(src.Type());
+    if (rows.empty()) {
+        for (size_t r = 0; r < src.Size(); ++r) AppendRow(src, r, out);
+    } else {
+        for (uint32_t r : rows) AppendRow(src, r, out);
+    }
+    return out;
+}
+
+// The chunk page indexes a trace file lists, in order.
+std::vector<uint32_t> TracedPages(const std::string& path, page_id_t first_page) {
+    std::ifstream in(path);
+    std::string line;
+    std::getline(in, line);  // the header
+    std::vector<uint32_t> pages;
+    while (std::getline(in, line)) {
+        const auto pid = static_cast<page_id_t>(std::stoul(line.substr(line.find(',') + 1)));
+        pages.push_back(pid - first_page);
+    }
+    return pages;
+}
+
+// True when no frame of the pool is pinned.
+::testing::AssertionResult NothingPinned(const BufferPoolManager& bpm) {
+    for (size_t f = 0; f < bpm.GetPoolSize(); ++f) {
+        const Page& page = bpm.GetPage(static_cast<frame_id_t>(f));
+        if (page.GetPinCount() != 0) {
+            return ::testing::AssertionFailure() << "frame " << f << " holds page " << page.GetPageId() << " pinned " << page.GetPinCount() << " times";
+        }
+    }
+    return ::testing::AssertionSuccess();
 }
 
 }  // namespace
@@ -1184,6 +1325,230 @@ TEST(EncodingRowsTest, UnknownEncodingThrows) {
         DecodeRowsDiscard(chunk.meta, pages, type, nullptr, 0);  // no rows asked, nothing read
         EXPECT_EQ(pages.TotalPins(), 0u);
     }
+}
+
+// The batched readers give the stored values and pin exactly the walk's pages, in order.
+TEST(EncodingRowsTest, BatchedReadsMatchThePageWalk) {
+    const std::string path = TempPath("batch") + ".db";
+    const std::string trace = TempPath("batch_trace") + ".csv";
+    std::filesystem::remove(path);
+    std::mt19937_64 rng(77);
+    {
+        DiskManager disk(path);
+        const BatchTable t = MakeBatchTable(disk, rng);
+        const ChunkMeta& words = t.meta.row_groups[0].chunks[kBatchWord];
+        ASSERT_EQ(words.encoding, Encoding::DICTIONARY);
+        ASSERT_GT(words.dict_page_count, 2u);
+
+        // Every row, a sparse list skipping pages, a dense list, and a middle band
+        std::vector<std::vector<uint32_t>> lists = {{}, RandomSubset(kBatchRows, 0.002, rng), RandomSubset(kBatchRows, 0.3, rng), {}};
+        for (uint32_t r = 30000; r < 31500; r += 3) lists[3].push_back(r);
+
+        // A pool with room for full batches, and one whose batches are 4 pages
+        const std::pair<bool, size_t> setups[] = {{false, kBatchPool}, {true, kBatchPool}, {false, 8}, {true, 8}};
+        for (const auto& [concurrent, frames] : setups) {
+            SCOPED_TRACE(std::string(concurrent ? "concurrent" : "plain") + ", " + std::to_string(frames) + " frames");
+            BufferPoolManager bpm(frames, &disk, std::make_unique<LRUEvictionPolicy>(frames));
+            bpm.SetConcurrent(concurrent);
+            const ColumnarTable table(&bpm, t.meta);
+            StringArena arena;
+
+            for (uint32_t c = 0; c < t.meta.columns.size(); ++c) {
+                const ColumnType& type = t.meta.columns[c].type;
+                const ChunkMeta& chunk = table.ChunkAt(0, c);
+                const EncodedChunk memory = EncodeChunk(t.values[c]);
+                ASSERT_EQ(memory.meta.page_count, chunk.page_count);
+                if (c != kBatchWord) ASSERT_GT(chunk.page_count, kPinBatch) << t.meta.columns[c].name;
+                for (size_t l = 0; l < lists.size(); ++l) {
+                    SCOPED_TRACE(t.meta.columns[c].name + " list " + std::to_string(l));
+                    const uint32_t* rows = lists[l].empty() ? nullptr : lists[l].data();
+                    const auto n = lists[l].empty() ? kBatchRows : static_cast<uint32_t>(lists[l].size());
+
+                    OrderPages walk(memory);
+                    StringArena scratch;
+                    (void)DecodeRowsToVector(memory, type, rows, n, walk, scratch);
+
+                    bpm.EnableTracing(trace);
+                    const ColumnVector got = ReadRowsToVector(table, c, rows, n, arena);
+                    bpm.DisableTracing();
+                    EXPECT_TRUE(SameValues(got, RowsOf(t.values[c], lists[l])));
+                    EXPECT_EQ(TracedPages(trace, chunk.first_page), walk.Order());
+                    EXPECT_TRUE(NothingPinned(bpm));
+                }
+            }
+
+            // Codes and the dictionary, through the same batches
+            const EncodedChunk memory = EncodeChunk(t.values[kBatchWord]);
+            for (size_t l = 0; l < lists.size(); ++l) {
+                SCOPED_TRACE("codes, list " + std::to_string(l));
+                const uint32_t* rows = lists[l].empty() ? nullptr : lists[l].data();
+                const auto n = lists[l].empty() ? kBatchRows : static_cast<uint32_t>(lists[l].size());
+                OrderPages walk(memory);
+                std::vector<uint32_t> want(n), got(n);
+                DecodeCodes(memory.meta, walk, rows, n, want.data());
+                bpm.EnableTracing(trace);
+                table.ReadCodes(0, kBatchWord, rows, n, got.data());
+                bpm.DisableTracing();
+                EXPECT_EQ(got, want);
+                EXPECT_EQ(TracedPages(trace, words.first_page), walk.Order());
+            }
+            OrderPages walk(memory);
+            std::vector<StringRef> want, got;
+            StringArena scratch;
+            DecodeDictionary(memory.meta, walk, ColumnType::Text(), want, scratch);
+            bpm.EnableTracing(trace);
+            table.ReadDictionary(0, kBatchWord, got, arena);
+            bpm.DisableTracing();
+            ASSERT_EQ(got.size(), want.size());
+            for (size_t e = 0; e < got.size(); ++e) EXPECT_EQ(View(got[e]), View(want[e])) << "entry " << e;
+            EXPECT_EQ(TracedPages(trace, words.first_page), walk.Order());
+
+            EXPECT_TRUE(NothingPinned(bpm));
+            EXPECT_NO_THROW(bpm.DropAllPages());
+            bpm.SetConcurrent(false);
+        }
+    }
+    std::filesystem::remove(path);
+    std::filesystem::remove(trace);
+}
+
+// A checksum failure or a NULL partway through a batch throws, leaving no pin.
+TEST(EncodingRowsTest, BatchedReadsLeaveNoPinOnRefusal) {
+    const std::string path = TempPath("batch_refusal") + ".db";
+    std::filesystem::remove(path);
+    std::mt19937_64 rng(78);
+    {
+        DiskManager disk(path);
+        const BatchTable t = MakeBatchTable(disk, rng, true);
+
+        // Damage data page 5 of b_id on disk, behind its checksum
+        const ChunkMeta& ids = t.meta.row_groups[0].chunks[kBatchId];
+        const page_id_t damaged = ids.first_page + ids.dict_page_count + 5;
+        std::vector<char> page(PAGE_SIZE);
+        disk.ReadPage(damaged, page.data());
+        page[100] = static_cast<char>(page[100] ^ 0x5A);
+        disk.WritePage(damaged, page.data());
+
+        // The rows on every b_id page but the damaged one
+        std::vector<uint32_t> around;
+        const uint32_t skip_from = ids.page_first_rows[5], skip_to = ids.page_first_rows[6];
+        for (uint32_t r = 0; r < kBatchRows; ++r) {
+            if (r < skip_from || r >= skip_to) around.push_back(r);
+        }
+
+        for (const bool concurrent : {false, true}) {
+            SCOPED_TRACE(concurrent ? "concurrent" : "plain");
+            BufferPoolManager bpm(kBatchPool, &disk, std::make_unique<LRUEvictionPolicy>(kBatchPool));
+            bpm.SetConcurrent(concurrent);
+            const ColumnarTable table(&bpm, t.meta);
+            StringArena arena;
+
+            EXPECT_EQ(ThrownText([&] { (void)ReadRowsToVector(table, kBatchId, nullptr, kBatchRows, arena); }),
+                      "batch: page " + std::to_string(damaged) + " failed its checksum");
+            EXPECT_TRUE(NothingPinned(bpm));
+            EXPECT_TRUE(SameValues(ReadRowsToVector(table, kBatchId, around.data(), static_cast<uint32_t>(around.size()), arena),
+                                   RowsOf(t.values[kBatchId], around)));
+
+            EXPECT_EQ(ThrownText([&] { (void)ReadRowsToVector(table, kBatchRate, nullptr, kBatchRows, arena); }),
+                      "damaged column chunk: row " + std::to_string(kBatchNullRow) + " is NULL");
+            EXPECT_TRUE(NothingPinned(bpm));
+            EXPECT_NO_THROW(bpm.DropAllPages());
+            bpm.SetConcurrent(false);
+        }
+    }
+    std::filesystem::remove(path);
+}
+
+// A pool smaller than a batch, or nearly full of pins, still reads every row.
+TEST(EncodingRowsTest, BatchedReadsInASmallPool) {
+    const std::string path = TempPath("batch_small") + ".db";
+    std::filesystem::remove(path);
+    std::mt19937_64 rng(79);
+    {
+        DiskManager disk(path);
+        const BatchTable t = MakeBatchTable(disk, rng);
+        const ChunkMeta& notes = t.meta.row_groups[0].chunks[kBatchNote];
+        const ChunkMeta& ids = t.meta.row_groups[0].chunks[kBatchId];
+
+        for (const bool concurrent : {false, true}) {
+            SCOPED_TRACE(concurrent ? "concurrent" : "plain");
+            {
+                BufferPoolManager bpm(8, &disk, std::make_unique<LRUEvictionPolicy>(8));
+                bpm.SetConcurrent(concurrent);
+                const ColumnarTable table(&bpm, t.meta);
+                StringArena arena;
+                for (const uint32_t c : {kBatchId, kBatchWord}) {
+                    EXPECT_TRUE(SameValues(ReadRowsToVector(table, c, nullptr, kBatchRows, arena), t.values[c])) << "column " << c;
+                }
+                EXPECT_TRUE(NothingPinned(bpm));
+                bpm.SetConcurrent(false);
+            }
+
+            // Two frames free: each batch is a short prefix; the reader takes the rest later
+            const size_t frames = 128;
+            ASSERT_GT(notes.page_count, frames);
+            BufferPoolManager bpm(frames, &disk, std::make_unique<LRUEvictionPolicy>(frames));
+            bpm.SetConcurrent(concurrent);
+            const ColumnarTable table(&bpm, t.meta);
+            StringArena arena;
+            for (page_id_t i = 0; i + 2 < frames; ++i) ASSERT_NE(bpm.FetchPage(notes.first_page + i), nullptr);
+            EXPECT_TRUE(SameValues(ReadRowsToVector(table, kBatchId, nullptr, kBatchRows, arena), t.values[kBatchId]));
+
+            // No frame at all is today's error
+            for (page_id_t i = frames - 2; i < frames; ++i) ASSERT_NE(bpm.FetchPage(notes.first_page + i), nullptr);
+            EXPECT_EQ(ThrownText([&] { (void)ReadRowsToVector(table, kBatchId, nullptr, kBatchRows, arena); }),
+                      "batch: no free frame for page " + std::to_string(ids.first_page));
+            for (page_id_t i = 0; i < frames; ++i) EXPECT_TRUE(bpm.UnpinPage(notes.first_page + i, false));
+            EXPECT_TRUE(NothingPinned(bpm));
+            EXPECT_NO_THROW(bpm.DropAllPages());
+            bpm.SetConcurrent(false);
+        }
+    }
+    std::filesystem::remove(path);
+}
+
+
+// Many workers on a small pool still read: their batches together keep to half the pool.
+TEST(EncodingRowsTest, BatchedReadsManyWorkersOnASmallPool) {
+    constexpr size_t kFrames = 64;
+    constexpr unsigned kWorkers = 48;  // one page each fits, two each would not
+    const std::string path = TempPath("batch_workers") + ".db";
+    std::filesystem::remove(path);
+    std::mt19937_64 rng(80);
+    {
+        DiskManager disk(path);
+        const BatchTable t = MakeBatchTable(disk, rng);
+        BufferPoolManager bpm(kFrames, &disk, std::make_unique<LRUEvictionPolicy>(kFrames));
+        const ColumnarTable table(&bpm, t.meta);
+        const uint32_t columns[] = {kBatchId, kBatchWide, kBatchRate};
+
+        std::atomic<int> refused{0}, wrong{0};
+        bpm.SetConcurrent(true, kWorkers);
+        EXPECT_EQ(bpm.ConcurrentWorkers(), kWorkers);
+        std::vector<std::thread> threads;
+        for (unsigned w = 0; w < kWorkers; ++w) {
+            threads.emplace_back([&, w] {
+                StringArena arena;
+                for (unsigned round = 0; round < 3; ++round) {
+                    const uint32_t c = columns[(w + round) % 3];
+                    try {
+                        if (!SameValues(ReadRowsToVector(table, c, nullptr, kBatchRows, arena), t.values[c])) wrong.fetch_add(1);
+                    } catch (const DatabaseException&) {
+                        refused.fetch_add(1);
+                    }
+                }
+            });
+        }
+        for (auto& thread : threads) thread.join();
+        bpm.SetConcurrent(false);
+
+        EXPECT_EQ(bpm.ConcurrentWorkers(), 1u);
+        EXPECT_EQ(refused.load(), 0);
+        EXPECT_EQ(wrong.load(), 0);
+        EXPECT_TRUE(NothingPinned(bpm));
+        EXPECT_NO_THROW(bpm.DropAllPages());
+    }
+    std::filesystem::remove(path);
 }
 
 }  // namespace shilmandb

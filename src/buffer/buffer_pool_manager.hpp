@@ -36,6 +36,12 @@ public:
     [[nodiscard]] bool FlushPage(page_id_t page_id);
     void FlushAllPages();
 
+    // Pins pages ids[0..n) in order; returns how many, a prefix when frames run out.
+    // A failed read leaves none pinned and rethrows; on, the batch takes two latch holds.
+    [[nodiscard]] size_t FetchPages(const page_id_t* ids, size_t n, Page** out);
+    // Unpins pages ids[0..n) clean, each as UnpinPage(id, false); on, in one latch hold.
+    void UnpinPages(const page_id_t* ids, size_t n);
+
     // Writes out dirty pages and empties the pool, and the policy starts over: like a restart
     // with an empty cache. Throws DatabaseException if a page is pinned.
     void DropAllPages();
@@ -69,10 +75,12 @@ public:
     size_t GetPoolSize() const;
     const Page& GetPage(frame_id_t frame_id) const;
 
-    // On, every call takes one latch, so worker threads can share the pool.
+    // On, every call takes one latch; workers says how many threads share the pool.
     // Switch it only from the calling thread, with no worker inside the pool.
-    void SetConcurrent(bool on);
+    void SetConcurrent(bool on, unsigned workers = 1);
     [[nodiscard]] bool IsConcurrent() const { return concurrent_; }
+    // Threads sharing the pool: the count given with the mode on, else 1
+    [[nodiscard]] unsigned ConcurrentWorkers() const { return workers_; }
     // Time spent waiting for the latch; ResetStats() zeroes it
     [[nodiscard]] std::chrono::nanoseconds GetLatchWaitTime() const;
 
@@ -111,6 +119,7 @@ private:
 
     // Concurrent mode. Off, only the owner check runs, and ResetStats zeroes latch_wait_.
     bool concurrent_{false};
+    unsigned workers_{1};
     std::thread::id owner_;                     // the thread that built the pool or last switched the mode
     mutable std::mutex latch_;
     mutable std::chrono::nanoseconds latch_wait_{0};
@@ -129,6 +138,9 @@ private:
     [[nodiscard]] std::unordered_map<page_id_t, frame_id_t>::iterator WaitUntilLoaded(std::unique_lock<std::mutex>& lock, page_id_t page_id);
     [[nodiscard]] Page* FetchPageConcurrent(page_id_t page_id);
     void AbandonLoad(page_id_t page_id, frame_id_t frame_id);
+    [[nodiscard]] size_t FetchPagesConcurrent(const page_id_t* ids, size_t n, Page** out);
+    void UnpinBatch(const page_id_t* ids, size_t n);
+    void UnpinClean(page_id_t page_id);
     [[nodiscard]] bool FlushPageConcurrent(page_id_t page_id);
     void DropAllPagesConcurrent();
     void CloseTrace();

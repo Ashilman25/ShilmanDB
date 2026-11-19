@@ -1026,13 +1026,17 @@ void RequireNoNulls(const PageView& view, const uint32_t* rows, uint32_t first, 
 }
 
 // Walks the data pages holding a requested row, in order, pinning each once.
-// visit(view, first, k0, k1) gets requested rows k0..k1-1, all on that page.
+// visit(view, first, k0, k1) gets rows k0..k1-1 on that page; pages.Expect gets the list first.
 template <typename Visit>
 void WalkDataPages(const ChunkMeta& meta, ChunkPages& pages, const ColumnType& type, const uint32_t* rows, uint32_t n, Visit visit) {
+    struct Step {
+        uint32_t page, k0, k1;
+    };
     const auto& firsts = meta.page_first_rows;
+    std::vector<Step> steps;
+    std::vector<uint32_t> indexes;
     uint32_t k = 0;
     for (uint32_t p = 0; p < firsts.size() && k < n; ++p) {
-        const uint32_t first = firsts[p];
         const uint32_t end = PageEnd(firsts, p, meta.value_count);
         const uint32_t k0 = k;
         if (rows == nullptr) {
@@ -1041,27 +1045,38 @@ void WalkDataPages(const ChunkMeta& meta, ChunkPages& pages, const ColumnType& t
             while (k < n && rows[k] < end) ++k;
         }
         if (k == k0) continue;  // no requested row here, so the page is never pinned
+        steps.push_back({p, k0, k});
+        indexes.push_back(meta.dict_page_count + p);
+    }
+    pages.Expect(indexes.data(), indexes.size());
 
-        PinnedPage pin(pages, meta.dict_page_count + p);
+    for (const Step& s : steps) {
+        const uint32_t first = firsts[s.page];
+        const uint32_t end = PageEnd(firsts, s.page, meta.value_count);
+        PinnedPage pin(pages, meta.dict_page_count + s.page);
         const PageView view = OpenPage(pin.Data(), PageKind::DATA, meta.encoding, first, type);
         if (view.header.value_count != end - first) {
             ThrowDamaged("page holds " + std::to_string(view.header.value_count) + " values, the chunk says " + std::to_string(end - first));
         }
-        RequireNoNulls(view, rows, first, k0, k);
-        visit(view, first, k0, k);
+        RequireNoNulls(view, rows, first, s.k0, s.k1);
+        visit(view, first, s.k0, s.k1);
     }
 }
 
 // Walks the dictionary pages where wanted(e0, e1) holds, pinning each once.
-// visit(view, e0, e1) gets the page's entries e0..e1-1.
+// visit(view, e0, e1) gets the page's entries e0..e1-1; pages.Expect gets the list first.
 template <typename Wanted, typename Visit>
 void WalkDictionaryPages(const ChunkMeta& meta, ChunkPages& pages, const ColumnType& type, Wanted wanted, Visit visit) {
     const auto& entries = meta.dict_page_first_entries;
+    std::vector<uint32_t> indexes;
     for (uint32_t j = 0; j < entries.size(); ++j) {
+        if (wanted(entries[j], PageEnd(entries, j, meta.dict_size))) indexes.push_back(j);
+    }
+    pages.Expect(indexes.data(), indexes.size());
+
+    for (const uint32_t j : indexes) {
         const uint32_t e0 = entries[j];
         const uint32_t e1 = PageEnd(entries, j, meta.dict_size);
-        if (!wanted(e0, e1)) continue;
-
         PinnedPage pin(pages, j);
         const PageView view = OpenPage(pin.Data(), PageKind::DICTIONARY, Encoding::PLAIN, e0, type);
         if (view.header.value_count != e1 - e0) {
