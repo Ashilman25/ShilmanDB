@@ -215,6 +215,13 @@ std::optional<double> SkipNumber(const Value& v, bool whole) {
 
 }  // namespace
 
+double ExpectedPagesTouched(double pages, double positions) {
+    if (pages <= 0.0 || positions <= 0.0) return 0.0;
+    if (pages <= 1.0) return pages;
+    // (1 - 1/p)^k through log1p, so a large p keeps its precision.
+    return pages * -std::expm1(positions * std::log1p(-1.0 / pages));
+}
+
 bool CostModel::MayMatch(const std::vector<const Expression*>& conjuncts, const std::unordered_map<std::string, MinMax>& ranges) {
     std::vector<const Expression*> leaves;
     for (const auto* c : conjuncts) Flatten(c, leaves);

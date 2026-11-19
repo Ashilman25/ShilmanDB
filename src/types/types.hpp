@@ -12,4 +12,7 @@ enum class TypeId : uint8_t {
     DATE = 5        //4 bytes, int32_t, days since Jan 1, 1970
 };
 
+// Any decimal text of at most this many digits survives a trip through a double.
+inline constexpr int kExactDoubleDigits = 15;
+
 }

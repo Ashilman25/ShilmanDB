@@ -82,6 +82,7 @@ target_include_directories(plan_dump_test PRIVATE ${CMAKE_SOURCE_DIR}/bench)
 target_compile_definitions(plan_dump_test PRIVATE PLAN_DUMP_GOLDEN_PATH="${CMAKE_SOURCE_DIR}/test/planner/golden/tpch_plans.txt")
 shilmandb_add_test(or_factoring_test planner/or_factoring_test.cpp)
 target_include_directories(or_factoring_test PRIVATE ${CMAKE_SOURCE_DIR}/bench)
+shilmandb_add_test(columnar_scan_cost_test planner/columnar_scan_cost_test.cpp)
 
 # Executor tests
 shilmandb_add_test(seq_scan_executor_test executor/seq_scan_executor_test.cpp)

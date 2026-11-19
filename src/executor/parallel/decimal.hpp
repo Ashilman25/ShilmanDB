@@ -4,14 +4,15 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include "types/types.hpp"
 
 namespace shilmandb::parallel {
 
 // The most digits a NUMERIC holds, so the widest exact decimal here.
 inline constexpr uint8_t kMaxDecimalDigits = 38;
 
-// Any decimal text of at most this many digits survives a trip through a double.
-inline constexpr int kExactDoubleDigits = 15;
+// Shared with the planner; see types/types.hpp.
+using shilmandb::kExactDoubleDigits;
 
 // An exact decimal: value / 10^scale.
 struct DecimalLiteral {

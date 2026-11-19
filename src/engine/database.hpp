@@ -118,11 +118,17 @@ public:
     [[nodiscard]] ScanCosts GetScanCosts() const;
     void SetScanCosts(std::optional<ScanCosts> costs) { scan_costs_ = costs; }
 
+    // What the parallel executor's planner assumes columnar scans cost: the defaults unless overridden.
+    // Negative values exist only to force a plan (tests and timing runs).
+    [[nodiscard]] ColumnarScanCosts GetColumnarScanCosts() const { return columnar_scan_costs_.value_or(ColumnarScanCosts{}); }
+    void SetColumnarScanCosts(std::optional<ColumnarScanCosts> costs) { columnar_scan_costs_ = costs; }
+
     // Set when a parallel query finishes; an error keeps the last value.
     [[nodiscard]] const ParallelQueryStats& LastParallelStats() const { return last_parallel_stats_; }
 
 private:
     std::optional<ScanCosts> scan_costs_;
+    std::optional<ColumnarScanCosts> columnar_scan_costs_;
     std::unique_ptr<DiskManager> disk_manager_;
     std::unique_ptr<BufferPoolManager> bpm_;
     std::unique_ptr<ColumnarFile> columnar_file_;

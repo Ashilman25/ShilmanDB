@@ -29,6 +29,25 @@ struct ScanCosts {
     [[nodiscard]] static constexpr ScanCosts ForPageRead(double us) { return {us, us, kScanRowUs, kIndexRowUs}; }
 };
 
+// What the parallel executor's scans of a columnar table cost, in microseconds.
+// Fitted by least squares from forced seq and index plans, timed at 1 thread
+// at SF=0.1 and SF=1 (2026-11-18); they pick the faster plan in all 22 measured cases.
+// Index fetches assume scattered positions, so a range on a clustered key is overpriced.
+struct ColumnarScanCosts {
+    static constexpr double kPageUs = 0.0993;
+    static constexpr double kValueUs = 0.00194;
+    static constexpr double kIndexEntryUs = 0.0373;
+    static constexpr double kPositionUs = 0.00290;
+
+    double page_us{kPageUs};               // one chunk page through the pool
+    double value_us{kValueUs};             // one value decoded and filtered by the parallel scan
+    double index_entry_us{kIndexEntryUs};  // one B+tree entry walked
+    double position_us{kPositionUs};       // one position decoded per read column
+};
+
+// Pages a position-ordered fetch touches: p * (1 - (1 - 1/p)^k) for k positions over p pages.
+[[nodiscard]] double ExpectedPagesTouched(double pages, double positions);
+
 struct CostModel {
     static constexpr double kMinSelectivity = 0.001;        
     static constexpr double kOpenRangeSelectivity = 0.33;   // heuristic for col > v / col < v

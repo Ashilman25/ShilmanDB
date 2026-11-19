@@ -58,6 +58,10 @@ public:
     // What scans cost when choosing between a table scan and an index (default: cached reads).
     void SetScanCosts(const ScanCosts& costs) { scan_costs_ = costs; }
 
+    // For the parallel executor: columnar tables' scans get these prices. nullopt = today's prices.
+    // Negative values exist only to force a plan (tests and timing runs).
+    void SetColumnarScanCosts(std::optional<ColumnarScanCosts> costs) { columnar_scan_costs_ = costs; }
+
     // For the parallel executor: two-table WHERE equalities also count as joins when pricing orders.
     void SetParallelPlanning(bool on) { parallel_planning_ = on; }
 
@@ -75,6 +79,7 @@ private:
 
     Catalog* catalog_;
     ScanCosts scan_costs_{};
+    std::optional<ColumnarScanCosts> columnar_scan_costs_;
     bool parallel_planning_{false};
 
 #ifdef SHILMANDB_HAS_LIBTORCH

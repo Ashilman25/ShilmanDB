@@ -216,6 +216,7 @@ Planner Database::MakePlanner(const QueryOptions& options) const {
     }
     planner.SetScanCosts(GetScanCosts());
     planner.SetParallelPlanning(options.mode == ExecutionMode::PARALLEL);
+    if (options.mode == ExecutionMode::PARALLEL) planner.SetColumnarScanCosts(GetColumnarScanCosts());
     return planner;
 }
 

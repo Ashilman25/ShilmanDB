@@ -130,6 +130,9 @@ const FilterPlanNode* FilterAboveIndexScan(const PlanNode& root) {
     return nullptr;
 }
 
+// A negative entry cost makes any usable index win, so these tests always plan their index scan.
+ColumnarScanCosts ForceIndex() { return ColumnarScanCosts{0.0, 0.0, -1.0, 0.0}; }
+
 // Data shared by the tests of one process, loaded on first use.
 class ParallelIndexScanSourceTest : public ::testing::Test {
 protected:
@@ -167,6 +170,7 @@ protected:
         (void)db_->GetCatalog()->CreateIndex("ix_k", "ix", "k");
         (void)db_->GetCatalog()->CreateIndex("ix_p", "ix", "p");
         db_->GetCatalog()->UpdateTableStats("ix");
+        db_->SetColumnarScanCosts(ForceIndex());
         return *db_;
     }
 
@@ -188,6 +192,7 @@ protected:
         auto* catalog = tpch_->GetCatalog();
         for (const auto& idx : tpch::IndexDescs()) (void)catalog->CreateIndex(idx.index_name, idx.table_name, idx.column_name);
         for (const auto& td : tpch::TableDescs()) catalog->UpdateTableStats(td.name);
+        tpch_->SetColumnarScanCosts(ForceIndex());
     }
 
     // Runs sql on db in one mode; the parallel executor on this many threads.

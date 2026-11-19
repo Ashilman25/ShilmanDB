@@ -120,6 +120,89 @@ bool HasUnplacedColumn(const Expression* expr, const std::vector<TableRef>& tabl
     return false;
 }
 
+// Per table slot, the columns the statement reads. A name that's unknown or ambiguous
+// counts every column of each slot that has it; a star counts every column.
+class StatementReads {
+public:
+    StatementReads(const std::vector<TableRef>& tables, const std::vector<TableInfo*>& table_infos) : tables_(tables), infos_(table_infos), read_(tables.size()) {
+        for (size_t i = 0; i < tables.size(); ++i) read_[i].assign(table_infos[i]->schema.GetColumnCount(), false);
+    }
+
+    void Add(const Expression* expr) {
+        if (!expr) return;
+        switch (expr->type) {
+            case ExprType::COLUMN_REF:
+                AddColumn(*static_cast<const ColumnRef*>(expr));
+                return;
+            case ExprType::LITERAL:
+                return;
+            case ExprType::BINARY_OP: {
+                const auto* bin = static_cast<const BinaryOp*>(expr);
+                Add(bin->left.get());
+                Add(bin->right.get());
+                return;
+            }
+            case ExprType::UNARY_OP:
+                Add(static_cast<const UnaryOp*>(expr)->operand.get());
+                return;
+            case ExprType::AGGREGATE: {
+                // COUNT(*) reads no column.
+                const auto* arg = static_cast<const Aggregate*>(expr)->arg.get();
+                if (arg != nullptr && arg->type != ExprType::STAR) Add(arg);
+                return;
+            }
+            case ExprType::STAR:
+                for (auto& slot : read_) slot.assign(slot.size(), true);
+                return;
+            case ExprType::CASE: {
+                const auto* ce = static_cast<const CaseExpression*>(expr);
+                for (const auto& [cond, result] : ce->when_clauses) {
+                    Add(cond.get());
+                    Add(result.get());
+                }
+                Add(ce->else_clause.get());
+                return;
+            }
+        }
+    }
+
+    // The column numbers slot i reads, in table order.
+    [[nodiscard]] std::vector<uint32_t> For(size_t slot) const {
+        std::vector<uint32_t> out;
+        for (uint32_t c = 0; c < read_[slot].size(); ++c) {
+            if (read_[slot][c]) out.push_back(c);
+        }
+        return out;
+    }
+
+private:
+    void AddColumn(const ColumnRef& col) {
+        const int slot = SlotOf(col, tables_, infos_);
+        if (slot >= 0) {
+            const auto& schema = infos_[static_cast<size_t>(slot)]->schema;
+            for (uint32_t c = 0; c < schema.GetColumnCount(); ++c) {
+                if (schema.GetColumn(c).name == col.column_name) {
+                    read_[static_cast<size_t>(slot)][c] = true;
+                    return;
+                }
+            }
+        }
+        for (size_t i = 0; i < infos_.size(); ++i) {
+            const auto& schema = infos_[i]->schema;
+            for (uint32_t c = 0; c < schema.GetColumnCount(); ++c) {
+                if (schema.GetColumn(c).name == col.column_name) {
+                    read_[i].assign(read_[i].size(), true);
+                    break;
+                }
+            }
+        }
+    }
+
+    const std::vector<TableRef>& tables_;
+    const std::vector<TableInfo*>& infos_;
+    std::vector<std::vector<bool>> read_;
+};
+
 // A name the cost formula maps back to this slot: alias first, then table name.
 auto QualifierFor(int slot, const std::vector<TableRef>& tables) -> std::optional<std::string> {
     const auto& table = tables[static_cast<size_t>(slot)];
@@ -622,6 +705,20 @@ auto Planner::Plan(SelectStatement stmt) -> std::unique_ptr<PlanNode> {
         }
     }
 
+    // Columnar scan prices need each table's read columns, taken before WHERE is split up.
+    const ColumnarScanCosts* columnar_costs = columnar_scan_costs_ ? &*columnar_scan_costs_ : nullptr;
+    std::vector<std::vector<uint32_t>> read_columns;
+    if (columnar_costs != nullptr) {
+        StatementReads reads(tables, table_infos);
+        for (const auto& item : stmt.select_list) reads.Add(item.expr.get());
+        reads.Add(stmt.where_clause.get());
+        for (const auto& join : stmt.joins) reads.Add(join.on_condition.get());
+        for (const auto& expr : stmt.group_by) reads.Add(expr.get());
+        reads.Add(stmt.having.get());
+        for (const auto& item : stmt.order_by) reads.Add(item.expr.get());
+        for (size_t i = 0; i < tables.size(); ++i) read_columns.push_back(reads.For(i));
+    }
+
     std::vector<std::vector<std::unique_ptr<Expression>>> table_predicates(tables.size());
     std::vector<std::unique_ptr<Expression>> residual_predicates;
 
@@ -687,7 +784,8 @@ auto Planner::Plan(SelectStatement stmt) -> std::unique_ptr<PlanNode> {
         for (const auto& pred : table_predicates[i]) skip_hints.push_back(pred->Clone());
 
         std::vector<std::unique_ptr<Expression>> residual;
-        auto scan = IndexSelector::SelectScanStrategy(tables[i].table_name, table_infos[i]->schema, table_predicates[i], residual, catalog_, scan_costs_);
+        auto scan = IndexSelector::SelectScanStrategy(tables[i].table_name, table_infos[i]->schema, table_predicates[i], residual, catalog_, scan_costs_,
+                                                      columnar_costs, columnar_costs != nullptr ? &read_columns[i] : nullptr);
         // Only a table scan skips row groups; the filter built below still checks every row.
         if (scan->type == PlanNodeType::SEQ_SCAN) static_cast<SeqScanPlanNode*>(scan.get())->skip_conjuncts = std::move(skip_hints);
 
