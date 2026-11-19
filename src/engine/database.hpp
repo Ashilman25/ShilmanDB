@@ -37,7 +37,7 @@ struct LoadOptions {
 struct QueryOptions {
     ExecutionMode mode{ExecutionMode::TUPLE};
     std::optional<std::vector<int>> forced_join_order;  // plan the joins in exactly this order
-    bool analyze{false};                                // count rows and time every operator (tuple mode only)
+    bool analyze{false};                                // count rows and time every operator (tuple and parallel modes)
     bool use_learned_join{true};                        // use the learned join model if one is loaded
     unsigned threads{0};                                // PARALLEL only: 0 = one per core, capped at 256
 };

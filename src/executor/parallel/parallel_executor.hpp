@@ -13,6 +13,7 @@ inline constexpr unsigned kMaxThreads = 256;
 
 // Compiles the plan, runs its pipelines in order and returns the result rows.
 // Any exception reaches the caller unchanged, with no page left pinned.
+// With ctx.op_stats set, fills it as tuple mode's analyze does, in thread time.
 [[nodiscard]] std::vector<Tuple> RunParallelQuery(const PlanNode& root, QueryContext& ctx);
 
 // Runs a compiled plan's pipelines in list order and returns the result rows.

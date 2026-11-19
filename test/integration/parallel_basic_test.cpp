@@ -473,16 +473,25 @@ TEST_F(ParallelBasicTest, ErrorLeavesNothingPinned) {
     EXPECT_EQ(Run(next, ExecutionMode::TUPLE).tuples.size(), 10u);
 }
 
-TEST_F(ParallelBasicTest, AnalyzeLeavesTheProfileEmpty) {
+TEST_F(ParallelBasicTest, AnalyzeFillsTheProfile) {
     QueryOptions options;
     options.mode = ExecutionMode::PARALLEL;
     options.threads = 1;
     options.analyze = true;
     const QueryResult r = db_->ExecuteSQL("SELECT a FROM t WHERE a < 10", options);
     EXPECT_EQ(r.tuples.size(), 10u);
-    EXPECT_TRUE(r.profile.operators.empty());
-    EXPECT_TRUE(r.profile.step_rows.empty());
-    EXPECT_TRUE(r.profile.scan_rows.empty());
+    // The filter runs inside the scan, so its own time is zero; the scan
+    // reports the rows of the one row group whose min and max allow a match.
+    ASSERT_EQ(r.profile.operators.size(), 3u);
+    EXPECT_EQ(r.profile.operators[0].name, "Projection");
+    EXPECT_EQ(r.profile.operators[1].name, "Filter");
+    EXPECT_EQ(r.profile.operators[2].name, "SeqScan t");
+    EXPECT_EQ(r.profile.operators[0].rows, 10u);
+    EXPECT_EQ(r.profile.operators[1].rows, 10u);
+    EXPECT_EQ(r.profile.operators[2].rows, 65536u);
+    EXPECT_EQ(r.profile.operators[1].self_ms, 0.0);
+    EXPECT_EQ(r.profile.scan_rows, std::vector<uint64_t>{10});
+    EXPECT_EQ(r.profile.step_rows, std::vector<uint64_t>{10});
     EXPECT_EQ(r.profile.join.tables, std::vector<std::string>{"t"});
     EXPECT_EQ(r.profile.join.source, JoinOrderSource::SINGLE_TABLE);
 }

@@ -82,6 +82,11 @@ void InsertSorted(std::vector<uint32_t>& columns, uint32_t c) {
     if (at == columns.end() || *at != c) columns.insert(at, c);
 }
 
+// A fused filter's predicate, or none.
+const Expression* PredicateOf(const FilterPlanNode* filter) {
+    return filter != nullptr ? filter->predicate.get() : nullptr;
+}
+
 // A hash join's key: its equality and the column it reads on each child.
 struct JoinKey {
     const BinaryOp* eq{nullptr};
@@ -210,7 +215,7 @@ public:
         CheckLimitsAboveExpanding();
         for (const LimitOperator* limit : current_.limits) sink->WatchLimit(&limit->Counter());
         plan_.result = sink.get();
-        Close(Own(std::move(sink)));
+        Close(Own(std::move(sink)), &root);
     }
 
 private:
@@ -239,10 +244,10 @@ private:
                 const auto& filter = static_cast<const FilterPlanNode&>(node);
                 const PlanNode& child = *filter.children[0];
                 if (child.type == PlanNodeType::SEQ_SCAN) {
-                    return Scan(static_cast<const SeqScanPlanNode&>(child), filter.predicate.get(), needed);
+                    return Scan(static_cast<const SeqScanPlanNode&>(child), &filter, needed);
                 }
                 if (child.type == PlanNodeType::INDEX_SCAN) {
-                    return IndexScan(static_cast<const IndexScanPlanNode&>(child), filter.predicate.get(), needed);
+                    return IndexScan(static_cast<const IndexScanPlanNode&>(child), &filter, needed);
                 }
                 return Filter(filter, needed);
             }
@@ -251,12 +256,12 @@ private:
             case PlanNodeType::LIMIT: {
                 const auto& limit = static_cast<const LimitPlanNode&>(node);
                 if (limit.children[0]->type == PlanNodeType::SORT) {
-                    return Sort(static_cast<const SortPlanNode&>(*limit.children[0]), needed, limit.limit);
+                    return Sort(static_cast<const SortPlanNode&>(*limit.children[0]), needed, &limit);
                 }
                 return Limit(limit, needed);
             }
             case PlanNodeType::SORT:
-                return Sort(static_cast<const SortPlanNode&>(node), needed, std::nullopt);
+                return Sort(static_cast<const SortPlanNode&>(node), needed, nullptr);
             case PlanNodeType::NESTED_LOOP_JOIN:
                 return NestedLoopJoin(static_cast<const NestedLoopJoinPlanNode&>(node), needed);
             case PlanNodeType::HASH_JOIN:
@@ -272,8 +277,7 @@ private:
     // Slot k holds needed[k]; NUMERIC slots carry their precision so sums can stay narrow.
     // A fused predicate's columns are read inside the scan and never handed up.
     // NULLs are refused in every column the plan lists, as today's scan does.
-    ScanSpec SpecFor(const std::string& table_name, const Schema& schema, const std::optional<std::vector<uint32_t>>& read_columns,
-                     const Expression* predicate, const std::vector<uint32_t>& needed) {
+    ScanSpec SpecFor(const std::string& table_name, const Schema& schema, const std::optional<std::vector<uint32_t>>& read_columns, const Expression* predicate, const std::vector<uint32_t>& needed) {
         const TableInfo& info = *ctx_.catalog->GetTable(table_name);
         const ColumnarTable* table = info.columnar.get();
         if (schema.GetColumnCount() != table->Meta().columns.size()) {
@@ -301,19 +305,20 @@ private:
     }
 
     // Row groups whose min and max rule out a match are never read.
-    InputLayout Scan(const SeqScanPlanNode& scan, const Expression* predicate, const std::vector<uint32_t>& needed) {
-        ScanSpec spec = SpecFor(scan.table_name, scan.output_schema, scan.read_columns, predicate, needed);
+    // A filter right above runs inside; it has no time of its own.
+    InputLayout Scan(const SeqScanPlanNode& scan, const FilterPlanNode* filter, const std::vector<uint32_t>& needed) {
+        ScanSpec spec = SpecFor(scan.table_name, scan.output_schema, scan.read_columns, PredicateOf(filter), needed);
         for (const auto& conj : scan.skip_conjuncts) spec.skip_conjuncts.push_back(conj.get());
-        SetSource(MakeScanSource(std::move(spec)));
+        SetSource(MakeScanSource(std::move(spec)), &scan, filter);
         return ScanLayout(*ctx_.catalog->GetTable(scan.table_name)->columnar, needed);
     }
 
     // The same scan over the index's matches, [low, high] inclusive as today's index scan.
     // Rows come in row-position order; a filter right above still runs inside.
-    InputLayout IndexScan(const IndexScanPlanNode& scan, const Expression* predicate, const std::vector<uint32_t>& needed) {
+    InputLayout IndexScan(const IndexScanPlanNode& scan, const FilterPlanNode* filter, const std::vector<uint32_t>& needed) {
         if (ctx_.catalog->GetIndex(scan.index_name) == nullptr) throw DatabaseException("IndexScanExecutor: index not found: " + scan.index_name);
-        ScanSpec spec = SpecFor(scan.table_name, scan.output_schema, scan.read_columns, predicate, needed);
-        SetSource(MakeIndexScanSource(std::move(spec), scan.index_name, scan.low_key, scan.high_key));
+        ScanSpec spec = SpecFor(scan.table_name, scan.output_schema, scan.read_columns, PredicateOf(filter), needed);
+        SetSource(MakeIndexScanSource(std::move(spec), scan.index_name, scan.low_key, scan.high_key), &scan, filter);
         return ScanLayout(*ctx_.catalog->GetTable(scan.table_name)->columnar, needed);
     }
 
@@ -324,7 +329,7 @@ private:
         std::vector<uint32_t> child_needed = needed;
         CollectColumns(*filter.predicate, child_needed);
         const InputLayout layout = Build(*filter.children[0], child_needed);
-        AddOperator(std::make_unique<FilterOperator>(CompiledExpr::Compile(*filter.predicate, layout)));
+        AddOperator(std::make_unique<FilterOperator>(CompiledExpr::Compile(*filter.predicate, layout)), &filter);
         return layout;
     }
 
@@ -343,7 +348,7 @@ private:
         out.slot_of_column.assign(projection.output_schema.GetColumnCount(), -1);
         for (size_t k = 0; k < needed.size(); ++k) out.slot_of_column[needed[k]] = static_cast<int>(k);
         out.slot_types = op->OutputTypes();
-        AddOperator(std::move(op));
+        AddOperator(std::move(op), &projection);
         return out;
     }
 
@@ -352,13 +357,15 @@ private:
         const InputLayout layout = Build(*limit.children[0], needed);
         auto op = std::make_unique<LimitOperator>(static_cast<uint64_t>(std::max<int64_t>(limit.limit, 0)));
         current_.limits.push_back(op.get());
-        AddOperator(std::move(op));
+        AddOperator(std::move(op), &limit);
         return layout;
     }
 
     // A breaker: the child's pipeline ends in the sort's sink, and the next pipeline
-    // starts from its source. Slot k holds needed[k]; a LIMIT above becomes its top n.
-    InputLayout Sort(const SortPlanNode& sort, const std::vector<uint32_t>& needed, std::optional<int64_t> limit) {
+    // starts from its source. Slot k holds needed[k]; a LIMIT above becomes its top n,
+    // reporting the rows the top n hands up. Its own time is only the result
+    // sink's, when it is the root.
+    InputLayout Sort(const SortPlanNode& sort, const std::vector<uint32_t>& needed, const LimitPlanNode* limit) {
         std::vector<uint32_t> child_needed = needed;
         for (const auto& item : sort.order_by) CollectColumns(*item.expr, child_needed);
         const InputLayout in = Build(*sort.children[0], child_needed);
@@ -368,7 +375,7 @@ private:
             spec.keys.push_back(CompiledExpr::Compile(*item.expr, in));
             spec.ascending.push_back(item.ascending);
         }
-        spec.limit = limit;
+        if (limit != nullptr) spec.limit = limit->limit;
         InputLayout out;
         out.slot_of_column.assign(sort.output_schema.GetColumnCount(), -1);
         for (uint32_t c : needed) {
@@ -379,8 +386,8 @@ private:
         }
 
         auto parts = MakeSort(std::move(spec));
-        const size_t sorted = Close(Own(std::move(parts.first)));
-        SetSource(std::move(parts.second));
+        const size_t sorted = Close(Own(std::move(parts.first)), &sort);
+        SetSource(std::move(parts.second), &sort, limit);
         current_.pipeline.depends_on.push_back(sorted);
         return out;
     }
@@ -427,8 +434,8 @@ private:
         out.slot_types = spec.out_types;
 
         auto parts = MakeHashAggregate(std::move(spec));
-        const size_t grouped = Close(Own(std::move(parts.first)));
-        SetSource(std::move(parts.second));
+        const size_t grouped = Close(Own(std::move(parts.first)), &agg);
+        SetSource(std::move(parts.second), &agg);
         current_.pipeline.depends_on.push_back(grouped);
         return out;
     }
@@ -460,9 +467,9 @@ private:
         if (join.predicate) spec.predicate = CompiledExpr::Compile(*join.predicate, out.layout);
 
         auto parts = MakeNestedLoopJoin(std::move(spec));
-        current_.pipeline.depends_on.push_back(Close(std::move(right_side), Own(std::move(parts.first))));
+        current_.pipeline.depends_on.push_back(Close(std::move(right_side), Own(std::move(parts.first)), &join));
         current_.expanding.push_back(parts.second.get());
-        AddOperator(std::move(parts.second));
+        AddOperator(std::move(parts.second), &join);
         return std::move(out.layout);
     }
 
@@ -515,22 +522,26 @@ private:
         spec.build_left = build_left;
 
         auto parts = MakeHashJoin(std::move(spec));
-        current_.pipeline.depends_on.push_back(Close(std::move(build_side), Own(std::move(parts.first))));
+        current_.pipeline.depends_on.push_back(Close(std::move(build_side), Own(std::move(parts.first)), &join));
         current_.expanding.push_back(parts.second.get());
-        AddOperator(std::move(parts.second));
+        AddOperator(std::move(parts.second), &join);
         return std::move(out.layout);
     }
 
-    // The pipeline being built gets its one source.
-    void SetSource(std::unique_ptr<Source> source) {
+    // The pipeline being built gets its one source, charged to node.
+    // A node fused into the source (a filter, a limit) gets the rows it hands up.
+    void SetSource(std::unique_ptr<Source> source, const PlanNode* node, const PlanNode* fused = nullptr) {
         assert(current_.pipeline.source == nullptr && "a pipeline has one source");
         current_.pipeline.source = source.get();
+        current_.pipeline.source_node = node;
+        if (fused != nullptr) current_.pipeline.source_fused.push_back(fused);
         plan_.sources.push_back(std::move(source));
     }
 
     // Children are built first, so operators land in the order rows pass through them.
-    void AddOperator(std::unique_ptr<Operator> op) {
+    void AddOperator(std::unique_ptr<Operator> op, const PlanNode* node) {
         current_.pipeline.operators.push_back(op.get());
+        current_.pipeline.operator_nodes.push_back(node);
         plan_.operators.push_back(std::move(op));
     }
 
@@ -540,17 +551,18 @@ private:
         return plan_.sinks.back().get();
     }
 
-    // Ends a pipeline in sink and adds it to the plan; returns its index.
+    // Ends a pipeline in sink, charged to node; returns its index in the plan.
     // Every pipeline it depends on was added before it, so the list stays in order.
-    size_t Close(Building building, Sink* sink) {
+    size_t Close(Building building, Sink* sink, const PlanNode* node) {
         assert(building.pipeline.source != nullptr && "a pipeline needs a source");
         building.pipeline.sink = sink;
+        building.pipeline.sink_node = node;
         plan_.pipelines.push_back(std::move(building.pipeline));
         return plan_.pipelines.size() - 1;
     }
 
     // Ends the pipeline being built and starts an empty one.
-    size_t Close(Sink* sink) { return Close(std::exchange(current_, Building{}), sink); }
+    size_t Close(Sink* sink, const PlanNode* node) { return Close(std::exchange(current_, Building{}), sink, node); }
 
     PhysicalPlan& plan_;
     QueryContext& ctx_;

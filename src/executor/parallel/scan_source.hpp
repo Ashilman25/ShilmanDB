@@ -80,6 +80,9 @@ public:
     // A snapshot of the counts since Prepare.
     [[nodiscard]] ScanCounters Counters() const;
 
+    // Rows of the morsels read, before any fused filter: an index scan's matches.
+    [[nodiscard]] std::optional<uint64_t> RowsRead() const override;
+
 private:
     struct Local;
 
@@ -124,7 +127,6 @@ private:
 
 // An INDEX_SCAN on a columnar table: positions from the B+tree, sorted,
 // one morsel per row group with matches.
-[[nodiscard]] std::unique_ptr<Source> MakeIndexScanSource(ScanSpec spec, std::string index_name,
-                                                          std::optional<Value> low, std::optional<Value> high);
+[[nodiscard]] std::unique_ptr<Source> MakeIndexScanSource(ScanSpec spec, std::string index_name, std::optional<Value> low, std::optional<Value> high);
 
 }  // namespace shilmandb::parallel

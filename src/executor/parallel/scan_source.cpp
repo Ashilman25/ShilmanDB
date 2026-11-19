@@ -428,6 +428,12 @@ ScanCounters ScanSource::Counters() const {
     return k;
 }
 
+// Counted at each morsel's start, before any conjunct narrows it.
+// A LIMIT that stops early still counts every morsel started, unlike tuple mode.
+std::optional<uint64_t> ScanSource::RowsRead() const {
+    return rows_considered_.load(std::memory_order_relaxed);
+}
+
 // A ScanSource behind the Source interface.
 std::unique_ptr<Source> MakeScanSource(ScanSpec spec) {
     return std::make_unique<ScanSource>(std::move(spec));

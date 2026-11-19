@@ -2,11 +2,17 @@
 #include "executor/executor_context.hpp"
 #include "executor/parallel/batch.hpp"
 #include "executor/parallel/vector.hpp"
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <vector>
+
+namespace shilmandb {
+struct PlanNode;
+}
 
 namespace shilmandb::parallel {
 
@@ -18,8 +24,9 @@ struct QueryContext {
     Catalog* catalog;
     unsigned threads{1};                  // already resolved
     WorkerPool* pool{nullptr};            // null when threads is 1
-    OperatorStatsMap* op_stats{nullptr};  // set when analyze is on
+    OperatorStatsMap* op_stats{nullptr};  // set when analyze is on: own times while running, totals after
     uint64_t morsels{0};                  // morsels started so far, added up by RunPipeline
+    std::chrono::nanoseconds task_extra{0};  // analyze: pool tasks' thread time beyond the caller's wall time
 };
 
 // A sink's output that only non-const code can change, so a const worker call can't.
@@ -68,6 +75,10 @@ public:
 
     // Fills out with the next rows of the morsel; false when it's done.
     virtual bool NextBatch(LocalState& local, Batch& out) const = 0;
+
+    // For analyze: rows read before a fused filter, once the pipeline is done.
+    // None means the rows handed up.
+    [[nodiscard]] virtual std::optional<uint64_t> RowsRead() const { return std::nullopt; }
 };
 
 // A streaming step between a source and a sink, shared by every worker.
@@ -110,6 +121,13 @@ struct Pipeline {
     std::vector<Operator*> operators;  // in the order rows pass through them
     Sink* sink;
     std::vector<size_t> depends_on;    // pipelines whose sinks must be finalized first
+
+    // For analyze: the plan node each step's time and rows go to; null charges nothing.
+    // Nodes fused into the source (a filter, a limit) get the rows it hands up.
+    const PlanNode* source_node{nullptr};
+    std::vector<const PlanNode*> source_fused;
+    std::vector<const PlanNode*> operator_nodes;  // empty, or one per operator
+    const PlanNode* sink_node{nullptr};
 };
 
 // Gives batch one slot per type, rebuilding the slots only when they differ.
@@ -118,10 +136,12 @@ void ShapeBatch(Batch& batch, const std::vector<VType>& types);
 // Runs one pipeline: every morsel through the operators into the sink, then Combine and Finalize.
 // Several workers take morsels when ctx has a pool, 2+ threads and 2+ morsels.
 // The buffer pool is concurrent only while they run.
+// With ctx.op_stats set, each step's own thread time and rows go to its plan node.
 void RunPipeline(Pipeline& p, QueryContext& ctx);
 
 // Runs task(0..count-1) once each, across the pool's workers when there is one.
 // For Finalize work that never touches the buffer pool. Rethrows the first exception.
+// With analyze on, adds workers' time past the caller's wall time to task_extra.
 void ForEachTask(QueryContext& ctx, size_t count, const std::function<void(size_t)>& task);
 
 }  // namespace shilmandb::parallel

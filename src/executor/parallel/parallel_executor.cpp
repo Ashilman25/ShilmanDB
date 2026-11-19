@@ -2,15 +2,32 @@
 #include "common/exception.hpp"
 #include "executor/parallel/compiler.hpp"
 #include <algorithm>
+#include <chrono>
 #include <string>
 #include <thread>
 
 namespace shilmandb::parallel {
 
-// Compiles, then runs.
+namespace {
+
+// Turns each node's own time into its subtree's total, children first; returns it.
+std::chrono::nanoseconds AddSubtreeTimes(const PlanNode& node, OperatorStatsMap& stats) {
+    std::chrono::nanoseconds children{0};
+    for (const auto& child : node.children) children += AddSubtreeTimes(*child, stats);
+    OperatorStats& own = stats[&node];
+    own.time += children;
+    return own.time;
+}
+
+}  // namespace
+
+// Compiles, then runs. With analyze on, the own times become totals at the end,
+// as tuple mode reports them.
 std::vector<Tuple> RunParallelQuery(const PlanNode& root, QueryContext& ctx) {
     PhysicalPlan plan = CompilePlan(root, ctx);
-    return RunPhysicalPlan(plan, ctx);
+    std::vector<Tuple> tuples = RunPhysicalPlan(plan, ctx);
+    if (ctx.op_stats != nullptr) (void)AddSubtreeTimes(root, *ctx.op_stats);
+    return tuples;
 }
 
 // Running in turn is enough once every dependency comes earlier in the list.

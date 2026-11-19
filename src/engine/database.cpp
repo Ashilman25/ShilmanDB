@@ -148,7 +148,8 @@ QueryResult Database::ExecuteSQL(const std::string& sql, const QueryOptions& opt
     auto planner = MakePlanner(options);
     auto plan = planner.Plan(std::move(*stmt));
 
-    // The parallel executor runs columnar plans itself; analyze leaves its profile empty for now.
+    // The parallel executor runs columnar plans itself. Its analyze times are
+    // thread time summed over workers, so they may pass the query's wall time.
     if (options.mode == ExecutionMode::PARALLEL) {
         const unsigned threads = parallel::ResolveThreads(options.threads);
         if (threads > 1 && (!worker_pool_ || worker_pool_->Size() < threads)) {
@@ -159,12 +160,14 @@ QueryResult Database::ExecuteSQL(const std::string& sql, const QueryOptions& opt
                 throw DatabaseException("couldn't start " + std::to_string(threads - 1) + " worker threads: " + e.what());
             }
         }
-        parallel::QueryContext ctx{bpm_.get(), catalog_.get(), threads, threads > 1 ? worker_pool_.get() : nullptr};
+        OperatorStatsMap op_stats;
+        parallel::QueryContext ctx{bpm_.get(), catalog_.get(), threads, threads > 1 ? worker_pool_.get() : nullptr, options.analyze ? &op_stats : nullptr};
         const auto latch_before = bpm_->GetLatchWaitTime();
         std::vector<Tuple> tuples = parallel::RunParallelQuery(*plan, ctx);
         last_parallel_stats_ = ParallelQueryStats{threads, ctx.morsels, std::max(std::chrono::nanoseconds{0}, bpm_->GetLatchWaitTime() - latch_before)};
         QueryProfile profile;
         profile.join = planner.GetJoinOrderInfo();
+        if (options.analyze) FillAnalyzeProfile(planner, plan.get(), op_stats, profile);
         return QueryResult{std::move(plan->output_schema), std::move(tuples), std::move(profile)};
     }
 
