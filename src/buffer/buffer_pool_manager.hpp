@@ -4,7 +4,12 @@
 #include "buffer/eviction_policy.hpp"
 #include "buffer/timed_eviction_policy.hpp"
 #include "common/config.hpp"
+#include <cassert>
+#include <chrono>
+#include <condition_variable>
 #include <memory>
+#include <mutex>
+#include <thread>
 #include <unordered_map>
 #include <list>
 #include <fstream>
@@ -53,13 +58,23 @@ public:
     // counts it).
     void EnableTracing(const std::string& trace_path, bool collapse_repeats = false);
     void DisableTracing();
-    [[nodiscard]] uint64_t GetTraceCount() const { return access_counter_; }  // fetches since EnableTracing
+    [[nodiscard]] uint64_t GetTraceCount() const {  // fetches since EnableTracing
+        auto lock = LatchIfConcurrent();
+        return access_counter_;
+    }
 
     // Pages the file has handed out; every valid page id is below this
     [[nodiscard]] page_id_t GetNumPages() const { return disk_manager_->GetNumPages(); }
 
     size_t GetPoolSize() const;
     const Page& GetPage(frame_id_t frame_id) const;
+
+    // On, every call takes one latch, so worker threads can share the pool.
+    // Switch it only from the calling thread, with no worker inside the pool.
+    void SetConcurrent(bool on);
+    [[nodiscard]] bool IsConcurrent() const { return concurrent_; }
+    // Time spent waiting for the latch; ResetStats() zeroes it
+    [[nodiscard]] std::chrono::nanoseconds GetLatchWaitTime() const;
 
 private:
     size_t pool_size_;
@@ -93,6 +108,31 @@ private:
     uint64_t access_counter_{0};
     bool trace_collapse_{false};
     page_id_t last_traced_page_{INVALID_PAGE_ID};
+
+    // Concurrent mode. Off, only the owner check runs, and ResetStats zeroes latch_wait_.
+    bool concurrent_{false};
+    std::thread::id owner_;                     // the thread that built the pool or last switched the mode
+    mutable std::mutex latch_;
+    mutable std::chrono::nanoseconds latch_wait_{0};
+    std::condition_variable load_done_;         // woken when a load finishes, well or badly
+    std::vector<bool> loading_;                 // per frame: its page is being read outside the latch
+
+    // Off, every change must come from the owner thread (checked in Debug only)
+    void AssertOwnerThread() const {
+        assert((concurrent_ || std::this_thread::get_id() == owner_) && "buffer pool used from a second thread while not concurrent");
+    }
+    // Holds the latch only while the mode is on
+    [[nodiscard]] std::unique_lock<std::mutex> LatchIfConcurrent() const {
+        return concurrent_ ? Latch() : std::unique_lock<std::mutex>{};
+    }
+    [[nodiscard]] std::unique_lock<std::mutex> Latch() const;
+    [[nodiscard]] std::unordered_map<page_id_t, frame_id_t>::iterator WaitUntilLoaded(std::unique_lock<std::mutex>& lock, page_id_t page_id);
+    [[nodiscard]] Page* FetchPageConcurrent(page_id_t page_id);
+    void AbandonLoad(page_id_t page_id, frame_id_t frame_id);
+    [[nodiscard]] bool FlushPageConcurrent(page_id_t page_id);
+    void DropAllPagesConcurrent();
+    void CloseTrace();
+    void OpenTrace(const std::string& trace_path, bool collapse_repeats);
 
     bool FindVictimFrame(page_id_t incoming_page, frame_id_t* frame_id);
     void RecordPolicyAccess(frame_id_t frame_id, page_id_t page_id, bool is_miss);

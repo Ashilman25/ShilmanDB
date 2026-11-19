@@ -46,6 +46,7 @@ shilmandb_add_test(lirs_eviction_policy_test buffer/lirs_eviction_policy_test.cp
 shilmandb_add_test(timed_eviction_policy_test buffer/timed_eviction_policy_test.cpp)
 shilmandb_add_test(eviction_policy_factory_test buffer/eviction_policy_factory_test.cpp)
 shilmandb_add_test(buffer_pool_manager_test buffer/buffer_pool_manager_test.cpp)
+shilmandb_add_test(buffer_pool_concurrent_test buffer/buffer_pool_concurrent_test.cpp)
 
 # Index tests
 shilmandb_add_test(btree_internal_page_test index/btree_internal_page_test.cpp)
