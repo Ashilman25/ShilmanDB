@@ -380,7 +380,9 @@ TEST_F(PlanDumpTest, WhereJoinsCountInParallelPlanning) {
         EXPECT_TRUE(today_far_off) << name;
 
         // Parallel planning only picks the order: tuple mode forced to it plans the same tree.
+        // Q19's OR is factored in parallel planning; OrFactoringTest.Q19NewModePlan checks it.
         for (const auto& q : tpch::Queries()) {
+            if (q.tag == "Q19") continue;
             const PlannedQuery parallel = PlanThroughDatabase(*db, q.sql, QueryOptions{ExecutionMode::PARALLEL});
             QueryOptions same_order;
             same_order.forced_join_order = parallel.join.order;

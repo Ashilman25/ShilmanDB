@@ -41,6 +41,7 @@ file(GLOB_RECURSE CORE_SOURCES
     src/planner/join_graph.cpp
     src/planner/cost_model.cpp
     src/planner/index_selector.cpp
+    src/planner/or_factoring.cpp
     src/executor/*.cpp
     src/engine/*.cpp
 )

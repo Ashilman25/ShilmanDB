@@ -4,6 +4,7 @@
 #include "planner/cost_model.hpp"
 #include "planner/expression_binder.hpp"
 #include "planner/column_usage.hpp"
+#include "planner/or_factoring.hpp"
 #include "common/exception.hpp"
 #include "types/value.hpp"
 #include <algorithm>
@@ -89,6 +90,34 @@ void CollectTableIndices(const Expression* expr, const std::vector<TableRef>& ta
     } else if (const auto* agg = dynamic_cast<const Aggregate*>(expr)) {
         CollectTableIndices(agg->arg.get(), tables, table_infos, indices);
     }
+}
+
+// True when some column in expr has no slot (unknown, or ambiguous without a qualifier).
+bool HasUnplacedColumn(const Expression* expr, const std::vector<TableRef>& tables, const std::vector<TableInfo*>& table_infos) {
+    if (!expr) return false;
+    switch (expr->type) {
+        case ExprType::COLUMN_REF:
+            return SlotOf(*static_cast<const ColumnRef*>(expr), tables, table_infos) < 0;
+        case ExprType::BINARY_OP: {
+            const auto* bin = static_cast<const BinaryOp*>(expr);
+            return HasUnplacedColumn(bin->left.get(), tables, table_infos) || HasUnplacedColumn(bin->right.get(), tables, table_infos);
+        }
+        case ExprType::UNARY_OP:
+            return HasUnplacedColumn(static_cast<const UnaryOp*>(expr)->operand.get(), tables, table_infos);
+        case ExprType::AGGREGATE:
+            return HasUnplacedColumn(static_cast<const Aggregate*>(expr)->arg.get(), tables, table_infos);
+        case ExprType::CASE: {
+            const auto* ce = static_cast<const CaseExpression*>(expr);
+            for (const auto& [cond, result] : ce->when_clauses) {
+                if (HasUnplacedColumn(cond.get(), tables, table_infos) || HasUnplacedColumn(result.get(), tables, table_infos)) return true;
+            }
+            return HasUnplacedColumn(ce->else_clause.get(), tables, table_infos);
+        }
+        case ExprType::LITERAL:
+        case ExprType::STAR:
+            return false;
+    }
+    return false;
 }
 
 // A name the cost formula maps back to this slot: alias first, then table name.
@@ -598,6 +627,16 @@ auto Planner::Plan(SelectStatement stmt) -> std::unique_ptr<PlanNode> {
 
     if (stmt.where_clause) {
         auto conjuncts = SplitConjuncts(std::move(stmt.where_clause));
+        // Parallel planning also pushes filters implied by an OR below the joins.
+        if (parallel_planning_) {
+            const auto tables_of = [&](const Expression& expr) {
+                std::unordered_set<int> refs;
+                CollectTableIndices(&expr, tables, table_infos, refs);
+                if (HasUnplacedColumn(&expr, tables, table_infos)) refs.insert(-1);  // never factored
+                return refs;
+            };
+            conjuncts = FactorOrConjuncts(std::move(conjuncts), tables_of);
+        }
 
         for (auto& conj : conjuncts) {
             std::unordered_set<int> refs;

@@ -103,6 +103,28 @@ TEST(MayMatchTest, OrMayMatchIfEitherSideMay) {
     EXPECT_FALSE(May(Bin(Op::OR, Cmp("x", Op::EQ, 5), Cmp("x", Op::EQ, 25)), XRange()));
 }
 
+// Q19's quantity hint: three ORed ranges, integer bounds on a decimal column.
+TEST(MayMatchTest, OrOfThreeRangesSkipsOnlyGroupsNoBranchCanMatch) {
+    const auto range = [](int32_t low, int32_t high) {
+        return Bin(Op::AND, Cmp("q", Op::GTE, low), Cmp("q", Op::LTE, high));
+    };
+    const auto hint = Bin(Op::OR, Bin(Op::OR, range(1, 11), range(10, 20)), range(20, 30));
+    const auto group = [](double min, double max) { return Ranges{{"q", MinMax{Value(min), Value(max)}}}; };
+
+    EXPECT_TRUE(May(hint, group(5.0, 8.0)));      // inside the first branch only
+    EXPECT_TRUE(May(hint, group(11.5, 11.8)));    // past the first branch, inside the second
+    EXPECT_TRUE(May(hint, group(25.0, 40.0)));    // overlaps part of the third branch
+    EXPECT_TRUE(May(hint, group(-5.0, 1.0)));     // touches the first branch's low end
+    EXPECT_FALSE(May(hint, group(30.5, 50.0)));   // above every branch
+    EXPECT_FALSE(May(hint, group(0.0, 0.99)));    // below every branch
+
+    // With a gap between branches, a group inside the gap is skipped.
+    const auto gapped = Bin(Op::OR, Bin(Op::OR, range(1, 5), range(10, 20)), range(25, 30));
+    EXPECT_FALSE(May(gapped, group(6.0, 9.0)));
+    EXPECT_FALSE(May(gapped, group(20.5, 24.5)));
+    EXPECT_TRUE(May(gapped, group(4.0, 12.0)));   // spans the first branch's end and the second's start
+}
+
 TEST(MayMatchTest, DateColumnWithStringLiteral) {
     const Ranges ranges = {{"d", MinMax{Date("1994-06-01"), Date("1994-12-31")}}};
     EXPECT_FALSE(May(Bin(Op::EQ, Col("d"), Lit(Value(std::string("1995-01-01")))), ranges));
