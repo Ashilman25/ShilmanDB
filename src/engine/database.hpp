@@ -10,6 +10,7 @@
 #include "executor/executor.hpp"
 #include "planner/planner.hpp"
 
+#include <chrono>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -21,6 +22,10 @@
 #endif
 
 namespace shilmandb {
+
+namespace parallel {
+class WorkerPool;
+}
 
 struct LoadOptions {
     StorageKind storage{StorageKind::ROW};
@@ -56,6 +61,13 @@ struct QueryResult {
     Schema schema;
     std::vector<Tuple> tuples;
     QueryProfile profile;
+};
+
+// What the last parallel query used, for benchmark reports.
+struct ParallelQueryStats {
+    unsigned threads{1};                    // the resolved thread count
+    uint64_t morsels{0};                    // morsels started across all its pipelines
+    std::chrono::nanoseconds latch_wait{0}; // time workers waited for the buffer pool's latch
 };
 
 class Database {
@@ -106,6 +118,9 @@ public:
     [[nodiscard]] ScanCosts GetScanCosts() const;
     void SetScanCosts(std::optional<ScanCosts> costs) { scan_costs_ = costs; }
 
+    // Set when a parallel query finishes; an error keeps the last value.
+    [[nodiscard]] const ParallelQueryStats& LastParallelStats() const { return last_parallel_stats_; }
+
 private:
     std::optional<ScanCosts> scan_costs_;
     std::unique_ptr<DiskManager> disk_manager_;
@@ -116,6 +131,11 @@ private:
 #ifdef SHILMANDB_HAS_LIBTORCH
     std::unique_ptr<LearnedJoinOptimizer> learned_join_optimizer_;
 #endif
+    ParallelQueryStats last_parallel_stats_;
+
+    // Last, so its threads are joined before anything they could touch goes away.
+    // Built on the first query wanting 2+ threads; rebuilt bigger when a query wants more.
+    std::unique_ptr<parallel::WorkerPool> worker_pool_;
 };
 
 }  // namespace shilmandb

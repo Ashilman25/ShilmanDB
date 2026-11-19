@@ -488,7 +488,7 @@ void UpdateExtremes(const T* x, const Selection& sel, uint32_t n, const uint32_t
 // Groups rows per worker and merges the workers' tables in Finalize.
 class AggregateSink final : public Sink {
 public:
-    AggregateSink(AggregateSpec spec, std::shared_ptr<const GroupShape> shape, std::shared_ptr<MergedGroups> out) : spec_(std::move(spec)), shape_(std::move(shape)), out_(std::move(out)) {}
+    AggregateSink(AggregateSpec spec, std::shared_ptr<const GroupShape> shape, SharedOutput<MergedGroups> out) : spec_(std::move(spec)), shape_(std::move(shape)), out_(std::move(out)) {}
 
     // A global local starts with its one group, so empty input still gives a row.
     [[nodiscard]] std::unique_ptr<LocalState> MakeLocal() const override {
@@ -516,32 +516,36 @@ public:
 
     // Merges the workers' tables: into one up to kMergeIntoOneMaxGroups summed groups,
     // else into hash partitions, each merged on its own.
+    // Partitions merge on the pool when there is one.
     void Finalize(QueryContext& ctx) override {
         std::vector<GroupTable> tables;
         for (auto& part : parts_) tables.push_back(std::move(static_cast<AggLocal&>(*part).table));
         parts_.clear();
-        out_->tables.clear();
+        MergedGroups& out = out_.Mutable();
+        out.tables.clear();
 
         const GroupShape& shape = *shape_;
         if (shape.global) {
             GroupTable merged = MakeTable(shape);
             AddGlobalGroup(merged, shape);
             for (const GroupTable& t : tables) MergeStates(merged, 0, shape, t, 0);
-            out_->tables.push_back(std::move(merged));
+            out.tables.push_back(std::move(merged));
         } else if (!tables.empty()) {
             size_t summed = 0;
             for (const GroupTable& t : tables) summed += t.size;
             const size_t partitions = MergePartitionCount(summed, ctx.threads);
             if (partitions == 1) {
-                out_->tables.push_back(MergeIntoOne(tables, shape));
+                out.tables.push_back(MergeIntoOne(tables, shape));
             } else {
                 const int bits = __builtin_ctzll(partitions);
                 std::vector<Buckets> buckets;
                 for (const GroupTable& t : tables) buckets.push_back(BucketByPartition(t, partitions, bits));
-                for (size_t p = 0; p < partitions; ++p) out_->tables.push_back(MergePartition(tables, buckets, p, shape));
+                // Each task writes only its own slot, so partitions merge at once.
+                out.tables.resize(partitions);
+                ForEachTask(ctx, partitions, [&](size_t p) { out.tables[p] = MergePartition(tables, buckets, p, shape); });
             }
         }
-        for (GroupTable& t : tables) out_->arenas.push_back(std::move(t.arena));
+        for (GroupTable& t : tables) out.arenas.push_back(std::move(t.arena));
     }
 
 private:
@@ -655,7 +659,7 @@ private:
 
     AggregateSpec spec_;
     std::shared_ptr<const GroupShape> shape_;
-    std::shared_ptr<MergedGroups> out_;
+    SharedOutput<MergedGroups> out_;
     std::vector<std::unique_ptr<LocalState>> parts_;  // one per worker, after Combine
 };
 
@@ -842,8 +846,8 @@ std::pair<std::unique_ptr<Sink>, std::unique_ptr<Source>> MakeHashAggregate(Aggr
         shape->aggs.push_back(info);
     }
 
-    auto groups = std::make_shared<MergedGroups>();
-    auto source = std::make_unique<AggregateSource>(shape, groups);
+    SharedOutput<MergedGroups> groups;
+    auto source = std::make_unique<AggregateSource>(shape, groups.Reader());
     auto sink = std::make_unique<AggregateSink>(std::move(spec), std::move(shape), std::move(groups));
     return {std::move(sink), std::move(source)};
 }

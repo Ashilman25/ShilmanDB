@@ -249,7 +249,7 @@ struct BuildLocal : LocalState {
 // Keeps the build side's keys and payload, strings copied, then builds the table.
 class BuildSink final : public Sink {
 public:
-    BuildSink(std::unique_ptr<CompiledExpr> key, KeyRule rule, std::vector<uint32_t> payload, std::shared_ptr<BuildTable> table) : key_(std::move(key)), rule_(rule), payload_(std::move(payload)), table_(std::move(table)) {}
+    BuildSink(std::unique_ptr<CompiledExpr> key, KeyRule rule, std::vector<uint32_t> payload, SharedOutput<BuildTable> table) : key_(std::move(key)), rule_(rule), payload_(std::move(payload)), table_(std::move(table)) {}
 
     // An empty store: the key column, then one per payload slot.
     [[nodiscard]] std::unique_ptr<LocalState> MakeLocal() const override {
@@ -284,9 +284,10 @@ public:
     // Keeps the worker's rows, arena and all, until Finalize.
     void Combine(std::unique_ptr<LocalState> local) override { parts_.push_back(std::move(local)); }
 
-    // Joins every worker's rows, sends them to hash partitions, then builds each partition.
+    // Joins every worker's rows, sends them to hash partitions, then builds each partition,
+    // on the pool when there is one.
     void Finalize(QueryContext& ctx) override {
-        BuildTable& t = *table_;
+        BuildTable& t = table_.Mutable();
         t.store = ColumnStore(1 + payload_.size());
         std::vector<uint64_t> hashes;
         for (auto& part : parts_) {
@@ -302,7 +303,7 @@ public:
         t.bits = __builtin_ctzll(count);
         t.partitions.assign(count, Partition{});
         Scatter(hashes, t);
-        for (Partition& p : t.partitions) BuildPartition(p);
+        ForEachTask(ctx, count, [&t](size_t p) { BuildPartition(t.partitions[p]); });
         t.ready = true;
     }
 
@@ -310,7 +311,7 @@ private:
     std::unique_ptr<CompiledExpr> key_;
     KeyRule rule_;
     std::vector<uint32_t> payload_;
-    std::shared_ptr<BuildTable> table_;
+    SharedOutput<BuildTable> table_;
     std::vector<std::unique_ptr<LocalState>> parts_;  // one per worker, after Combine
 };
 
@@ -454,9 +455,10 @@ std::pair<std::unique_ptr<Sink>, std::unique_ptr<Operator>> MakeHashJoin(JoinSpe
     const KeyRule build_rule = spec.build_left ? rules.first : rules.second;
     const KeyRule probe_rule = spec.build_left ? rules.second : rules.first;
 
-    auto table = std::make_shared<BuildTable>();
-    auto sink = std::make_unique<BuildSink>(std::move(spec.build_key), build_rule, spec.build_payload, table);
-    auto op = std::make_unique<ProbeOperator>(std::move(spec), probe_rule, std::move(table));
+    SharedOutput<BuildTable> table;
+    std::shared_ptr<const BuildTable> reader = table.Reader();
+    auto sink = std::make_unique<BuildSink>(std::move(spec.build_key), build_rule, spec.build_payload, std::move(table));
+    auto op = std::make_unique<ProbeOperator>(std::move(spec), probe_rule, std::move(reader));
     return {std::move(sink), std::move(op)};
 }
 

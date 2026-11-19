@@ -313,6 +313,7 @@ struct GeneratedQuery {
     bool star{false};                            // SELECT * over a join: columns matched by name
     std::vector<size_t> empty_unsafe;            // outputs not compared when the input is empty
     int count_column{-1};                        // the COUNT(*) output that says so
+    bool uses_double{false};                     // some expression reads a DOUBLE value
 
     // The full text, with or without the LIMIT.
     std::string Sql(bool with_limit = true) const {
@@ -339,6 +340,7 @@ public:
     // One query: tables, then a shape, then maybe an order and a limit.
     GeneratedQuery Next() {
         GeneratedQuery q;
+        double_seen_ = false;
         ordered_ = Chance(rng_, 0.5);
         const bool limited = Chance(rng_, 0.3);
         division_ok_ = ordered_ || !limited;  // an unordered LIMIT may stop before a bad row
@@ -359,6 +361,7 @@ public:
             for (size_t i : order) q.keys.emplace_back(i, Chance(rng_, 0.6));
         }
         if (limited) q.limit = std::vector<int64_t>{0, 1, 3, 10, 100, 5000}[Pick(rng_, 6)];
+        q.uses_double = double_seen_;
         return q;
     }
 
@@ -531,6 +534,7 @@ private:
         e.type = info.type;
         e.scale = info.scale;
         e.mag = info.mag;
+        if (info.type == T::DBL) double_seen_ = true;
         return e;
     }
 
@@ -838,6 +842,7 @@ private:
         const T dt = tables_[t].cols[c].type;
         const bool integer = (num.type == T::INT || num.type == T::BIG) && (dt == T::INT || dt == T::BIG);
         e.type = integer ? ((num.type == T::BIG || dt == T::BIG) ? T::BIG : T::INT) : T::DBL;
+        if (e.type == T::DBL) double_seen_ = true;
         e.sql = "(" + num.sql + " / " + tables_[t].cols[c].name + ")";
         e.noisy = true;
         e.scale = 99;
@@ -1025,6 +1030,7 @@ private:
     bool ordered_{false};
     bool division_ok_{true};
     bool allow_case_{true};
+    mutable bool double_seen_{false};  // this query made a DOUBLE expression; never drawn from rng_
 };
 
 // One seed's three tables, drawn from rng right after it is seeded.

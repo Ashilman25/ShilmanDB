@@ -3,6 +3,8 @@
 #include "executor/parallel/batch.hpp"
 #include "executor/parallel/vector.hpp"
 #include <cstddef>
+#include <cstdint>
+#include <functional>
 #include <memory>
 #include <vector>
 
@@ -15,8 +17,29 @@ struct QueryContext {
     BufferPoolManager* bpm;
     Catalog* catalog;
     unsigned threads{1};                  // already resolved
-    WorkerPool* pool{nullptr};
+    WorkerPool* pool{nullptr};            // null when threads is 1
     OperatorStatsMap* op_stats{nullptr};  // set when analyze is on
+    uint64_t morsels{0};                  // morsels started so far, added up by RunPipeline
+};
+
+// A sink's output that only non-const code can change, so a const worker call can't.
+template <typename T>
+class SharedOutput {
+public:
+    SharedOutput() : value_(std::make_shared<T>()) {}
+    SharedOutput(const SharedOutput&) = delete;
+    SharedOutput& operator=(const SharedOutput&) = delete;
+    SharedOutput(SharedOutput&&) noexcept = default;
+    SharedOutput& operator=(SharedOutput&&) noexcept = default;
+
+    [[nodiscard]] const T& Get() const { return *value_; }
+    [[nodiscard]] T& Mutable() { return *value_; }
+
+    // A read-only handle for whoever reads the output later.
+    [[nodiscard]] std::shared_ptr<const T> Reader() const { return value_; }
+
+private:
+    std::shared_ptr<T> value_;
 };
 
 // One worker's own state for a source, operator or sink.
@@ -93,6 +116,12 @@ struct Pipeline {
 void ShapeBatch(Batch& batch, const std::vector<VType>& types);
 
 // Runs one pipeline: every morsel through the operators into the sink, then Combine and Finalize.
+// Several workers take morsels when ctx has a pool, 2+ threads and 2+ morsels.
+// The buffer pool is concurrent only while they run.
 void RunPipeline(Pipeline& p, QueryContext& ctx);
+
+// Runs task(0..count-1) once each, across the pool's workers when there is one.
+// For Finalize work that never touches the buffer pool. Rethrows the first exception.
+void ForEachTask(QueryContext& ctx, size_t count, const std::function<void(size_t)>& task);
 
 }  // namespace shilmandb::parallel

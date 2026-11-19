@@ -5,6 +5,7 @@
 #include "executor/executor_factory.hpp"
 #include "executor/executor_context.hpp"
 #include "executor/parallel/parallel_executor.hpp"
+#include "executor/parallel/worker_pool.hpp"
 #include "common/exception.hpp"
 #include "storage/columnar/bulk_loader.hpp"
 
@@ -12,6 +13,7 @@
 #include <chrono>
 #include <fstream>
 #include <sstream>
+#include <system_error>
 #include <utility>
 
 namespace shilmandb {
@@ -148,8 +150,19 @@ QueryResult Database::ExecuteSQL(const std::string& sql, const QueryOptions& opt
 
     // The parallel executor runs columnar plans itself; analyze leaves its profile empty for now.
     if (options.mode == ExecutionMode::PARALLEL) {
-        parallel::QueryContext ctx{bpm_.get(), catalog_.get(), parallel::ResolveThreads(options.threads)};
+        const unsigned threads = parallel::ResolveThreads(options.threads);
+        if (threads > 1 && (!worker_pool_ || worker_pool_->Size() < threads)) {
+            worker_pool_.reset();  // the old threads end before the new ones start
+            try {
+                worker_pool_ = std::make_unique<parallel::WorkerPool>(threads);
+            } catch (const std::system_error& e) {
+                throw DatabaseException("couldn't start " + std::to_string(threads - 1) + " worker threads: " + e.what());
+            }
+        }
+        parallel::QueryContext ctx{bpm_.get(), catalog_.get(), threads, threads > 1 ? worker_pool_.get() : nullptr};
+        const auto latch_before = bpm_->GetLatchWaitTime();
         std::vector<Tuple> tuples = parallel::RunParallelQuery(*plan, ctx);
+        last_parallel_stats_ = ParallelQueryStats{threads, ctx.morsels, std::max(std::chrono::nanoseconds{0}, bpm_->GetLatchWaitTime() - latch_before)};
         QueryProfile profile;
         profile.join = planner.GetJoinOrderInfo();
         return QueryResult{std::move(plan->output_schema), std::move(tuples), std::move(profile)};

@@ -192,8 +192,9 @@ void ScanSource::Prepare(QueryContext& ctx) {
     groups_skipped_.store(table_->RowGroupCount() - groups_.size(), std::memory_order_relaxed);
     rows_considered_.store(0, std::memory_order_relaxed);
     rows_passed_.store(0, std::memory_order_relaxed);
-    rows_decoded_ = std::vector<std::atomic<uint64_t>>(n);
-    for (auto& rows : rows_decoded_) rows.store(0, std::memory_order_relaxed);
+    rows_decoded_ = std::make_unique<std::atomic<uint64_t>[]>(n);
+    decoded_columns_ = n;
+    for (size_t c = 0; c < n; ++c) rows_decoded_[c].store(0, std::memory_order_relaxed);
 }
 
 // Arrays grow on the first morsels and are reused after that.
@@ -370,8 +371,8 @@ ScanCounters ScanSource::Counters() const {
     k.groups_skipped = groups_skipped_.load(std::memory_order_relaxed);
     k.rows_considered = rows_considered_.load(std::memory_order_relaxed);
     k.rows_passed = rows_passed_.load(std::memory_order_relaxed);
-    k.rows_decoded.reserve(rows_decoded_.size());
-    for (const auto& rows : rows_decoded_) k.rows_decoded.push_back(rows.load(std::memory_order_relaxed));
+    k.rows_decoded.reserve(decoded_columns_);
+    for (size_t c = 0; c < decoded_columns_; ++c) k.rows_decoded.push_back(rows_decoded_[c].load(std::memory_order_relaxed));
     return k;
 }
 

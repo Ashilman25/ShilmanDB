@@ -25,7 +25,7 @@ struct RightLocal : LocalState {
 // Keeps the right side's kept slots, copying strings, since its morsels won't last.
 class RightSink final : public Sink {
 public:
-    RightSink(std::vector<uint32_t> slots, std::shared_ptr<RightRows> out) : slots_(std::move(slots)), out_(std::move(out)) {}
+    RightSink(std::vector<uint32_t> slots, SharedOutput<RightRows> out) : slots_(std::move(slots)), out_(std::move(out)) {}
 
     // One empty buffer per kept slot.
     [[nodiscard]] std::unique_ptr<LocalState> MakeLocal() const override {
@@ -46,18 +46,19 @@ public:
 
     // Joins every worker's rows into one set the operator reads.
     void Finalize(QueryContext&) override {
-        out_->store = ColumnStore(slots_.size());
-        for (auto& part : parts_) out_->store.Absorb(std::move(static_cast<RightLocal&>(*part).store));
+        RightRows& out = out_.Mutable();
+        out.store = ColumnStore(slots_.size());
+        for (auto& part : parts_) out.store.Absorb(std::move(static_cast<RightLocal&>(*part).store));
         parts_.clear();
-        if (out_->store.rows > std::numeric_limits<uint32_t>::max()) {
+        if (out.store.rows > std::numeric_limits<uint32_t>::max()) {
             throw DatabaseException("the parallel executor can't join against more than 4294967295 rows");
         }
-        out_->ready = true;
+        out.ready = true;
     }
 
 private:
     std::vector<uint32_t> slots_;
-    std::shared_ptr<RightRows> out_;
+    SharedOutput<RightRows> out_;
     std::vector<std::unique_ptr<LocalState>> parts_;  // one per worker, after Combine
 };
 
@@ -127,9 +128,10 @@ private:
 
 // The sink and operator share the right rows, so neither outlives what it reads.
 std::pair<std::unique_ptr<Sink>, std::unique_ptr<Operator>> MakeNestedLoopJoin(NestedLoopSpec spec) {
-    auto right = std::make_shared<RightRows>();
-    auto sink = std::make_unique<RightSink>(spec.right_slots, right);
-    auto op = std::make_unique<NestedLoopOperator>(std::move(spec), std::move(right));
+    SharedOutput<RightRows> right;
+    std::shared_ptr<const RightRows> reader = right.Reader();
+    auto sink = std::make_unique<RightSink>(spec.right_slots, std::move(right));
+    auto op = std::make_unique<NestedLoopOperator>(std::move(spec), std::move(reader));
     return {std::move(sink), std::move(op)};
 }
 

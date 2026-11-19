@@ -91,11 +91,12 @@ private:
     std::vector<size_t> groups_;     // the row groups to read, one per morsel
 
     // Counts every worker adds to from const StartMorsel, so atomic and mutable.
-    // Prepare sizes rows_decoded_; workers never resize it.
+    // Prepare allocates rows_decoded_; a const call can't reallocate it.
     mutable std::atomic<uint64_t> groups_skipped_{0};
     mutable std::atomic<uint64_t> rows_considered_{0};
     mutable std::atomic<uint64_t> rows_passed_{0};
-    mutable std::vector<std::atomic<uint64_t>> rows_decoded_;  // per table column
+    std::unique_ptr<std::atomic<uint64_t>[]> rows_decoded_;  // per table column
+    size_t decoded_columns_{0};                             // rows_decoded_'s size
 };
 
 // The source for one scan.

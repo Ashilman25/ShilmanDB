@@ -78,7 +78,7 @@ struct SortLocal : LocalState {
 // Keeps every row it's given; with a limit, each worker keeps only its top n.
 class SortSink final : public Sink {
 public:
-    SortSink(SortSpec spec, std::shared_ptr<SortedRows> out) : spec_(std::move(spec)), out_(std::move(out)) {
+    SortSink(SortSpec spec, SharedOutput<SortedRows> out) : spec_(std::move(spec)), out_(std::move(out)) {
         assert(spec_.keys.size() == spec_.ascending.size() && "one direction per key");
         assert(spec_.columns.size() == spec_.types.size() && "one type per kept column");
         for (const auto& key : spec_.keys) key_types_.push_back(key->Type());
@@ -118,15 +118,16 @@ public:
     // Joins every worker's rows, sorts them, and keeps the strings for the source.
     // The key values and their strings go once the order is known.
     void Finalize(QueryContext&) override {
+        SortedRows& out = out_.Mutable();
         ColumnStore keys(key_types_.size());
-        out_->kept = ColumnStore(spec_.columns.size());
+        out.kept = ColumnStore(spec_.columns.size());
         for (auto& part : parts_) {
             auto& p = static_cast<SortLocal&>(*part);
             keys.Absorb(std::move(p.keys));
-            out_->kept.Absorb(std::move(p.kept));
+            out.kept.Absorb(std::move(p.kept));
         }
         parts_.clear();
-        out_->order = SortedOrder(keys, out_->kept);
+        out.order = SortedOrder(keys, out.kept);
     }
 
 private:
@@ -176,7 +177,7 @@ private:
     SortSpec spec_;
     std::vector<VType> key_types_;
     std::optional<size_t> limit_;  // the spec's limit, at least 0
-    std::shared_ptr<SortedRows> out_;
+    SharedOutput<SortedRows> out_;
     std::vector<std::unique_ptr<LocalState>> parts_;  // one per worker, after Combine
 };
 
@@ -224,8 +225,8 @@ private:
 
 // The sink and source share the sorted rows, so neither outlives what it reads.
 std::pair<std::unique_ptr<Sink>, std::unique_ptr<Source>> MakeSort(SortSpec spec) {
-    auto rows = std::make_shared<SortedRows>();
-    auto source = std::make_unique<SortSource>(spec.types, rows);
+    SharedOutput<SortedRows> rows;
+    auto source = std::make_unique<SortSource>(spec.types, rows.Reader());
     auto sink = std::make_unique<SortSink>(std::move(spec), std::move(rows));
     return {std::move(sink), std::move(source)};
 }

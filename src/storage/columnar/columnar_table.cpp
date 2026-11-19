@@ -10,6 +10,24 @@ namespace shilmandb {
 
 namespace {
 
+// Unpins a page when it goes out of scope, unless told to keep the pin.
+class PinGuard {
+public:
+    PinGuard(BufferPoolManager* bpm, page_id_t pid) : bpm_(bpm), pid_(pid) {}
+    ~PinGuard() {
+        if (bpm_ != nullptr) (void)bpm_->UnpinPage(pid_, false);
+    }
+    PinGuard(const PinGuard&) = delete;
+    PinGuard& operator=(const PinGuard&) = delete;
+
+    // The caller takes over the pin.
+    void Keep() { bpm_ = nullptr; }
+
+private:
+    BufferPoolManager* bpm_;
+    page_id_t pid_;
+};
+
 // Serves a chunk's pages from the buffer pool.
 // Checks each page once per read from disk.
 class PoolPages : public ChunkPages {
@@ -23,13 +41,12 @@ public:
         const page_id_t pid = chunk_.first_page + index;
         Page* page = bpm_->FetchPage(pid);
         if (page == nullptr) throw DatabaseException(table_ + ": no free frame for page " + std::to_string(pid));
+        PinGuard guard(bpm_, pid);
         if (!page->IsVerified()) {
-            if (!VerifyPage(page->GetData(), pid)) {
-                (void)bpm_->UnpinPage(pid, false);
-                throw DatabaseException(table_ + ": page " + std::to_string(pid) + " failed its checksum");
-            }
+            if (!VerifyPage(page->GetData(), pid)) throw DatabaseException(table_ + ": page " + std::to_string(pid) + " failed its checksum");
             page->MarkVerified();
         }
+        guard.Keep();
         return page->GetData();
     }
 

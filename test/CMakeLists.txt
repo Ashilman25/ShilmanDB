@@ -117,6 +117,7 @@ shilmandb_add_test(parallel_hash_aggregate_test executor/parallel/hash_aggregate
 target_include_directories(parallel_hash_aggregate_test PRIVATE ${CMAKE_SOURCE_DIR}/bench)
 shilmandb_add_test(parallel_hash_join_test executor/parallel/hash_join_test.cpp)
 target_include_directories(parallel_hash_join_test PRIVATE ${CMAKE_SOURCE_DIR}/bench)
+shilmandb_add_test(parallel_worker_pool_test executor/parallel/worker_pool_test.cpp)
 
 # Integration tests
 shilmandb_add_test(end_to_end_test integration/end_to_end_test.cpp)
@@ -142,6 +143,8 @@ shilmandb_add_test(parallel_tpch_test integration/parallel_tpch_test.cpp)
 target_include_directories(parallel_tpch_test PRIVATE ${CMAKE_SOURCE_DIR}/bench)
 shilmandb_add_test(parallel_differential_test integration/parallel_differential_test.cpp)
 target_include_directories(parallel_differential_test PRIVATE ${CMAKE_SOURCE_DIR}/bench)
+shilmandb_add_test(parallel_threads_test integration/parallel_threads_test.cpp)
+target_include_directories(parallel_threads_test PRIVATE ${CMAKE_SOURCE_DIR}/bench)
 shilmandb_add_test(page_owners_test integration/page_owners_test.cpp)
 target_include_directories(page_owners_test PRIVATE ${CMAKE_SOURCE_DIR}/bench)
 shilmandb_add_test(eviction_sim_test integration/eviction_sim_test.cpp)
