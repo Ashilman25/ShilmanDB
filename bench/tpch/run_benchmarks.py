@@ -26,11 +26,15 @@ stream_correctness.csv (every workload item checked against SQLite). A
 workload label adds _<workload>_s<seed> after the config name, for example
 baseline_stream_s1. The three files above only cover the single workload.
 
-The columnar, columnar+index and columnar+vectorized configs run only when
-named. Within one call each columnar file is loaded once per scale factor and
-reused by later runs: columnar has its own, and columnar+index and
-columnar+vectorized share an indexed one. Every run that loads
-its tables leaves load_times_<label>_sf<sf>.csv in the output folder.
+The columnar, columnar+index, columnar+vectorized, columnar+parallel and
+columnar+parallel_1thread configs run only when named. Within one call each
+columnar file is loaded once per scale factor and reused by later runs:
+columnar has its own, and the indexed configs share another. Every run that
+loads its tables leaves load_times_<label>_sf<sf>.csv in the output folder.
+
+--parallel-threads 2,4 adds columnar+parallel_2thread and columnar+parallel_4thread
+after the named configs. Every parallel run leaves
+parallel_stats_<label>_sf<sf>.csv in the output folder.
 
 """
 
@@ -139,14 +143,57 @@ PRIMARY_CONFIGS: Dict[str, List[str]] = {
         "--execution-mode", "vectorized",
         "--storage", "columnar",
     ],
+    # The parallel executor on the indexed columnar file, on every core or one
+    "columnar+parallel": [
+        "--create-indexes", "true",
+        "--execution-mode", "parallel",
+        "--storage", "columnar",
+    ],
+    "columnar+parallel_1thread": [
+        "--create-indexes", "true",
+        "--execution-mode", "parallel",
+        "--storage", "columnar",
+        "--threads", "1",
+    ],
 }
+
+# The most threads one parallel query may use (kMaxThreads in the engine).
+MAX_PARALLEL_THREADS: int = 256
+_SWEEP_CONFIG_RE = re.compile(r"columnar\+parallel_(\d+)thread")
 
 # What --configs all runs. The columnar configs run only when named.
 SHILMANDB_CONFIG_NAMES: List[str] = ["baseline", "+index", "+learned", "+vectorized"]
-COLUMNAR_CONFIG_NAMES: List[str] = ["columnar", "columnar+index", "columnar+vectorized"]
+COLUMNAR_CONFIG_NAMES: List[str] = ["columnar", "columnar+index", "columnar+vectorized",
+                                     "columnar+parallel", "columnar+parallel_1thread"]
 SQLITE_CONFIG_NAMES: List[str] = ["sqlite_disk", "sqlite_memory"]
 ALL_CONFIG_NAMES: List[str] = SHILMANDB_CONFIG_NAMES + SQLITE_CONFIG_NAMES
 KNOWN_CONFIG_NAMES: List[str] = ALL_CONFIG_NAMES + COLUMNAR_CONFIG_NAMES
+
+
+# The sweep config for n threads; 1 thread is the named columnar+parallel_1thread.
+def sweep_config_name(threads: int) -> str:
+    return f"columnar+parallel_{threads}thread"
+
+
+# The sweep configs --parallel-threads adds, in its order, skipping any already named.
+def sweep_configs(threads: Sequence[int], named: Sequence[str]) -> List[str]:
+    return [name for name in map(sweep_config_name, threads) if name not in named]
+
+
+# A config's load_tpch flags; a sweep config is columnar+parallel plus --threads N.
+def config_flags(config_name: str) -> List[str]:
+    if config_name in PRIMARY_CONFIGS:
+        return PRIMARY_CONFIGS[config_name]
+    m = _SWEEP_CONFIG_RE.fullmatch(config_name)
+    if m is None:
+        raise ValueError(f"unknown ShilmanDB config: {config_name}")
+    return PRIMARY_CONFIGS["columnar+parallel"] + ["--threads", m.group(1)]
+
+
+# True for a config whose tables are columnar, sweep configs included.
+def is_columnar_config(config_name: str) -> bool:
+    return config_name in COLUMNAR_CONFIG_NAMES or _SWEEP_CONFIG_RE.fullmatch(config_name) is not None
+
 
 # Other engines, added to a run only by --duckdb and --postgres.
 DUCKDB_CONFIG_NAMES: List[str] = ["duckdb", "duckdb_1thread"]
@@ -531,9 +578,7 @@ def build_command(binary: Path, sf: str, config_name: str, data_dir: Path, resul
                   db_file: Path, pool_size: int, warmup_runs: int, timed_runs: int,
                   extra_flags: Sequence[str] = (), reuse_db: bool = False) -> List[str]:
 
-    if config_name not in PRIMARY_CONFIGS:
-        raise ValueError(f"unknown ShilmanDB config: {config_name}")
-
+    flags = config_flags(config_name)
     cmd: List[str] = [
         str(binary),
         "--sf", sf,
@@ -545,7 +590,7 @@ def build_command(binary: Path, sf: str, config_name: str, data_dir: Path, resul
         "--results-dir", str(results_dir),
         "--no-verify",
     ]
-    cmd += PRIMARY_CONFIGS[config_name]
+    cmd += flags
     if reuse_db:
         cmd.append("--reuse-db")
     cmd += extra_flags
@@ -564,7 +609,7 @@ def warn_on_db_pages_mismatch(info: Dict[str, str], sf: str) -> None:
 
 
 # The database files the columnar configs share in one runner call, all in one folder.
-# Per scale factor, columnar has a file and the two indexed configs share another.
+# Per scale factor, columnar has a file and the indexed configs share another.
 @dataclass
 class ColumnarFiles:
     root: Path
@@ -572,7 +617,7 @@ class ColumnarFiles:
 
     # The file this config uses at this scale factor; None for a row config.
     def db_file(self, sf: str, config_name: str) -> Optional[Path]:
-        if config_name not in COLUMNAR_CONFIG_NAMES:
+        if not is_columnar_config(config_name):
             return None
         kind = "plain" if config_name == "columnar" else "indexed"
         return self.root / f"tpch_sf{sf}_{kind}.db"
@@ -583,6 +628,13 @@ def copy_load_times(tmp_path: Path, output_dir: Path, label: str, sf: str) -> No
     src = tmp_path / "load_times.csv"
     if src.exists():
         shutil.copyfile(src, output_dir / f"load_times_{label}_sf{sf}.csv")
+
+
+# Same for a parallel run's parallel_stats.csv: <output>/parallel_stats_<label>_sf<sf>.csv.
+def copy_parallel_stats(tmp_path: Path, output_dir: Path, label: str, sf: str) -> None:
+    src = tmp_path / "parallel_stats.csv"
+    if src.exists():
+        shutil.copyfile(src, output_dir / f"parallel_stats_{label}_sf{sf}.csv")
 
 
 # Run load_tpch once for a (sf, config) in a temp folder and hand that folder to the caller.
@@ -683,10 +735,11 @@ def run_shilmandb_config(binary: Path, sf: str, config_name: str, data_dir: Path
             if src.exists():
                 shutil.copyfile(src, results_parent / f"{name}_sf{sf}.csv")
         copy_load_times(tmp_path, output_dir, label, sf)
+        copy_parallel_stats(tmp_path, output_dir, label, sf)
 
         info = read_run_info(tmp_path / "run_info.csv")
         # DB_PAGES counts heap pages, so only a row run can be checked against it
-        if config_name not in COLUMNAR_CONFIG_NAMES:
+        if not is_columnar_config(config_name):
             warn_on_db_pages_mismatch(info, sf)
         policy_ms = read_policy_ms(tmp_path / "policy_time.csv")
 
@@ -728,7 +781,7 @@ def run_workload_config(binary: Path, sf: str, config_name: str, data_dir: Path,
         copy_load_times(tmp_path, output_dir, label, sf)
 
         info = read_run_info(tmp_path / "run_info.csv")
-        if config_name not in COLUMNAR_CONFIG_NAMES:
+        if not is_columnar_config(config_name):
             warn_on_db_pages_mismatch(info, sf)
         try:
             totals = parse_stream_totals(tmp_path / "stream_totals.csv")
@@ -1399,6 +1452,15 @@ def fraction_list(text: str) -> List[float]:
     return list(dict.fromkeys(values))
 
 
+# --parallel-threads: whole numbers from 1 to 256, duplicates dropped, order kept.
+def parallel_threads_list(text: str) -> List[int]:
+    message = f"--parallel-threads expects whole numbers from 1 to {MAX_PARALLEL_THREADS}, e.g. 2,4,6,12"
+    values = [v.strip() for v in text.split(",") if v.strip()]
+    if not values or not all(v.isascii() and v.isdigit() and 1 <= int(v) <= MAX_PARALLEL_THREADS for v in values):
+        raise argparse.ArgumentTypeError(message)
+    return list(dict.fromkeys(int(v) for v in values))
+
+
 def eviction_policy_list(text: str) -> List[str]:
     values = _comma_list(text, str.strip, "--eviction-policies expects names")
     if not values or any(v not in EVICTION_POLICIES for v in values):
@@ -1437,7 +1499,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR, help=f"TPC-H data dir (default: {DEFAULT_DATA_DIR})")
     p.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR, help=f"Output dir (default: {DEFAULT_OUTPUT_DIR})")
     p.add_argument("--sf", action="append", choices=KNOWN_SCALE_FACTORS + ["all"], help="Scale factor(s). Repeat flag or use 'all'. Default: 'all'.")
-    p.add_argument("--configs", default="all", help=("Comma-separated configs. Accepts 'all' (" + ",".join(ALL_CONFIG_NAMES) + "), 'none' (no ShilmanDB or SQLite config) or a subset of: " + ",".join(KNOWN_CONFIG_NAMES) + ". The columnar configs run only when named; columnar+index loads a file that a later columnar+vectorized reuses"))
+    p.add_argument("--configs", default="all", help=("Comma-separated configs. Accepts 'all' (" + ",".join(ALL_CONFIG_NAMES) + "), 'none' (no ShilmanDB or SQLite config) or a subset of: " + ",".join(KNOWN_CONFIG_NAMES) + ". The columnar configs run only when named; columnar+index loads an indexed file that later columnar+vectorized, columnar+parallel and columnar+parallel_1thread runs (and the --parallel-threads sweep) reuse"))
+    p.add_argument("--parallel-threads", type=parallel_threads_list, default=[], help=f"Comma list of thread counts (1 to {MAX_PARALLEL_THREADS}); each adds columnar+parallel_<N>thread (columnar+parallel with --threads N) after the named configs. 1 is columnar+parallel_1thread")
     p.add_argument("--duckdb", action="store_true", help="Also run DuckDB (duckdb, duckdb_1thread) through run_duckdb_benchmarks.py; exit 3 if it fails")
     p.add_argument("--postgres", action="store_true", help="Also run Postgres (postgres, postgres_1worker) through run_postgres_benchmarks.py; needs the server on port 5434; exit 3 if it fails")
     p.add_argument("--warmup", type=int, default=1, help="Warmup runs per query, DuckDB and Postgres included (default 1)")
@@ -1493,6 +1556,8 @@ def main() -> int:
     if args.miss_penalty_us != [0] or args.direct_io or args.pool_fractions or args.policy_timing:
         print(f"  miss_penalty_us={args.miss_penalty_us}, direct_io={args.direct_io}, "
               f"pool_fractions={args.pool_fractions}, policy_timing={args.policy_timing}")
+    if args.parallel_threads:
+        print(f"  parallel_threads={args.parallel_threads}")
     has_workloads = any(w != "single" for w in args.workloads)
     if has_workloads:
         print(f"  workloads={args.workloads}, seed={args.seed}, stream_length={args.stream_length}")
@@ -1501,6 +1566,7 @@ def main() -> int:
         print(f"  engines={engines}")
 
     shilmandb_configs = [c for c in configs if c in PRIMARY_CONFIGS]
+    shilmandb_configs += sweep_configs(args.parallel_threads, shilmandb_configs)
     if "+learned" in shilmandb_configs and args.eviction_policies != ["lru"]:
         print("  note: +learned is V2 eviction, so it runs once, not once per policy")
     # latencies.csv, hit_rates.csv and correctness.csv describe single-query runs only, so a call
@@ -1580,7 +1646,7 @@ def main() -> int:
         workload_records.append(stats)
 
     # Columnar files last this call only; removed at the end, even on error
-    uses_columnar = any(c in COLUMNAR_CONFIG_NAMES for c in shilmandb_configs)
+    uses_columnar = any(is_columnar_config(c) for c in shilmandb_configs)
     with (tempfile.TemporaryDirectory(prefix="shilmandb_columnar_") if uses_columnar else nullcontext()) as shared_dir:
         columnar_files = ColumnarFiles(Path(shared_dir)) if shared_dir else None
         for spec in planned_runs(sfs, shilmandb_configs, args.workloads, args.miss_penalty_us, args.pool_fractions, args.eviction_policies):
