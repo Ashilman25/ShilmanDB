@@ -3,10 +3,12 @@
 #include "executor/parallel/pipeline.hpp"
 #include "parser/ast.hpp"
 #include "storage/columnar/columnar_table.hpp"
+#include "types/value.hpp"
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -44,14 +46,24 @@ struct ScanCounters {
 // Splits a filter's AND tree, left first, and compiles each part into the spec.
 void AddConjuncts(ScanSpec& spec, const ColumnarTable& table, const Expression& predicate);
 
+// An index on the scanned table and its key range [low, high], either end open.
+struct IndexBounds {
+    std::string index;
+    std::optional<Value> low;
+    std::optional<Value> high;
+};
+
 // Reads a columnar table one row group per morsel. Each conjunct decodes its column
 // for the rows still selected and narrows them; handed-up columns come last, for the
 // survivors only. A morsel's batches stay valid until its local starts the next one.
+// With index bounds, a morsel is a row group holding matches and starts from them alone.
 class ScanSource : public Source {
 public:
     explicit ScanSource(ScanSpec spec);
+    ScanSource(ScanSpec spec, IndexBounds bounds);
 
-    // Finds the table; keeps the row groups whose min and max allow a match.
+    // Finds the table; keeps the row groups whose min and max allow a match,
+    // or, with an index, walks it and groups the matches by row group.
     void Prepare(QueryContext& ctx) override;
 
     [[nodiscard]] size_t MorselCount() const override { return groups_.size(); }
@@ -80,6 +92,9 @@ private:
     // Drops the failed survivors from the survivor list and every column read later.
     void Narrow(Local& l, size_t step) const;
 
+    // Walks the index range; fills groups_ and each group's sorted offsets.
+    void FindMatches(QueryContext& ctx);
+
     ScanSpec spec_;
     const ColumnarTable* table_{nullptr};
     std::vector<VType> types_;       // per table column
@@ -89,6 +104,11 @@ private:
     std::vector<bool> handed_;       // per table column: handed up
     std::vector<size_t> last_use_;   // per table column: the last conjunct step reading it, 0 for none
     std::vector<size_t> groups_;     // the row groups to read, one per morsel
+
+    // Index matches: morsel m starts from offsets_[first_[m]] up to offsets_[first_[m + 1]].
+    std::optional<IndexBounds> bounds_;
+    std::vector<uint32_t> offsets_;  // row offsets in their group, ascending per group
+    std::vector<size_t> first_;      // one more entry than groups_
 
     // Counts every worker adds to from const StartMorsel, so atomic and mutable.
     // Prepare allocates rows_decoded_; a const call can't reallocate it.
@@ -101,5 +121,10 @@ private:
 
 // The source for one scan.
 [[nodiscard]] std::unique_ptr<Source> MakeScanSource(ScanSpec spec);
+
+// An INDEX_SCAN on a columnar table: positions from the B+tree, sorted,
+// one morsel per row group with matches.
+[[nodiscard]] std::unique_ptr<Source> MakeIndexScanSource(ScanSpec spec, std::string index_name,
+                                                          std::optional<Value> low, std::optional<Value> high);
 
 }  // namespace shilmandb::parallel

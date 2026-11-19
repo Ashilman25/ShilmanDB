@@ -234,12 +234,15 @@ private:
             case PlanNodeType::SEQ_SCAN:
                 return Scan(static_cast<const SeqScanPlanNode&>(node), nullptr, needed);
             case PlanNodeType::INDEX_SCAN:
-                return IndexRange(static_cast<const IndexScanPlanNode&>(node), needed);
+                return IndexScan(static_cast<const IndexScanPlanNode&>(node), nullptr, needed);
             case PlanNodeType::FILTER: {
                 const auto& filter = static_cast<const FilterPlanNode&>(node);
                 const PlanNode& child = *filter.children[0];
                 if (child.type == PlanNodeType::SEQ_SCAN) {
                     return Scan(static_cast<const SeqScanPlanNode&>(child), filter.predicate.get(), needed);
+                }
+                if (child.type == PlanNodeType::INDEX_SCAN) {
+                    return IndexScan(static_cast<const IndexScanPlanNode&>(child), filter.predicate.get(), needed);
                 }
                 return Filter(filter, needed);
             }
@@ -269,79 +272,49 @@ private:
     // Slot k holds needed[k]; NUMERIC slots carry their precision so sums can stay narrow.
     // A fused predicate's columns are read inside the scan and never handed up.
     // NULLs are refused in every column the plan lists, as today's scan does.
-    InputLayout Scan(const SeqScanPlanNode& scan, const Expression* predicate, const std::vector<uint32_t>& needed) {
-        const TableInfo& info = *ctx_.catalog->GetTable(scan.table_name);
+    ScanSpec SpecFor(const std::string& table_name, const Schema& schema, const std::optional<std::vector<uint32_t>>& read_columns,
+                     const Expression* predicate, const std::vector<uint32_t>& needed) {
+        const TableInfo& info = *ctx_.catalog->GetTable(table_name);
         const ColumnarTable* table = info.columnar.get();
-        if (scan.output_schema.GetColumnCount() != table->Meta().columns.size()) {
-            throw DatabaseException("the parallel executor: the plan's columns don't match table " + scan.table_name);
+        if (schema.GetColumnCount() != table->Meta().columns.size()) {
+            throw DatabaseException("the parallel executor: the plan's columns don't match table " + table_name);
         }
 
         ScanSpec spec;
-        spec.table = scan.table_name;
+        spec.table = table_name;
         spec.columns = needed;
-        spec.refuse_nulls = ColumnarReadColumns(info, scan.read_columns);
-        for (const auto& conj : scan.skip_conjuncts) spec.skip_conjuncts.push_back(conj.get());
+        spec.refuse_nulls = ColumnarReadColumns(info, read_columns);
         if (predicate != nullptr) AddConjuncts(spec, *table, *predicate);
 #ifndef NDEBUG
-        if (scan.read_columns) {
+        // An index key may be unlisted when its predicate was used up; it isn't read.
+        if (read_columns) {
             std::vector<uint32_t> read = needed;
             read.insert(read.end(), spec.single_column.begin(), spec.single_column.end());
             for (const auto& columns : spec.multi_columns) read.insert(read.end(), columns.begin(), columns.end());
             for (uint32_t c : read) {
-                const bool listed = std::find(scan.read_columns->begin(), scan.read_columns->end(), c) != scan.read_columns->end();
+                const bool listed = std::find(read_columns->begin(), read_columns->end(), c) != read_columns->end();
                 assert(listed && "a scan reads a column its plan doesn't list");
             }
         }
 #endif
-
-        SetSource(MakeScanSource(std::move(spec)));
-        return ScanLayout(*table, needed);
+        return spec;
     }
 
-    // For now an index scan reads the whole table and filters to the index range.
-    // [low, high] is inclusive, as today's index scan reads it; rows come in table order.
-    // NULLs are refused in every column the plan lists.
-    InputLayout IndexRange(const IndexScanPlanNode& scan, const std::vector<uint32_t>& needed) {
-        const IndexInfo* index = ctx_.catalog->GetIndex(scan.index_name);
-        if (index == nullptr) throw DatabaseException("IndexScanExecutor: index not found: " + scan.index_name);
-        const TableInfo& info = *ctx_.catalog->GetTable(scan.table_name);
-        const ColumnarTable* table = info.columnar.get();
-        if (scan.output_schema.GetColumnCount() != table->Meta().columns.size()) {
-            throw DatabaseException("the parallel executor: the plan's columns don't match table " + scan.table_name);
-        }
-
-        ScanSpec spec;
-        spec.table = scan.table_name;
-        spec.columns = needed;
-        spec.refuse_nulls = ColumnarReadColumns(info, scan.read_columns);
-        const uint32_t key = index->col_idx;
-        const auto add_bound = [&](BinaryOp::Op op, const Value& bound) {
-            BinaryOp test;
-            test.op = op;
-            auto column = std::make_unique<ColumnRef>();
-            column->column_name = index->column_name;
-            column->bound_index = key;
-            auto literal = std::make_unique<Literal>();
-            literal->value = bound;
-            test.left = std::move(column);
-            test.right = std::move(literal);
-            spec.single.push_back(CompiledExpr::Compile(test, ScanLayout(*table, {key})));
-            spec.single_column.push_back(key);
-        };
-        if (scan.low_key) add_bound(BinaryOp::Op::GTE, *scan.low_key);
-        if (scan.high_key) add_bound(BinaryOp::Op::LTE, *scan.high_key);
-#ifndef NDEBUG
-        // The key may be unlisted when the index used up its predicate.
-        if (scan.read_columns) {
-            for (uint32_t c : needed) {
-                const bool listed = std::find(scan.read_columns->begin(), scan.read_columns->end(), c) != scan.read_columns->end();
-                assert(listed && "an index scan hands up a column its plan doesn't list");
-            }
-        }
-#endif
-
+    // Row groups whose min and max rule out a match are never read.
+    InputLayout Scan(const SeqScanPlanNode& scan, const Expression* predicate, const std::vector<uint32_t>& needed) {
+        ScanSpec spec = SpecFor(scan.table_name, scan.output_schema, scan.read_columns, predicate, needed);
+        for (const auto& conj : scan.skip_conjuncts) spec.skip_conjuncts.push_back(conj.get());
         SetSource(MakeScanSource(std::move(spec)));
-        return ScanLayout(*table, needed);
+        return ScanLayout(*ctx_.catalog->GetTable(scan.table_name)->columnar, needed);
+    }
+
+    // The same scan over the index's matches, [low, high] inclusive as today's index scan.
+    // Rows come in row-position order; a filter right above still runs inside.
+    InputLayout IndexScan(const IndexScanPlanNode& scan, const Expression* predicate, const std::vector<uint32_t>& needed) {
+        if (ctx_.catalog->GetIndex(scan.index_name) == nullptr) throw DatabaseException("IndexScanExecutor: index not found: " + scan.index_name);
+        ScanSpec spec = SpecFor(scan.table_name, scan.output_schema, scan.read_columns, predicate, needed);
+        SetSource(MakeIndexScanSource(std::move(spec), scan.index_name, scan.low_key, scan.high_key));
+        return ScanLayout(*ctx_.catalog->GetTable(scan.table_name)->columnar, needed);
     }
 
     // The batch passes through, so the filter's layout is its child's.

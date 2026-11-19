@@ -2,6 +2,7 @@
 #include "catalog/catalog.hpp"
 #include "common/exception.hpp"
 #include "executor/columnar_scan_executor.hpp"
+#include "index/btree_index.hpp"
 #include "planner/cost_model.hpp"
 #include "storage/columnar/field_parser.hpp"
 #include "storage/columnar/string_arena.hpp"
@@ -139,6 +140,11 @@ ScanSource::ScanSource(ScanSpec spec) : spec_(std::move(spec)) {
     assert(spec_.multi.size() == spec_.multi_columns.size() && "one column list per multi conjunct");
 }
 
+// The index is found in Prepare too.
+ScanSource::ScanSource(ScanSpec spec, IndexBounds bounds) : ScanSource(std::move(spec)) {
+    bounds_ = std::move(bounds);
+}
+
 // Runs on the calling thread: per-column facts, zone maps, and fresh counts.
 void ScanSource::Prepare(QueryContext& ctx) {
     const TableInfo* info = ctx.catalog->GetTable(spec_.table);
@@ -185,8 +191,12 @@ void ScanSource::Prepare(QueryContext& ctx) {
 
     // A skipped row group never becomes a morsel, so it costs no page read.
     groups_.clear();
-    for (size_t g = 0; g < table_->RowGroupCount(); ++g) {
-        if (spec_.skip_conjuncts.empty() || CostModel::MayMatch(spec_.skip_conjuncts, table_->GroupRanges(g))) groups_.push_back(g);
+    if (bounds_) {
+        FindMatches(ctx);
+    } else {
+        for (size_t g = 0; g < table_->RowGroupCount(); ++g) {
+            if (spec_.skip_conjuncts.empty() || CostModel::MayMatch(spec_.skip_conjuncts, table_->GroupRanges(g))) groups_.push_back(g);
+        }
     }
 
     groups_skipped_.store(table_->RowGroupCount() - groups_.size(), std::memory_order_relaxed);
@@ -195,6 +205,40 @@ void ScanSource::Prepare(QueryContext& ctx) {
     rows_decoded_ = std::make_unique<std::atomic<uint64_t>[]>(n);
     decoded_columns_ = n;
     for (size_t c = 0; c < n; ++c) rows_decoded_[c].store(0, std::memory_order_relaxed);
+}
+
+// Walks as today's index scan does: from low, stopping at the first key past high.
+// Positions sort as (group, offset), so each group's pages are read in file order.
+void ScanSource::FindMatches(QueryContext& ctx) {
+    const IndexInfo* index = ctx.catalog->GetIndex(bounds_->index);
+    if (index == nullptr) throw DatabaseException("IndexScanExecutor: index not found: " + bounds_->index);
+    if (index->table_name != spec_.table) throw DatabaseException("index " + bounds_->index + " is not on table " + spec_.table);
+
+    std::vector<uint64_t> found;  // group in the high bits, offset in the low 32
+    BTreeIndex& tree = *index->index;
+    for (auto it = bounds_->low ? tree.Begin(*bounds_->low) : tree.Begin(); !it.IsEnd(); ++it) {
+        const auto entry = *it;
+        if (bounds_->high && entry.first > *bounds_->high) break;
+        const RowPosition pos = FromRid(entry.second);
+        if (pos.row_group >= table_->RowGroupCount() || pos.offset >= table_->RowGroupRows(pos.row_group)) {
+            throw DatabaseException("damaged index: " + bounds_->index + " points past table " + spec_.table);
+        }
+        found.push_back((static_cast<uint64_t>(pos.row_group) << 32) | pos.offset);
+    }
+    std::sort(found.begin(), found.end());
+    found.erase(std::unique(found.begin(), found.end()), found.end());
+
+    offsets_.clear();
+    first_.clear();
+    for (uint64_t p : found) {
+        const auto group = static_cast<size_t>(p >> 32);
+        if (groups_.empty() || groups_.back() != group) {
+            groups_.push_back(group);
+            first_.push_back(offsets_.size());
+        }
+        offsets_.push_back(static_cast<uint32_t>(p));
+    }
+    first_.push_back(offsets_.size());
 }
 
 // Arrays grow on the first morsels and are reused after that.
@@ -234,6 +278,14 @@ void ScanSource::StartMorsel(size_t morsel, LocalState& local) const {
     l.group_rows = table_->RowGroupRows(group);
     l.count = l.group_rows;
     l.cursor = 0;
+    if (bounds_) {
+        // Distinct and ascending, so a group matched whole is rows 0 .. n - 1.
+        const auto from = offsets_.begin() + static_cast<std::ptrdiff_t>(first_[morsel]);
+        const auto to = offsets_.begin() + static_cast<std::ptrdiff_t>(first_[morsel + 1]);
+        l.count = static_cast<uint32_t>(to - from);
+        std::copy(from, to, Room(l.rows, l.count));
+    }
+    const uint32_t considered = l.count;
 
     const size_t singles = spec_.single.size();
     for (size_t i = 0; i < singles && l.count > 0; ++i) {
@@ -254,7 +306,7 @@ void ScanSource::StartMorsel(size_t morsel, LocalState& local) const {
         }
     }
 
-    rows_considered_.fetch_add(l.group_rows, std::memory_order_relaxed);
+    rows_considered_.fetch_add(considered, std::memory_order_relaxed);
     rows_passed_.fetch_add(l.count, std::memory_order_relaxed);
     for (uint32_t c : read_) {
         if (l.decoded[c] > 0) rows_decoded_[c].fetch_add(l.decoded[c], std::memory_order_relaxed);
@@ -379,6 +431,15 @@ ScanCounters ScanSource::Counters() const {
 // A ScanSource behind the Source interface.
 std::unique_ptr<Source> MakeScanSource(ScanSpec spec) {
     return std::make_unique<ScanSource>(std::move(spec));
+}
+
+// The same scan, its morsels limited to the index's matches.
+std::unique_ptr<Source> MakeIndexScanSource(ScanSpec spec, std::string index_name, std::optional<Value> low, std::optional<Value> high) {
+    IndexBounds bounds;
+    bounds.index = std::move(index_name);
+    bounds.low = std::move(low);
+    bounds.high = std::move(high);
+    return std::make_unique<ScanSource>(std::move(spec), std::move(bounds));
 }
 
 }  // namespace shilmandb::parallel
