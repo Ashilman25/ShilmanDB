@@ -92,12 +92,20 @@ void CollectTableIndices(const Expression* expr, const std::vector<TableRef>& ta
     }
 }
 
-// True when some column in expr has no slot (unknown, or ambiguous without a qualifier).
+// True when col may not read its slot's table: it has no slot, or it's
+// qualified and its name isn't in that table alone (binding ignores qualifiers).
+bool IsUnplacedColumn(const ColumnRef& col, const std::vector<TableRef>& tables, const std::vector<TableInfo*>& table_infos) {
+    const int slot = SlotOf(col, tables, table_infos);
+    if (slot < 0) return true;
+    return col.table_name.has_value() && ResolveUnqualifiedColumn(col.column_name, tables, table_infos) != slot;
+}
+
+// True when some column in expr is unplaced (IsUnplacedColumn).
 bool HasUnplacedColumn(const Expression* expr, const std::vector<TableRef>& tables, const std::vector<TableInfo*>& table_infos) {
     if (!expr) return false;
     switch (expr->type) {
         case ExprType::COLUMN_REF:
-            return SlotOf(*static_cast<const ColumnRef*>(expr), tables, table_infos) < 0;
+            return IsUnplacedColumn(*static_cast<const ColumnRef*>(expr), tables, table_infos);
         case ExprType::BINARY_OP: {
             const auto* bin = static_cast<const BinaryOp*>(expr);
             return HasUnplacedColumn(bin->left.get(), tables, table_infos) || HasUnplacedColumn(bin->right.get(), tables, table_infos);

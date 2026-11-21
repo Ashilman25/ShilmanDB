@@ -207,6 +207,47 @@ protected:
     }
 
     std::unique_ptr<Database> LoadColumnar() { return Load(StorageKind::COLUMNAR); }
+
+    // t1(a_k, x, a_y) and t2(b_k, x, b_y), columnar, from these rows: both have an x.
+    std::unique_ptr<Database> LoadSharedX(const std::string& what, const std::string& t1_rows, const std::string& t2_rows) {
+        auto db = std::make_unique<Database>(TempPath(what + ".db"), 64);
+        LoadOptions columnar;
+        columnar.storage = StorageKind::COLUMNAR;
+        const auto load = [&](const std::string& name, const Schema& schema, const std::string& text) {
+            const std::string path = TempPath(what + "_" + name + ".tbl");
+            std::ofstream(path, std::ios::binary) << text;
+            db->LoadTable(name, schema, path, columnar);
+        };
+        load("t1", Schema({Column("a_k", ColumnType::Integer()), Column("x", ColumnType::Integer()), Column("a_y", ColumnType::Integer())}), t1_rows);
+        load("t2", Schema({Column("b_k", ColumnType::Integer()), Column("x", ColumnType::Integer()), Column("b_y", ColumnType::Integer())}), t2_rows);
+        return db;
+    }
+
+    // PARALLEL on one thread must answer as VECTORIZED does, both joining t1 then t2.
+    static void ExpectSameAsVectorized(Database& db, const std::string& sql, size_t want_rows) {
+        QueryOptions vectorized{ExecutionMode::VECTORIZED};
+        vectorized.forced_join_order = std::vector<int>{0, 1};
+        QueryOptions parallel = vectorized;
+        parallel.mode = ExecutionMode::PARALLEL;
+        parallel.threads = 1;
+        const QueryResult want = db.ExecuteSQL(sql, vectorized);
+        ASSERT_EQ(want.tuples.size(), want_rows);
+        const QueryResult got = db.ExecuteSQL(sql, parallel);
+        EXPECT_TRUE(tpch::SameResult(got, want)) << got.tuples.size() << " rows";
+    }
+
+    // The filter right above table's scan in sql's parallel plan, as text, or "".
+    static std::string ScanFilter(Database& db, const std::string& sql, const std::string& table) {
+        QueryOptions parallel{ExecutionMode::PARALLEL};
+        parallel.forced_join_order = std::vector<int>{0, 1};
+        Parser parser(sql);
+        auto stmt = parser.Parse();
+        Planner planner = db.MakePlanner(parallel);
+        const auto plan = planner.Plan(std::move(*stmt));
+        const PlanNode* parent = ParentOfScan(*plan, table);
+        if (parent == nullptr || parent->type != PlanNodeType::FILTER) return "";
+        return Text(*static_cast<const FilterPlanNode*>(parent)->predicate);
+    }
 };
 
 }  // namespace
@@ -439,6 +480,26 @@ TEST_F(OrFactoringTest, AmbiguousColumnsAreNeverFactored) {
     ASSERT_NE(t1, nullptr);
     ASSERT_EQ(t1->type, PlanNodeType::FILTER);
     EXPECT_EQ(Text(*static_cast<const FilterPlanNode*>(t1)->predicate), Text(*ParseWhere("a_y = 1 OR a_y = 2")));
+}
+
+// Binding ignores qualifiers, so above the join t2.x reads t1's x:
+// a filter on t2's own x would drop the row the OR keeps.
+TEST_F(OrFactoringTest, QualifiedSharedColumnsAreNeverFactored) {
+    auto db = LoadSharedX("qualified", "1|20|1\n2|30|2\n", "1|99|10\n2|40|30\n");
+    const std::string sql = "SELECT a_k, b_k FROM t1, t2 WHERE a_k = b_k AND ((t2.x = 20 AND a_y = 1) OR (t2.x = 40 AND a_y = 2))";
+    ExpectSameAsVectorized(*db, sql, 1);
+    EXPECT_EQ(ScanFilter(*db, sql, "t2"), "");
+    EXPECT_EQ(ScanFilter(*db, sql, "t1"), Text(*ParseWhere("a_y = 1 OR a_y = 2")));
+}
+
+// t1.b_y names a table without b_y; the OR above the join reads t2's.
+TEST_F(OrFactoringTest, QualifierNamingAnotherTableIsNeverFactored) {
+    auto db = LoadSharedX("other_table", "1|20|1\n2|30|2\n", "1|99|10\n2|40|30\n");
+    const std::string sql =
+        "SELECT a_k, b_k FROM t1, t2 WHERE a_k = b_k AND ((t1.b_y = 10 AND a_y = 1 AND b_k = 1) OR (t1.b_y = 30 AND a_y = 2 AND b_k = 2))";
+    ExpectSameAsVectorized(*db, sql, 2);
+    EXPECT_EQ(ScanFilter(*db, sql, "t1"), Text(*ParseWhere("a_y = 1 OR a_y = 2")));
+    EXPECT_EQ(ScanFilter(*db, sql, "t2"), Text(*ParseWhere("b_k = 1 OR b_k = 2")));
 }
 
 // Planned for the parallel executor, Q19 filters part and lineitem below the join.
