@@ -17,7 +17,7 @@ HERE = Path(__file__).resolve().parent
 CHECK_TOLERANCE = 1e-9      # relative
 P, P1 = "columnar+parallel", "columnar+parallel_1thread"
 SWEEP_RE = re.compile(r"columnar\+parallel_(\d+)thread")
-HEADER: List[str] = ["query", "P", "P1", "D", "D1", "PG", "PG1", "P_over_PG", "P_over_D", "P1_over_D1", "ours_speedup", "duckdb_speedup", "check"]
+HEADER: List[str] = ["query", "P", "P1", "D", "D1", "PG", "PG1", "P_over_PG", "P_over_D", "P1_over_D1", "ours_speedup", "duckdb_speedup", "check", "P_over_PG1", "P1_over_PG1"]
 
 
 # Loads run_benchmarks.py by path, for its scale factors and median reader.
@@ -82,6 +82,16 @@ class BarRow:
     @property
     def check(self) -> float:
         return self.p1_over_d1 * self.duckdb_speedup / self.ours_speedup
+
+    # All our threads against one Postgres worker.
+    @property
+    def p_over_pg1(self) -> float:
+        return self.p / self.pg1
+
+    # One thread each: speed per core against Postgres.
+    @property
+    def p1_over_pg1(self) -> float:
+        return self.p1 / self.pg1
 
 
 @dataclass
@@ -163,7 +173,8 @@ def table_cells(table: BarTable) -> List[List[str]]:
         cells.append([
             r.query, _ms(r.p), _ms(r.p1), _ms(r.d), _ms(r.d1), _ms(r.pg), _ms(r.pg1),
             _ratio(r.p_over_pg), _ratio(r.p_over_d), _ratio(r.p1_over_d1),
-            _ratio(r.ours_speedup), _ratio(r.duckdb_speedup), _ratio(r.check)
+            _ratio(r.ours_speedup), _ratio(r.duckdb_speedup), _ratio(r.check),
+            _ratio(r.p_over_pg1), _ratio(r.p1_over_pg1)
             ] + [_ms(r.sweep.get(n)) for n in table.sweep_threads])
     return cells
 

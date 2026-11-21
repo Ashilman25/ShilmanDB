@@ -19,7 +19,7 @@ spec.loader.exec_module(mod)
 LATENCIES_HEADER = ("sf,query,config,median_latency_ms,rows,hits,misses,visits,page_hit_rate,reads,read_ms,"
                     "us_per_read,policy_ms,pool_size,miss_penalty_us,direct_io,eviction\n")
 BAR_HEADER = ["query", "P", "P1", "D", "D1", "PG", "PG1", "P_over_PG", "P_over_D", "P1_over_D1",
-              "ours_speedup", "duckdb_speedup", "check"]
+              "ours_speedup", "duckdb_speedup", "check", "P_over_PG1", "P1_over_PG1"]
 
 
 # One latencies.csv row as run_benchmarks writes it (only the median matters here).
@@ -91,10 +91,16 @@ def test_worked_example(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
     assert float(q6["duckdb_speedup"]) == pytest.approx(10.846, abs=5e-4)
     assert float(q6["P_over_PG"]) == pytest.approx(40.0 / 1127.4, abs=1e-6)
     assert q6["check"] == q6["P_over_D"]
+    # Against one Postgres worker: PG1 1312.3, not PG 1127.4
+    assert q6["P_over_PG1"] == f"{40.0 / 1312.3:.6f}"
+    assert q6["P1_over_PG1"] == f"{300.0 / 1312.3:.6f}"
+    assert rows[0]["P_over_PG1"] == f"{100.0 / 7153.6:.6f}"
+    assert rows[0]["P1_over_PG1"] == f"{900.0 / 7153.6:.6f}"
     assert float(q6["P2"]) == 160.0
     # Ratios carry 6 decimals
     assert q6["P_over_D"] == f"{40.0 / 10.4:.6f}"
-    assert "Q6" in capsys.readouterr().out
+    printed = capsys.readouterr().out
+    assert "Q6" in printed and "P1_over_PG1" in printed and f"{300.0 / 1312.3:.6f}" in printed
 
 
 def test_check_multiplies_back(tmp_path: Path) -> None:
@@ -105,6 +111,8 @@ def test_check_multiplies_back(tmp_path: Path) -> None:
     q6 = table.rows[1]
     assert q6.p_over_d == pytest.approx(40.0 / 10.4, rel=1e-12)
     assert q6.duckdb_speedup == pytest.approx(112.8 / 10.4, rel=1e-12)
+    assert q6.p_over_pg1 == pytest.approx(40.0 / 1312.3, rel=1e-12)
+    assert q6.p1_over_pg1 == pytest.approx(300.0 / 1312.3, rel=1e-12)
 
 
 def test_out_flag(tmp_path: Path) -> None:
