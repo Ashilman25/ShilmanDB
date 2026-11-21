@@ -93,6 +93,51 @@ void ExpectTooWide(Fn fn) {
     }
 }
 
+using U128 = unsigned __int128;
+constexpr __int128 kI128Max = std::numeric_limits<__int128>::max();
+constexpr __int128 kI128Min = std::numeric_limits<__int128>::min();
+constexpr __int128 kI64Max = std::numeric_limits<int64_t>::max();
+constexpr __int128 kI64Min = std::numeric_limits<int64_t>::min();
+
+// |v| as unsigned; INT128_MIN gives 2^127.
+U128 Magnitude(__int128 v) {
+    return v < 0 ? U128{0} - static_cast<U128>(v) : static_cast<U128>(v);
+}
+
+// a * b from four 64-bit products: true on overflow, out the product mod 2^128.
+// Uses neither the builtin nor a division, so it runs on Linux too.
+bool ReferenceMul(__int128 a, __int128 b, __int128* out) {
+    const U128 x = Magnitude(a);
+    const U128 y = Magnitude(b);
+    const auto x0 = static_cast<uint64_t>(x), x1 = static_cast<uint64_t>(x >> 64);
+    const auto y0 = static_cast<uint64_t>(y), y1 = static_cast<uint64_t>(y >> 64);
+    const U128 low = static_cast<U128>(x0) * y0;
+    const U128 cross1 = static_cast<U128>(x0) * y1;
+    const U128 cross2 = static_cast<U128>(x1) * y0;
+    const U128 mid = (low >> 64) + static_cast<uint64_t>(cross1) + static_cast<uint64_t>(cross2);
+    const U128 high = static_cast<U128>(x1) * y1 + (cross1 >> 64) + (cross2 >> 64) + (mid >> 64);
+    const U128 magnitude = (mid << 64) | static_cast<uint64_t>(low);
+    const bool negative = (a < 0) != (b < 0);
+    *out = static_cast<__int128>(negative ? U128{0} - magnitude : magnitude);
+    const U128 limit = (U128{1} << 127) - (negative ? 0 : 1);
+    return high != 0 || magnitude > limit;
+}
+
+// The helper against the reference, and against the builtin where it links.
+void ExpectMulMatches(__int128 a, __int128 b) {
+    __int128 got = 0;
+    __int128 want = 0;
+    const bool got_overflow = detail::MulOverflow128(a, b, &got);
+    const bool want_overflow = ReferenceMul(a, b, &want);
+    EXPECT_EQ(got_overflow, want_overflow) << Str(a) << " * " << Str(b);
+    if (!want_overflow) EXPECT_TRUE(got == want) << Str(a) << " * " << Str(b) << " = " << Str(got) << ", expected " << Str(want);
+#ifdef __APPLE__
+    __int128 builtin = 0;
+    EXPECT_EQ(got_overflow, __builtin_mul_overflow(a, b, &builtin)) << Str(a) << " * " << Str(b);
+    if (!got_overflow) EXPECT_TRUE(got == builtin) << Str(a) << " * " << Str(b);
+#endif
+}
+
 // A random value of 1 to 16 digits with |n| <= 2^53, sign included.
 int64_t RandomNarrow(std::mt19937_64& rng) {
     std::uniform_int_distribution<int> digit_count(1, 16);
@@ -252,6 +297,120 @@ TEST(ParallelDecimalTest, CheckedMulPast38Digits) {
     ExpectTooWide([] { return CheckedMul(-TenTo(20), TenTo(20)); });
     ExpectTooWide([] { return CheckedMul(std::numeric_limits<__int128>::min(), -1); });
     ExpectTooWide([] { return CheckedMul(std::numeric_limits<__int128>::min(), 1); });
+}
+
+// Overflow means past __int128 itself; the product is exact otherwise.
+TEST(ParallelDecimalTest, MulOverflow128AtTheBoundaries) {
+    struct Case {
+        __int128 a;
+        __int128 b;
+        bool overflow;
+        __int128 product;  // checked only without overflow
+    };
+    const __int128 two64 = static_cast<__int128>(1) << 64;
+    const __int128 two63 = static_cast<__int128>(1) << 63;
+    const __int128 two126 = static_cast<__int128>(1) << 126;
+    const std::vector<Case> cases = {
+        {0, 0, false, 0},
+        {0, kI128Max, false, 0},
+        {kI128Min, 0, false, 0},
+        {1, kI128Max, false, kI128Max},
+        {-1, kI128Max, false, -kI128Max},
+        {1, kI128Min, false, kI128Min},
+        {-1, kI128Min, true, 0},
+        // Both in int64: never past 2^126.
+        {kI64Min, kI64Min, false, two126},
+        {kI64Max, kI64Max, false, kI64Max * kI64Max},
+        {kI64Min, kI64Max, false, kI64Min * kI64Max},
+        {kI64Min, -1, false, two63},
+        // One past int64.
+        {kI64Max + 1, 2, false, two64},
+        {two64, two63 / 2, false, two126},
+        {two64, two63, true, 0},
+        {-two64, two63, false, kI128Min},
+        {two64, -two63, false, kI128Min},
+        {-two64, -two63, true, 0},
+        // Both past int64.
+        {two64, two64, true, 0},
+        {two64, -two64, true, 0},
+        {-two64, -two64, true, 0},
+        // Next to INT128_MIN and INT128_MAX.
+        {kI128Min + 1, -1, false, kI128Max},
+        {kI128Min + 1, 1, false, kI128Min + 1},
+        {kI128Min + 1, 2, true, 0},
+        {kI128Min, 2, true, 0},
+        {kI128Min, -2, true, 0},
+        {kI128Min, kI128Min, true, 0},
+        {kI128Max, kI128Max, true, 0},
+        {kI128Max, -1, false, -kI128Max},
+        {kI128Min / 2, 2, false, kI128Min},
+        {kI128Min / 2, -2, true, 0},
+        {two126, 2, true, 0},
+        {two126, -2, false, kI128Min},
+    };
+    for (const Case& c : cases) {
+        __int128 product = 0;
+        EXPECT_EQ(detail::MulOverflow128(c.a, c.b, &product), c.overflow) << Str(c.a) << " * " << Str(c.b);
+        if (!c.overflow) EXPECT_TRUE(product == c.product) << Str(c.a) << " * " << Str(c.b) << " = " << Str(product);
+        ExpectMulMatches(c.a, c.b);
+        ExpectMulMatches(c.b, c.a);
+    }
+
+    // The division bound is exact: the largest factor fits, one more overflows.
+    for (const __int128 b : {TenTo(19) + 1, two64 + 3, kI64Max + 2, TenTo(30) + 7}) {
+        const __int128 top = kI128Max / b;
+        const __int128 bottom = static_cast<__int128>((U128{1} << 127) / static_cast<U128>(b));
+        __int128 product = 0;
+        EXPECT_FALSE(detail::MulOverflow128(top, b, &product)) << Str(b);
+        EXPECT_TRUE(product == top * b);
+        EXPECT_TRUE(detail::MulOverflow128(top + 1, b, &product)) << Str(b);
+        EXPECT_FALSE(detail::MulOverflow128(-bottom, b, &product)) << Str(b);
+        EXPECT_TRUE(product == -bottom * b);
+        EXPECT_TRUE(detail::MulOverflow128(-bottom - 1, b, &product)) << Str(b);
+        for (const __int128 a : {top, top + 1, -bottom, -bottom - 1}) {
+            ExpectMulMatches(a, b);
+            ExpectMulMatches(b, -a);
+        }
+    }
+}
+
+// Random magnitudes of every bit length and sign, against the reference.
+TEST(ParallelDecimalTest, MulOverflow128MatchesReference) {
+    std::mt19937_64 rng(128);
+    std::uniform_int_distribution<int> bits(0, 127);
+    const auto random_value = [&] {
+        const U128 raw = (static_cast<U128>(rng()) << 64) | rng();
+        const int n = bits(rng);
+        const U128 magnitude = n == 0 ? 0 : raw >> (128 - n);
+        const auto v = static_cast<__int128>(magnitude);
+        return (rng() & 1) ? -v : v;
+    };
+    for (int i = 0; i < 200000; ++i) ExpectMulMatches(random_value(), random_value());
+}
+
+// Too wide past 10^38 - 1, on either path, either sign.
+TEST(ParallelDecimalTest, CheckedMulAtTheDecimalBound) {
+    const __int128 ones = MaxNumeric() / 9;  // 38 ones
+    EXPECT_TRUE(CheckedMul(ones, 9) == MaxNumeric());
+    EXPECT_TRUE(CheckedMul(-9, ones) == -MaxNumeric());
+    ExpectTooWide([&] { return CheckedMul(ones + 1, 9); });
+    ExpectTooWide([&] { return CheckedMul(9, -(ones + 1)); });
+
+    // Both past int64: (10^19 - 1)(10^19 + 1) = 10^38 - 1.
+    EXPECT_TRUE(CheckedMul(TenTo(19) - 1, TenTo(19) + 1) == MaxNumeric());
+    EXPECT_TRUE(CheckedMul(-(TenTo(19) - 1), TenTo(19) + 1) == -MaxNumeric());
+    ExpectTooWide([] { return CheckedMul(TenTo(19), TenTo(19)); });
+    ExpectTooWide([] { return CheckedMul(TenTo(19), -TenTo(19)); });
+
+    // Both in int64: at most 2^126, under 10^38.
+    EXPECT_TRUE(CheckedMul(kI64Min, kI64Min) == static_cast<__int128>(1) << 126);
+    EXPECT_TRUE(CheckedMul(kI64Min, kI64Max) == kI64Min * kI64Max);
+    EXPECT_TRUE(CheckedMul(0, kI128Min) == 0);
+
+    // Past __int128 itself.
+    ExpectTooWide([] { return CheckedMul(kI128Max, 2); });
+    ExpectTooWide([] { return CheckedMul(kI128Min, kI128Min); });
+    ExpectTooWide([] { return CheckedMul(-TenTo(20), -TenTo(20)); });
 }
 
 TEST(ParallelDecimalTest, MulFits64) {

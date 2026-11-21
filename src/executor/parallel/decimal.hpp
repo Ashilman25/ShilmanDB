@@ -1,6 +1,7 @@
 #pragma once
 #include <cassert>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -48,6 +49,21 @@ constexpr bool FitsDecimal(__int128 v) {
 // Throws DatabaseException("NUMERIC result is too wide"); kept out of line.
 [[noreturn]] void ThrowTooWide();
 
+// True when a * b passes __int128; out gets the product mod 2^128, like the builtin.
+// The 128-bit builtin needs compiler-rt, which libgcc builds can't link.
+constexpr bool MulOverflow128(__int128 a, __int128 b, __int128* out) {
+    using U128 = unsigned __int128;
+    *out = static_cast<__int128>(static_cast<U128>(a) * static_cast<U128>(b));
+    constexpr __int128 lo = std::numeric_limits<int64_t>::min();
+    constexpr __int128 hi = std::numeric_limits<int64_t>::max();
+    if (a >= lo && a <= hi && b >= lo && b <= hi) return false;  // |a * b| <= 2^126
+    const U128 ua = a < 0 ? U128{0} - static_cast<U128>(a) : static_cast<U128>(a);
+    const U128 ub = b < 0 ? U128{0} - static_cast<U128>(b) : static_cast<U128>(b);
+    // A negative product may reach 2^127, a positive one 2^127 - 1.
+    const U128 limit = (U128{1} << 127) - ((a < 0) == (b < 0) ? 1 : 0);
+    return ub != 0 && ua > limit / ub;
+}
+
 }  // namespace detail
 
 // The exact value of the shortest text that round-trips v (tries %.1g to %.<max_digits>g).
@@ -74,7 +90,7 @@ constexpr bool FitsDecimal(__int128 v) {
 // a * b; throws when the product passes 38 digits.
 [[nodiscard]] inline __int128 CheckedMul(__int128 a, __int128 b) {
     __int128 product;
-    if (__builtin_mul_overflow(a, b, &product) || !detail::FitsDecimal(product)) detail::ThrowTooWide();
+    if (detail::MulOverflow128(a, b, &product) || !detail::FitsDecimal(product)) detail::ThrowTooWide();
     return product;
 }
 

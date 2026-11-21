@@ -136,7 +136,7 @@ void Normalize(const Vector& v, const Selection& sel, uint32_t n, const KeyRule&
             for (uint32_t k = 0; k < n; ++k) {
                 const __int128 x = wide ? v.I128()[sel[k]] : v.I64()[sel[k]];
                 __int128 y = 0;
-                const bool fits = !__builtin_mul_overflow(x, factor, &y) && detail::FitsDecimal(y);
+                const bool fits = !detail::MulOverflow128(x, factor, &y) && detail::FitsDecimal(y);
                 out.i128[k] = fits ? y : 0;
                 out.valid[k] = fits ? 1 : 0;
                 out.all_valid = out.all_valid && fits;
