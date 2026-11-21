@@ -109,7 +109,8 @@ Database::Database(const std::string& db_file, size_t buffer_pool_size, Eviction
     }
 #endif
 
-    // Built before the file is opened, so a policy that can't be built creates nothing either
+    // Built before the file is opened,
+    // so a policy that can't be built creates nothing either
     auto policy = MakeEvictionPolicy(eviction, buffer_pool_size, eviction_model_path);
     disk_manager_ = std::make_unique<DiskManager>(db_file);
     bpm_ = std::make_unique<BufferPoolManager>(buffer_pool_size, disk_manager_.get(), std::move(policy));
@@ -189,7 +190,8 @@ QueryResult Database::ExecuteSQL(const std::string& sql, const QueryOptions& opt
     }
     executor->Close();
 
-    // Stats are final after Close, and the planner's node pointers are good while the plan lives.
+    // Stats are final after Close,
+    // and the planner's node pointers are good while the plan lives.
     QueryProfile profile;
     profile.join = planner.GetJoinOrderInfo();
     if (options.analyze) {

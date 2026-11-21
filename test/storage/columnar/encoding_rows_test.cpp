@@ -1508,7 +1508,8 @@ TEST(EncodingRowsTest, BatchedReadsInASmallPool) {
 }
 
 
-// Many workers on a small pool still read: their batches together keep to half the pool.
+// Many workers on a small pool still read:
+// their batches together keep to half the pool.
 TEST(EncodingRowsTest, BatchedReadsManyWorkersOnASmallPool) {
     constexpr size_t kFrames = 64;
     constexpr unsigned kWorkers = 48;  // one page each fits, two each would not

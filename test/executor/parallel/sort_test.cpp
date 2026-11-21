@@ -579,7 +579,8 @@ TEST_F(ParallelSortTest, DoubleTiesHaveATotalOrder) {
 }
 
 TEST_F(ParallelSortTest, NanKeysSortAfterNumbersInOneOrder) {
-    // A NaN key comes after every number in ASC (before in DESC), NaNs by their bits.
+    // A NaN key comes after every number in ASC (before in DESC),
+    // NaNs by their bits.
     // That's one order, so sort and top n agree in any worker split.
     const VType kDouble{Kind::DOUBLE, 0, false, TypeId::DECIMAL};
     const auto from_bits = [](uint64_t b) {

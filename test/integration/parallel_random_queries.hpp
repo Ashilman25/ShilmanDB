@@ -82,7 +82,7 @@ inline std::string DateText(int64_t z) {
     const int64_t d = doy - (153 * mp + 2) / 5 + 1;
     const int64_t m = mp < 10 ? mp + 3 : mp - 9;
     const int64_t y = yoe + era * 400 + (m <= 2 ? 1 : 0);
-    char buf[16];
+    char buf[64];  // room for three of the widest long longs, so nothing is cut
     std::snprintf(buf, sizeof(buf), "%04lld-%02lld-%02lld", static_cast<long long>(y), static_cast<long long>(m), static_cast<long long>(d));
     return buf;
 }
@@ -1036,9 +1036,11 @@ private:
 // One seed's three tables, drawn from rng right after it is seeded.
 // Every tenth seed of a shard has one table of two or three row groups,
 // so shards take about the same time; the rest keep to one group each.
-inline std::vector<TableData> SeedTables(Rng& rng, int seed) {
+// With every_seed_big, every seed gets such a table, so scans run several workers.
+inline std::vector<TableData> SeedTables(Rng& rng, int seed, bool every_seed_big = false) {
     const SharedShape shape = MakeShape(rng);
-    const int big = (seed - 1) / kSeedShards % 10 == 0 ? static_cast<int>(Pick(rng, 3)) : -1;
+    const bool has_big = every_seed_big || (seed - 1) / kSeedShards % 10 == 0;
+    const int big = has_big ? static_cast<int>(Pick(rng, 3)) : -1;
     const size_t big_groups = Chance(rng, 1.0 / 3) ? 3 : 2;
     std::vector<TableData> tables;
     for (int i = 0; i < 3; ++i) tables.push_back(MakeTable(rng, static_cast<char>('a' + i), shape, i == big ? big_groups : 1));

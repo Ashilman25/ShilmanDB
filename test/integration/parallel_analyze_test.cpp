@@ -272,8 +272,9 @@ const std::vector<std::pair<std::string, std::string>>& WideQueries() {
 
 }  // namespace
 
-// A LIMIT over a SORT runs as one top n. Its Sort reports the rows it hands up,
-// what tuple mode's Limit pulls from its Sort, so rows match there too.
+// A LIMIT over a SORT runs as one top n. Its Sort reports the rows
+// it hands up, what tuple mode's Limit pulls from its Sort,
+// so rows match there too.
 // The extra queries add a HAVING filter, a join's filter and a nested-loop join.
 TEST_F(ParallelAnalyzeTest, NamesAndRowsMatchTupleMode) {
     NeedTpch();
@@ -329,8 +330,8 @@ TEST_F(ParallelAnalyzeTest, SeveralThreadsOnFortyRowGroups) {
     }
 }
 
-// A LIMIT with no ORDER BY stops early. Workers read ahead of it and a scan
-// counts whole morsels, so rows below the limit may pass tuple mode's.
+// A LIMIT with no ORDER BY stops early. Workers read ahead of it,
+// and a scan counts whole morsels, so rows below the limit may pass tuple mode's.
 TEST_F(ParallelAnalyzeTest, EarlyLimitRowsAtLeastTupleMode) {
     Database& db = NeedWide();
     const std::string sql = "SELECT w_id, w_tag FROM wide40 WHERE w_amt > 100.00 LIMIT 50";

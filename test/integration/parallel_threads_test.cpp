@@ -108,7 +108,9 @@ void WriteSide(const std::string& path) {
 class ParallelThreadsTest : public ::testing::Test {
 protected:
     static std::unique_ptr<Database> db_;
+    static std::unique_ptr<Database> plain_db_;  // TPC-H without indexes
     static std::string file_;
+    static std::string plain_file_;
     static std::string data_dir_;
     static bool tpch_loaded_;
     static bool wide_loaded_;
@@ -116,12 +118,15 @@ protected:
     static void SetUpTestSuite() {
         const std::string pid = std::to_string(::getpid());
         file_ = (std::filesystem::temp_directory_path() / ("shilmandb_parallel_threads_test_" + pid + ".db")).string();
+        plain_file_ = (std::filesystem::temp_directory_path() / ("shilmandb_parallel_threads_plain_" + pid + ".db")).string();
         data_dir_ = FindDataDir();
     }
 
     static void TearDownTestSuite() {
         db_.reset();
+        plain_db_.reset();
         std::filesystem::remove(file_);
+        std::filesystem::remove(plain_file_);
     }
 
     // A small pool, so many workers evict each other's pages.
@@ -133,19 +138,35 @@ protected:
         return *db_;
     }
 
+    // TPC-H SF=0.01 into db, columnar, then the 8 indexes when asked, then stats.
+    static void LoadTpch(Database& db, bool indexes) {
+        LoadOptions options;
+        options.storage = StorageKind::COLUMNAR;
+        for (const auto& td : tpch::TableDescs()) db.LoadTable(td.name, td.schema, data_dir_ + td.tbl_file, options);
+        auto* catalog = db.GetCatalog();
+        if (indexes) {
+            for (const auto& idx : tpch::IndexDescs()) (void)catalog->CreateIndex(idx.index_name, idx.table_name, idx.column_name);
+        }
+        for (const auto& td : tpch::TableDescs()) catalog->UpdateTableStats(td.name);
+    }
+
     // TPC-H SF=0.01, columnar, with the 8 indexes; skips without the data.
     // The skip ends only this helper, so callers check IsSkipped() after it.
     void NeedTpch() {
         if (data_dir_.empty()) GTEST_SKIP() << "TPC-H SF=0.01 data not found. Run bench/tpch/generate_tpch_data.sh first.";
         if (tpch_loaded_) return;
-        Database& db = Db();
-        LoadOptions options;
-        options.storage = StorageKind::COLUMNAR;
-        for (const auto& td : tpch::TableDescs()) db.LoadTable(td.name, td.schema, data_dir_ + td.tbl_file, options);
-        auto* catalog = db.GetCatalog();
-        for (const auto& idx : tpch::IndexDescs()) (void)catalog->CreateIndex(idx.index_name, idx.table_name, idx.column_name);
-        for (const auto& td : tpch::TableDescs()) catalog->UpdateTableStats(td.name);
+        LoadTpch(Db(), true);
         tpch_loaded_ = true;
+    }
+
+    // TPC-H SF=0.01 without indexes, in its own database with the same small pool.
+    // Skips without the data, so callers check IsSkipped() after it.
+    void NeedPlainTpch() {
+        if (data_dir_.empty()) GTEST_SKIP() << "TPC-H SF=0.01 data not found. Run bench/tpch/generate_tpch_data.sh first.";
+        if (plain_db_) return;
+        std::filesystem::remove(plain_file_);
+        plain_db_ = std::make_unique<Database>(plain_file_, 512);
+        LoadTpch(*plain_db_, false);
     }
 
     // wide40 (40 row groups) and side70 (two row groups).
@@ -173,23 +194,26 @@ protected:
         wide_loaded_ = true;
     }
 
-    // Runs sql in the parallel executor on this many threads.
-    static QueryResult Run(const std::string& sql, unsigned threads) {
+    // Runs sql in db's parallel executor on this many threads.
+    static QueryResult Run(Database& db, const std::string& sql, unsigned threads) {
         QueryOptions options;
         options.mode = ExecutionMode::PARALLEL;
         options.threads = threads;
-        return Db().ExecuteSQL(sql, options);
+        return db.ExecuteSQL(sql, options);
     }
 
+    // Runs sql in the shared database's parallel executor on this many threads.
+    static QueryResult Run(const std::string& sql, unsigned threads) { return Run(Db(), sql, threads); }
+
     // Every query bit-identical at every thread count to its answer on one thread.
-    static void ExpectSameAtEveryCount(const std::string& tag, const std::string& sql) {
+    static void ExpectSameAtEveryCount(Database& db, const std::string& tag, const std::string& sql) {
         SCOPED_TRACE(tag);
-        const QueryResult one = Run(sql, 1);
+        const QueryResult one = Run(db, sql, 1);
         for (unsigned threads : kThreadCounts) {
             if (threads == 1) continue;
-            const QueryResult many = Run(sql, threads);
+            const QueryResult many = Run(db, sql, threads);
             EXPECT_TRUE(SameBits(many, one)) << threads << " threads: " << sql;
-            EXPECT_EQ(Db().LastParallelStats().threads, threads);
+            EXPECT_EQ(db.LastParallelStats().threads, threads);
         }
     }
 
@@ -216,7 +240,9 @@ protected:
 };
 
 std::unique_ptr<Database> ParallelThreadsTest::db_;
+std::unique_ptr<Database> ParallelThreadsTest::plain_db_;
 std::string ParallelThreadsTest::file_;
+std::string ParallelThreadsTest::plain_file_;
 std::string ParallelThreadsTest::data_dir_;
 bool ParallelThreadsTest::tpch_loaded_ = false;
 bool ParallelThreadsTest::wide_loaded_ = false;
@@ -280,15 +306,43 @@ std::string TextKey(const Row& row) {
     return key;
 }
 
+// The row's cells exactly, each decimal by its bits.
+std::string ExactKey(const Row& row) {
+    std::string key;
+    for (const Cell& c : row) {
+        if (c.decimal) {
+            char bits[sizeof(double)];
+            std::memcpy(bits, &c.number, sizeof(double));
+            key.append(bits, sizeof(double));
+        } else {
+            key += c.text;
+        }
+        key += '\x1f';
+    }
+    return key;
+}
+
 // Each row of got matches a different row of pool;
-// with all, nothing is left over.
+// with all, nothing is left over. Equal rows pair first,
+// so a near-equal row can't take the row another one equals.
 std::string Unmatched(const std::vector<Row>& got, const std::vector<Row>& pool, bool all) {
-    std::multimap<std::string, size_t> spare;
-    for (size_t i = 0; i < pool.size(); ++i) spare.emplace(TextKey(pool[i]), i);
+    std::multimap<std::string, size_t> equal;
+    for (size_t i = 0; i < pool.size(); ++i) equal.emplace(ExactKey(pool[i]), i);
+    std::vector<const Row*> rest;
     for (const Row& row : got) {
-        auto range = spare.equal_range(TextKey(row));
+        auto it = equal.find(ExactKey(row));
+        if (it == equal.end()) {
+            rest.push_back(&row);
+        } else {
+            equal.erase(it);
+        }
+    }
+    std::multimap<std::string, size_t> spare;
+    for (const auto& entry : equal) spare.emplace(TextKey(pool[entry.second]), entry.second);
+    for (const Row* row : rest) {
+        auto range = spare.equal_range(TextKey(*row));
         auto it = range.first;
-        while (it != range.second && !SameRow(row, pool[it->second])) ++it;
+        while (it != range.second && !SameRow(*row, pool[it->second])) ++it;
         if (it == range.second) return "a row with no match";
         spare.erase(it);
     }
@@ -398,7 +452,8 @@ void ParallelThreadsTest::RandomShard(int shard) {
     int exact = 0;
     for (int seed = 1 + shard; seed <= kRandomSeeds; seed += kRandomShards) {
         test::Rng rng = test::SeedRng(seed);
-        const std::vector<test::TableData> tables = test::SeedTables(rng, seed);
+        // Each seed gets a table of 2 or 3 row groups, so 4 threads use several workers.
+        const std::vector<test::TableData> tables = test::SeedTables(rng, seed, true);
         std::filesystem::remove(base + ".db");
         {
             Database db(base + ".db", 4096);
@@ -453,7 +508,15 @@ void ParallelThreadsTest::RandomShard(int shard) {
 TEST_F(ParallelThreadsTest, SameAnswersAtEveryThreadCount) {
     NeedTpch();
     if (IsSkipped()) return;
-    for (const auto& q : tpch::Queries()) ExpectSameAtEveryCount(q.tag, q.sql);
+    for (const auto& q : tpch::Queries()) ExpectSameAtEveryCount(Db(), q.tag, q.sql);
+}
+
+// Without indexes Q10 and Q14 plan seq scans, unlike on the indexed database.
+TEST_F(ParallelThreadsTest, SameAnswersAtEveryThreadCountWithoutIndexes) {
+    NeedPlainTpch();
+    if (IsSkipped()) return;
+    for (const auto& td : tpch::TableDescs()) ASSERT_TRUE(plain_db_->GetCatalog()->GetTableIndexes(td.name).empty()) << td.name;
+    for (const auto& q : tpch::Queries()) ExpectSameAtEveryCount(*plain_db_, q.tag, q.sql);
 }
 
 TEST_F(ParallelThreadsTest, SameAnswersOnFortyRowGroups) {
@@ -466,7 +529,7 @@ TEST_F(ParallelThreadsTest, SameAnswersOnFortyRowGroups) {
         {"many groups", "SELECT w_id, COUNT(*), SUM(w_amt) FROM wide40 WHERE w_id < 200000 GROUP BY w_id ORDER BY w_id DESC LIMIT 25"},
         {"top n", "SELECT w_id, w_amt, w_tag FROM wide40 WHERE w_amt > 999.00 ORDER BY w_amt DESC, w_id LIMIT 30"},
     };
-    for (const auto& [tag, sql] : queries) ExpectSameAtEveryCount(tag, sql);
+    for (const auto& [tag, sql] : queries) ExpectSameAtEveryCount(Db(), tag, sql);
 }
 
 TEST_F(ParallelThreadsTest, TinyTablesAtEighteenThreads) {

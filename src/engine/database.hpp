@@ -113,8 +113,8 @@ public:
     [[nodiscard]] BufferPoolManager* GetBufferPoolManager() const;
     [[nodiscard]] DiskManager* GetDiskManager() const;
 
-    // What the planner assumes a scan costs. Read from the disk manager on every call, so it
-    // follows the read penalty and direct I/O, unless an override is set.
+    // What the planner assumes a scan costs. Read from the disk manager on every call,
+    // so it follows the read penalty and direct I/O, unless an override is set.
     [[nodiscard]] ScanCosts GetScanCosts() const;
     void SetScanCosts(std::optional<ScanCosts> costs) { scan_costs_ = costs; }
 

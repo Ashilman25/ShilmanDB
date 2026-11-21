@@ -529,7 +529,8 @@ private:
     }
 
     // The pipeline being built gets its one source, charged to node.
-    // A node fused into the source (a filter, a limit) gets the rows it hands up.
+    // A node fused into the source (a filter, a limit)
+    // gets the rows it hands up.
     void SetSource(std::unique_ptr<Source> source, const PlanNode* node, const PlanNode* fused = nullptr) {
         assert(current_.pipeline.source == nullptr && "a pipeline has one source");
         current_.pipeline.source = source.get();

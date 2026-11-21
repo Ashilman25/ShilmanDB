@@ -674,8 +674,9 @@ TEST_F(ParallelHashJoinTest, SameSideEqualityIsSkippedAnIntendedDifference) {
 }
 
 TEST_F(ParallelHashJoinTest, SharedColumnNameKeysResolveByName) {
-    // Both tables have a column k. Binding ignores qualifiers, so ka.k and kb.k
-    // both bind to the left child's k; the key is found by name in each child.
+    // Both tables have a column k. Binding ignores qualifiers,
+    // so ka.k and kb.k both bind to the left child's k;
+    // the key is found by name in each child.
     Load("ka", Schema({Column("k", ColumnType::Integer()), Column("x", ColumnType::Integer())}), "1|5|\n2|5|\n3|6|\n");
     Load("kb", Schema({Column("k", ColumnType::Integer()), Column("y", ColumnType::Integer())}), "1|5|\n3|6|\n4|5|\n");
     struct Case {

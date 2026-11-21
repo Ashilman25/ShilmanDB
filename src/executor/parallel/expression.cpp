@@ -1841,7 +1841,8 @@ std::unique_ptr<CompiledExpr> CompiledExpr::Compile(const Expression& expr, cons
     return Compiler(in).Build(expr);
 }
 
-// A left-deep chain of AND nodes: each part runs only on rows the ones before passed.
+// A left-deep chain of AND nodes:
+// each part runs only on rows the ones before passed.
 std::unique_ptr<CompiledExpr> CompiledExpr::CompileAnd(const std::vector<const Expression*>& parts, const InputLayout& in) {
     if (parts.empty()) return nullptr;
     Compiler compiler(in);

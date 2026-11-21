@@ -39,7 +39,8 @@ constexpr unsigned kThreads[] = {1, 8};
 constexpr uint32_t kK = 0, kP = 1, kAmt = 2, kD = 3, kNote = 4, kTag = 5, kNul = 6;
 const char* const kTags[] = {"amber", "blue", "coral", "dune", "ember", "fern", "gold"};
 
-// k is the row number; p scatters it, so p's index order jumps between row groups.
+// k is the row number; p scatters it,
+// so p's index order jumps between row groups.
 uint32_t P(uint32_t r) {
     return static_cast<uint32_t>((static_cast<uint64_t>(r) * 7919u) % kRows);
 }
@@ -130,7 +131,8 @@ const FilterPlanNode* FilterAboveIndexScan(const PlanNode& root) {
     return nullptr;
 }
 
-// A negative entry cost makes any usable index win, so these tests always plan their index scan.
+// A negative entry cost makes any usable index win,
+// so these tests always plan their index scan.
 ColumnarScanCosts ForceIndex() { return ColumnarScanCosts{0.0, 0.0, -1.0, 0.0}; }
 
 // Data shared by the tests of one process, loaded on first use.

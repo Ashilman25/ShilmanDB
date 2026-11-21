@@ -336,7 +336,8 @@ TEST_F(ParallelBasicTest, IndexScanReadsTheIndexRange) {
     (void)db_->GetCatalog()->CreateIndex("t_a", "t", "a");
     (void)db_->GetCatalog()->CreateIndex("t_g", "t", "g");
     (void)db_->GetCatalog()->CreateIndex("t_d", "t", "d");
-    // A negative entry cost makes any usable index win, so every case plans its index scan.
+    // A negative entry cost makes any usable index win,
+    // so every case plans its index scan.
     db_->SetColumnarScanCosts(ColumnarScanCosts{0.0, 0.0, -1.0, 0.0});
     struct Case {
         std::string sql;

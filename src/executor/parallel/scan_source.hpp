@@ -56,7 +56,8 @@ struct IndexBounds {
 // Reads a columnar table one row group per morsel. Each conjunct decodes its column
 // for the rows still selected and narrows them; handed-up columns come last, for the
 // survivors only. A morsel's batches stay valid until its local starts the next one.
-// With index bounds, a morsel is a row group holding matches and starts from them alone.
+// With index bounds, a morsel is a row group holding matches,
+// and starts from them alone.
 class ScanSource : public Source {
 public:
     explicit ScanSource(ScanSpec spec);

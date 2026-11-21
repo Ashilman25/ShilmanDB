@@ -41,7 +41,8 @@ uint32_t K(uint32_t r) {
     return static_cast<uint32_t>((static_cast<uint64_t>(r) * 7919u) % kRows);
 }
 
-// A negative entry cost makes any usable index win; a positive one with no other cost loses.
+// A negative entry cost makes any usable index win;
+// a positive one with no other cost loses.
 ColumnarScanCosts ForceIndex() { return ColumnarScanCosts{0.0, 0.0, -1.0, 0.0}; }
 ColumnarScanCosts ForceSeq() { return ColumnarScanCosts{0.0, 0.0, 1.0, 0.0}; }
 
@@ -252,7 +253,8 @@ TEST_F(ColumnarScanCostTest, RowModesIgnoreColumnarCosts) {
         }
     }
     db.SetColumnarScanCosts(std::nullopt);
-    // The row store picks its index for a narrow range and a table scan for a wide one, as today.
+    // The row store picks its index for a narrow range
+    // and a table scan for a wide one, as today.
     EXPECT_TRUE(UsesIndex("SELECT rs_id FROM rs WHERE rs_k >= 10 AND rs_k <= 20"));
     EXPECT_FALSE(UsesIndex("SELECT rs_id FROM rs WHERE rs_k >= 10"));
 }
@@ -300,7 +302,8 @@ TEST_F(ColumnarScanCostTest, CostsFollowTheFormula) {
         return IndexSelector::EstimateScanCosts("cs", where.conjuncts, db.GetCatalog(), ScanCosts{}, &c, &read);
     };
 
-    // The zone maps keep group 1 alone; amt is read only for the rows the filter keeps.
+    // The zone maps keep group 1 alone;
+    // amt is read only for the rows the filter keeps.
     const double out = std::min<double>(kGroupRows, kRows * CostModel::EstimateSelectivity(where.conjuncts, stats));
     const ScanCostEstimate pages = price(ColumnarScanCosts{1.0, 0.0, 0.0, 0.0});
     EXPECT_NEAR(pages.seq, Pages(kId, {1}) + ExpectedPagesTouched(Pages(kAmt, {1}), out), 1e-9);
@@ -327,7 +330,8 @@ TEST_F(ColumnarScanCostTest, CostsFollowTheFormula) {
 }
 
 TEST_F(ColumnarScanCostTest, ReadColumnsComeFromTheStatement) {
-    // With these constants a 10% range on k picks the index only when few columns are read.
+    // With these constants a 10% range on k
+    // picks the index only when few columns are read.
     Database& db = Db();
     db.SetColumnarScanCosts(ColumnarScanCosts{0.0, 0.25, 0.0, 1.0});
     const std::string range = " WHERE k >= 100000 AND k <= 126213";
@@ -407,7 +411,8 @@ TEST_F(ColumnarScanCostTest, WideLiteralsStayAsAFilter) {
         EXPECT_EQ(FilterAboveIndexScan(*today), nullptr);
     }
 
-    // On a NUMERIC(15,2) column, literals of 15 digits or fewer are exact, so the index consumes them.
+    // On a NUMERIC(15,2) column, literals of 15 digits or fewer are exact,
+    // so the index consumes them.
     db.SetColumnarScanCosts(ForceIndex());
     const std::vector<Case> exact = {
         {"SELECT v_id FROM w19 WHERE n15 = 1999.25", {"1999"}, true},

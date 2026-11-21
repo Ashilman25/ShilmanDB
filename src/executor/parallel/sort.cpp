@@ -132,7 +132,8 @@ public:
 
 private:
     // True when row a comes before row b: keys first, then kept columns ascending.
-    // Keys compare as Value does, NaN last; the tie pass uses a total order on doubles.
+    // Keys compare as Value does, NaN last;
+    // the tie pass uses a total order on doubles.
     bool Before(const ColumnStore& keys, const ColumnStore& kept, uint32_t a, uint32_t b) const {
         for (size_t i = 0; i < keys.columns.size(); ++i) {
             const int c = CompareAt(keys.columns[i], key_types_[i], a, b);

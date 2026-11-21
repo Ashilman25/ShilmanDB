@@ -3,7 +3,8 @@
 // Any change to such a plan fails PlansMatchGolden.
 // After a plan change I mean to make, rewrite the golden with
 //   SHILMANDB_WRITE_GOLDEN=1 ./build-debug/test/plan_dump_test --gtest_filter=PlanDumpTest.PlansMatchGolden
-// and review its diff before keeping it.
+// and review its diff before keeping it. That run fails on purpose;
+// rerun without the variable to check the new golden.
 
 #include <gtest/gtest.h>
 #include <unistd.h>
@@ -267,6 +268,8 @@ TEST_F(PlanDumpTest, PlansMatchGolden) {
         out << text;
         ASSERT_TRUE(out.good()) << "could not write " << path;
         std::cout << "wrote " << path << "\n";
+        // A rewrite never passes, so a variable left set can't hide a changed plan.
+        ADD_FAILURE() << "golden rewritten; rerun without SHILMANDB_WRITE_GOLDEN";
     }
 
     ASSERT_TRUE(std::filesystem::exists(path)) << path << " is missing; write it with SHILMANDB_WRITE_GOLDEN=1";
