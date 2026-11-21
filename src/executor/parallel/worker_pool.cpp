@@ -1,19 +1,89 @@
 #include "executor/parallel/worker_pool.hpp"
 #include "common/exception.hpp"
+#include <sys/resource.h>
+#include <unistd.h>
+#include <algorithm>
+#include <climits>
+#include <cstddef>
+#include <memory>
 #include <string>
+#include <system_error>
 
 namespace shilmandb::parallel {
+
+namespace {
+
+constexpr size_t kUnlimitedStack = size_t{8} << 20;  // used when the stack limit is unlimited
+
+// The main thread's stack size: the soft limit, or 8 MiB when unlimited.
+// At least PTHREAD_STACK_MIN, rounded up to whole pages.
+size_t WorkerStackSize() {
+    size_t size = kUnlimitedStack;
+    rlimit limit{};
+    if (getrlimit(RLIMIT_STACK, &limit) == 0 && limit.rlim_cur != RLIM_INFINITY) size = static_cast<size_t>(limit.rlim_cur);
+    size = std::max(size, static_cast<size_t>(PTHREAD_STACK_MIN));
+    const long page_size = sysconf(_SC_PAGESIZE);
+    const size_t page = page_size > 0 ? static_cast<size_t>(page_size) : 4096;
+    return (size + page - 1) / page * page;
+}
+
+// Throws on a pthread error code, as std::thread does.
+void Check(int rc, const char* what) {
+    if (rc != 0) throw std::system_error(rc, std::generic_category(), what);
+}
+
+// Thread attributes asking for the worker stack size.
+class StackAttr {
+public:
+    StackAttr() {
+        Check(pthread_attr_init(&attr_), "pthread_attr_init");
+        const int rc = pthread_attr_setstacksize(&attr_, WorkerStackSize());
+        if (rc != 0) pthread_attr_destroy(&attr_);
+        Check(rc, "pthread_attr_setstacksize");
+    }
+    ~StackAttr() { pthread_attr_destroy(&attr_); }
+    StackAttr(const StackAttr&) = delete;
+    StackAttr& operator=(const StackAttr&) = delete;
+
+    [[nodiscard]] const pthread_attr_t* Get() const { return &attr_; }
+
+private:
+    pthread_attr_t attr_{};
+};
+
+// What a background thread needs to run its loop.
+struct ThreadStart {
+    WorkerPool* pool;
+    unsigned index;
+};
+
+}  // namespace
 
 // A thread that fails to start stops the ones already running.
 WorkerPool::WorkerPool(unsigned threads) {
     const unsigned background = threads > 1 ? threads - 1 : 0;
+    if (background == 0) return;
     threads_.reserve(background);
     try {
-        for (unsigned i = 0; i < background; ++i) threads_.emplace_back([this, i] { Loop(i + 1); });
+        const StackAttr attr;
+        for (unsigned i = 0; i < background; ++i) {
+            auto start = std::make_unique<ThreadStart>(ThreadStart{this, i + 1});
+            pthread_t thread{};
+            Check(pthread_create(&thread, attr.Get(), &WorkerPool::ThreadMain, start.get()), "pthread_create");
+            (void)start.release();      // the thread owns it now
+            threads_.push_back(thread);  // can't throw: reserved above
+        }
     } catch (...) {
         StopAll();
         throw;
     }
+}
+
+// Takes over its start record, then loops until the pool stops.
+void* WorkerPool::ThreadMain(void* arg) noexcept {
+    const std::unique_ptr<ThreadStart> start(static_cast<ThreadStart*>(arg));
+    start->pool->Loop(start->index);
+    return nullptr;
 }
 
 WorkerPool::~WorkerPool() {
@@ -27,9 +97,8 @@ void WorkerPool::StopAll() {
         stopping_ = true;
     }
     start_.notify_all();
-    for (std::thread& t : threads_) {
-        if (t.joinable()) t.join();
-    }
+    for (pthread_t thread : threads_) pthread_join(thread, nullptr);
+    threads_.clear();
 }
 
 // Background workers start under the lock, so they see everything set before Run.

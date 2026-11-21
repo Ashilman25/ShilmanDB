@@ -1,10 +1,10 @@
 #pragma once
+#include <pthread.h>
 #include <condition_variable>
 #include <cstdint>
 #include <exception>
 #include <functional>
 #include <mutex>
-#include <thread>
 #include <vector>
 
 namespace shilmandb::parallel {
@@ -12,10 +12,12 @@ namespace shilmandb::parallel {
 // Threads that wait between runs and work on one job at a time.
 // The calling thread is worker 0,
 // so a pool of n threads starts n - 1.
+// Each gets the main thread's stack size, so deep expressions don't crash them.
 // One caller at a time: Run is not reentrant.
 class WorkerPool {
 public:
     // Starts threads - 1 background threads (none for 0 or 1).
+    // Throws std::system_error when one can't start.
     explicit WorkerPool(unsigned threads);
 
     // Stops and joins every background thread.
@@ -34,6 +36,9 @@ public:
     void Run(unsigned workers, const std::function<void(unsigned)>& fn);
 
 private:
+    // A background thread's entry point; arg is its start record.
+    static void* ThreadMain(void* arg) noexcept;
+
     // A background thread's loop: wait for a run,
     // and take part if its index is in it.
     void Loop(unsigned index);
@@ -44,7 +49,7 @@ private:
     // Stops the threads started so far and joins them.
     void StopAll();
 
-    std::vector<std::thread> threads_;  // thread i is worker i + 1
+    std::vector<pthread_t> threads_;    // thread i is worker i + 1
     std::mutex mutex_;
     std::condition_variable start_;     // a new run, or stopping
     std::condition_variable finished_;  // the last background worker of a run returned

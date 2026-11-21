@@ -37,6 +37,9 @@ constexpr unsigned kThreadCounts[] = {1, 2, 4, 8, 18};
 constexpr int kRandomShards = 5;
 constexpr int kRandomSeeds = 100;
 constexpr int kRandomQueriesPerSeed = 8;
+constexpr size_t kDeepRows = 3 * 65536;  // three row groups, so three workers
+// Overflows a 512 KiB stack in Debug; fits 8 MiB with room, even under ASan.
+constexpr int kDeepTerms = 2000;
 
 const char* const kTags[] = {"amber", "blue", "coral", "dune", "ember", "fern", "gold"};
 
@@ -558,6 +561,35 @@ TEST_F(ParallelThreadsTest, DefaultThreadCountAnswers) {
     EXPECT_EQ(Db().LastParallelStats().threads, parallel::ResolveThreads(0));
     EXPECT_TRUE(SameBits(deflt, one));
     EXPECT_EQ(one.tuples.size(), 7u);
+}
+
+// A 2,000-level sum recurses that deep on each worker's stack, the pool's threads included.
+TEST_F(ParallelThreadsTest, DeepExpressionOnPoolThreads) {
+    const std::string path = file_ + "_deep3.tbl";
+    int32_t want = 0;
+    {
+        std::ofstream out(path, std::ios::binary);
+        for (size_t r = 0; r < kDeepRows; ++r) {
+            out << r << '|' << r % 50 << "|\n";
+            if (r % 50 == 1) ++want;
+        }
+    }
+    LoadOptions options;
+    options.storage = StorageKind::COLUMNAR;
+    Db().LoadTable("deep3", Schema({Column("d_a", ColumnType::BigInt()), Column("d_b", ColumnType::Integer())}), path, options);
+    std::filesystem::remove(path);
+
+    // d_b = 1 runs first, so the sum sees few rows but still recurses all the way.
+    std::string sum = "d_a";
+    for (int i = 1; i < kDeepTerms; ++i) sum += " + d_b";
+    const std::string sql = "SELECT COUNT(*) FROM deep3 WHERE d_b = 1 AND " + sum + " > 0";
+    const QueryResult one = Run(sql, 1);
+    const QueryResult many = Run(sql, 18);
+    EXPECT_EQ(Db().LastParallelStats().threads, 18u);
+    EXPECT_GE(Db().LastParallelStats().morsels, 3u) << "each row group is a morsel";
+    EXPECT_TRUE(SameBits(many, one));
+    ASSERT_EQ(one.tuples.size(), 1u);
+    EXPECT_EQ(one.tuples[0].GetValue(one.schema, 0).integer_, want);
 }
 
 TEST_F(ParallelThreadsTest, RandomQueriesAtFourThreads0) { RandomShard(0); }
