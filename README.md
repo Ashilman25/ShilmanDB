@@ -9,7 +9,7 @@ Numbers on this page are marked by how we know them: *measured* (we ran it), *fr
 
 ## Status
 
-**Today** ShilmanDB is a single-threaded row store, with an opt-in columnar file format (14a) that the same executor reads. It runs 8 of the 22 TPC-H queries (8 *measured*; TPC-H has 22, *from docs*), and it has been measured on one Mac at SF=1 against SQLite, DuckDB and Postgres, and at SF=10 against DuckDB and Postgres. Every layer is written here, from page I/O up: a buffer pool, B+tree indexes, a hand-written SQL parser, a cost-based planner, and an executor that runs one row at a time, with a vectorized path that runs scans, filters, projections and aggregates a batch of rows at a time.
+**Today** ShilmanDB's default is a single-threaded row store. It also has an opt-in columnar file format (14a) and, for columnar tables, a parallel vectorized executor (14b) beside the original one. It runs 8 of the 22 TPC-H queries (8 *measured*; TPC-H has 22, *from docs*), and it has been measured on one Mac at SF=1 against SQLite, DuckDB and Postgres, and at SF=10 against DuckDB and Postgres. Every layer is written here, from page I/O up: a buffer pool, B+tree indexes, a hand-written SQL parser, a cost-based planner, and an executor that runs one row at a time, with a vectorized path that runs scans, filters, projections and aggregates a batch of rows at a time. The parallel executor keeps each column as a typed vector from the scan to the result and spreads a query over every core.
 
 **What it is becoming (in progress; only a first slice of the app is built so far):**
 
@@ -21,7 +21,7 @@ Numbers on this page are marked by how we know them: *measured* (we ran it), *fr
 
 The bar and the ladder are goals, not stops. A step that misses them still finishes, and the gap is reported as it is. As I put it when I set them: *"if it doesnt hit the production bar that wont be a stop just get the best we can but yes the production bars are the goals"*.
 
-The speed goal past Postgres is DuckDB's class. DuckDB is a team's years of work, so that is the hardest bar this project has set, and today's engine is far from it (next section).
+The speed goal past Postgres is DuckDB's class. DuckDB is a team's years of work, so that is the hardest bar this project has set. Step 7's engine was far from it; the parallel executor (14b) is within 5× of it at SF=10 on these 8 TPC-H queries, on this Mac (next section).
 
 ## Where it stands
 
@@ -43,18 +43,32 @@ The headline compares ShilmanDB's headline config, `+vectorized` (8 indexes; fas
 
 † Includes Q1 at SF=10, a DRIFT result (below).
 
-In plain words:
+In plain words, for step 7's baseline (the row-at-a-time and vectorized executors, measured 2026-11-14):
 
-- **SQLite:** at SF=1 ShilmanDB is faster than SQLite on disk on all 8 queries, and faster than SQLite in memory on 5 of 8.
-- **Postgres:** ShilmanDB is slower on every query, at both sizes, so the goal of beating Postgres is not met yet. Single process against single process (`postgres_1worker`), it is faster only on Q1 at both sizes and on Q12 at SF=10.
-- **DuckDB:** ShilmanDB is about 99× slower at SF=1 and 233× at SF=10 (geometric means). Even DuckDB on one thread is 7.59-104× faster at SF=1.
-- **Q19** is the worst query against both: it joins `lineitem` and `part`, then tests a three-branch `OR` on every joined row.
-- **SF=10:** all three ShilmanDB configs ran, and every answer was checked against DuckDB and Postgres. † Q1 is a *DRIFT* result: its sums are off by up to 0.25 (2.24e-13 relative) because ShilmanDB adds decimals as doubles. Every other answer matches.
+- **SQLite:** at SF=1 `+vectorized` was faster than SQLite on disk on all 8 queries, and faster than SQLite in memory on 5 of 8.
+- **Postgres:** `+vectorized` was slower on every query, at both sizes. Single process against single process (`postgres_1worker`), it was faster only on Q1 at both sizes and on Q12 at SF=10. The parallel executor (14b, below) is faster than `postgres` on every query.
+- **DuckDB:** `+vectorized` was about 99× slower at SF=1 and 233× at SF=10 (geometric means). Even DuckDB on one thread was 7.59-104× faster at SF=1.
+- **Q19** was `+vectorized`'s worst query against both: it joined `lineitem` and `part`, then tested a three-branch `OR` on every joined row.
+- **SF=10:** all three ShilmanDB configs ran, and every answer was checked against DuckDB and Postgres. † Q1 was a *DRIFT* result: its sums were off by up to 0.25 (2.24e-13 relative) because those executors add decimals as doubles. Every other answer matched.
 
-**Why the gap to DuckDB** (*inferred* from how the engines are built, not profiled): DuckDB stores columns, compressed, and reads only the columns a query uses; its loops use the CPU's vector instructions; and it uses every core. ShilmanDB reads whole rows, on one thread, through a buffer pool. The steps meant to close it:
+**Since 14b** (the parallel executor on columnar tables, `columnar+parallel`, 18 threads, with the same 8 indexes as `+vectorized`; `duckdb` still has none; run on 2026-11-21 with SQLite, DuckDB and Postgres run again the same day; *measured*):
 
-- **14a (done, 2026-11-17):** a columnar file format, with exact decimal storage. It loads TPC-H SF=10 in 4.2 s and every answer still matches (*measured*), but queries aren't faster yet: today's executor rebuilds rows from the columns (*inferred*), so the speed has to come from 14b.
-- **14b:** a parallel vectorized executor, target SF=10.
+| `columnar+parallel` ÷ | SF=1, range | SF=1, geometric mean | SF=10, range | SF=10, geometric mean |
+|---|---:|---:|---:|---:|
+| `postgres` | 0.053-0.294 | 0.091 | 0.029-0.228 | 0.056 |
+| `duckdb` | 1.39-3.52 | 2.02 | 2.74-4.85 | 3.53 |
+| `sqlite_disk` | 0.0011-0.029 | 0.011 | did not run | |
+
+- **Postgres:** the parallel executor is faster on all 8 queries at both sizes; at SF=10 4.4-34× faster. Q14 is the closest.
+- **DuckDB:** at SF=10 it takes 2.74-4.85× DuckDB's time, inside the 10× goal set for this step on every query. Each ratio splits into speed per core (one thread against `duckdb_1thread`) and how much each engine gains from its cores. On Q1, Q3 and Q5 ShilmanDB gains more from its cores than DuckDB (7.94-11.65× from 1 to 18 threads, against 6.89-10.67×), so the gap there is speed per core (3.39-3.71× `duckdb_1thread`). On Q6, Q12, Q14 and Q19 scaling is a large part of it: ShilmanDB gains 1.88-5.14×, DuckDB 7.87-9.95×.
+- **Answers:** every answer matches SQLite at SF=1 and DuckDB and Postgres at SF=10, with no DRIFT: the parallel executor adds decimals exactly, so Q1's DRIFT is gone. The answers are the same at every thread count.
+
+Every 14b table, the thread sweep and the commands: [docs/benchmarks.md](docs/benchmarks.md#14b-the-parallel-executor).
+
+**Why the gap to DuckDB** (*inferred* from how the engines are built, not profiled): DuckDB stores columns, compressed, and reads only the columns a query uses; its loops use the CPU's vector instructions; and it uses every core. Step 7's ShilmanDB read whole rows, on one thread, through a buffer pool. The steps meant to close it:
+
+- **14a (done, 2026-11-17):** a columnar file format, with exact decimal storage. It loads TPC-H SF=10 in 4.2 s and every answer still matched (*measured*), but queries weren't faster under the original executors, which rebuild rows from the columns (*inferred*); the speed came from 14b.
+- **14b (built and measured, 2026-11-21):** a parallel vectorized executor for columnar tables, target SF=10. At SF=10 it beats Postgres on all 8 queries and takes 2.74-4.85× DuckDB's time (*measured*, above). The main limit on scaling past 6-8 threads is the buffer pool's one lock (*measured* waits; the cause *inferred*).
 - **14c:** out-of-core execution (joins, aggregates and sorts that spill to disk), target SF=100.
 
 **Main limits today:**
@@ -112,13 +126,13 @@ SQL string → lexer → parser (AST) → planner (physical plan) → executor (
 
 | Layer | Directory | What it does |
 |---|---|---|
-| Storage | `src/storage/` | 8 KB page I/O, slotted pages, heap files |
+| Storage | `src/storage/` | 8 KB page I/O, slotted pages, heap files; the columnar file format (`columnar/`) |
 | Buffer | `src/buffer/` | buffer pool with pin counts; LRU (default), CLOCK, LRU-2, ARC, LIRS and the learned policies |
 | Index | `src/index/` | B+tree with point lookups and range scans |
 | Catalog | `src/catalog/` | schemas, indexes and per-column statistics |
 | Parser | `src/parser/` | hand-written lexer and recursive-descent parser |
 | Planner | `src/planner/` | join order search, filtered row estimates, scan costs |
-| Executor | `src/executor/` | row-at-a-time operators, plus a vectorized path |
+| Executor | `src/executor/` | row-at-a-time operators, plus a vectorized path; the parallel vectorized executor for columnar tables (`parallel/`) |
 | Engine | `src/engine/` | the `Database` class: `ExecuteSQL()`, `LoadTable()` |
 
 More in [docs/architecture.md](docs/architecture.md).
@@ -141,7 +155,7 @@ bash bench/tpch/generate_tpch_data.sh 0.01
 cd build-debug && ctest -j 12 --output-on-failure && cd ..
 ```
 
-On a fresh copy of the repo, 929 of the 930 Debug tests pass and 1 skips (*measured*): `EvictionSimTest.V2ExportedWeightsMatchTorch`, which needs the exported V2 weights file, not checked in. The `SqliteComparisonTest` tests check each of the 8 queries' answers at SF=0.01 against fixed expected results.
+On a fresh copy of the repo, 1438 of the 1439 Debug tests pass and 1 skips (*measured* 2026-11-20): `EvictionSimTest.V2ExportedWeightsMatchTorch`, which needs the exported V2 weights file, not checked in. The `SqliteComparisonTest` tests check each of the 8 queries' answers at SF=0.01 against fixed expected results.
 
 **Release build with the bench tools.** Use this one for any timing.
 
@@ -153,7 +167,7 @@ cmake --build build
 cd build && ctest -j 12 --output-on-failure -E NextBeforeInitAsserts && cd ..
 ```
 
-On the fresh copy, 925 of the 926 pass and the same `V2ExportedWeightsMatchTorch` test skips (*measured*).
+On a fresh copy at release `v0.1.0`, 925 of the 926 passed and the same `V2ExportedWeightsMatchTorch` test skipped (*measured* then; not recounted on a fresh copy since 14a and 14b added tests).
 
 **Run the TPC-H queries.** `load_tpch` loads the data into a database file and builds the 8 indexes. Then it runs the 8 queries: one untimed warmup pass, then 5 timed runs of each. It has no flag for a single query; the query texts are in [bench/tpch/tpch_workload.hpp](bench/tpch/tpch_workload.hpp). It adds to an existing database file, so start from a fresh one.
 
@@ -174,7 +188,7 @@ python3 -m venv .venv
 .venv/bin/python -m pytest bench -q -W error
 ```
 
-On a fresh copy with only `requirements.txt` installed: 1,376 passed and 23 skipped, in 42 seconds (*measured*). Run it after the Release build: some tests drive the `build/bench/` tools and skip without them.
+On a fresh copy at release `v0.1.0` with only `requirements.txt` installed: 1,376 passed and 23 skipped, in 42 seconds (*measured* then; not recounted on a fresh copy since). Run it after the Release build: some tests drive the `build/bench/` tools and skip without them.
 
 The full benchmark against SQLite, DuckDB and Postgres is in [docs/benchmarks.md](docs/benchmarks.md#how-to-reproduce).
 
