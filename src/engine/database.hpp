@@ -10,6 +10,7 @@
 #include "executor/executor.hpp"
 #include "planner/planner.hpp"
 
+#include <chrono>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -22,6 +23,10 @@
 
 namespace shilmandb {
 
+namespace parallel {
+class WorkerPool;
+}
+
 struct LoadOptions {
     StorageKind storage{StorageKind::ROW};
     char delimiter{'|'};
@@ -32,8 +37,9 @@ struct LoadOptions {
 struct QueryOptions {
     ExecutionMode mode{ExecutionMode::TUPLE};
     std::optional<std::vector<int>> forced_join_order;  // plan the joins in exactly this order
-    bool analyze{false};                                // count rows and time every operator (tuple mode only)
+    bool analyze{false};                                // count rows and time every operator (tuple and parallel modes)
     bool use_learned_join{true};                        // use the learned join model if one is loaded
+    unsigned threads{0};                                // PARALLEL only: 0 = one per core, capped at 256
 };
 
 struct OperatorProfile {
@@ -55,6 +61,13 @@ struct QueryResult {
     Schema schema;
     std::vector<Tuple> tuples;
     QueryProfile profile;
+};
+
+// What the last parallel query used, for benchmark reports.
+struct ParallelQueryStats {
+    unsigned threads{1};                    // the resolved thread count
+    uint64_t morsels{0};                    // morsels started across all its pipelines
+    std::chrono::nanoseconds latch_wait{0}; // time workers waited for the buffer pool's latch
 };
 
 class Database {
@@ -88,6 +101,9 @@ public:
     // Parses and plans the query without running it, and returns how its joins were ordered.
     [[nodiscard]] JoinOrderInfo ExplainJoinOrder(const std::string& sql, const QueryOptions& options = {});
 
+    // Builds the planner ExecuteSQL and ExplainJoinOrder use for these options.
+    [[nodiscard]] Planner MakePlanner(const QueryOptions& options) const;
+
     void LoadTable(const std::string& table_name, const Schema& schema, const std::string& tbl_file_path, char delimiter = '|');
 
     // Loads into the row store or, committed to the file, as a columnar table.
@@ -97,16 +113,22 @@ public:
     [[nodiscard]] BufferPoolManager* GetBufferPoolManager() const;
     [[nodiscard]] DiskManager* GetDiskManager() const;
 
-    // What the planner assumes a scan costs. Read from the disk manager on every call, so it
-    // follows the read penalty and direct I/O, unless an override is set.
+    // What the planner assumes a scan costs. Read from the disk manager on every call,
+    // so it follows the read penalty and direct I/O, unless an override is set.
     [[nodiscard]] ScanCosts GetScanCosts() const;
     void SetScanCosts(std::optional<ScanCosts> costs) { scan_costs_ = costs; }
 
-private:
-    // A planner with the join model (if wanted and loaded) and any forced order set.
-    [[nodiscard]] Planner MakePlanner(const QueryOptions& options) const;
+    // What the parallel executor's planner assumes columnar scans cost: the defaults unless overridden.
+    // Negative values exist only to force a plan (tests and timing runs).
+    [[nodiscard]] ColumnarScanCosts GetColumnarScanCosts() const { return columnar_scan_costs_.value_or(ColumnarScanCosts{}); }
+    void SetColumnarScanCosts(std::optional<ColumnarScanCosts> costs) { columnar_scan_costs_ = costs; }
 
+    // Set when a parallel query finishes; an error keeps the last value.
+    [[nodiscard]] const ParallelQueryStats& LastParallelStats() const { return last_parallel_stats_; }
+
+private:
     std::optional<ScanCosts> scan_costs_;
+    std::optional<ColumnarScanCosts> columnar_scan_costs_;
     std::unique_ptr<DiskManager> disk_manager_;
     std::unique_ptr<BufferPoolManager> bpm_;
     std::unique_ptr<ColumnarFile> columnar_file_;
@@ -115,6 +137,11 @@ private:
 #ifdef SHILMANDB_HAS_LIBTORCH
     std::unique_ptr<LearnedJoinOptimizer> learned_join_optimizer_;
 #endif
+    ParallelQueryStats last_parallel_stats_;
+
+    // Last, so its threads are joined before anything they could touch goes away.
+    // Built on the first query wanting 2+ threads; rebuilt bigger when a query wants more.
+    std::unique_ptr<parallel::WorkerPool> worker_pool_;
 };
 
 }  // namespace shilmandb

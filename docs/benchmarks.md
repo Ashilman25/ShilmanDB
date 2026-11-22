@@ -2,7 +2,7 @@
 
 This page has ShilmanDB's query times against SQLite, DuckDB and Postgres. All four ran the same 8 TPC-H queries on one Mac on 2026-11-14. It covers how they were run, every time at SF=1 and SF=10, and how to run them again.
 
-The ShilmanDB measured here is today's engine: a single-threaded row store. These numbers are the starting point that later work on the engine is compared with. The engine's design is in [architecture.md](architecture.md).
+The ShilmanDB measured here is the engine as of 2026-11-14: a single-threaded row store. These numbers are the starting point that later work on the engine is compared with. The last section, "14b: the parallel executor", adds runs from 2026-11-21 of a second executor for columnar tables, with DuckDB and Postgres run again the same day. The engine's design is in [architecture.md](architecture.md).
 
 Numbers are marked by how we know them: *measured* (we ran it), *from docs* (copied from a spec or project notes) or *inferred* (worked out from other numbers). Every time and ratio in the result tables is *measured*: a time is the median of the measured runs, and a ratio divides two of those medians.
 
@@ -12,6 +12,7 @@ Numbers are marked by how we know them: *measured* (we ran it), *from docs* (cop
 - **Against Postgres:** `+vectorized` is slower than `postgres` (memory settings tuned for this machine, parallel workers on) on all 8 queries: 2.29-14.5× at SF=1 and 2.20-23.6× at SF=10. The goal of being faster than Postgres is not met yet. Against `postgres_1worker` (one process, like ShilmanDB), it is faster on Q1 at both sizes (0.92, 0.88) and on Q12 at SF=10 (0.85). *measured*
 - **Against DuckDB:** `+vectorized` is 24.1-385× slower than `duckdb` at SF=1 and 66.4-1,836× slower at SF=10. Even against `duckdb_1thread` it is 7.59-104× slower at SF=1 and 7.68-208× slower at SF=10. *measured*
 - **SF=10:** all three ShilmanDB configs ran at SF=10. Every answer was checked. Q1's sums come out up to 0.25 off because ShilmanDB adds decimals as doubles, so Q1 is a DRIFT result in all three configs (below). *measured*
+- **Since 14b (2026-11-21):** the parallel executor on columnar tables, at SF=10 with DuckDB and Postgres run the same day, is faster than `postgres` on all 8 queries (0.029-0.228 of its time) and 2.74-4.85× `duckdb` (geometric mean 3.53), with every answer PASS and no DRIFT. *measured* ([14b: the parallel executor](#14b-the-parallel-executor))
 
 **How to read a ratio:** ShilmanDB's time ÷ the other engine's time. Above 1 means ShilmanDB is slower; below 1 means it is faster.
 
@@ -243,14 +244,103 @@ The vectorized path runs scans, filters, projections and aggregates a batch of r
 
 These reasons are *inferred*, from how the engines are built. They were not profiled here.
 
-- **Against DuckDB:** DuckDB stores columns, compressed, and reads only the columns a query uses. It runs tight loops that use the CPU's vector instructions, and it uses every core. ShilmanDB reads whole rows, one thread, through a buffer pool. Cores are not the whole story: `duckdb_1thread` is still 7.59-104× faster than `+vectorized` at SF=1 (*measured*).
+- **Against DuckDB:** DuckDB stores columns, compressed, and reads only the columns a query uses. It runs tight loops that use the CPU's vector instructions, and it uses every core. Step 7's ShilmanDB read whole rows, on one thread, through a buffer pool. Cores are not the whole story: `duckdb_1thread` is still 7.59-104× faster than `+vectorized` at SF=1 (*measured*).
 - **Against Postgres:** Postgres's parallel workers make 6 of the 8 queries 2.27-3.48× faster, and Q6 and Q14 1.27× and 1.16× (*measured*, `postgres_1worker` ÷ `postgres` at SF=1). Single process against single process, `+vectorized` takes 0.92-5.59× Postgres's time at SF=1.
 - **Q19** is ShilmanDB's worst query against both engines. It joins `lineitem` and `part`, then checks a three-branch `OR` on every joined row. Its time also grows fastest with scale (16× from SF=1 to SF=10).
 
 The steps meant to close the gap:
 - **14a:** a columnar file format, with exact decimal storage.
-- **14b:** a parallel vectorized executor, target SF=10.
+- **14b:** a parallel vectorized executor, target SF=10 (built and measured: at SF=10 faster than `postgres` and 2.74-4.85× `duckdb` on all 8 queries; see the 14b section below).
 - **14c:** out-of-core execution, target SF=100.
+
+## 14b: the parallel executor
+
+14b adds a second executor to ShilmanDB, for columnar tables (the format 14a added). It keeps each column as a typed vector from the scan to the result, compiles filters into loops over those vectors, decodes a column only for the rows earlier filters kept, adds decimals exactly in 128-bit integers, and splits each table into row groups of 65,536 rows that worker threads take one at a time. Today's executors stay as they are.
+
+### What is run
+
+| Engine | Config | What it is | Indexes |
+|---|---|---|---|
+| ShilmanDB | `columnar+parallel` | the parallel executor on columnar tables, every core (18 threads here) | 8 |
+| ShilmanDB | `columnar+parallel_1thread` | the same on one thread | 8 |
+| ShilmanDB | `columnar+parallel_<N>thread` | the same on N threads (the sweep: 2, 4, 6, 12) | 8 |
+| ShilmanDB | `columnar+vectorized` | 14a's columnar tables under the vectorized executor, the control | 8 |
+
+The buffer pool is step 7's: 2,048 pages at SF=1 and 8,192 at SF=10. DuckDB and Postgres run the same day as ShilmanDB, with the configs and settings above. The bar for 14b, at SF=10: faster than `postgres` on 7 of the 8 queries, and at most 10× `duckdb` per query as the goal. Each ratio to DuckDB is split into two factors that multiply back to it: speed per core (`columnar+parallel_1thread` ÷ `duckdb_1thread`) and the two engines' 1-to-18-thread speedups. `bench/tpch/report_bar.py` computes the table from a run's CSVs.
+
+The parallel configs must PASS against every reference with no DRIFT. They add decimals exactly, so a DRIFT would mean inexact arithmetic.
+
+### 14b at SF=1
+
+Run on 2026-11-21 at `3aa1045`, every config in one run with SQLite, DuckDB and Postgres (`bench/results/parallel_sf1/`). Median ms of 5 timed runs after 1 warmup; `sqlite_disk` is the median of its 5 disk runs. P = `columnar+parallel` (18 threads), P1 = `columnar+parallel_1thread`. Every time and ratio is *measured*.
+
+| Query | P | P1 | `columnar+vectorized` | `+vectorized` | `sqlite_disk` | `duckdb` | `postgres` | P ÷ `duckdb` | P ÷ `postgres` | P ÷ `columnar+vectorized` |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Q1 | 14.87 | 148.74 | 623.0 | 642.6 | 2,032.3 | 4.77 | 269.7 | 3.12 | 0.055 | 0.024 |
+| Q3 | 11.53 | 59.64 | 878.8 | 485.5 | 706.9 | 6.35 | 107.8 | 1.81 | 0.107 | 0.013 |
+| Q5 | 14.56 | 114.61 | 1,537.4 | 879.0 | 879.1 | 8.99 | 194.0 | 1.62 | 0.075 | 0.0095 |
+| Q6 | 6.05 | 23.70 | 265.1 | 298.5 | 311.6 | 1.72 | 95.6 | 3.52 | 0.063 | 0.023 |
+| Q10 | 20.15 | 70.61 | 693.6 | 519.3 | 1,557.0 | 14.26 | 105.6 | 1.41 | 0.191 | 0.029 |
+| Q12 | 9.00 | 39.05 | 649.9 | 503.1 | 725.6 | 4.76 | 171.3 | 1.89 | 0.053 | 0.014 |
+| Q14 | 11.68 | 17.44 | 272.2 | 122.7 | 398.4 | 5.04 | 39.7 | 2.32 | 0.294 | 0.043 |
+| Q19 | 8.20 | 23.69 | 3,354.3 | 2,402.3 | 7,783.8 | 5.90 | 145.3 | 1.39 | 0.056 | 0.0024 |
+
+- **Answers:** 104 PASS and 8 SKIP against SQLite: 13 configs × 8 queries (9 ShilmanDB configs with the thread sweep, `duckdb`, `duckdb_1thread`, `postgres`, `postgres_1worker`); the 8 SKIP are the `sqlite_disk` reference itself. No DRIFT, no FAIL. The answer files are byte-identical at 1, 2, 4, 6, 12 and 18 threads (`cmp`).
+- **Against DuckDB and Postgres:** 1.39-3.52× `duckdb` (geometric mean 2.02) and 0.053-0.294 of `postgres` (0.091). Speed per core is 1.11-3.66 (`columnar+parallel_1thread` ÷ `duckdb_1thread`); 1 to 18 threads makes ShilmanDB 1.49-10.00× faster and DuckDB 2.75-8.53×.
+- **Against SQLite and the older ShilmanDB configs:** P takes 0.0011-0.029 of `sqlite_disk`'s time, 0.0034-0.095 of `+vectorized`'s and 0.0024-0.043 of `columnar+vectorized`'s (23-409× faster).
+- **A slower day:** this run's `baseline` and `+vectorized` took 0.99-1.07× the times in step 7's "Results at SF=1" above (`+vectorized` Q19 1.17×), and `duckdb` 1.03-1.16× (ratios *inferred*, across days). The bar compares engines from the same run, so its ratios don't carry that drift.
+
+### 14b at SF=10
+
+Run on 2026-11-21 at `3aa1045` (`bench/results/parallel_sf10/`), with `duckdb`, `duckdb_1thread`, `postgres` and `postgres_1worker` in the same run. Median ms of 5 timed runs after 1 warmup; the pool is 8,192 pages. The table is `bench/tpch/report_bar.py`'s `bar_sf10.csv`, rounded. Every time and ratio is *measured*.
+
+| Query | P | P1 | `duckdb` | `duckdb_1thread` | `postgres` | `postgres_1worker` | P ÷ `postgres` | P ÷ `duckdb` | speed per core | ShilmanDB speedup | DuckDB speedup |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Q1 | 128.1 | 1,492.4 | 37.7 | 401.9 | 4,407.2 | 8,511.9 | 0.029 | 3.40 | 3.71 | 11.65 | 10.67 |
+| Q3 | 93.8 | 744.8 | 31.9 | 219.6 | 2,008.0 | 5,026.9 | 0.047 | 2.94 | 3.39 | 7.94 | 6.89 |
+| Q5 | 144.3 | 1,503.1 | 52.6 | 437.9 | 2,805.9 | 7,476.5 | 0.051 | 2.74 | 3.43 | 10.41 | 8.32 |
+| Q6 | 56.8 | 245.3 | 11.7 | 116.4 | 1,246.2 | 3,259.3 | 0.046 | 4.85 | 2.11 | 4.32 | 9.95 |
+| Q10 | 157.3 | 905.9 | 46.0 | 331.3 | 2,016.0 | 4,466.2 | 0.078 | 3.42 | 2.73 | 5.76 | 7.20 |
+| Q12 | 78.0 | 400.8 | 25.3 | 217.4 | 2,295.1 | 6,067.0 | 0.034 | 3.08 | 1.84 | 5.14 | 8.59 |
+| Q14 | 109.0 | 204.9 | 23.5 | 200.2 | 478.4 | 726.1 | 0.228 | 4.64 | 1.02 | 1.88 | 8.53 |
+| Q19 | 78.7 | 248.0 | 21.2 | 167.0 | 1,469.0 | 3,863.4 | 0.054 | 3.71 | 1.48 | 3.15 | 7.87 |
+
+- **Faster than `postgres` on all 8 queries** (the bar asked for 7 of 8): 0.029-0.228 of its time (geometric mean 0.056), so 4.4-34× faster. The closest is Q14. Against `postgres_1worker` it's 0.013-0.150. On one thread, ShilmanDB is faster than `postgres` with its parallel workers on all 8 (0.17-0.54).
+- **At most 10× `duckdb` on all 8 queries** (the goal): 2.74-4.85× (geometric mean 3.53). Step 7's `+vectorized` was 66.4-1,836× at SF=10 (above).
+- **How to read a row:** the ratio to DuckDB is speed per core × (DuckDB's speedup ÷ ShilmanDB's). On Q6: 245.3 ÷ 116.4 = 2.11 per core, and DuckDB gains 9.95× from its cores against ShilmanDB's 4.32×, a factor of 2.30, so 2.11 × 2.30 = 4.85. On Q1, Q3 and Q5 ShilmanDB gains more from its cores than DuckDB (7.94-11.65× against 6.89-10.67×), so the gap there is speed per core (3.39-3.71); Q10 is mostly speed per core too (2.73). On Q6, Q12, Q14 and Q19 scaling is a large part: ShilmanDB gains 1.88-5.14× from 18 threads, DuckDB 7.87-9.95× (most of the gap on Q14 and Q19, about half on Q6 and Q12).
+- **What holds the scaling back** (*inferred*): the buffer pool has one lock, the main limit on scaling past 6-8 threads. At 18 threads waiting for it takes 7.4-37.3% of the worker threads' time (Q19 37.3%, Q6 25.3%, Q12 19.0% the highest; *measured*); Q14 also finds its index entries on one thread before the workers start. Q14 and Q19 are fastest at 6 threads (89.1 and 68.6 ms).
+- **Answers:** the 6 parallel configs (1, 2, 4, 6, 12 and 18 threads) PASS 48 of 48 against DuckDB and 48 of 48 against Postgres, with no DRIFT. Step 7's Q1 DRIFT is gone, because the parallel executor adds decimals exactly. `columnar+vectorized`, which still adds them as doubles, keeps Q1's DRIFT (max abs 0.25, max rel 2.24e-13), as in step 7. The parallel answer files are byte-identical at every thread count (`cmp`).
+- **Against the older executor:** P takes 0.0017-0.033 of `columnar+vectorized`'s time in the same run (31-582× faster).
+- **A slower day:** this run's `duckdb` took 1.07-1.17× its step 7 times at SF=10 and `postgres` 1.02-1.54× (ratios *inferred*, across days). Both sides of each bar ratio ran the same day.
+
+### Reproducing the 14b runs
+
+As run on 2026-11-21, after the build and data steps in "How to reproduce" below. The SF=10 run reads no SQLite and writes no `correctness.csv`; `compare_results.py` prints its answer checks.
+
+```bash
+bash bench/tpch/pg_baseline_server.sh start
+
+# SF=1: every config with SQLite, DuckDB and Postgres, then the bar table (bar_sf1.0.csv)
+.venv/bin/python bench/tpch/run_benchmarks.py --sf 1.0 \
+    --configs baseline,+vectorized,columnar+vectorized,columnar+parallel,columnar+parallel_1thread,sqlite_disk \
+    --parallel-threads 2,4,6,12 --duckdb --postgres --output-dir bench/results/parallel_sf1
+.venv/bin/python bench/tpch/report_bar.py --results-dir bench/results/parallel_sf1 --sf 1.0
+
+# SF=10: the columnar configs with DuckDB and Postgres, the answers against each, then the bar table (bar_sf10.csv)
+.venv/bin/python bench/tpch/run_benchmarks.py --sf 10 \
+    --configs columnar+vectorized,columnar+parallel,columnar+parallel_1thread \
+    --parallel-threads 2,4,6,12 --duckdb --postgres --skip-sqlite --skip-correctness \
+    --output-dir bench/results/parallel_sf10
+.venv/bin/python scripts/compare_results.py --sf 10 \
+    --shilmandb-dir bench/results/parallel_sf10/shilmandb_results \
+    --reference-dir bench/results/parallel_sf10/duckdb_results --reference-config duckdb --reference-name DuckDB
+.venv/bin/python scripts/compare_results.py --sf 10 \
+    --shilmandb-dir bench/results/parallel_sf10/shilmandb_results \
+    --reference-dir bench/results/parallel_sf10/postgres_results --reference-config postgres --reference-name Postgres
+.venv/bin/python bench/tpch/report_bar.py --results-dir bench/results/parallel_sf10 --sf 10
+
+bash bench/tpch/pg_baseline_server.sh stop
+```
 
 ## Load times
 

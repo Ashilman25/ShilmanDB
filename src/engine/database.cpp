@@ -4,6 +4,8 @@
 #include "planner/planner.hpp"
 #include "executor/executor_factory.hpp"
 #include "executor/executor_context.hpp"
+#include "executor/parallel/parallel_executor.hpp"
+#include "executor/parallel/worker_pool.hpp"
 #include "common/exception.hpp"
 #include "storage/columnar/bulk_loader.hpp"
 
@@ -11,6 +13,7 @@
 #include <chrono>
 #include <fstream>
 #include <sstream>
+#include <system_error>
 #include <utility>
 
 namespace shilmandb {
@@ -106,7 +109,8 @@ Database::Database(const std::string& db_file, size_t buffer_pool_size, Eviction
     }
 #endif
 
-    // Built before the file is opened, so a policy that can't be built creates nothing either
+    // Built before the file is opened,
+    // so a policy that can't be built creates nothing either
     auto policy = MakeEvictionPolicy(eviction, buffer_pool_size, eviction_model_path);
     disk_manager_ = std::make_unique<DiskManager>(db_file);
     bpm_ = std::make_unique<BufferPoolManager>(buffer_pool_size, disk_manager_.get(), std::move(policy));
@@ -145,6 +149,29 @@ QueryResult Database::ExecuteSQL(const std::string& sql, const QueryOptions& opt
     auto planner = MakePlanner(options);
     auto plan = planner.Plan(std::move(*stmt));
 
+    // The parallel executor runs columnar plans itself. Its analyze times are
+    // thread time summed over workers, so they may pass the query's wall time.
+    if (options.mode == ExecutionMode::PARALLEL) {
+        const unsigned threads = parallel::ResolveThreads(options.threads);
+        if (threads > 1 && (!worker_pool_ || worker_pool_->Size() < threads)) {
+            worker_pool_.reset();  // the old threads end before the new ones start
+            try {
+                worker_pool_ = std::make_unique<parallel::WorkerPool>(threads);
+            } catch (const std::system_error& e) {
+                throw DatabaseException("couldn't start " + std::to_string(threads - 1) + " worker threads: " + e.what());
+            }
+        }
+        OperatorStatsMap op_stats;
+        parallel::QueryContext ctx{bpm_.get(), catalog_.get(), threads, threads > 1 ? worker_pool_.get() : nullptr, options.analyze ? &op_stats : nullptr};
+        const auto latch_before = bpm_->GetLatchWaitTime();
+        std::vector<Tuple> tuples = parallel::RunParallelQuery(*plan, ctx);
+        last_parallel_stats_ = ParallelQueryStats{threads, ctx.morsels, std::max(std::chrono::nanoseconds{0}, bpm_->GetLatchWaitTime() - latch_before)};
+        QueryProfile profile;
+        profile.join = planner.GetJoinOrderInfo();
+        if (options.analyze) FillAnalyzeProfile(planner, plan.get(), op_stats, profile);
+        return QueryResult{std::move(plan->output_schema), std::move(tuples), std::move(profile)};
+    }
+
     // Declared before the executor so the profilers' pointers into it outlive them.
     OperatorStatsMap op_stats;
     ExecutorContext ctx{bpm_.get(), catalog_.get(), options.analyze ? &op_stats : nullptr};
@@ -163,7 +190,8 @@ QueryResult Database::ExecuteSQL(const std::string& sql, const QueryOptions& opt
     }
     executor->Close();
 
-    // Stats are final after Close, and the planner's node pointers are good while the plan lives.
+    // Stats are final after Close,
+    // and the planner's node pointers are good while the plan lives.
     QueryProfile profile;
     profile.join = planner.GetJoinOrderInfo();
     if (options.analyze) {
@@ -192,6 +220,8 @@ Planner Database::MakePlanner(const QueryOptions& options) const {
         planner.SetForcedJoinOrder(*options.forced_join_order);
     }
     planner.SetScanCosts(GetScanCosts());
+    planner.SetParallelPlanning(options.mode == ExecutionMode::PARALLEL);
+    if (options.mode == ExecutionMode::PARALLEL) planner.SetColumnarScanCosts(GetColumnarScanCosts());
     return planner;
 }
 

@@ -74,8 +74,9 @@ void DiskManager::ReadPage(page_id_t page_id, char* page_data) {
         }
     }
 
-    ++read_stats_.reads;
-    read_stats_.time += std::chrono::steady_clock::now() - start;
+    const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start);
+    read_count_.fetch_add(1, std::memory_order_relaxed);
+    read_nanos_.fetch_add(static_cast<uint64_t>(elapsed.count()), std::memory_order_relaxed);
 }
 
 void DiskManager::SetDirectIO(bool on) {

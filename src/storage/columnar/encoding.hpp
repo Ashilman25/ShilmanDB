@@ -1,6 +1,7 @@
 #pragma once
 #include "common/config.hpp"
 #include "storage/columnar/column_vector.hpp"
+#include "storage/columnar/string_arena.hpp"
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -81,6 +82,13 @@ public:
     virtual ~ChunkPages() = default;
     [[nodiscard]] virtual const char* Pin(uint32_t index) = 0;
     virtual void Unpin(uint32_t index) = 0;
+
+    // Before a walk: the page indexes it will pin, in order, one at a time.
+    // Lets a reader pin them in batches; ignoring it is fine.
+    virtual void Expect(const uint32_t* indexes, size_t n) {
+        (void)indexes;
+        (void)n;
+    }
 };
 
 // Appends all value_count values, holding at most one page at a time.
@@ -88,5 +96,23 @@ void DecodeChunk(const ChunkMeta& meta, ChunkPages& pages, ColumnVector& out);
 
 // Appends the value at one row of the chunk.
 void DecodeValue(const ChunkMeta& meta, ChunkPages& pages, uint32_t row, ColumnVector& out);
+
+// A few words for a physical kind, like "64-bit integers", for error messages.
+[[nodiscard]] const char* PhysicalKindWords(PhysicalKind kind);
+
+// Writes rows into out[0..n): rows lists ascending positions, or nullptr means rows 0..n-1.
+// Pins each page holding a row once. A NULL row or a wrong-kind type throws.
+void DecodeRows(const ChunkMeta& meta, ChunkPages& pages, const ColumnType& type, const uint32_t* rows, uint32_t n, int64_t* out);
+void DecodeRows(const ChunkMeta& meta, ChunkPages& pages, const ColumnType& type, const uint32_t* rows, uint32_t n, __int128* out);
+void DecodeRows(const ChunkMeta& meta, ChunkPages& pages, const ColumnType& type, const uint32_t* rows, uint32_t n, double* out);
+
+// Strings are copied into arena, so they stay valid after the pages are unpinned.
+void DecodeRows(const ChunkMeta& meta, ChunkPages& pages, const ColumnType& type, const uint32_t* rows, uint32_t n, StringRef* out, StringArena& arena);
+
+// The dictionary codes of the listed rows, for any DICTIONARY chunk.
+void DecodeCodes(const ChunkMeta& meta, ChunkPages& pages, const uint32_t* rows, uint32_t n, uint32_t* out);
+
+// Replaces out with every dictionary entry, copied into arena. DICTIONARY string chunks only.
+void DecodeDictionary(const ChunkMeta& meta, ChunkPages& pages, const ColumnType& type, std::vector<StringRef>& out, StringArena& arena);
 
 }  // namespace shilmandb

@@ -32,14 +32,42 @@ static std::vector<IndexDesc> BuildIndexDescs() {
 
 // ── Fixture: one database per storage, loaded once for the suite ────
 
-class SqliteComparisonTest : public ::testing::TestWithParam<StorageKind> {
+// A storage and the mode every query of the test runs in.
+struct StorageMode {
+    StorageKind storage;
+    ExecutionMode mode;
+};
+
+// Runs each query in one mode, so the bodies keep calling db_->ExecuteSQL(sql).
+class ModeDatabase {
+public:
+    ModeDatabase() = default;
+    ModeDatabase(Database* db, ExecutionMode mode) : db_(db), mode_(mode) {}
+
+    // The query in this test's mode; the parallel executor on one thread.
+    [[nodiscard]] QueryResult ExecuteSQL(const std::string& sql) const {
+        QueryOptions options;
+        options.mode = mode_;
+        options.threads = 1;
+        return db_->ExecuteSQL(sql, options);
+    }
+
+    // Lets db_->ExecuteSQL(sql) read as it did with a plain Database pointer.
+    const ModeDatabase* operator->() const { return this; }
+
+private:
+    Database* db_{nullptr};
+    ExecutionMode mode_{ExecutionMode::TUPLE};
+};
+
+class SqliteComparisonTest : public ::testing::TestWithParam<StorageMode> {
 protected:
     static std::unique_ptr<Database> row_db_;
     static std::unique_ptr<Database> columnar_db_;
     static std::string row_file_;
     static std::string columnar_file_;
     static std::string data_dir_;
-    Database* db_{nullptr};
+    ModeDatabase db_;
 
     // Try several candidate paths for the SF=0.01 data directory.
     // CTest runs from build/test/, so ../../bench/... is the typical relative path.
@@ -103,10 +131,10 @@ protected:
             GTEST_SKIP() << "TPC-H SF=0.01 data not found. "
                             "Run bench/tpch/generate_tpch_data.sh first.";
         }
-        const bool row = GetParam() == StorageKind::ROW;
+        const bool row = GetParam().storage == StorageKind::ROW;
         auto& slot = row ? row_db_ : columnar_db_;
-        if (!slot) slot = Load(row ? row_file_ : columnar_file_, data_dir_, GetParam());
-        db_ = slot.get();
+        if (!slot) slot = Load(row ? row_file_ : columnar_file_, data_dir_, GetParam().storage);
+        db_ = ModeDatabase(slot.get(), GetParam().mode);
     }
 };
 
@@ -116,16 +144,22 @@ std::string SqliteComparisonTest::row_file_;
 std::string SqliteComparisonTest::columnar_file_;
 std::string SqliteComparisonTest::data_dir_;
 
-// Names the storage in test output, so ctest shows /Row and /Columnar.
-static void PrintTo(StorageKind storage, std::ostream* os) {
-    *os << (storage == StorageKind::ROW ? "Row" : "Columnar");
+// Row, Columnar or Columnar_Parallel; the row store never runs in parallel mode.
+static std::string NameOf(const StorageMode& p) {
+    const std::string storage = p.storage == StorageKind::ROW ? "Row" : "Columnar";
+    return p.mode == ExecutionMode::PARALLEL ? storage + "_Parallel" : storage;
+}
+
+// Names the pair in test output, so ctest shows /Row, /Columnar and /Columnar_Parallel.
+static void PrintTo(const StorageMode& p, std::ostream* os) {
+    *os << NameOf(p);
 }
 
 INSTANTIATE_TEST_SUITE_P(Storage, SqliteComparisonTest,
-                         ::testing::Values(StorageKind::ROW, StorageKind::COLUMNAR),
-                         [](const ::testing::TestParamInfo<StorageKind>& info) {
-                             return std::string(info.param == StorageKind::ROW ? "Row" : "Columnar");
-                         });
+                         ::testing::Values(StorageMode{StorageKind::ROW, ExecutionMode::TUPLE},
+                                           StorageMode{StorageKind::COLUMNAR, ExecutionMode::TUPLE},
+                                           StorageMode{StorageKind::COLUMNAR, ExecutionMode::PARALLEL}),
+                         [](const ::testing::TestParamInfo<StorageMode>& info) { return NameOf(info.param); });
 
 // ── Q1: Pricing Summary ─────────────────────────────────────────────
 

@@ -12,6 +12,7 @@ bench/
 │   ├── page_owners.hpp          page → table or index map (load_tpch --dump-page-owners)
 │   ├── generate_tpch_data.sh    builds dbgen and writes bench/tpch_data/
 │   ├── run_benchmarks.py        the main runner (SQLite + every config)
+│   ├── report_bar.py            the bar table: parallel ShilmanDB against DuckDB and Postgres
 │   ├── run_sqlite_benchmarks.py SQLite timings and the answer key
 │   ├── run_duckdb_benchmarks.py DuckDB timings (same queries, file reused while its marker matches)
 │   ├── run_postgres_benchmarks.py  Postgres timings (own server on port 5434, 8 indexes, database reused while its marker matches)

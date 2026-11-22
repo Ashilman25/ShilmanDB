@@ -1,5 +1,6 @@
 #pragma once
 #include "common/config.hpp"
+#include <atomic>
 #include <cassert>
 #include <cstring>
 
@@ -16,9 +17,10 @@ public:
     [[nodiscard]] int GetPinCount() const { return pin_count_; }
     [[nodiscard]] bool IsDirty() const { return is_dirty_; }
 
-    // A columnar page read from disk is checksummed once, then marked verified
-    [[nodiscard]] bool IsVerified() const { return is_verified_; }
-    void MarkVerified() { is_verified_ = true; }
+    // A columnar page read from disk is checksummed once, then marked verified.
+    // Two threads may verify the same page at once, so the flag is atomic.
+    [[nodiscard]] bool IsVerified() const { return is_verified_.load(std::memory_order_acquire); }
+    void MarkVerified() { is_verified_.store(true, std::memory_order_release); }
 
     [[nodiscard]] page_id_t GetPageId() const { return page_id_; }
     void SetPageId(page_id_t id) { page_id_ = id; }
@@ -32,7 +34,7 @@ public:
         page_id_ = INVALID_PAGE_ID;
         pin_count_ = 0;
         is_dirty_ = false;
-        is_verified_ = false;
+        is_verified_.store(false, std::memory_order_relaxed);  // frames change hands under the latch
     }
 
     void ResetMemory() {
@@ -45,7 +47,7 @@ private:
     page_id_t page_id_{INVALID_PAGE_ID};
     int pin_count_{0};
     bool is_dirty_{false};
-    bool is_verified_{false};
+    std::atomic<bool> is_verified_{false};
 };
 
 }  // namespace shilmandb

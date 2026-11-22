@@ -54,8 +54,14 @@ public:
     // The file's real size in bytes, partial last page included
     [[nodiscard]] uint64_t GetFileBytes() const;
 
-    [[nodiscard]] ReadStats GetReadStats() const { return read_stats_; }
-    void ResetReadStats() { read_stats_ = {}; }
+    // Reads can come from several threads at once, so the counts are atomic
+    [[nodiscard]] ReadStats GetReadStats() const {
+        return {read_count_.load(std::memory_order_relaxed), std::chrono::nanoseconds(read_nanos_.load(std::memory_order_relaxed))};
+    }
+    void ResetReadStats() {
+        read_count_.store(0, std::memory_order_relaxed);
+        read_nanos_.store(0, std::memory_order_relaxed);
+    }
 
     // Makes every read take at least this long, to stand in for slower storage. Zero is off.
     void SetReadPenalty(std::chrono::microseconds penalty) { read_penalty_ = penalty; }
@@ -73,7 +79,8 @@ private:
     int fd_{-1};
     std::string file_name_;
     std::atomic<page_id_t> next_page_id_{0};
-    ReadStats read_stats_{};
+    std::atomic<uint64_t> read_count_{0};
+    std::atomic<uint64_t> read_nanos_{0};
     std::chrono::microseconds read_penalty_{0};
     bool direct_io_{false};
     WriteObserver* observer_{nullptr};

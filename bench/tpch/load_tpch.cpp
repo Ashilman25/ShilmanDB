@@ -1,6 +1,7 @@
 #include "engine/database.hpp"
 #include "buffer/eviction_policy_factory.hpp"
 #include "executor/executor.hpp"
+#include "executor/parallel/parallel_executor.hpp"
 #include "common/exception.hpp"
 #include "storage/columnar/bulk_loader.hpp"
 #include "tpch/page_owners.hpp"
@@ -44,6 +45,7 @@ struct Args {
     int warmup_runs{1};
     int timed_runs{5};
     ExecutionMode exec_mode{ExecutionMode::TUPLE};
+    unsigned threads{0};  // parallel mode only; 0 = one per core
     int64_t miss_penalty_us{0};
     bool direct_io{false};
     bool policy_timing{false};
@@ -70,7 +72,7 @@ static void PrintUsage(const char* prog) {
               << " [--enable-tracing <path> [--trace-collapse]] [--pool-size <N>] [--create-indexes <true|false>]"
               << " [--warmup <N>] [--runs <N>]"
               << " [--results-dir <path>]"
-              << " [--execution-mode <tuple|vectorized>]"
+              << " [--execution-mode <tuple|vectorized|parallel> [--threads <N>]]"
               << " [--miss-penalty-us <N>] [--direct-io] [--policy-timing] [--planner-read-us <X>]"
               << " [--workload <single|stream|lookup|mixed>] [--stream-length <N>] [--seed <S>] [--keep-load-pool]"
               << " [--dump-page-owners <path>]"
@@ -119,6 +121,7 @@ static Args ParseArgs(int argc, char* argv[]) {
     std::string eviction_version{"v2"};
     bool version_given = false;
     bool load_threads_given = false;
+    bool threads_given = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -166,10 +169,20 @@ static Args ParseArgs(int argc, char* argv[]) {
                 args.exec_mode = ExecutionMode::VECTORIZED;
             } else if (mode_str == "tuple") {
                 args.exec_mode = ExecutionMode::TUPLE;
+            } else if (mode_str == "parallel") {
+                args.exec_mode = ExecutionMode::PARALLEL;
             } else {
-                std::cerr << "Error: unknown --execution-mode '" << mode_str << "' (expected 'tuple' or 'vectorized')\n";
+                std::cerr << "Error: unknown --execution-mode '" << mode_str << "' (expected 'tuple', 'vectorized' or 'parallel')\n";
                 std::exit(1);
             }
+        } else if (arg == "--threads" && i + 1 < argc) {
+            const std::string val = argv[++i];
+            const auto threads = ParseUnsigned(val);
+            if (!threads || *threads > parallel::kMaxThreads) {
+                ExitWithError("--threads expects a whole number from 0 to " + std::to_string(parallel::kMaxThreads) + ", got '" + val + "'");
+            }
+            args.threads = static_cast<unsigned>(*threads);
+            threads_given = true;
         } else if (arg == "--miss-penalty-us" && i + 1 < argc) {
             std::string val = argv[++i];
             try {
@@ -305,6 +318,10 @@ static Args ParseArgs(int argc, char* argv[]) {
     const bool columnar = args.storage == StorageKind::COLUMNAR;
     if (load_threads_given && !columnar) ExitWithError("--load-threads needs --storage columnar");
     if (args.reuse_db && !columnar) ExitWithError("--reuse-db needs --storage columnar");
+    const bool parallel_mode = args.exec_mode == ExecutionMode::PARALLEL;
+    if (threads_given && !parallel_mode) ExitWithError("--threads needs --execution-mode parallel");
+    // The parallel executor reads only columnar tables, so every query would fail
+    if (parallel_mode && !columnar) ExitWithError("--execution-mode parallel needs --storage columnar");
     // Page owners walk heap pages, which a columnar table doesn't have
     if (!args.dump_page_owners.empty() && columnar) ExitWithError("--dump-page-owners needs --storage row");
     // The loader runs at most kMaxLoadThreads workers, so the count printed is the real one
@@ -350,6 +367,20 @@ static double ToMs(std::chrono::nanoseconds t) {
 }
 
 static const char* BoolText(bool b) { return b ? "true" : "false"; }
+
+// "tuple", "vectorized" or "parallel", as run_info.csv records it.
+static const char* ModeName(ExecutionMode mode) {
+    if (mode == ExecutionMode::PARALLEL) return "parallel";
+    return mode == ExecutionMode::VECTORIZED ? "vectorized" : "tuple";
+}
+
+// The mode and thread count every query of this run gets.
+static QueryOptions MakeQueryOptions(const Args& args) {
+    QueryOptions options;
+    options.mode = args.exec_mode;
+    options.threads = args.threads;
+    return options;
+}
 
 // A number with a fixed count of decimals.
 static std::string Fixed(double value, int decimals) {
@@ -442,8 +473,10 @@ static void WriteRunInfo(std::ostream& ofs, const Args& args, const RunInfo& inf
         << "miss_penalty_us," << args.miss_penalty_us << "\n"
         << "direct_io," << BoolText(args.direct_io) << "\n"
         << "eviction," << info.eviction << "\n"
-        << "execution_mode," << (args.exec_mode == ExecutionMode::VECTORIZED ? "vectorized" : "tuple") << "\n"
-        << "policy_timing," << BoolText(args.policy_timing) << "\n"
+        << "execution_mode," << ModeName(args.exec_mode) << "\n";
+    // The resolved count, as the database works it out for every query
+    if (args.exec_mode == ExecutionMode::PARALLEL) ofs << "threads," << parallel::ResolveThreads(args.threads) << "\n";
+    ofs << "policy_timing," << BoolText(args.policy_timing) << "\n"
         << "us_per_read,";
     if (reads.reads > 0) {
         const double read_us = std::chrono::duration<double, std::micro>(reads.time).count();
@@ -581,7 +614,7 @@ static const char* KindName(tpch::StreamItem::Kind kind) {
 }
 
 // Runs one item with fresh counts, the way each timed run of a single query starts.
-static ItemRun RunItem(Database& db, const tpch::StreamItem& item, ExecutionMode mode) {
+static ItemRun RunItem(Database& db, const tpch::StreamItem& item, const QueryOptions& options) {
     auto* bpm = db.GetBufferPoolManager();
     auto* disk = db.GetDiskManager();
     bpm->ResetStats();
@@ -591,7 +624,7 @@ static ItemRun RunItem(Database& db, const tpch::StreamItem& item, ExecutionMode
     auto& rec = run.record;
     rec.trace_start = bpm->GetTraceCount();
     const auto start = std::chrono::steady_clock::now();
-    auto result = db.ExecuteSQL(item.sql, mode);
+    auto result = db.ExecuteSQL(item.sql, options);
     rec.latency_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
     rec.trace_end = bpm->GetTraceCount();
 
@@ -640,9 +673,10 @@ static int RunWorkload(Database& db, const Args& args, const RunInfo& info) {
     const bool tracing = !args.trace_path.empty();
 
     // Gives nothing back if the item failed, after saying which one
+    const QueryOptions options = MakeQueryOptions(args);
     auto run_item = [&](size_t seq) -> std::optional<ItemRun> {
         try {
-            return RunItem(db, items[seq], args.exec_mode);
+            return RunItem(db, items[seq], options);
         } catch (const std::exception& e) {
             std::cerr << "Error: " << items[seq].tag << " seq " << seq << ": " << e.what() << "\n";
             return std::nullopt;
@@ -808,9 +842,10 @@ int main(int argc, char* argv[]) {
     auto args = ParseArgs(argc, argv);
 
     std::cout << "=== ShilmanDB TPC-H Loader (SF=" << args.sf << ") ===\n";
-    std::cout << "Execution mode: "
-              << (args.exec_mode == ExecutionMode::VECTORIZED ? "VECTORIZED" : "TUPLE")
-              << "\n";
+    std::string mode_name = ModeName(args.exec_mode);
+    std::transform(mode_name.begin(), mode_name.end(), mode_name.begin(), [](unsigned char ch) { return static_cast<char>(std::toupper(ch)); });
+    std::cout << "Execution mode: " << mode_name << "\n";
+    if (args.exec_mode == ExecutionMode::PARALLEL) std::cout << "Threads: " << parallel::ResolveThreads(args.threads) << "\n";
     std::cout << "Eviction policy: " << EvictionPolicyKindName(args.eviction) << "\n";
     const std::string eviction_name = RunInfoEvictionName(args.eviction);
 
@@ -1003,6 +1038,16 @@ int main(int argc, char* argv[]) {
         };
         std::vector<LatencyRecord> latencies;
 
+        // parallel_stats.csv rows, one per successful timed run in parallel mode
+        struct ParallelRecord {
+            std::string tag;
+            int run;
+            ParallelQueryStats stats;
+        };
+        std::vector<ParallelRecord> parallel_records;
+        const QueryOptions options = MakeQueryOptions(args);
+        const bool parallel_mode = args.exec_mode == ExecutionMode::PARALLEL;
+
         // One extra run per query with the policy timer on
         std::vector<PolicyRecord> policy_records;
 
@@ -1017,7 +1062,7 @@ int main(int argc, char* argv[]) {
             for (int w = 0; w < args.warmup_runs; ++w) {
                 for (const auto& q : queries) {
                     try {
-                        (void)db.ExecuteSQL(q.sql, args.exec_mode);
+                        (void)db.ExecuteSQL(q.sql, options);
                     } catch (const std::exception& e) {
                         std::cerr << "  warmup " << q.tag << " failed: " << e.what() << "\n";
                     }
@@ -1035,9 +1080,10 @@ int main(int argc, char* argv[]) {
                 disk->ResetReadStats();
                 auto start = std::chrono::steady_clock::now();
                 try {
-                    auto result = db.ExecuteSQL(q.sql, args.exec_mode);
+                    auto result = db.ExecuteSQL(q.sql, options);
                     auto elapsed = std::chrono::steady_clock::now() - start;
                     double ms = std::chrono::duration<double, std::milli>(elapsed).count();
+                    const ParallelQueryStats parallel_stats = db.LastParallelStats();
                     uint64_t hits = bpm->GetHitCount();
                     uint64_t misses = bpm->GetMissCount();
                     uint64_t visits = bpm->GetVisitCount();
@@ -1077,6 +1123,7 @@ int main(int argc, char* argv[]) {
 
                     latencies.push_back({q.tag, run, rows, ms, hits, misses, visits,
                                          read_stats.reads, read_ms});
+                    if (parallel_mode) parallel_records.push_back({q.tag, run, parallel_stats});
                 } catch (const std::exception& e) {
                     auto elapsed = std::chrono::steady_clock::now() - start;
                     double ms = std::chrono::duration<double, std::milli>(elapsed).count();
@@ -1091,7 +1138,7 @@ int main(int argc, char* argv[]) {
                 auto start = std::chrono::steady_clock::now();
 
                 try {
-                    auto result = db.ExecuteSQL(q.sql, args.exec_mode);
+                    auto result = db.ExecuteSQL(q.sql, options);
                     auto elapsed = std::chrono::steady_clock::now() - start;
                     double ms = std::chrono::duration<double, std::milli>(elapsed).count();
                     policy_records.push_back({q.tag, result.tuples.size(), ms, bpm->GetPolicyStats()});
@@ -1130,6 +1177,18 @@ int main(int argc, char* argv[]) {
             } else {
                 std::cerr << "Warning: could not open " << lat_path.string() << " for writing\n";
             }
+        }
+
+        // Threads, morsels and latch wait per timed run, beside latencies.csv
+        if (export_csv && parallel_mode && !parallel_records.empty()) {
+            const auto stats_path = fs::path(args.results_dir) / "parallel_stats.csv";
+            const bool stats_ok = WriteCsv(stats_path, "query,run,threads,morsels,latch_wait_ms", [&](std::ostream& ofs) {
+                for (const auto& rec : parallel_records) {
+                    ofs << rec.tag << "," << rec.run << "," << rec.stats.threads << "," << rec.stats.morsels << ","
+                        << Fixed(ToMs(rec.stats.latch_wait), 3) << "\n";
+                }
+            });
+            if (stats_ok) std::cout << "Parallel stats written to " << stats_path.string() << "\n";
         }
 
         // Settings and totals for this run

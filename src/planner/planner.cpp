@@ -4,12 +4,14 @@
 #include "planner/cost_model.hpp"
 #include "planner/expression_binder.hpp"
 #include "planner/column_usage.hpp"
+#include "planner/or_factoring.hpp"
 #include "common/exception.hpp"
 #include "types/value.hpp"
 #include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <numeric>
+#include <optional>
 #include <string>
 #include <unordered_set>
 
@@ -55,23 +57,29 @@ auto ResolveUnqualifiedColumn(const std::string& col_name, const std::vector<Tab
     return found;
 }
 
+// The first slot whose alias or table name is `name`, or -1.
+// The join cost formula reads qualifiers the same way.
+auto SlotNamed(const std::string& name, const std::vector<TableRef>& tables) -> int {
+    for (size_t i = 0; i < tables.size(); ++i) {
+        if ((tables[i].alias.has_value() && tables[i].alias.value() == name) || tables[i].table_name == name) {
+            return static_cast<int>(i);
+        }
+    }
+    return -1;
+}
+
+// The slot a column reads from, or -1 when unknown or ambiguous.
+auto SlotOf(const ColumnRef& col, const std::vector<TableRef>& tables, const std::vector<TableInfo*>& table_infos) -> int {
+    if (col.table_name.has_value()) return SlotNamed(col.table_name.value(), tables);
+    return ResolveUnqualifiedColumn(col.column_name, tables, table_infos);
+}
+
 void CollectTableIndices(const Expression* expr, const std::vector<TableRef>& tables, const std::vector<TableInfo*>& table_infos, std::unordered_set<int>& indices) {
     if (!expr) return;
 
     if (const auto* col = dynamic_cast<const ColumnRef*>(expr)) {
-        if (col->table_name.has_value()) {
-            const auto& name = col->table_name.value();
-
-            for (size_t i = 0; i < tables.size(); ++i) {
-                if ((tables[i].alias.has_value() && tables[i].alias.value() == name) || tables[i].table_name == name) {
-                    indices.insert(static_cast<int>(i));
-                    break;
-                }
-            }
-        } else {
-            int idx = ResolveUnqualifiedColumn(col->column_name, tables, table_infos);
-            if (idx >= 0) indices.insert(idx);
-        }
+        const int idx = SlotOf(*col, tables, table_infos);
+        if (idx >= 0) indices.insert(idx);
     } else if (const auto* bin = dynamic_cast<const BinaryOp*>(expr)) {
         CollectTableIndices(bin->left.get(), tables, table_infos, indices);
         CollectTableIndices(bin->right.get(), tables, table_infos, indices);
@@ -82,6 +90,156 @@ void CollectTableIndices(const Expression* expr, const std::vector<TableRef>& ta
     } else if (const auto* agg = dynamic_cast<const Aggregate*>(expr)) {
         CollectTableIndices(agg->arg.get(), tables, table_infos, indices);
     }
+}
+
+// True when col may not read its slot's table: it has no slot, or it's
+// qualified and its name isn't in that table alone (binding ignores qualifiers).
+bool IsUnplacedColumn(const ColumnRef& col, const std::vector<TableRef>& tables, const std::vector<TableInfo*>& table_infos) {
+    const int slot = SlotOf(col, tables, table_infos);
+    if (slot < 0) return true;
+    return col.table_name.has_value() && ResolveUnqualifiedColumn(col.column_name, tables, table_infos) != slot;
+}
+
+// True when some column in expr is unplaced (IsUnplacedColumn).
+bool HasUnplacedColumn(const Expression* expr, const std::vector<TableRef>& tables, const std::vector<TableInfo*>& table_infos) {
+    if (!expr) return false;
+    switch (expr->type) {
+        case ExprType::COLUMN_REF:
+            return IsUnplacedColumn(*static_cast<const ColumnRef*>(expr), tables, table_infos);
+        case ExprType::BINARY_OP: {
+            const auto* bin = static_cast<const BinaryOp*>(expr);
+            return HasUnplacedColumn(bin->left.get(), tables, table_infos) || HasUnplacedColumn(bin->right.get(), tables, table_infos);
+        }
+        case ExprType::UNARY_OP:
+            return HasUnplacedColumn(static_cast<const UnaryOp*>(expr)->operand.get(), tables, table_infos);
+        case ExprType::AGGREGATE:
+            return HasUnplacedColumn(static_cast<const Aggregate*>(expr)->arg.get(), tables, table_infos);
+        case ExprType::CASE: {
+            const auto* ce = static_cast<const CaseExpression*>(expr);
+            for (const auto& [cond, result] : ce->when_clauses) {
+                if (HasUnplacedColumn(cond.get(), tables, table_infos) || HasUnplacedColumn(result.get(), tables, table_infos)) return true;
+            }
+            return HasUnplacedColumn(ce->else_clause.get(), tables, table_infos);
+        }
+        case ExprType::LITERAL:
+        case ExprType::STAR:
+            return false;
+    }
+    return false;
+}
+
+// Per table slot, the columns the statement reads. A name that's unknown or ambiguous
+// counts every column of each slot that has it; a star counts every column.
+class StatementReads {
+public:
+    StatementReads(const std::vector<TableRef>& tables, const std::vector<TableInfo*>& table_infos) : tables_(tables), infos_(table_infos), read_(tables.size()) {
+        for (size_t i = 0; i < tables.size(); ++i) read_[i].assign(table_infos[i]->schema.GetColumnCount(), false);
+    }
+
+    void Add(const Expression* expr) {
+        if (!expr) return;
+        switch (expr->type) {
+            case ExprType::COLUMN_REF:
+                AddColumn(*static_cast<const ColumnRef*>(expr));
+                return;
+            case ExprType::LITERAL:
+                return;
+            case ExprType::BINARY_OP: {
+                const auto* bin = static_cast<const BinaryOp*>(expr);
+                Add(bin->left.get());
+                Add(bin->right.get());
+                return;
+            }
+            case ExprType::UNARY_OP:
+                Add(static_cast<const UnaryOp*>(expr)->operand.get());
+                return;
+            case ExprType::AGGREGATE: {
+                // COUNT(*) reads no column.
+                const auto* arg = static_cast<const Aggregate*>(expr)->arg.get();
+                if (arg != nullptr && arg->type != ExprType::STAR) Add(arg);
+                return;
+            }
+            case ExprType::STAR:
+                for (auto& slot : read_) slot.assign(slot.size(), true);
+                return;
+            case ExprType::CASE: {
+                const auto* ce = static_cast<const CaseExpression*>(expr);
+                for (const auto& [cond, result] : ce->when_clauses) {
+                    Add(cond.get());
+                    Add(result.get());
+                }
+                Add(ce->else_clause.get());
+                return;
+            }
+        }
+    }
+
+    // The column numbers slot i reads, in table order.
+    [[nodiscard]] std::vector<uint32_t> For(size_t slot) const {
+        std::vector<uint32_t> out;
+        for (uint32_t c = 0; c < read_[slot].size(); ++c) {
+            if (read_[slot][c]) out.push_back(c);
+        }
+        return out;
+    }
+
+private:
+    void AddColumn(const ColumnRef& col) {
+        const int slot = SlotOf(col, tables_, infos_);
+        if (slot >= 0) {
+            const auto& schema = infos_[static_cast<size_t>(slot)]->schema;
+            for (uint32_t c = 0; c < schema.GetColumnCount(); ++c) {
+                if (schema.GetColumn(c).name == col.column_name) {
+                    read_[static_cast<size_t>(slot)][c] = true;
+                    return;
+                }
+            }
+        }
+        for (size_t i = 0; i < infos_.size(); ++i) {
+            const auto& schema = infos_[i]->schema;
+            for (uint32_t c = 0; c < schema.GetColumnCount(); ++c) {
+                if (schema.GetColumn(c).name == col.column_name) {
+                    read_[i].assign(read_[i].size(), true);
+                    break;
+                }
+            }
+        }
+    }
+
+    const std::vector<TableRef>& tables_;
+    const std::vector<TableInfo*>& infos_;
+    std::vector<std::vector<bool>> read_;
+};
+
+// A name the cost formula maps back to this slot: alias first, then table name.
+auto QualifierFor(int slot, const std::vector<TableRef>& tables) -> std::optional<std::string> {
+    const auto& table = tables[static_cast<size_t>(slot)];
+    if (table.alias.has_value() && SlotNamed(table.alias.value(), tables) == slot) return table.alias;
+    if (SlotNamed(table.table_name, tables) == slot) return table.table_name;
+    return std::nullopt;
+}
+
+// A copy of `column = column` across two tables with both sides qualified, else nullptr.
+auto QualifiedJoinEquality(const Expression* expr, const std::vector<TableRef>& tables, const std::vector<TableInfo*>& table_infos) -> std::unique_ptr<Expression> {
+    const auto* bin = dynamic_cast<const BinaryOp*>(expr);
+    if (!bin || bin->op != BinaryOp::Op::EQ) return nullptr;
+    const auto* left = dynamic_cast<const ColumnRef*>(bin->left.get());
+    const auto* right = dynamic_cast<const ColumnRef*>(bin->right.get());
+    if (!left || !right) return nullptr;
+
+    const int left_slot = SlotOf(*left, tables, table_infos);
+    const int right_slot = SlotOf(*right, tables, table_infos);
+    if (left_slot < 0 || right_slot < 0 || left_slot == right_slot) return nullptr;
+
+    auto left_name = QualifierFor(left_slot, tables);
+    auto right_name = QualifierFor(right_slot, tables);
+    if (!left_name || !right_name) return nullptr;
+
+    auto copy = bin->Clone();
+    auto* eq = static_cast<BinaryOp*>(copy.get());
+    static_cast<ColumnRef*>(eq->left.get())->table_name = std::move(left_name);
+    static_cast<ColumnRef*>(eq->right.get())->table_name = std::move(right_name);
+    return copy;
 }
 
 auto CombinePredicates(std::vector<std::unique_ptr<Expression>>& preds) -> std::unique_ptr<Expression> {
@@ -542,11 +700,48 @@ auto Planner::Plan(SelectStatement stmt) -> std::unique_ptr<PlanNode> {
     }
     info.edges = explicit_edges;
 
+    // Parallel planning prices orders with copies of the ON conditions plus every WHERE join,
+    // qualified so the cost formula can place them. Off, it reads stmt.joins as before.
+    std::vector<JoinClause> cost_joins;
+    if (parallel_planning_) {
+        for (const auto& join : stmt.joins) {
+            JoinClause copy;
+            copy.join_type = join.join_type;
+            copy.right_table = join.right_table;
+            copy.on_condition = join.on_condition ? join.on_condition->Clone() : nullptr;
+            cost_joins.push_back(std::move(copy));
+        }
+    }
+
+    // Columnar scan prices need each table's read columns, taken before WHERE is split up.
+    const ColumnarScanCosts* columnar_costs = columnar_scan_costs_ ? &*columnar_scan_costs_ : nullptr;
+    std::vector<std::vector<uint32_t>> read_columns;
+    if (columnar_costs != nullptr) {
+        StatementReads reads(tables, table_infos);
+        for (const auto& item : stmt.select_list) reads.Add(item.expr.get());
+        reads.Add(stmt.where_clause.get());
+        for (const auto& join : stmt.joins) reads.Add(join.on_condition.get());
+        for (const auto& expr : stmt.group_by) reads.Add(expr.get());
+        reads.Add(stmt.having.get());
+        for (const auto& item : stmt.order_by) reads.Add(item.expr.get());
+        for (size_t i = 0; i < tables.size(); ++i) read_columns.push_back(reads.For(i));
+    }
+
     std::vector<std::vector<std::unique_ptr<Expression>>> table_predicates(tables.size());
     std::vector<std::unique_ptr<Expression>> residual_predicates;
 
     if (stmt.where_clause) {
         auto conjuncts = SplitConjuncts(std::move(stmt.where_clause));
+        // Parallel planning also pushes filters implied by an OR below the joins.
+        if (parallel_planning_) {
+            const auto tables_of = [&](const Expression& expr) {
+                std::unordered_set<int> refs;
+                CollectTableIndices(&expr, tables, table_infos, refs);
+                if (HasUnplacedColumn(&expr, tables, table_infos)) refs.insert(-1);  // never factored
+                return refs;
+            };
+            conjuncts = FactorOrConjuncts(std::move(conjuncts), tables_of);
+        }
 
         for (auto& conj : conjuncts) {
             std::unordered_set<int> refs;
@@ -555,11 +750,21 @@ auto Planner::Plan(SelectStatement stmt) -> std::unique_ptr<PlanNode> {
             if (refs.size() == 1) {
                 table_predicates[*refs.begin()].push_back(std::move(conj));
             } else {
-                if (refs.size() == 2) AddTableEdges(refs, info.edges);
+                if (refs.size() == 2) {
+                    AddTableEdges(refs, info.edges);
+                    if (parallel_planning_) {
+                        if (auto equality = QualifiedJoinEquality(conj.get(), tables, table_infos)) {
+                            JoinClause clause;
+                            clause.on_condition = std::move(equality);
+                            cost_joins.push_back(std::move(clause));
+                        }
+                    }
+                }
                 residual_predicates.push_back(std::move(conj));
             }
         }
     }
+    const std::vector<JoinClause>& order_joins = parallel_planning_ ? cost_joins : stmt.joins;
 
     std::sort(info.edges.begin(), info.edges.end());
     info.edges.erase(std::unique(info.edges.begin(), info.edges.end()), info.edges.end());
@@ -587,7 +792,8 @@ auto Planner::Plan(SelectStatement stmt) -> std::unique_ptr<PlanNode> {
         for (const auto& pred : table_predicates[i]) skip_hints.push_back(pred->Clone());
 
         std::vector<std::unique_ptr<Expression>> residual;
-        auto scan = IndexSelector::SelectScanStrategy(tables[i].table_name, table_infos[i]->schema, table_predicates[i], residual, catalog_, scan_costs_);
+        auto scan = IndexSelector::SelectScanStrategy(tables[i].table_name, table_infos[i]->schema, table_predicates[i], residual, catalog_, scan_costs_,
+                                                      columnar_costs, columnar_costs != nullptr ? &read_columns[i] : nullptr);
         // Only a table scan skips row groups; the filter built below still checks every row.
         if (scan->type == PlanNodeType::SEQ_SCAN) static_cast<SeqScanPlanNode*>(scan.get())->skip_conjuncts = std::move(skip_hints);
 
@@ -644,11 +850,11 @@ auto Planner::Plan(SelectStatement stmt) -> std::unique_ptr<PlanNode> {
                 info.model_order = learned_order;
 
                 if (!IsConnectedOrder(learned_order, explicit_edges)) {
-                    order = JoinOrderOptimizer::FindBestOrder(tables, stmt.joins, stats, info.edges);
+                    order = JoinOrderOptimizer::FindBestOrder(tables, order_joins, stats, info.edges);
                 } else {
-                    double learned_cost = JoinOrderOptimizer::EstimateCost(learned_order, tables, stmt.joins, stats);
-                    auto exhaustive_order = JoinOrderOptimizer::FindBestOrder(tables, stmt.joins, stats, info.edges);
-                    double exhaustive_cost = JoinOrderOptimizer::EstimateCost(exhaustive_order, tables, stmt.joins, stats);
+                    double learned_cost = JoinOrderOptimizer::EstimateCost(learned_order, tables, order_joins, stats);
+                    auto exhaustive_order = JoinOrderOptimizer::FindBestOrder(tables, order_joins, stats, info.edges);
+                    double exhaustive_cost = JoinOrderOptimizer::EstimateCost(exhaustive_order, tables, order_joins, stats);
 
                     if (learned_cost <= 1.5 * exhaustive_cost) {
                         order = std::move(learned_order);
@@ -658,18 +864,19 @@ auto Planner::Plan(SelectStatement stmt) -> std::unique_ptr<PlanNode> {
                     }
                 }
             } catch (const std::exception&) {
-                order = JoinOrderOptimizer::FindBestOrder(tables, stmt.joins, stats, info.edges);
+                order = JoinOrderOptimizer::FindBestOrder(tables, order_joins, stats, info.edges);
             }
 #endif
         } else {
             info.source = JoinOrderSource::CLASSICAL;
-            order = JoinOrderOptimizer::FindBestOrder(tables, stmt.joins, stats, info.edges);
+            order = JoinOrderOptimizer::FindBestOrder(tables, order_joins, stats, info.edges);
         }
 
         // Record the estimates now: the loop below moves the ON conditions out of stmt.joins.
         info.order = order;
-        info.est_step_rows = JoinOrderOptimizer::EstimateStepRows(order, tables, stmt.joins, stats);
+        info.est_step_rows = JoinOrderOptimizer::EstimateStepRows(order, tables, order_joins, stats);
         info.est_cost = std::accumulate(info.est_step_rows.begin(), info.est_step_rows.end(), 0.0);
+        assert(info.est_step_rows.size() == order.size() && "one row estimate per join step");
 
         current = std::move(scans[order[0]]);
         step_nodes_.push_back(current.get());
@@ -731,9 +938,16 @@ auto Planner::Plan(SelectStatement stmt) -> std::unique_ptr<PlanNode> {
             std::unique_ptr<PlanNode> join_node;
             auto post_filter = CombinePredicates(post_filter_preds);
 
+            // The estimates for both sides, so an executor can pick its build side.
+            const double est_left = info.est_step_rows[k - 1];
+            const double est_right = info.est_scan_rows[static_cast<size_t>(new_idx)];
+
             if (equi_pred) {
                 auto schema_for_join = join_schema;
-                join_node = std::make_unique<HashJoinPlanNode>(std::move(join_schema), std::move(equi_pred));
+                auto hash_join = std::make_unique<HashJoinPlanNode>(std::move(join_schema), std::move(equi_pred));
+                hash_join->est_left_rows = est_left;
+                hash_join->est_right_rows = est_right;
+                join_node = std::move(hash_join);
                 join_node->children.push_back(std::move(current));
                 join_node->children.push_back(std::move(scans[new_idx]));
                 if (post_filter) {
@@ -744,7 +958,10 @@ auto Planner::Plan(SelectStatement stmt) -> std::unique_ptr<PlanNode> {
                     current = std::move(join_node);
                 }
             } else {
-                join_node = std::make_unique<NestedLoopJoinPlanNode>(std::move(join_schema), std::move(post_filter));
+                auto loop_join = std::make_unique<NestedLoopJoinPlanNode>(std::move(join_schema), std::move(post_filter));
+                loop_join->est_left_rows = est_left;
+                loop_join->est_right_rows = est_right;
+                join_node = std::move(loop_join);
                 join_node->children.push_back(std::move(current));
                 join_node->children.push_back(std::move(scans[new_idx]));
                 current = std::move(join_node);
