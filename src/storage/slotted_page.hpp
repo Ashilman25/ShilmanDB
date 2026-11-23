@@ -26,6 +26,9 @@ static_assert(sizeof(SlotEntry)  == 4, "SlotEntry must be exactly 4 bytes");
 
 class SlottedPage {
 public:
+    // The biggest row an empty page holds: the page minus its header and one slot
+    static constexpr uint16_t kMaxTupleLength = PAGE_SIZE - sizeof(PageHeader) - sizeof(SlotEntry);
+
     static void Init(char* page_data, page_id_t page_id);
 
     static PageHeader* GetHeader(char* page_data);
@@ -44,5 +47,7 @@ private:
     static const SlotEntry* GetSlotEntry(const char* page_data, uint16_t slot_id);
     static uint16_t FindTupleDataStart(const char* page_data, uint16_t num_slots);
 };
+
+static_assert(SlottedPage::kMaxTupleLength == PAGE_SIZE - PAGE_HEADER_SIZE - SLOT_ENTRY_SIZE, "the biggest row must fill an empty page exactly and fit a uint16_t");
 
 }  // namespace shilmandb

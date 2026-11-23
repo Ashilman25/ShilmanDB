@@ -1,6 +1,8 @@
 #include "storage/table_heap.hpp"
 #include "storage/slotted_page.hpp"
+#include "common/exception.hpp"
 #include <cassert>
+#include <string>
 
 namespace shilmandb {
 
@@ -22,8 +24,9 @@ page_id_t TableHeap::GetFirstPageId() const { return first_page_id_; }
 
 
 RID TableHeap::InsertTuple(const Tuple& tuple) {
-    if (tuple.GetLength() > static_cast<uint32_t>(UINT16_MAX)) {
-        return RID{INVALID_PAGE_ID, 0};
+    // a row that can't fit an empty page would allocate pages forever
+    if (tuple.GetLength() > SlottedPage::kMaxTupleLength) {
+        throw DatabaseException("row of " + std::to_string(tuple.GetLength()) + " bytes is bigger than a page (" + std::to_string(SlottedPage::kMaxTupleLength) + " bytes); use columnar storage for big values");
     }
 
     auto tuple_len = static_cast<uint16_t>(tuple.GetLength());

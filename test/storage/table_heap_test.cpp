@@ -6,10 +6,17 @@
 #include "buffer/buffer_pool_manager.hpp"
 #include "buffer/lru_eviction_policy.hpp"
 #include "catalog/schema.hpp"
+#include "common/exception.hpp"
 #include "types/value.hpp"
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <filesystem>
+#include <future>
 #include <memory>
 #include <set>
+#include <system_error>
+#include <thread>
 #include <vector>
 
 namespace shilmandb {
@@ -51,6 +58,39 @@ protected:
         return Tuple(
             {Value(id), Value(std::string("row_") + std::to_string(id))},
             schema);
+    }
+
+    // A one-VARCHAR row of exactly n bytes
+    static Tuple BigRow(uint32_t n, const Schema& schema) {
+        const uint32_t overhead = Tuple({Value(std::string())}, schema).GetLength();
+        return Tuple({Value(std::string(n - overhead, 'x'))}, schema);
+    }
+
+    // Inserts on its own thread; a hung insert ends the process instead of hanging the run.
+    // The pool checks its owner thread; SetConcurrent(false) hands ownership over and back.
+    RID InsertOrExit(BufferPoolManager* bpm, TableHeap& heap, const Tuple& tuple) {
+        std::promise<RID> done;
+        auto result = done.get_future();
+        std::thread worker([&] {
+            try {
+                bpm->SetConcurrent(false);
+                done.set_value(heap.InsertTuple(tuple));
+            } catch (...) {
+                done.set_exception(std::current_exception());
+            }
+        });
+        if (result.wait_for(std::chrono::seconds(10)) != std::future_status::ready) {
+            std::fprintf(stderr, "FAILED: inserting a row of %u bytes still running after 10 s\n",
+                         tuple.GetLength());
+            std::fflush(stdout);
+            std::fflush(stderr);
+            std::error_code ec;
+            std::filesystem::remove(test_file_, ec);  // the loop keeps growing it
+            std::_Exit(1);
+        }
+        worker.join();
+        bpm->SetConcurrent(false);
+        return result.get();
     }
 };
 
@@ -162,6 +202,40 @@ TEST_F(TableHeapTest, GetTupleByRID) {
 
     EXPECT_EQ(out.GetValue(schema, 0), Value(static_cast<int32_t>(42)));
     EXPECT_EQ(out.GetValue(schema, 1), Value(std::string("row_42")));
+}
+
+// ---------------------------------------------------------------------------
+// A row must fit one empty page; a bigger one is refused, never looped on
+// ---------------------------------------------------------------------------
+TEST_F(TableHeapTest, RowBiggerThanAPageIsRefused) {
+    auto [dm, bpm] = MakeBPM(64);
+    Schema schema({Column("text", TypeId::VARCHAR)});
+    TableHeap heap(bpm.get());
+
+    // A row of exactly a page's room fits and reads back
+    const Tuple fits = BigRow(SlottedPage::kMaxTupleLength, schema);
+    ASSERT_EQ(fits.GetLength(), SlottedPage::kMaxTupleLength);
+    const RID rid = InsertOrExit(bpm.get(), heap, fits);
+    ASSERT_NE(rid.page_id, INVALID_PAGE_ID);
+    Tuple out;
+    ASSERT_TRUE(heap.GetTuple(rid, &out, schema));
+    EXPECT_EQ(out.GetValue(schema, 0), fits.GetValue(schema, 0));
+
+    const auto pages_before = dm->GetNumPages();
+    const std::string room = std::to_string(SlottedPage::kMaxTupleLength);
+    for (uint32_t n : {static_cast<uint32_t>(SlottedPage::kMaxTupleLength) + 1, 9000u}) {
+        const Tuple big = BigRow(n, schema);
+        ASSERT_EQ(big.GetLength(), n);
+        try {
+            (void)InsertOrExit(bpm.get(), heap, big);
+            ADD_FAILURE() << "a row of " << n << " bytes was inserted";
+        } catch (const DatabaseException& e) {
+            EXPECT_EQ(std::string(e.what()),
+                      "row of " + std::to_string(n) + " bytes is bigger than a page (" + room +
+                          " bytes); use columnar storage for big values");
+        }
+    }
+    EXPECT_EQ(dm->GetNumPages(), pages_before);  // refused before any page was added
 }
 
 // ---------------------------------------------------------------------------
