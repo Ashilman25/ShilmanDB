@@ -18,6 +18,12 @@ namespace {
 constexpr size_t kCatalogSlice = PAGE_SIZE - kPageHeaderSize;  // blob bytes per catalog page
 constexpr const char* kNotOurs = "not a ShilmanDB file, or an older format; reload it";
 
+// The format creates and commits write; 0 means kFormatVersion. Only tests change it.
+uint32_t test_write_format = 0;
+
+// The format version the next create or commit writes.
+uint32_t WriteFormat() { return test_write_format != 0 ? test_write_format : kFormatVersion; }
+
 // What the open refuses with, so a half-created file can be created again instead.
 class Refusal : public DatabaseException {
 public:
@@ -70,6 +76,7 @@ void ColumnarFile::Create() {
     std::vector<char> page(PAGE_SIZE);
     for (page_id_t slot = 0; slot < kHeaderPages; ++slot) {
         Superblock sb;
+        sb.format_version = WriteFormat();
         sb.generation = slot == 0 ? 1 : 0;
         EncodeSuperblock(sb, slot, page.data());
         disk_->WritePage(slot, page.data());
@@ -95,7 +102,7 @@ void ColumnarFile::Open() {
     const bool all_zero = std::all_of(header.begin(), header.end(), [](char c) { return c == 0; });
     if (bytes < PAGE_SIZE && !all_zero) Refuse(kNotOurs);
 
-    // Another version in either slot refuses, so I never cut pages a newer build committed
+    // An unreadable version in either slot refuses, so I never cut a newer build's pages
     std::optional<uint32_t> other;
     for (const SlotRead& s : slots) {
         if (s.state == SlotState::OTHER_VERSION) {
@@ -105,7 +112,7 @@ void ColumnarFile::Open() {
     if (other) {
         const std::string theirs = std::to_string(*other);
         const std::string ours = std::to_string(kFormatVersion);
-        if (*other < kFormatVersion) {
+        if (*other < kOldestFormatVersion) {
             Refuse("written in format " + theirs + ", this build reads format " + ours + "; reload it");
         }
         Refuse("written by a newer ShilmanDB (format " + theirs + "; this build reads format " + ours + ")");
@@ -214,8 +221,9 @@ CatalogMeta ColumnarFile::ReadCatalog(const Superblock& sb) const {
 }
 
 // Catalog pages, sync, the other slot, sync, then the in-memory switch.
+// A file opened in an older format is written in kFormatVersion from here on.
 void ColumnarFile::Commit(CatalogMeta next) {
-    const std::vector<char> blob = EncodeCatalog(next);
+    const std::vector<char> blob = EncodeCatalog(next, WriteFormat());
     if (blob.size() > std::numeric_limits<uint32_t>::max()) {
         throw DatabaseException("the catalog is too big to commit: " + std::to_string(blob.size()) + " bytes");
     }
@@ -246,6 +254,7 @@ void ColumnarFile::Commit(CatalogMeta next) {
     disk_->Sync();
 
     Superblock sb = current_;
+    sb.format_version = WriteFormat();
     sb.generation += 1;
     sb.catalog_first_page = first;
     sb.catalog_page_count = count;
@@ -261,6 +270,14 @@ void ColumnarFile::Commit(CatalogMeta next) {
     catalog_ = std::move(next);
     current_ = sb;
     current_slot_ = slot;
+}
+
+// Only versions this build reads can be written.
+void ColumnarFile::WriteFormatForTest(uint32_t version) {
+    if (version != 0 && (version < kOldestFormatVersion || version > kFormatVersion)) {
+        throw DatabaseException("can't write format " + std::to_string(version));
+    }
+    test_write_format = version;
 }
 
 // Throws with the file's path in front of the reason.

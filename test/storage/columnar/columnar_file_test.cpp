@@ -5,6 +5,7 @@
 #include "common/exception.hpp"
 #include "storage/columnar/catalog_codec.hpp"
 #include "storage/columnar/columnar_file.hpp"
+#include "storage/columnar/columnar_table.hpp"
 #include "storage/columnar/encoding.hpp"
 #include "storage/columnar/superblock.hpp"
 #include "storage/disk_manager.hpp"
@@ -48,6 +49,44 @@ public:
 private:
     int syncs_{0};
 };
+
+// Makes creates and commits write an older format until it goes out of scope.
+class WriteFormatScope {
+public:
+    explicit WriteFormatScope(uint32_t version) { ColumnarFile::WriteFormatForTest(version); }
+    ~WriteFormatScope() { ColumnarFile::WriteFormatForTest(0); }
+    WriteFormatScope(const WriteFormatScope&) = delete;
+    WriteFormatScope& operator=(const WriteFormatScope&) = delete;
+};
+
+// A string of n bytes whose content depends on n and seed.
+std::string Text(size_t n, char seed) {
+    std::string s(n, ' ');
+    for (size_t i = 0; i < n; ++i) s[i] = static_cast<char>('a' + (i * 7 + n + seed) % 26);
+    return s;
+}
+
+// An id column 1..lengths.size() and a text column of those lengths.
+std::pair<ColumnVector, ColumnVector> Rows(const std::vector<size_t>& lengths, char seed) {
+    ColumnVector ids(ColumnType::BigInt());
+    ColumnVector texts(ColumnType::Text());
+    for (size_t i = 0; i < lengths.size(); ++i) {
+        ids.AppendInt(static_cast<int64_t>(i + 1) * 1000 + seed);
+        texts.AppendString(Text(lengths[i], seed));
+    }
+    return {std::move(ids), std::move(texts)};
+}
+
+// The text of the DatabaseException f throws, or "" when it throws none.
+template <typename F>
+std::string ThrownText(F f) {
+    try {
+        f();
+    } catch (const DatabaseException& e) {
+        return e.what();
+    }
+    return "";
+}
 
 class ColumnarFileTest : public ::testing::Test {
 protected:
@@ -166,6 +205,61 @@ protected:
         WriteSlot(1, sb);
     }
 
+    // An id and a text column, their chunks written to the file.
+    static ColumnarTableMeta WrittenTable(DiskManager* disk, uint32_t oid, const std::string& name, const std::pair<ColumnVector, ColumnVector>& rows) {
+        ColumnarTableMeta table;
+        table.oid = oid;
+        table.name = name;
+        table.columns.push_back(ColumnMeta{"id", 1, ColumnType::BigInt(), false});
+        table.columns.push_back(ColumnMeta{"body", 2, ColumnType::Text(), false});
+        RowGroupMeta group;
+        group.row_count = static_cast<uint32_t>(rows.first.Size());
+        group.chunks.push_back(WriteChunk(disk, rows.first));
+        group.chunks.push_back(WriteChunk(disk, rows.second));
+        table.row_count = group.row_count;
+        table.row_groups.push_back(std::move(group));
+        return table;
+    }
+
+    // Scans both columns through a pool, whole and row by row, against the values.
+    static void ExpectTableHolds(DiskManager* disk, const ColumnarTableMeta& meta, const std::pair<ColumnVector, ColumnVector>& rows) {
+        SCOPED_TRACE("table " + meta.name);
+        BufferPoolManager bpm(16, disk, std::make_unique<LRUEvictionPolicy>(16));
+        const ColumnarTable table(&bpm, meta);
+        ColumnVector ids(ColumnType::BigInt());
+        ColumnVector texts(ColumnType::Text());
+        table.ReadChunk(0, 0, ids);
+        table.ReadChunk(0, 1, texts);
+        ASSERT_EQ(ids.Size(), rows.first.Size());
+        ASSERT_EQ(texts.Size(), rows.second.Size());
+        for (size_t i = 0; i < ids.Size(); ++i) {
+            EXPECT_EQ(ids.GetInt(i), rows.first.GetInt(i)) << "row " << i;
+            EXPECT_EQ(texts.GetString(i), rows.second.GetString(i)) << "row " << i;
+            ColumnVector one(ColumnType::Text());
+            table.ReadValue(RowPosition{0, static_cast<uint16_t>(i)}, 1, one);
+            EXPECT_EQ(one.GetString(0), rows.second.GetString(i)) << "row " << i;
+        }
+    }
+
+    // The format version in a slot's bytes, whatever its checksum.
+    uint32_t SlotVersionOnDisk(page_id_t slot) const {
+        const std::vector<char> bytes = FileBytes();
+        uint32_t version = 0;
+        std::memcpy(&version, bytes.data() + static_cast<size_t>(slot) * PAGE_SIZE + 48, sizeof(version));
+        return version;
+    }
+
+    // The version at the front of the catalog blob that the newer slot names.
+    uint32_t CatalogVersionOnDisk() const {
+        const SlotRead a = ReadSlot(0);
+        const SlotRead b = ReadSlot(1);
+        const Superblock& sb = b.block.generation > a.block.generation ? b.block : a.block;
+        const std::vector<char> bytes = FileBytes();
+        uint32_t version = 0;
+        std::memcpy(&version, bytes.data() + static_cast<size_t>(sb.catalog_first_page) * PAGE_SIZE + kPageHeaderSize, sizeof(version));
+        return version;
+    }
+
     // One BIGINT column of 10 rows on one PLAIN page, plus an index on it.
     static CatalogMeta TableWithChunk(page_id_t first_page, uint32_t page_count, page_id_t index_root) {
         CatalogMeta meta = OneTable(kFirstOid, 1);
@@ -271,19 +365,27 @@ TEST_F(ColumnarFileTest, ShortTextFileRefused) {
 }
 
 TEST_F(ColumnarFileTest, VersionMessages) {
-    // A newer slot refuses the open even though slot 0 is a valid format-1 slot.
+    // A newer slot refuses the open even though slot 0 is a valid slot.
     MakeNewFile();
-    WriteVersion(1, 2);
+    WriteVersion(1, 3);
     std::vector<char> before = FileBytes();
-    EXPECT_EQ(OpenError(), path_ + ": written by a newer ShilmanDB (format 2; this build reads format 1)");
+    EXPECT_EQ(OpenError(), path_ + ": written by a newer ShilmanDB (format 3; this build reads format 2)");
     EXPECT_EQ(FileBytes(), before);
 
     std::filesystem::remove(path_);
     MakeNewFile();
     WriteVersion(0, 0);
     before = FileBytes();
-    EXPECT_EQ(OpenError(), path_ + ": written in format 0, this build reads format 1; reload it");
+    EXPECT_EQ(OpenError(), path_ + ": written in format 0, this build reads format 2; reload it");
     EXPECT_EQ(FileBytes(), before);
+
+    // Versions 1 and 2 are both read.
+    for (uint32_t version : {1u, 2u}) {
+        std::filesystem::remove(path_);
+        MakeNewFile();
+        WriteVersion(1, version);
+        EXPECT_EQ(OpenError(), "") << "version " << version;
+    }
 }
 
 TEST_F(ColumnarFileTest, BothSlotsOtherVersions) {
@@ -291,7 +393,7 @@ TEST_F(ColumnarFileTest, BothSlotsOtherVersions) {
     WriteVersion(0, 3);
     WriteVersion(1, 5);
     const std::vector<char> before = FileBytes();
-    EXPECT_EQ(OpenError(), path_ + ": written by a newer ShilmanDB (format 5; this build reads format 1)");
+    EXPECT_EQ(OpenError(), path_ + ": written by a newer ShilmanDB (format 5; this build reads format 2)");
     EXPECT_EQ(FileBytes(), before);
 }
 
@@ -310,11 +412,11 @@ TEST_F(ColumnarFileTest, OtherPageSizeRefused) {
 TEST_F(ColumnarFileTest, OtherVersionWithBadChecksumRefused) {
     // A newer format may change the checksum; the version alone must refuse.
     MakeNewFile();
-    WriteVersion(1, 2);
+    WriteVersion(1, 3);
     Flip(PAGE_SIZE + 200);
     ASSERT_EQ(ReadSlot(0).state, SlotState::VALID);
     const std::vector<char> before = FileBytes();
-    EXPECT_EQ(OpenError(), path_ + ": written by a newer ShilmanDB (format 2; this build reads format 1)");
+    EXPECT_EQ(OpenError(), path_ + ": written by a newer ShilmanDB (format 3; this build reads format 2)");
     EXPECT_EQ(FileBytes(), before);
 }
 
@@ -713,6 +815,121 @@ TEST_F(ColumnarFileTest, OidsPersist) {
     DiskManager disk(path_);
     ColumnarFile file(&disk);
     EXPECT_EQ(file.AllocateOid(), 16386u);
+}
+
+TEST_F(ColumnarFileTest, OpensVersionOneFileAndWritesTwo) {
+    const auto first = Rows({0, 5, 300, 8155, 12, 4000, 1}, 'f');
+    const auto second = Rows({40, 40, 8000, 2}, 's');
+    const auto big = Rows({3, 8156, 70000, 9}, 'b');
+
+    // The format 1 path writes the file: the create, then a commit per table.
+    {
+        WriteFormatScope format_one(1);
+        DiskManager disk(path_);
+        ColumnarFile file(&disk);
+        CatalogMeta meta;
+        meta.tables.push_back(WrittenTable(&disk, file.AllocateOid(), "first", first));
+        file.Commit(meta);
+        meta.tables.push_back(WrittenTable(&disk, file.AllocateOid(), "second", second));
+        file.Commit(meta);
+
+        // Format 1 can't hold a big value, so that commit writes nothing.
+        CatalogMeta with_big = meta;
+        with_big.tables.push_back(WrittenTable(&disk, file.AllocateOid(), "third", big));
+        RecordingObserver observer;
+        disk.SetWriteObserver(&observer);
+        EXPECT_EQ(ThrownText([&] { file.Commit(with_big); }),
+                  "catalog format 1 can't hold values bigger than a page: table third, column body");
+        disk.SetWriteObserver(nullptr);
+        EXPECT_TRUE(observer.events.empty());
+        EXPECT_EQ(file.Catalog().tables.size(), 2u);
+    }
+
+    // On disk, both slots and the catalog blob say version 1.
+    for (page_id_t slot : {page_id_t{0}, page_id_t{1}}) {
+        EXPECT_EQ(SlotVersionOnDisk(slot), 1u) << "slot " << slot;
+        EXPECT_EQ(ReadSlot(slot).state, SlotState::VALID) << "slot " << slot;
+    }
+    EXPECT_EQ(CatalogVersionOnDisk(), 1u);
+
+    // This build opens it as it is, lists its tables and scans them.
+    {
+        DiskManager disk(path_);
+        ColumnarFile file(&disk);
+        EXPECT_EQ(file.Current().format_version, 1u);
+        EXPECT_EQ(file.Current().generation, 3u);
+        ASSERT_EQ(file.Catalog().tables.size(), 2u);
+        EXPECT_EQ(file.Catalog().tables[0].name, "first");
+        EXPECT_EQ(file.Catalog().tables[1].name, "second");
+        // The blob has format 1's layout: no big page counts.
+        EXPECT_EQ(file.Current().catalog_bytes, EncodeCatalog(file.Catalog(), 1).size());
+        EXPECT_LT(file.Current().catalog_bytes, EncodeCatalog(file.Catalog()).size());
+        ExpectTableHolds(&disk, file.Catalog().tables[0], first);
+        ExpectTableHolds(&disk, file.Catalog().tables[1], second);
+
+        // The next commit, with a big value now, writes version 2.
+        CatalogMeta meta = file.Catalog();
+        meta.tables.push_back(WrittenTable(&disk, file.AllocateOid(), "third", big));
+        ASSERT_GT(meta.tables[2].row_groups[0].chunks[1].big_page_count, 0u);
+        file.Commit(meta);
+        EXPECT_EQ(file.Current().format_version, 2u);
+    }
+
+    // A commit writes one slot; the other keeps the version 1 commit before it.
+    const page_id_t newer = ReadSlot(1).block.generation > ReadSlot(0).block.generation ? 1 : 0;
+    EXPECT_EQ(SlotVersionOnDisk(newer), 2u);
+    EXPECT_EQ(SlotVersionOnDisk(1 - newer), 1u);
+    EXPECT_EQ(CatalogVersionOnDisk(), 2u);
+    {
+        DiskManager disk(path_);
+        ColumnarFile file(&disk);
+        EXPECT_EQ(file.Current().format_version, 2u);
+        ASSERT_EQ(file.Catalog().tables.size(), 3u);
+        ExpectTableHolds(&disk, file.Catalog().tables[0], first);
+        ExpectTableHolds(&disk, file.Catalog().tables[2], big);
+        file.Commit(file.Catalog());
+    }
+
+    // After one more commit, both slots read version 2.
+    for (page_id_t slot : {page_id_t{0}, page_id_t{1}}) {
+        EXPECT_EQ(SlotVersionOnDisk(slot), 2u) << "slot " << slot;
+        EXPECT_EQ(ReadSlot(slot).state, SlotState::VALID) << "slot " << slot;
+    }
+    DiskManager disk(path_);
+    ColumnarFile file(&disk);
+    ASSERT_EQ(file.Catalog().tables.size(), 3u);
+    ExpectTableHolds(&disk, file.Catalog().tables[2], big);
+}
+
+// The pool checks a big-value page's checksum like any other page's.
+TEST_F(ColumnarFileTest, BigValuePageFailsItsChecksum) {
+    const auto rows = Rows({5, 20000, 4}, 'c');
+    page_id_t last_big_page = 0;
+    {
+        DiskManager disk(path_);
+        ColumnarFile file(&disk);
+        CatalogMeta meta;
+        meta.tables.push_back(WrittenTable(&disk, file.AllocateOid(), "docs", rows));
+        const ChunkMeta& chunk = meta.tables[0].row_groups[0].chunks[1];
+        ASSERT_EQ(chunk.big_page_count, 3u);
+        last_big_page = chunk.first_page + chunk.page_count - 1;
+        file.Commit(meta);
+        ExpectTableHolds(&disk, file.Catalog().tables[0], rows);
+    }
+    Flip(static_cast<std::streamoff>(last_big_page) * PAGE_SIZE + 100);
+
+    DiskManager disk(path_);
+    ColumnarFile file(&disk);
+    BufferPoolManager bpm(16, &disk, std::make_unique<LRUEvictionPolicy>(16));
+    const ColumnarTable table(&bpm, file.Catalog().tables[0]);
+    const std::string failed = "docs: page " + std::to_string(last_big_page) + " failed its checksum";
+    ColumnVector all(ColumnType::Text());
+    EXPECT_EQ(ThrownText([&] { table.ReadChunk(0, 1, all); }), failed);
+    ColumnVector one(ColumnType::Text());
+    EXPECT_EQ(ThrownText([&] { table.ReadValue(RowPosition{0, 1}, 1, one); }), failed);
+    table.ReadValue(RowPosition{0, 2}, 1, one);  // its data page is fine
+    ASSERT_EQ(one.Size(), 1u);
+    EXPECT_EQ(one.GetString(0), rows.second.GetString(2));
 }
 
 TEST_F(ColumnarFileTest, ReadStatsStartAtZero) {

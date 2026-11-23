@@ -4,7 +4,9 @@
 
 namespace shilmandb {
 
-inline constexpr uint32_t kFormatVersion = 1;
+// Every commit writes kFormatVersion; this build reads every version from the oldest up.
+inline constexpr uint32_t kFormatVersion = 2;
+inline constexpr uint32_t kOldestFormatVersion = 1;
 inline constexpr page_id_t kHeaderPages = 2;  // pages 0 and 1 are the two superblock slots
 inline constexpr uint32_t kFirstOid = 16384;
 inline constexpr char kMagic[16] = {'S', 'h', 'i', 'l', 'm', 'a', 'n', 'D', 'B', 0, 0, 0, 0, 0, 0, 0};
@@ -23,7 +25,7 @@ struct Superblock {
 
 enum class SlotState { VALID, NO_MAGIC, BAD_CHECKSUM, OTHER_VERSION };
 
-// For OTHER_VERSION only block.format_version is filled in.
+// OTHER_VERSION is a version this build can't read; only block.format_version is filled in.
 struct SlotRead {
     SlotState state{SlotState::NO_MAGIC};
     Superblock block;

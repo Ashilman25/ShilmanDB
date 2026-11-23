@@ -1,11 +1,17 @@
 #include <gtest/gtest.h>
 #include "common/exception.hpp"
+#include "storage/columnar/crc32c.hpp"
 #include "storage/columnar/encoding.hpp"
+#include "storage/columnar/string_arena.hpp"
 #include <cmath>
+#include <cstdio>
 #include <cstring>
+#include <iterator>
 #include <limits>
+#include <optional>
 #include <random>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace shilmandb {
@@ -15,33 +21,45 @@ constexpr Encoding kAllEncodings[] = {Encoding::CONSTANT, Encoding::PLAIN, Encod
                                       Encoding::DICTIONARY};
 
 // Hands out a chunk's pages, checking pins are undone, one page at a time.
+// A big-value page may be pinned beside its data page, one at a time.
 class MemoryPages : public ChunkPages {
 public:
-    explicit MemoryPages(const EncodedChunk& chunk) : chunk_(chunk) {}
+    explicit MemoryPages(const EncodedChunk& chunk)
+        : chunk_(chunk), first_big_(chunk.meta.big_page_count <= chunk.meta.page_count ? chunk.meta.page_count - chunk.meta.big_page_count : 0) {}
     ~MemoryPages() override {
         EXPECT_EQ(pins_, unpins_);
         EXPECT_EQ(pinned_, kNone);
+        EXPECT_EQ(pinned_big_, kNone);
     }
 
     const char* Pin(uint32_t index) override {
-        EXPECT_EQ(pinned_, kNone) << "two pages pinned at once";
+        uint32_t& slot = index >= first_big_ ? pinned_big_ : pinned_;
+        EXPECT_EQ(slot, kNone) << (index >= first_big_ ? "two big-value pages pinned at once" : "two pages pinned at once");
         EXPECT_LT(index, chunk_.meta.page_count);
-        pinned_ = index;
+        slot = index;
         ++pins_;
+        if (index >= first_big_) ++big_pins_;
         return chunk_.pages.data() + static_cast<size_t>(index) * PAGE_SIZE;
     }
     void Unpin(uint32_t index) override {
-        EXPECT_EQ(pinned_, index);
-        pinned_ = kNone;
+        uint32_t& slot = index >= first_big_ ? pinned_big_ : pinned_;
+        EXPECT_EQ(slot, index);
+        slot = kNone;
         ++unpins_;
     }
+
+    // How many times a big-value page was pinned.
+    [[nodiscard]] uint64_t BigPins() const { return big_pins_; }
 
 private:
     static constexpr uint32_t kNone = UINT32_MAX;
     const EncodedChunk& chunk_;
+    uint32_t first_big_;
     uint32_t pinned_{kNone};
+    uint32_t pinned_big_{kNone};
     uint64_t pins_{0};
     uint64_t unpins_{0};
+    uint64_t big_pins_{0};
 };
 
 // Compares two vectors row by row; doubles by their bits.
@@ -572,24 +590,316 @@ TEST(EncodingTest, Utf8RoundTrip) {
     }
 }
 
-TEST(EncodingTest, ValueTooBigForPageThrows) {
-    const auto v = Strings({"fine", std::string(9000, 'x')});
-    try {
-        (void)EncodeChunk(v);
-        FAIL() << "expected a throw";
-    } catch (const DatabaseException& e) {
-        EXPECT_NE(std::string(e.what()).find("bigger than a page"), std::string::npos) << e.what();
-        EXPECT_NE(std::string(e.what()).find("9000"), std::string::npos) << e.what();
-    }
-    EXPECT_THROW((void)TryEncodeChunk(v, Encoding::DICTIONARY), DatabaseException);
+namespace {
 
-    // The largest value that fits shares its page with NULL bits.
+// A string of n bytes whose content depends on n, so two lengths never match.
+std::string S(size_t n) {
+    std::string s(n, ' ');
+    for (size_t i = 0; i < n; ++i) s[i] = static_cast<char>('a' + (i * 7 + n) % 26);
+    return s;
+}
+
+// A TEXT vector of these strings.
+ColumnVector StringsOf(const std::vector<std::string>& values) {
+    ColumnVector v(ColumnType::Text());
+    for (const auto& s : values) v.AppendString(s);
+    return v;
+}
+
+// The listed entries of values, in order.
+std::vector<std::string> Pick(const std::vector<std::string>& values, const std::vector<uint32_t>& rows) {
+    std::vector<std::string> out;
+    for (uint32_t r : rows) out.push_back(values[r]);
+    return out;
+}
+
+// Every string of a chunk without NULLs, by DecodeChunk.
+std::vector<std::string> DecodeAll(const EncodedChunk& chunk) {
+    const ColumnVector v = Decode(chunk, ColumnType::Text());
+    std::vector<std::string> out;
+    for (size_t i = 0; i < v.Size(); ++i) out.emplace_back(v.GetString(i));
+    return out;
+}
+
+// The listed rows by DecodeRows; nullptr rows means all of them.
+std::vector<std::string> DecodeRowsStrings(const EncodedChunk& chunk, const std::vector<uint32_t>* rows) {
+    MemoryPages pages(chunk);
+    StringArena arena;
+    const uint32_t n = rows != nullptr ? static_cast<uint32_t>(rows->size()) : chunk.meta.value_count;
+    std::vector<StringRef> refs(n);
+    DecodeRows(chunk.meta, pages, ColumnType::Text(), rows != nullptr ? rows->data() : nullptr, n, refs.data(), arena);
+    std::vector<std::string> out;
+    for (StringRef s : refs) out.emplace_back(View(s));
+    return out;
+}
+std::vector<std::string> DecodeRowsStrings(const EncodedChunk& chunk, const std::vector<uint32_t>& rows) {
+    return DecodeRowsStrings(chunk, &rows);
+}
+
+// One row by DecodeValue.
+std::string DecodeOne(const EncodedChunk& chunk, uint32_t row) {
+    ColumnVector out(ColumnType::Text());
+    MemoryPages pages(chunk);
+    DecodeValue(chunk.meta, pages, row, out);
+    return std::string(out.GetString(0));
+}
+
+// Bytes [at, at + n) of page index of the chunk.
+std::string PageBytes(const EncodedChunk& chunk, uint32_t index, size_t at, size_t n) {
+    return std::string(chunk.pages.data() + static_cast<size_t>(index) * PAGE_SIZE + at, n);
+}
+
+// Where slot i's bytes start, on a page with one big-bits byte and no NULLs.
+size_t SlotStart(const EncodedChunk& chunk, uint32_t page, uint32_t i) {
+    uint16_t offset = 0;
+    std::memcpy(&offset, chunk.pages.data() + static_cast<size_t>(page) * PAGE_SIZE + kPageHeaderSize + 1 + 2 * i, sizeof(offset));
+    return offset;
+}
+
+// Many copies of three words, and one big value.
+ColumnVector RepeatedWithOneBig() {
+    const char* words[] = {"red", "green", "blue"};
+    ColumnVector v(ColumnType::Text());
+    for (int i = 0; i < 5000; ++i) v.AppendString(i == 2500 ? S(10000) : words[i % 3]);
+    return v;
+}
+
+}  // namespace
+
+// Values up to 8,155 bytes stay in line; one more byte goes out of line.
+TEST(EncodingTest, InLineLimitIs8155Bytes) {
+    // The largest in-line value shares its page with NULL bits.
     ColumnVector edge(ColumnType::Text());
-    edge.AppendString(std::string(8155, 'y'));
+    edge.AppendString(S(8155));
     edge.AppendNull();
     ExpectEveryEncodingRoundTrips(edge);
-    edge.AppendString(std::string(8156, 'y'));
-    EXPECT_THROW((void)EncodeChunk(edge), DatabaseException);
+    const EncodedChunk in_line = EncodeChunk(edge);
+    EXPECT_EQ(in_line.meta.big_page_count, 0u);
+    EXPECT_EQ(HeaderOf(in_line, 0).flags, kPageHasNulls);
+
+    edge.AppendString(S(8156));
+    const EncodedChunk out_of_line = EncodeChunk(edge);
+    EXPECT_EQ(out_of_line.meta.encoding, Encoding::PLAIN);
+    EXPECT_EQ(out_of_line.meta.big_page_count, 1u);
+    ExpectEveryEncodingRoundTrips(edge);
+
+    // 9,000 bytes, refused before big values, now round-trips.
+    ExpectEveryEncodingRoundTrips(Strings({"fine", S(9000)}));
+}
+
+TEST(EncodingTest, BigValuesRoundTrip) {
+    // short, 8,155 in line, 8,156 out of line, 24,481 (four pages), 3 MB, short
+    const std::vector<std::string> input = {"a", S(8155), S(8156), S(3 * 8160 + 1), S(3 << 20), "b"};
+    const EncodedChunk chunk = EncodeChunk(StringsOf(input));
+    EXPECT_EQ(chunk.meta.encoding, Encoding::PLAIN);
+    EXPECT_GT(chunk.meta.big_page_count, 0u);
+    EXPECT_EQ(chunk.meta.big_page_count, 1u + 4u + 386u);  // 3 MB is 385.5 pages of 8,160 bytes
+    EXPECT_EQ(chunk.meta.page_count, chunk.meta.page_first_rows.size() + chunk.meta.big_page_count);
+    EXPECT_EQ(chunk.pages.size(), static_cast<size_t>(chunk.meta.page_count) * PAGE_SIZE);
+    EXPECT_EQ(DecodeAll(chunk), input);
+    EXPECT_EQ(DecodeRowsStrings(chunk, {2, 4}), Pick(input, {2, 4}));
+    EXPECT_EQ(DecodeRowsStrings(chunk, nullptr), input);
+    EXPECT_EQ(DecodeOne(chunk, 3), input[3]);
+    for (uint32_t row = 0; row < input.size(); ++row) EXPECT_EQ(DecodeOne(chunk, row), input[row]) << "row " << row;
+
+    // Many rows over several data pages, with NULLs and big values among them.
+    std::mt19937_64 rng(31);
+    ColumnVector mixed(ColumnType::Text());
+    for (int i = 0; i < 3000; ++i) {
+        if (i % 13 == 5) {
+            mixed.AppendNull();
+        } else if (i % 97 == 0) {
+            mixed.AppendString(S(8156 + rng() % 20000));
+        } else {
+            mixed.AppendString(RandomString(200, rng));
+        }
+    }
+    const EncodedChunk many = EncodeChunk(mixed);
+    EXPECT_EQ(many.meta.encoding, Encoding::PLAIN);
+    EXPECT_GT(many.meta.page_first_rows.size(), 10u);
+    EXPECT_GE(many.meta.big_page_count, 28u);  // 28 big values, each on at least one page
+    ExpectEveryEncodingRoundTrips(mixed);
+
+    // A decode pins each big-value page once per value read.
+    MemoryPages pages(many);
+    ColumnVector out(ColumnType::Text());
+    DecodeChunk(many.meta, pages, out);
+    EXPECT_EQ(pages.BigPins(), many.meta.big_page_count);
+}
+
+// On disk: a flagged data page, its big bits and refs, then big-value pages.
+TEST(EncodingTest, BigValueLayout) {
+    const EncodedChunk chunk = EncodeChunk(Strings({"a", S(8156), S(9000)}));
+    ASSERT_EQ(chunk.meta.page_first_rows.size(), 1u);
+    EXPECT_EQ(chunk.meta.dict_page_count, 0u);
+    EXPECT_EQ(chunk.meta.big_page_count, 3u);  // 8,156 bytes on one page, 9,000 on two
+    ASSERT_EQ(chunk.meta.page_count, 4u);
+
+    const ColumnarPageHeader data = HeaderOf(chunk, 0);
+    EXPECT_EQ(data.kind, static_cast<uint8_t>(PageKind::DATA));
+    EXPECT_EQ(data.encoding, static_cast<uint8_t>(Encoding::PLAIN));
+    EXPECT_EQ(data.flags, kPageBigValues);
+    EXPECT_EQ(data.value_count, 3u);
+    EXPECT_EQ(chunk.pages[kPageHeaderSize], 0x06) << "slots 1 and 2 are big";
+
+    // Offsets start after the big bits; each big slot holds an 8-byte reference.
+    const size_t strings = kPageHeaderSize + 1 + 2 * 4;
+    EXPECT_EQ(SlotStart(chunk, 0, 0), strings);
+    EXPECT_EQ(SlotStart(chunk, 0, 1), strings + 1);
+    EXPECT_EQ(SlotStart(chunk, 0, 2), strings + 1 + 8);
+    EXPECT_EQ(SlotStart(chunk, 0, 3), strings + 1 + 16);
+    EXPECT_EQ(PageBytes(chunk, 0, strings, 1), "a");
+    BigValueRef first, second;
+    std::memcpy(&first, chunk.pages.data() + strings + 1, sizeof(first));
+    std::memcpy(&second, chunk.pages.data() + strings + 9, sizeof(second));
+    EXPECT_EQ(first.page_index, 1u);
+    EXPECT_EQ(first.length, 8156u);
+    EXPECT_EQ(second.page_index, 2u);
+    EXPECT_EQ(second.length, 9000u);
+
+    // Each big-value page: its header, then a piece of the value, then zeros.
+    const struct {
+        uint32_t page, first_byte, bytes;
+        std::string piece;
+    } pieces[] = {{1, 0, 8156, S(8156)}, {2, 0, 8160, S(9000).substr(0, 8160)}, {3, 8160, 840, S(9000).substr(8160)}};
+    for (const auto& p : pieces) {
+        SCOPED_TRACE("page " + std::to_string(p.page));
+        const ColumnarPageHeader h = HeaderOf(chunk, p.page);
+        EXPECT_EQ(h.kind, static_cast<uint8_t>(PageKind::BIG_VALUE));
+        EXPECT_EQ(h.first_row, p.first_byte);
+        EXPECT_EQ(h.value_count, p.bytes);
+        EXPECT_EQ(PageBytes(chunk, p.page, kPageHeaderSize, p.bytes), p.piece);
+        const std::string rest = PageBytes(chunk, p.page, kPageHeaderSize + p.bytes, PAGE_SIZE - kPageHeaderSize - p.bytes);
+        EXPECT_EQ(rest, std::string(rest.size(), '\0'));
+    }
+
+    // With NULL bits, the big bits follow them.
+    ColumnVector nulls(ColumnType::Text());
+    nulls.AppendString("a");
+    nulls.AppendNull();
+    nulls.AppendString(S(8156));
+    const EncodedChunk with_nulls = EncodeChunk(nulls);
+    EXPECT_EQ(HeaderOf(with_nulls, 0).flags, kPageHasNulls | kPageBigValues);
+    EXPECT_EQ(with_nulls.pages[kPageHeaderSize], 0x02) << "slot 1 is NULL";
+    EXPECT_EQ(with_nulls.pages[kPageHeaderSize + 1], 0x04) << "slot 2 is big";
+}
+
+TEST(EncodingTest, BigValueChunkIsNeverDictionary) {
+    const ColumnVector v = RepeatedWithOneBig();
+    EXPECT_FALSE(TryEncodeChunk(v, Encoding::DICTIONARY).has_value());
+    const EncodedChunk chunk = EncodeChunk(v);
+    EXPECT_EQ(chunk.meta.encoding, Encoding::PLAIN);
+    EXPECT_TRUE(SameValues(Decode(chunk, v.Type()), v));
+
+    // The same words without the big value pick DICTIONARY.
+    ColumnVector small(ColumnType::Text());
+    for (size_t i = 0; i < v.Size(); ++i) {
+        if (i != 2500) small.AppendString(v.GetString(i));
+    }
+    EXPECT_EQ(EncodeChunk(small).meta.encoding, Encoding::DICTIONARY);
+}
+
+// One big value repeated isn't CONSTANT, so a chunk's meta never holds a big value.
+TEST(EncodingTest, BigConstantStaysOnPages) {
+    for (int rows : {1, 3}) {
+        SCOPED_TRACE(std::to_string(rows) + " rows");
+        ColumnVector same(ColumnType::Text());
+        for (int i = 0; i < rows; ++i) same.AppendString(S(9000));
+        EXPECT_FALSE(TryEncodeChunk(same, Encoding::CONSTANT).has_value());
+        const EncodedChunk chunk = EncodeChunk(same);
+        EXPECT_EQ(chunk.meta.encoding, Encoding::PLAIN);
+        EXPECT_FALSE(chunk.meta.constant.has_value());
+        EXPECT_TRUE(SameValues(Decode(chunk, same.Type()), same));
+    }
+    // An in-line value repeated is still CONSTANT.
+    EXPECT_EQ(EncodeChunk(Strings({S(8155), S(8155)})).meta.encoding, Encoding::CONSTANT);
+}
+
+TEST(EncodingTest, ValueOverTheCapIsRefused) {
+    EXPECT_THROW(CheckValueSize(1025, /*cap=*/1024), DatabaseException);
+    EXPECT_NO_THROW(CheckValueSize(1024, 1024));
+    EXPECT_EQ(ThrownText([] { CheckValueSize(1025, 1024); }), "value of 1025 bytes is over the 1 GiB limit for one value");
+
+    static_assert(kMaxBigValueBytes == 1073741824, "the cap is 1 GiB");
+    EXPECT_NO_THROW(CheckValueSize(kMaxBigValueBytes));
+    EXPECT_EQ(ThrownText([] { CheckValueSize(kMaxBigValueBytes + 1); }), "value of 1073741825 bytes is over the 1 GiB limit for one value");
+}
+
+// Forged big-value pages and references are refused, even with good checksums.
+TEST(EncodingTest, DamagedBigValuePageThrows) {
+    const std::vector<std::string> input = {"a", S(9000), "b"};
+    const EncodedChunk good = EncodeChunk(StringsOf(input));
+    ASSERT_EQ(good.meta.page_count, 3u);  // the data page, then the value's two pages
+    ASSERT_EQ(good.meta.big_page_count, 2u);
+    const size_t ref_at = SlotStart(good, 0, 1);
+
+    // Rewrites a page header field, then reseals.
+    const auto forge_header = [&](uint32_t page, auto change) {
+        EncodedChunk chunk = good;
+        char* p = chunk.pages.data() + static_cast<size_t>(page) * PAGE_SIZE;
+        ColumnarPageHeader h;
+        std::memcpy(&h, p, sizeof(h));
+        change(h);
+        std::memcpy(p, &h, sizeof(h));
+        SealPages(chunk.pages.data(), chunk.meta.page_count, 7);
+        return chunk;
+    };
+    // Rewrites the big slot's reference, then reseals.
+    const auto forge_ref = [&](uint32_t page_index, uint32_t length) {
+        EncodedChunk chunk = good;
+        const BigValueRef ref{page_index, length};
+        std::memcpy(chunk.pages.data() + ref_at, &ref, sizeof(ref));
+        SealPages(chunk.pages.data(), chunk.meta.page_count, 7);
+        return chunk;
+    };
+
+    {
+        SCOPED_TRACE("a big-value page of another kind");
+        ExpectDamaged(forge_header(1, [](ColumnarPageHeader& h) { h.kind = static_cast<uint8_t>(PageKind::DATA); }), ColumnType::Text(), 1);
+    }
+    {
+        SCOPED_TRACE("a piece starting at the wrong byte");
+        ExpectDamaged(forge_header(2, [](ColumnarPageHeader& h) { h.first_row = 8000; }), ColumnType::Text(), 1);
+    }
+    {
+        SCOPED_TRACE("a piece of the wrong length");
+        ExpectDamaged(forge_header(2, [](ColumnarPageHeader& h) { h.value_count = 841; }), ColumnType::Text(), 1);
+    }
+    {
+        SCOPED_TRACE("the big flag on a dictionary page");
+        const ColumnVector words = Strings({"x", "y", "x", "y", "x"});
+        EncodedChunk coded = *TryEncodeChunk(words, Encoding::DICTIONARY);
+        coded.pages[offsetof(ColumnarPageHeader, flags)] = static_cast<char>(kPageBigValues);
+        ExpectDamaged(coded, words.Type(), 0);
+    }
+    {
+        SCOPED_TRACE("the big flag on an integer page");
+        const ColumnVector ints = Ints(ColumnType::BigInt(), {5, 900, 17});
+        EncodedChunk plain = *TryEncodeChunk(ints, Encoding::PLAIN);
+        plain.pages[offsetof(ColumnarPageHeader, flags)] = static_cast<char>(kPageBigValues);
+        ExpectDamaged(plain, ints.Type(), 0);
+    }
+    for (const auto& [page_index, length] : {std::pair<uint32_t, uint32_t>{0, 9000}, {2, 9000}, {1, 8000}, {1, 9001}, {1, UINT32_MAX}}) {
+        SCOPED_TRACE("a reference to " + std::to_string(length) + " bytes at page " + std::to_string(page_index));
+        ExpectDamaged(forge_ref(page_index, length), ColumnType::Text(), 1);
+    }
+    {
+        SCOPED_TRACE("a chunk that doesn't count its big-value pages");
+        EncodedChunk uncounted = good;
+        uncounted.meta.big_page_count = 0;
+        ExpectDamaged(uncounted, ColumnType::Text(), 1);
+    }
+
+    // The checksum covers big-value pages like any other.
+    EncodedChunk sealed = good;
+    SealPages(sealed.pages.data(), sealed.meta.page_count, 100);
+    for (uint32_t i = 0; i < sealed.meta.page_count; ++i) {
+        EXPECT_TRUE(VerifyPage(sealed.pages.data() + static_cast<size_t>(i) * PAGE_SIZE, 100 + i));
+    }
+    char* last = sealed.pages.data() + 2 * PAGE_SIZE;
+    last[kPageHeaderSize + 500] = static_cast<char>(last[kPageHeaderSize + 500] ^ 1);
+    EXPECT_FALSE(VerifyPage(last, 102));
+    EXPECT_EQ(DecodeAll(EncodeChunk(StringsOf(input))), input);
 }
 
 TEST(EncodingTest, ChecksumCatchesFlippedBit) {
@@ -749,6 +1059,197 @@ TEST(EncodingTest, ValueOutsideTypeThrows) {
 
     ExpectEveryEncodingRoundTrips(Ints(ColumnType::Boolean(), {0, 1, 1, 0}));
     ExpectEveryEncodingRoundTrips(Ints(ColumnType::Integer(), {INT32_MIN, INT32_MAX}));
+}
+
+namespace {
+
+// Appends a field's raw bytes, for hashing a chunk's meta.
+template <typename T>
+void PutRaw(std::vector<char>& out, const T& x) {
+    const char* p = reinterpret_cast<const char*>(&x);
+    out.insert(out.end(), p, p + sizeof(T));
+}
+
+// A present flag, then the scalar's kind and bytes.
+void PutScalarBytes(std::vector<char>& out, const std::optional<Scalar>& s) {
+    PutRaw(out, static_cast<uint8_t>(s.has_value()));
+    if (!s) return;
+    PutRaw(out, static_cast<uint8_t>(s->index()));
+    switch (s->index()) {
+        case 0: PutRaw(out, std::get<int64_t>(*s)); break;
+        case 1: PutRaw(out, std::get<__int128>(*s)); break;
+        case 2: PutRaw(out, std::get<double>(*s)); break;
+        default: {
+            const std::string& text = std::get<std::string>(*s);
+            PutRaw(out, static_cast<uint32_t>(text.size()));
+            out.insert(out.end(), text.begin(), text.end());
+            break;
+        }
+    }
+}
+
+// The meta fields a chunk had before big values, as bytes.
+std::vector<char> MetaBytes(const ChunkMeta& m) {
+    std::vector<char> out;
+    PutRaw(out, m.first_page);
+    PutRaw(out, m.page_count);
+    PutRaw(out, m.dict_page_count);
+    PutRaw(out, static_cast<uint8_t>(m.encoding));
+    PutRaw(out, m.value_count);
+    PutRaw(out, m.null_count);
+    PutRaw(out, static_cast<uint32_t>(m.page_first_rows.size()));
+    for (uint32_t x : m.page_first_rows) PutRaw(out, x);
+    PutRaw(out, static_cast<uint32_t>(m.dict_page_first_entries.size()));
+    for (uint32_t x : m.dict_page_first_entries) PutRaw(out, x);
+    PutRaw(out, m.dict_size);
+    PutScalarBytes(out, m.min);
+    PutScalarBytes(out, m.max);
+    PutScalarBytes(out, m.constant);
+    return out;
+}
+
+// One CRC32C over the picked chunk and every forced encoding: meta, then pages.
+uint32_t ChunkHash(const ColumnVector& v) {
+    std::vector<std::optional<EncodedChunk>> chunks;
+    chunks.emplace_back(EncodeChunk(v));
+    for (Encoding e : kAllEncodings) chunks.push_back(TryEncodeChunk(v, e));
+    uint32_t crc = 0;
+    for (const auto& chunk : chunks) {
+        const uint8_t present = chunk.has_value() ? 1 : 0;
+        crc = Crc32c(&present, 1, crc);
+        if (!chunk) continue;
+        const std::vector<char> meta = MetaBytes(chunk->meta);
+        crc = Crc32c(meta.data(), meta.size(), crc);
+        crc = Crc32c(chunk->pages.data(), chunk->pages.size(), crc);
+    }
+    return crc;
+}
+
+// Letters drawn straight from the engine, so every library gives the same string.
+std::string Letters(size_t n, std::mt19937_64& rng) {
+    std::string s(n, ' ');
+    for (char& c : s) c = static_cast<char>('a' + rng() % 26);
+    return s;
+}
+
+// The fixed chunks whose bytes must never change: every encoding, NULLs, long strings.
+std::vector<std::pair<std::string, ColumnVector>> TodaysChunks() {
+    std::vector<std::pair<std::string, ColumnVector>> cases;
+    std::mt19937_64 rng(20261122);
+    const size_t lengths[] = {0, 1, 7, 64, 65, 300, 4000, 8154, 8155};
+
+    ColumnVector long_text(ColumnType::Text());
+    for (int i = 0; i < 60; ++i) long_text.AppendString(Letters(lengths[i % 9], rng));
+    cases.emplace_back("plain strings up to 8155", std::move(long_text));
+
+    ColumnVector long_nulls(ColumnType::Text());
+    for (int i = 0; i < 60; ++i) {
+        if (i % 4 == 3) long_nulls.AppendNull(); else long_nulls.AppendString(Letters(lengths[i % 9], rng));
+    }
+    cases.emplace_back("plain strings with NULLs", std::move(long_nulls));
+
+    ColumnVector varchar(ColumnType::Varchar(30));
+    for (int i = 0; i < 5000; ++i) {
+        if (i % 7 == 0) varchar.AppendNull(); else varchar.AppendString(std::to_string(i) + Letters(rng() % 20, rng));
+    }
+    cases.emplace_back("varchar with NULLs", std::move(varchar));
+
+    const char* words[] = {"alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf"};
+    ColumnVector seven(ColumnType::Text());
+    ColumnVector seven_nulls(ColumnType::Varchar(10));
+    for (int i = 0; i < 65536; ++i) {
+        seven.AppendString(words[rng() % 7]);
+        if (rng() % 10 == 0) seven_nulls.AppendNull(); else seven_nulls.AppendString(words[rng() % 7]);
+    }
+    cases.emplace_back("dictionary strings", std::move(seven));
+    cases.emplace_back("dictionary strings with NULLs", std::move(seven_nulls));
+
+    ColumnVector small(ColumnType::BigInt());
+    ColumnVector small_nulls(ColumnType::Integer());
+    ColumnVector wide_ints(ColumnType::Integer());
+    ColumnVector dates(ColumnType::Date());
+    ColumnVector flags(ColumnType::Boolean());
+    ColumnVector shorts(ColumnType::SmallInt());
+    for (int i = 0; i < 65536; ++i) {
+        small.AppendInt(static_cast<int64_t>(rng() % 100));
+        if (i % 9 == 0) small_nulls.AppendNull(); else small_nulls.AppendInt(static_cast<int64_t>(rng() % 5000) - 2500);
+        wide_ints.AppendInt(static_cast<int32_t>(rng()));
+        dates.AppendInt(8000 + static_cast<int64_t>(rng() % 2557));
+        flags.AppendInt(static_cast<int64_t>(rng() & 1));
+        shorts.AppendInt(static_cast<int16_t>(rng()));
+    }
+    cases.emplace_back("bitpack integers", std::move(small));
+    cases.emplace_back("bitpack integers with NULLs", std::move(small_nulls));
+    cases.emplace_back("random integers", std::move(wide_ints));
+    cases.emplace_back("dates", std::move(dates));
+    cases.emplace_back("booleans", std::move(flags));
+    cases.emplace_back("smallints", std::move(shorts));
+
+    ColumnVector money(ColumnType::Numeric(15, 2));
+    ColumnVector wide_money(ColumnType::Numeric(38, 6));
+    ColumnVector doubles(ColumnType::Double());
+    for (int i = 0; i < 20000; ++i) {
+        money.AppendInt(static_cast<int64_t>(rng() % 2000000000000000ULL) - 1000000000000000LL);
+        if (i % 11 == 0) wide_money.AppendNull(); else wide_money.AppendWide(static_cast<__int128>(static_cast<int64_t>(rng())) * 1000003);
+        doubles.AppendDouble(static_cast<double>(static_cast<int64_t>(rng() >> 11)) / 1024.0);
+    }
+    cases.emplace_back("numeric 15,2", std::move(money));
+    cases.emplace_back("numeric 38,6 with NULLs", std::move(wide_money));
+    cases.emplace_back("doubles", std::move(doubles));
+
+    ColumnVector same_text(ColumnType::Text());
+    for (int i = 0; i < 1000; ++i) same_text.AppendString("the same words");
+    ColumnVector same_int(ColumnType::BigInt());
+    for (int i = 0; i < 1000; ++i) same_int.AppendInt(-42);
+    ColumnVector all_null(ColumnType::Text());
+    for (int i = 0; i < 1000; ++i) all_null.AppendNull();
+    cases.emplace_back("constant string", std::move(same_text));
+    cases.emplace_back("constant integer", std::move(same_int));
+    cases.emplace_back("all NULL", std::move(all_null));
+    return cases;
+}
+
+}  // namespace
+
+// Values up to 8,155 bytes: pages and meta match the encoder before big values.
+TEST(EncodingTest, NoBigValueKeepsTodaysBytes) {
+    // Hashes taken from the encoder as it was before big values.
+    struct Expected {
+        const char* name;
+        Encoding picked;
+        uint32_t hash;
+    };
+    const Expected expected[] = {
+        {"plain strings up to 8155", Encoding::PLAIN, 0xCC8660ABu},
+        {"plain strings with NULLs", Encoding::PLAIN, 0xA8C89AA9u},
+        {"varchar with NULLs", Encoding::PLAIN, 0x86E9B3ECu},
+        {"dictionary strings", Encoding::DICTIONARY, 0x76DCDB30u},
+        {"dictionary strings with NULLs", Encoding::DICTIONARY, 0x11C030D9u},
+        {"bitpack integers", Encoding::BITPACK, 0x8D7413F8u},
+        {"bitpack integers with NULLs", Encoding::BITPACK, 0x2BF841A1u},
+        {"random integers", Encoding::PLAIN, 0x99D751A9u},
+        {"dates", Encoding::BITPACK, 0x37CB91C1u},
+        {"booleans", Encoding::BITPACK, 0x4FD21ABFu},
+        {"smallints", Encoding::PLAIN, 0x3DA92A29u},
+        {"numeric 15,2", Encoding::BITPACK, 0x20C0FFD1u},
+        {"numeric 38,6 with NULLs", Encoding::PLAIN, 0xFD191D04u},
+        {"doubles", Encoding::PLAIN, 0x30DDB14Fu},
+        {"constant string", Encoding::CONSTANT, 0xDB2ACD32u},
+        {"constant integer", Encoding::CONSTANT, 0x7771D54Du},
+        {"all NULL", Encoding::CONSTANT, 0x5EE05D2Bu},
+    };
+    const auto cases = TodaysChunks();
+    ASSERT_EQ(cases.size(), std::size(expected));
+    for (size_t i = 0; i < cases.size(); ++i) {
+        ASSERT_EQ(cases[i].first, expected[i].name);
+        const EncodedChunk picked = EncodeChunk(cases[i].second);
+        EXPECT_EQ(picked.meta.encoding, expected[i].picked) << cases[i].first;
+        EXPECT_EQ(picked.meta.big_page_count, 0u) << cases[i].first;
+        const uint32_t hash = ChunkHash(cases[i].second);
+        char text[16];
+        std::snprintf(text, sizeof(text), "0x%08Xu", hash);
+        EXPECT_EQ(hash, expected[i].hash) << cases[i].first << ": " << text;
+    }
 }
 
 }  // namespace shilmandb

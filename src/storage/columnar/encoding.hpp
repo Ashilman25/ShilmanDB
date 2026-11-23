@@ -14,18 +14,33 @@ static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__, "the columnar file form
 namespace shilmandb {
 
 // What a page of the columnar file holds. The numbers are part of the format.
-enum class PageKind : uint8_t { SUPERBLOCK = 1, CATALOG = 2, DICTIONARY = 3, DATA = 4 };
+enum class PageKind : uint8_t { SUPERBLOCK = 1, CATALOG = 2, DICTIONARY = 3, DATA = 4, BIG_VALUE = 5 };
 
 // How a column chunk is stored. The numbers are part of the format.
 enum class Encoding : uint8_t { CONSTANT = 1, PLAIN = 2, BITPACK = 3, DICTIONARY = 4 };
 
 inline constexpr size_t kPageHeaderSize = 32;
 inline constexpr uint8_t kPageHasNulls = 0x01;     // NULL bits follow the header
-inline constexpr uint8_t kPageBigValues = 0x02;    // reserved for values bigger than a page
+inline constexpr uint8_t kPageBigValues = 0x02;    // a bit per slot marking big values follows the NULL bits
 
 // The biggest string a page holds: one NULL-bits byte and two offsets sit beside it.
+// A longer one is a big value, on big-value pages after the chunk's data pages.
 inline constexpr size_t kMaxValueBytes = PAGE_SIZE - kPageHeaderSize - 1 - 2 * sizeof(uint16_t);
-static_assert(kMaxValueBytes == 8155, "a stored string is at most 8,155 bytes");
+static_assert(kMaxValueBytes == 8155, "a stored string is at most 8,155 bytes in line");
+
+// The biggest value a column holds.
+inline constexpr size_t kMaxBigValueBytes = size_t{1} << 30;
+
+// Throws when a value is over cap bytes; tests pass a smaller cap.
+void CheckValueSize(size_t bytes, size_t cap = kMaxBigValueBytes);
+
+// A big slot's bytes on a data page: where its pages start, and its length.
+// Its pages hold the value in order, up to PAGE_SIZE - kPageHeaderSize bytes each.
+struct BigValueRef {
+    uint32_t page_index{0};  // counted from the chunk's first page
+    uint32_t length{0};
+};
+static_assert(sizeof(BigValueRef) == 8, "a big value reference is 8 bytes on disk");
 
 // The first 32 bytes of every page, stored exactly as laid out here.
 struct ColumnarPageHeader {
@@ -48,8 +63,9 @@ using Scalar = std::variant<int64_t, __int128, double, std::string>;
 
 struct ChunkMeta {
     page_id_t first_page{INVALID_PAGE_ID};           // INVALID for CONSTANT
-    uint32_t page_count{0};                          // dictionary pages first, then data pages
+    uint32_t page_count{0};                          // dictionary pages, data pages, then big-value pages
     uint32_t dict_page_count{0};
+    uint32_t big_page_count{0};                      // big-value pages, after the data pages
     Encoding encoding{Encoding::PLAIN};
     uint32_t value_count{0};
     uint32_t null_count{0};

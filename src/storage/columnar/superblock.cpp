@@ -55,7 +55,7 @@ void EncodeSuperblock(const Superblock& sb, page_id_t slot, char* page) {
 }
 
 // Checks the magic, then the version, then the checksum and kind.
-// Another version may checksum differently, so its checksum is never looked at.
+// An unreadable version may checksum differently, so its checksum is never looked at.
 SlotRead DecodeSuperblock(const char* page, page_id_t slot) {
     SlotRead read;
     SlotLayout layout;
@@ -65,7 +65,7 @@ SlotRead DecodeSuperblock(const char* page, page_id_t slot) {
         return read;
     }
     read.block.format_version = layout.format_version;
-    if (layout.format_version != kFormatVersion) {
+    if (layout.format_version < kOldestFormatVersion || layout.format_version > kFormatVersion) {
         read.state = SlotState::OTHER_VERSION;
         return read;
     }

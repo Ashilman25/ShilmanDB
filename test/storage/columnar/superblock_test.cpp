@@ -2,6 +2,7 @@
 #include "storage/columnar/encoding.hpp"
 #include "storage/columnar/superblock.hpp"
 #include <cstring>
+#include <string>
 #include <vector>
 
 namespace shilmandb {
@@ -68,12 +69,12 @@ TEST(SuperblockTest, SuperblockStates) {
     EXPECT_EQ(DecodeSuperblock(good.data(), 1).state, SlotState::BAD_CHECKSUM);
 
     Superblock newer = Sample();
-    newer.format_version = 2;
+    newer.format_version = 3;
     std::vector<char> page(PAGE_SIZE);
     EncodeSuperblock(newer, 1, page.data());
     const SlotRead read = DecodeSuperblock(page.data(), 1);
     EXPECT_EQ(read.state, SlotState::OTHER_VERSION);
-    EXPECT_EQ(read.block.format_version, 2u);
+    EXPECT_EQ(read.block.format_version, 3u);
 
     // A sealed page of another kind with the magic in place is not a superblock.
     std::vector<char> other_kind = good;
@@ -89,23 +90,49 @@ TEST(SuperblockTest, SuperblockStates) {
 TEST(SuperblockTest, OtherVersionWhateverTheChecksum) {
     // A newer format may change the checksum, so the version is read first.
     Superblock newer = Sample();
-    newer.format_version = 2;
+    newer.format_version = 3;
     std::vector<char> page(PAGE_SIZE);
     EncodeSuperblock(newer, 1, page.data());
     page[56] ^= 0x10;  // a bit of the generation, so the checksum fails
     const SlotRead read = DecodeSuperblock(page.data(), 1);
     EXPECT_EQ(read.state, SlotState::OTHER_VERSION);
-    EXPECT_EQ(read.block.format_version, 2u);
+    EXPECT_EQ(read.block.format_version, 3u);
 
     // Also with the wrong slot's seed.
     EncodeSuperblock(newer, 1, page.data());
     EXPECT_EQ(DecodeSuperblock(page.data(), 0).state, SlotState::OTHER_VERSION);
 
-    // A format-1 slot with a bad checksum is still just damaged.
-    std::vector<char> torn(PAGE_SIZE);
-    EncodeSuperblock(Sample(), 0, torn.data());
-    torn[56] ^= 0x10;
-    EXPECT_EQ(DecodeSuperblock(torn.data(), 0).state, SlotState::BAD_CHECKSUM);
+    // A readable version's slot with a bad checksum is still just damaged.
+    for (uint32_t version : {1u, 2u}) {
+        Superblock readable = Sample();
+        readable.format_version = version;
+        std::vector<char> torn(PAGE_SIZE);
+        EncodeSuperblock(readable, 0, torn.data());
+        torn[56] ^= 0x10;
+        EXPECT_EQ(DecodeSuperblock(torn.data(), 0).state, SlotState::BAD_CHECKSUM) << "version " << version;
+    }
+}
+
+TEST(SuperblockTest, ReadsVersionsOneAndTwo) {
+    EXPECT_EQ(kFormatVersion, 2u);
+    EXPECT_EQ(kOldestFormatVersion, 1u);
+    EXPECT_EQ(Superblock{}.format_version, 2u);
+    for (uint32_t version : {0u, 1u, 2u, 3u, 7u}) {
+        SCOPED_TRACE("version " + std::to_string(version));
+        Superblock sb = Sample();
+        sb.format_version = version;
+        std::vector<char> page(PAGE_SIZE);
+        EncodeSuperblock(sb, 1, page.data());
+        const SlotRead read = DecodeSuperblock(page.data(), 1);
+        EXPECT_EQ(read.block.format_version, version);
+        if (version == 1 || version == 2) {
+            ASSERT_EQ(read.state, SlotState::VALID);
+            EXPECT_EQ(read.block.generation, sb.generation);
+            EXPECT_EQ(read.block.catalog_bytes, sb.catalog_bytes);
+        } else {
+            EXPECT_EQ(read.state, SlotState::OTHER_VERSION);
+        }
+    }
 }
 
 }  // namespace

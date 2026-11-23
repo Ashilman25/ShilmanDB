@@ -28,31 +28,53 @@ constexpr Encoding kAllEncodings[] = {Encoding::CONSTANT, Encoding::PLAIN, Encod
                                       Encoding::DICTIONARY};
 
 // Hands out a chunk's pages one at a time and counts each page's pins.
+// A big-value page may be pinned beside its data page, one at a time.
 // With poison on, an unpinned page's bytes are overwritten, so stale pointers show.
 class CountingPages : public ChunkPages {
 public:
     explicit CountingPages(const EncodedChunk& chunk, bool poison = false)
-        : chunk_(chunk), poison_(poison), pins_(chunk.meta.page_count, 0), copy_(poison ? PAGE_SIZE : 0) {}
-    ~CountingPages() override { EXPECT_EQ(pinned_, kNone) << "a page is still pinned"; }
+        : chunk_(chunk),
+          poison_(poison),
+          first_big_(chunk.meta.big_page_count <= chunk.meta.page_count ? chunk.meta.page_count - chunk.meta.big_page_count : 0),
+          pins_(chunk.meta.page_count, 0),
+          copy_(poison ? PAGE_SIZE : 0),
+          big_copy_(poison ? PAGE_SIZE : 0) {}
+    ~CountingPages() override {
+        EXPECT_EQ(pinned_, kNone) << "a page is still pinned";
+        EXPECT_EQ(pinned_big_, kNone) << "a big-value page is still pinned";
+    }
 
     const char* Pin(uint32_t index) override {
-        EXPECT_EQ(pinned_, kNone) << "two pages pinned at once";
+        const bool big = index >= first_big_;
+        uint32_t& slot = big ? pinned_big_ : pinned_;
+        EXPECT_EQ(slot, kNone) << (big ? "two big-value pages pinned at once" : "two pages pinned at once");
         if (index >= chunk_.meta.page_count) {
             ADD_FAILURE() << "page " << index << " is past the chunk's " << chunk_.meta.page_count;
             throw DatabaseException("page past the chunk");
         }
-        pinned_ = index;
+        slot = index;
         ++pins_[index];
         const char* page = chunk_.pages.data() + static_cast<size_t>(index) * PAGE_SIZE;
         if (!poison_) return page;
-        std::memcpy(copy_.data(), page, PAGE_SIZE);
-        return copy_.data();
+        std::vector<char>& copy = big ? big_copy_ : copy_;
+        std::memcpy(copy.data(), page, PAGE_SIZE);
+        return copy.data();
     }
     void Unpin(uint32_t index) override {
-        EXPECT_EQ(pinned_, index);
-        pinned_ = kNone;
-        if (poison_) std::memset(copy_.data(), 0xAB, PAGE_SIZE);
+        const bool big = index >= first_big_;
+        uint32_t& slot = big ? pinned_big_ : pinned_;
+        EXPECT_EQ(slot, index);
+        slot = kNone;
+        if (poison_) std::memset((big ? big_copy_ : copy_).data(), 0xAB, PAGE_SIZE);
     }
+
+    // Records the walk's page list; big-value pages must never be in it.
+    void Expect(const uint32_t* indexes, size_t n) override {
+        for (size_t i = 0; i < n; ++i) EXPECT_LT(indexes[i], first_big_) << "a big-value page in a batch";
+        expected_.insert(expected_.end(), indexes, indexes + n);
+    }
+    // Every page index the walks listed, in order.
+    [[nodiscard]] const std::vector<uint32_t>& Expected() const { return expected_; }
 
     [[nodiscard]] const std::vector<uint32_t>& Pins() const { return pins_; }
     [[nodiscard]] uint32_t MaxPins() const { return pins_.empty() ? 0 : *std::max_element(pins_.begin(), pins_.end()); }
@@ -67,9 +89,13 @@ private:
     static constexpr uint32_t kNone = UINT32_MAX;
     const EncodedChunk& chunk_;
     bool poison_;
+    uint32_t first_big_;
     std::vector<uint32_t> pins_;
-    std::vector<char> copy_;  // the pinned page's bytes when poisoning
+    std::vector<char> copy_;      // the pinned page's bytes when poisoning
+    std::vector<char> big_copy_;  // the pinned big-value page's bytes when poisoning
+    std::vector<uint32_t> expected_;
     uint32_t pinned_{kNone};
+    uint32_t pinned_big_{kNone};
 };
 
 // Compares two vectors row by row; doubles by their bits.
@@ -856,6 +882,66 @@ TEST(EncodingRowsTest, LongAndMultibyteStrings) {
         DecodeRows(chunk->meta, pages, ColumnType::Text(), nullptr, 50, out.data(), arena);
     }
     for (StringRef s : out) EXPECT_EQ(View(s), emoji_run.substr(0, 8000));
+}
+
+// Big values come back through DecodeRows, copied before their pages are unpinned.
+// Their pages are pinned one at a time beside the data page, never batched.
+TEST(EncodingRowsTest, BigValuesDecodeRows) {
+    std::mt19937_64 rng(77);
+    const auto letters = [&](size_t n) {
+        std::string s(n, ' ');
+        for (char& c : s) c = static_cast<char>('a' + rng() % 26);
+        return s;
+    };
+    std::vector<std::string> values;
+    for (int i = 0; i < 2000; ++i) {
+        const bool big = i % 61 == 0 || (i >= 1000 && i < 1004);  // four big values in a row too
+        values.push_back(big ? letters(8156 + rng() % 30000) : RandomString(300, rng));
+    }
+    ColumnVector v(ColumnType::Text());
+    for (const auto& s : values) v.AppendString(s);
+    const EncodedChunk chunk = EncodeChunk(v);
+    ASSERT_EQ(chunk.meta.encoding, Encoding::PLAIN);
+    ASSERT_GE(chunk.meta.big_page_count, 37u);  // 37 big values, each on at least one page
+    const ChunkMeta& meta = chunk.meta;
+    const auto n = static_cast<uint32_t>(values.size());
+    ExpectDecodeRowsMatches(chunk, ColumnType::Text(), rng);
+
+    // Every page read once, only data pages listed, copies outliving the poisoned pages.
+    StringArena arena;
+    std::vector<StringRef> all(n);
+    const std::vector<uint32_t> rows = RandomSubset(n, 0.3, rng);
+    std::vector<StringRef> some(rows.size());
+    {
+        CountingPages pages(chunk, true);
+        DecodeRows(meta, pages, ColumnType::Text(), nullptr, n, all.data(), arena);
+        for (uint32_t i = 0; i < meta.page_count; ++i) EXPECT_EQ(pages.Pins()[i], 1u) << "page " << i;
+        EXPECT_EQ(pages.Expected().size(), meta.page_first_rows.size());
+        DecodeRows(meta, pages, ColumnType::Text(), rows.data(), static_cast<uint32_t>(rows.size()), some.data(), arena);
+    }
+    for (uint32_t i = 0; i < n; ++i) ASSERT_EQ(View(all[i]), values[i]) << "row " << i;
+    for (size_t k = 0; k < rows.size(); ++k) ASSERT_EQ(View(some[k]), values[rows[k]]) << "row " << rows[k];
+
+    // A forged reference on the first data page is refused, leaving nothing pinned.
+    EncodedChunk forged = chunk;
+    char* page = forged.pages.data();
+    ColumnarPageHeader h;
+    std::memcpy(&h, page, sizeof(h));
+    ASSERT_EQ(h.flags, kPageBigValues);
+    uint16_t slot0 = 0;
+    std::memcpy(&slot0, page + kPageHeaderSize + (h.value_count + 7) / 8, sizeof(slot0));
+    const BigValueRef outside{0, 9000};  // page 0 is the data page itself
+    std::memcpy(page + slot0, &outside, sizeof(outside));
+    ExpectRowsDamaged(forged, ColumnType::Text(), 0);
+
+    // A NULL on a page with big values is still refused.
+    ColumnVector with_null(ColumnType::Text());
+    with_null.AppendString(letters(9000));
+    with_null.AppendNull();
+    const EncodedChunk null_chunk = EncodeChunk(with_null);
+    CountingPages pages(null_chunk);
+    EXPECT_EQ(ThrownText([&] { DecodeRowsDiscard(null_chunk.meta, pages, ColumnType::Text(), nullptr, 2); }),
+              "damaged column chunk: row 1 is NULL");
 }
 
 TEST(EncodingRowsTest, NullSlotThrows) {

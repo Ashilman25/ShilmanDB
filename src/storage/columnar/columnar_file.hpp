@@ -29,6 +29,9 @@ public:
     // After a failed write or sync, reload: don't retry over the same data pages.
     void Commit(CatalogMeta next);
 
+    // Tests only: creates and commits write this older format; 0 puts back kFormatVersion.
+    static void WriteFormatForTest(uint32_t version);
+
 private:
     void Create();
     void Open();

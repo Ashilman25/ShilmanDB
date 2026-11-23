@@ -21,7 +21,7 @@ constexpr size_t kMinString = 4;
 constexpr size_t kMinOptional = 1;
 constexpr size_t kMinColumnType = 1 + 1 + 1 + 4;
 constexpr size_t kMinColumn = kMinString + 4 + kMinColumnType + 1;
-constexpr size_t kMinChunk = 4 + 4 + 4 + 1 + 4 + 4 + 4 + 4 + 4 + 3 * kMinOptional;
+constexpr size_t kMinChunk = 4 + 4 + 4 + 1 + 4 + 4 + 4 + 4 + 4 + 3 * kMinOptional;  // version 1; version 2 adds 4
 constexpr size_t kMinRowGroup = 4 + 4;
 constexpr size_t kMinStats = 8 + 8 + 4 + 4;
 constexpr size_t kMinTable = 4 + kMinString + 4 + 8 + 4 + kMinStats;
@@ -195,10 +195,12 @@ void PutU32List(Writer& w, const std::vector<uint32_t>& list) {
 }
 
 // Fixed fields, page lists, then min, max and constant.
-void PutChunk(Writer& w, const ChunkMeta& c) {
+// Version 2 adds the big-value page count after the dictionary page count.
+void PutChunk(Writer& w, const ChunkMeta& c, uint32_t version) {
     w.Put(c.first_page);
     w.Put(c.page_count);
     w.Put(c.dict_page_count);
+    if (version >= 2) w.Put(c.big_page_count);
     w.Put(c.encoding);
     w.Put(c.value_count);
     w.Put(c.null_count);
@@ -238,7 +240,7 @@ void PutStats(Writer& w, const TableStats& stats) {
 }
 
 // Name and columns, row groups with their chunks, then stats.
-void PutTable(Writer& w, const ColumnarTableMeta& t) {
+void PutTable(Writer& w, const ColumnarTableMeta& t, uint32_t version) {
     w.Put(t.oid);
     w.PutString(t.name);
     w.PutCount(t.columns.size());
@@ -253,7 +255,13 @@ void PutTable(Writer& w, const ColumnarTableMeta& t) {
     for (const auto& group : t.row_groups) {
         w.Put(group.row_count);
         w.PutCount(group.chunks.size());
-        for (const auto& chunk : group.chunks) PutChunk(w, chunk);
+        for (size_t c = 0; c < group.chunks.size(); ++c) {
+            if (version < 2 && group.chunks[c].big_page_count > 0) {
+                const std::string column = c < t.columns.size() ? t.columns[c].name : std::to_string(c + 1);
+                throw DatabaseException("catalog format " + std::to_string(version) + " can't hold values bigger than a page: table " + t.name + ", column " + column);
+            }
+            PutChunk(w, group.chunks[c], version);
+        }
     }
     PutStats(w, t.stats);
 }
@@ -376,11 +384,13 @@ void CheckPageStarts(const std::vector<uint32_t>& starts, uint32_t count, const 
 }
 
 // Reads a chunk and checks the page lists readers index by.
-ChunkMeta GetChunk(Reader& r, uint32_t group_rows) {
+// A version 1 chunk has no big-value pages.
+ChunkMeta GetChunk(Reader& r, uint32_t group_rows, uint32_t version) {
     ChunkMeta c;
     c.first_page = r.Get<uint32_t>();
     c.page_count = r.Get<uint32_t>();
     c.dict_page_count = r.Get<uint32_t>();
+    if (version >= 2) c.big_page_count = r.Get<uint32_t>();
     c.encoding = GetEncoding(r);
     c.value_count = r.Get<uint32_t>();
     c.null_count = r.Get<uint32_t>();
@@ -396,7 +406,11 @@ ChunkMeta GetChunk(Reader& r, uint32_t group_rows) {
     }
     if (c.null_count > c.value_count) Damaged("more NULLs than values in a chunk");
     if (c.dict_page_count > c.page_count) Damaged("more dictionary pages than pages in a chunk");
-    if (c.page_first_rows.size() != c.page_count - c.dict_page_count) {
+    if (c.big_page_count > 0 && c.encoding != Encoding::PLAIN) Damaged("big-value pages in a chunk that isn't PLAIN");
+    if (static_cast<uint64_t>(c.dict_page_count) + c.big_page_count > c.page_count) {
+        Damaged("more dictionary and big-value pages than pages in a chunk");
+    }
+    if (c.page_first_rows.size() != c.page_count - c.dict_page_count - c.big_page_count) {
         Damaged("chunk data page list doesn't match its page count");
     }
     if (c.dict_page_first_entries.size() != c.dict_page_count) {
@@ -437,7 +451,7 @@ void GetStats(Reader& r, TableStats& stats) {
 }
 
 // Reads a table and checks its columns, groups and row counts line up.
-ColumnarTableMeta GetTable(Reader& r) {
+ColumnarTableMeta GetTable(Reader& r, uint32_t version) {
     ColumnarTableMeta t;
     t.oid = r.Get<uint32_t>();
     t.name = r.GetString();
@@ -462,11 +476,11 @@ ColumnarTableMeta GetTable(Reader& r) {
         if (group.row_count > kRowGroupSize) {
             Damaged("row group of " + std::to_string(group.row_count) + " rows");
         }
-        group.chunks.resize(r.GetCount(kMinChunk, "chunks"));
+        group.chunks.resize(r.GetCount(kMinChunk + (version >= 2 ? sizeof(uint32_t) : 0), "chunks"));
         if (group.chunks.size() != t.columns.size()) {
             Damaged("row group with " + std::to_string(group.chunks.size()) + " chunks for " + std::to_string(t.columns.size()) + " columns");
         }
-        for (ChunkMeta& chunk : group.chunks) chunk = GetChunk(r, group.row_count);
+        for (ChunkMeta& chunk : group.chunks) chunk = GetChunk(r, group.row_count, version);
         rows += group.row_count;
     }
     if (rows != t.row_count) Damaged("table " + t.name + " row count doesn't match its row groups");
@@ -501,12 +515,15 @@ IndexMeta GetIndex(Reader& r, const std::vector<ColumnarTableMeta>& tables) {
 }  // namespace
 
 // Version, byte count (filled in last), tables, then indexes.
-std::vector<char> EncodeCatalog(const CatalogMeta& meta) {
+std::vector<char> EncodeCatalog(const CatalogMeta& meta, uint32_t version) {
+    if (version < kOldestFormatVersion || version > kFormatVersion) {
+        throw DatabaseException("can't write catalog format " + std::to_string(version));
+    }
     Writer w;
-    w.Put(kFormatVersion);
+    w.Put(version);
     w.Put(uint64_t{0});
     w.PutCount(meta.tables.size());
-    for (const auto& table : meta.tables) PutTable(w, table);
+    for (const auto& table : meta.tables) PutTable(w, table, version);
     w.PutCount(meta.indexes.size());
     for (const auto& index : meta.indexes) PutIndex(w, index);
 
@@ -520,8 +537,8 @@ std::vector<char> EncodeCatalog(const CatalogMeta& meta) {
 CatalogMeta DecodeCatalog(const char* data, size_t size) {
     Reader r(data, size);
     const auto version = r.Get<uint32_t>();
-    if (version != kFormatVersion) {
-        Damaged("version " + std::to_string(version) + ", expected " + std::to_string(kFormatVersion));
+    if (version < kOldestFormatVersion || version > kFormatVersion) {
+        Damaged("version " + std::to_string(version) + ", expected " + std::to_string(kOldestFormatVersion) + " to " + std::to_string(kFormatVersion));
     }
     const auto total = r.Get<uint64_t>();
     if (total != size) Damaged("says " + std::to_string(total) + " bytes but has " + std::to_string(size));
@@ -531,7 +548,7 @@ CatalogMeta DecodeCatalog(const char* data, size_t size) {
     std::unordered_set<std::string> table_names;
     std::unordered_set<uint32_t> table_oids;
     for (auto& table : meta.tables) {
-        table = GetTable(r);
+        table = GetTable(r, version);
         CheckUnique(table_names, table.name, "tables named " + table.name);
         CheckUnique(table_oids, table.oid, "tables with oid " + std::to_string(table.oid));
     }

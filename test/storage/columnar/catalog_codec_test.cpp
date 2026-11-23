@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 #include "common/exception.hpp"
 #include "storage/columnar/catalog_codec.hpp"
+#include "storage/columnar/crc32c.hpp"
 #include "storage/columnar/superblock.hpp"
 #include <algorithm>
 #include <cstring>
@@ -19,9 +20,10 @@ constexpr Encoding kAllEncodings[] = {Encoding::CONSTANT, Encoding::PLAIN, Encod
 constexpr size_t kByteCountOffset = 4;  // u32 version, then the u64 byte count
 
 // Builds random but well-formed catalogs, and notes which variants it used.
+// With big_pages on, PLAIN chunks may count big-value pages too.
 class CatalogMaker {
 public:
-    explicit CatalogMaker(uint32_t seed) : rng_(seed) {}
+    explicit CatalogMaker(uint32_t seed, bool big_pages = false) : rng_(seed), big_pages_(big_pages) {}
 
     std::set<Encoding> encodings_seen;
     std::set<size_t> scalars_seen;
@@ -134,7 +136,8 @@ private:
         if (encoding == Encoding::DICTIONARY) c.dict_size = Int(0, static_cast<int>(rows - c.null_count));
         c.dict_page_count = c.dict_size == 0 ? 0 : Int(1, static_cast<int>(std::min<uint32_t>(3, c.dict_size)));
         const auto data_pages = static_cast<uint32_t>(Int(1, static_cast<int>(std::min<uint32_t>(4, rows))));
-        c.page_count = c.dict_page_count + data_pages;
+        if (big_pages_ && encoding == Encoding::PLAIN) c.big_page_count = static_cast<uint32_t>(Int(0, 5));
+        c.page_count = c.dict_page_count + data_pages + c.big_page_count;
         c.first_page = static_cast<page_id_t>(Int(2, 1 << 24));
         for (uint32_t i = 0; i < data_pages; ++i) c.page_first_rows.push_back(i * (rows / data_pages));
         for (uint32_t i = 0; i < c.dict_page_count; ++i) {
@@ -192,6 +195,7 @@ private:
     }
 
     std::mt19937 rng_;
+    bool big_pages_;
     int next_encoding_{0};
 };
 
@@ -275,7 +279,7 @@ void ExpectDamagedAfter(const std::function<void(CatalogMeta&)>& change, const s
 }
 
 TEST(CatalogCodecTest, CatalogRoundTrip) {
-    CatalogMaker maker(20261116);
+    CatalogMaker maker(20261116, true);
     for (int i = 0; i < 50; ++i) {
         const CatalogMeta meta = maker.Catalog();
         const std::vector<char> bytes = EncodeCatalog(meta);
@@ -322,6 +326,116 @@ TEST(CatalogCodecTest, CatalogKeepsFields) {
     EXPECT_FALSE(back.indexes[0].unique);
 }
 
+// Version 1 bytes match the catalog codec from before big values, hashes taken from it.
+TEST(CatalogCodecTest, VersionOneBytesMatchTheOldCodec) {
+    const std::vector<char> small = EncodeCatalog(SmallCatalog(), 1);
+    EXPECT_EQ(small.size(), 415u);
+    EXPECT_EQ(Crc32c(small.data(), small.size()), 0xE7BB5C5Bu);
+
+    CatalogMaker maker(20261122);
+    uint32_t crc = 0;
+    size_t bytes = 0;
+    for (int i = 0; i < 20; ++i) {
+        const std::vector<char> blob = EncodeCatalog(maker.Catalog(), 1);
+        crc = Crc32c(blob.data(), blob.size(), crc);
+        bytes += blob.size();
+    }
+    EXPECT_EQ(bytes, 39284u);
+    EXPECT_EQ(crc, 0x8AF8C4A9u);
+}
+
+// The text of the DatabaseException f throws, or "" when it throws none.
+template <typename F>
+std::string ThrownText(F f) {
+    try {
+        f();
+    } catch (const DatabaseException& e) {
+        return e.what();
+    }
+    return "";
+}
+
+// Chunk 0 of the small catalog as PLAIN text, with big-value pages.
+CatalogMeta CatalogWithBigPages() {
+    CatalogMeta meta = SmallCatalog();
+    meta.tables[0].columns[0].type = ColumnType::Text();
+    meta.indexes.clear();
+    ChunkMeta& chunk = meta.tables[0].row_groups[0].chunks[0];
+    chunk.encoding = Encoding::PLAIN;
+    chunk.big_page_count = 7;
+    chunk.page_count = 2 + 7;
+    chunk.min.reset();
+    chunk.max.reset();
+    return meta;
+}
+
+TEST(CatalogCodecTest, VersionOneCatalogHasNoBigPages) {
+    EXPECT_EQ(kFormatVersion, 2u);
+    EXPECT_EQ(kOldestFormatVersion, 1u);
+    const CatalogMeta meta = SmallCatalog();
+    const std::vector<char> v1 = EncodeCatalog(meta, 1);
+    const std::vector<char> v2 = EncodeCatalog(meta);
+    uint32_t version = 0;
+    std::memcpy(&version, v1.data(), sizeof(version));
+    EXPECT_EQ(version, 1u);
+    std::memcpy(&version, v2.data(), sizeof(version));
+    EXPECT_EQ(version, 2u);
+    EXPECT_EQ(EncodeCatalog(meta, 2), v2);
+
+    // Version 2 adds a 4-byte big page count to each of the two chunks.
+    EXPECT_EQ(v2.size(), v1.size() + 2 * sizeof(uint32_t));
+    const CatalogMeta back = DecodeCatalog(v1.data(), v1.size());
+    for (const ChunkMeta& chunk : back.tables[0].row_groups[0].chunks) EXPECT_EQ(chunk.big_page_count, 0u);
+    EXPECT_EQ(EncodeCatalog(back), v2) << "read as version 1, written as version 2";
+    EXPECT_EQ(EncodeCatalog(back, 1), v1);
+
+    // Version 1 can't hold big values, and no other version is written.
+    EXPECT_EQ(ThrownText([] { (void)EncodeCatalog(CatalogWithBigPages(), 1); }),
+              "catalog format 1 can't hold values bigger than a page: table orders, column o_orderkey");
+    EXPECT_EQ(ThrownText([&] { (void)EncodeCatalog(meta, 0); }), "can't write catalog format 0");
+    EXPECT_EQ(ThrownText([&] { (void)EncodeCatalog(meta, 3); }), "can't write catalog format 3");
+}
+
+TEST(CatalogCodecTest, BigPageCountRoundTrips) {
+    const std::vector<char> bytes = EncodeCatalog(CatalogWithBigPages());
+    const CatalogMeta back = DecodeCatalog(bytes.data(), bytes.size());
+    const ChunkMeta& chunk = back.tables[0].row_groups[0].chunks[0];
+    EXPECT_EQ(chunk.big_page_count, 7u);
+    EXPECT_EQ(chunk.page_count, 9u);
+    EXPECT_EQ(chunk.page_first_rows, (std::vector<uint32_t>{0, 2000}));
+    EXPECT_EQ(back.tables[0].row_groups[0].chunks[1].big_page_count, 0u);
+    EXPECT_EQ(EncodeCatalog(back), bytes);
+
+    // Random catalogs with big pages round-trip too.
+    CatalogMaker maker(7, true);
+    for (int i = 0; i < 20; ++i) {
+        const std::vector<char> blob = EncodeCatalog(maker.Catalog());
+        const CatalogMeta again = DecodeCatalog(blob.data(), blob.size());
+        ASSERT_EQ(EncodeCatalog(again), blob) << "catalog " << i;
+    }
+}
+
+// Big-value pages only in PLAIN chunks, and inside the chunk's page count.
+TEST(CatalogCodecTest, BigPageShapesThrow) {
+    const auto damaged_after = [](const std::function<void(ChunkMeta&)>& change, const std::string& fragment) {
+        CatalogMeta meta = CatalogWithBigPages();
+        change(meta.tables[0].row_groups[0].chunks[0]);
+        ExpectDamaged(EncodeCatalog(meta), fragment, fragment);
+    };
+    damaged_after([](ChunkMeta& c) { c.encoding = Encoding::BITPACK; }, "big-value pages in a chunk that isn't PLAIN");
+    damaged_after([](ChunkMeta& c) { c.big_page_count = 10; }, "more dictionary and big-value pages than pages in a chunk");
+    damaged_after([](ChunkMeta& c) { c.big_page_count = UINT32_MAX; }, "more dictionary and big-value pages than pages in a chunk");
+    damaged_after([](ChunkMeta& c) { c.big_page_count = 6; }, "chunk data page list doesn't match its page count");
+    damaged_after([](ChunkMeta& c) { c.big_page_count = 8; }, "chunk data page list doesn't match its page count");
+
+    // A dictionary chunk with big pages is refused too.
+    CatalogMeta coded = SmallCatalog();
+    ChunkMeta& dict = coded.tables[0].row_groups[0].chunks[1];
+    dict.big_page_count = 1;
+    dict.page_count += 1;
+    ExpectDamaged(EncodeCatalog(coded), "big pages on a dictionary chunk", "big-value pages in a chunk that isn't PLAIN");
+}
+
 TEST(CatalogCodecTest, EmptyCatalogRoundTrips) {
     const std::vector<char> bytes = EncodeCatalog(CatalogMeta{});
     EXPECT_EQ(bytes.size(), 20u);  // version, byte count, two empty counts
@@ -353,9 +467,12 @@ TEST(CatalogCodecTest, CatalogTruncatedOrCorruptThrows) {
     std::memcpy(many_tables.data() + 12, &huge, sizeof(huge));
     ExpectDamaged(many_tables, "table count past the end");
 
-    std::vector<char> version = bytes;
-    version[0] = 2;
-    ExpectDamaged(version, "another version");
+    // Versions 1 and 2 are read; anything else is refused.
+    for (const char other : {char{0}, char{3}}) {
+        std::vector<char> version = bytes;
+        version[0] = other;
+        ExpectDamaged(version, "another version", "version " + std::to_string(other) + ", expected 1 to 2");
+    }
 
     std::vector<char> trailing = bytes;
     trailing.push_back(0);
