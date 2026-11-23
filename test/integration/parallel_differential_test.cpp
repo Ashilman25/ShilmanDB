@@ -20,6 +20,9 @@
 #include "catalog/catalog.hpp"
 #include "engine/database.hpp"
 #include "integration/parallel_random_queries.hpp"
+#include "parser/parser.hpp"
+#include "planner/plan_dump.hpp"
+#include "planner/planner.hpp"
 
 // Random tables and random queries: the parallel executor against vectorized mode.
 // The generator (parallel_random_queries.hpp) stays clear of the known, intended
@@ -241,7 +244,8 @@ std::string OrderedBlocks(const std::vector<Row>& got, size_t g0, size_t g1, con
 void SkipEmptyInputCells(const GeneratedQuery& q, std::vector<Row>& rows) {
     if (q.count_column < 0) return;
     for (Row& row : rows) {
-        if (row[static_cast<size_t>(q.count_column)].value.integer_ != 0) continue;
+        const Value& count = row[static_cast<size_t>(q.count_column)].value;
+        if ((count.type_ == TypeId::BIGINT ? count.bigint_ : count.integer_) != 0) continue;
         for (size_t c : q.empty_unsafe) {
             row[c] = Cell();
             row[c].text = "(empty input)";
@@ -249,16 +253,25 @@ void SkipEmptyInputCells(const GeneratedQuery& q, std::vector<Row>& rows) {
     }
 }
 
+// sql's COUNT columns in today's plan on db, which parallel plans type BIGINT.
+std::vector<bool> CountsOf(const Database& db, const std::string& sql) {
+    return test::CountColumns(*db.MakePlanner(QueryOptions{}).Plan(std::move(*Parser(sql).Parse())));
+}
+
 // How got differs from want_all, or "" when it may stand in for it.
 // With a LIMIT, want_all is vectorized mode's answer without the LIMIT.
-std::string Difference(const GeneratedQuery& q, const QueryResult& got, const QueryResult& want_all) {
+// counts marks want_all's COUNT columns: BIGINT in got where want_all has INTEGER.
+std::string Difference(const GeneratedQuery& q, const QueryResult& got, const QueryResult& want_all, const std::vector<bool>& counts) {
     std::vector<uint32_t> got_columns;
     std::vector<uint32_t> want_columns;
     std::string why = ColumnsByName(q, got.schema, got_columns);
     if (why.empty()) why = ColumnsByName(q, want_all.schema, want_columns);
     if (!why.empty()) return why;
     for (size_t k = 0; k < got_columns.size(); ++k) {
-        if (got.schema.GetColumn(got_columns[k]).type != want_all.schema.GetColumn(want_columns[k]).type) {
+        const TypeId today = want_all.schema.GetColumn(want_columns[k]).type;
+        const bool count = want_columns[k] < counts.size() && counts[want_columns[k]];
+        if (count && today != TypeId::INTEGER) return "column " + q.outputs[k] + " is a COUNT but not INTEGER today";
+        if (got.schema.GetColumn(got_columns[k]).type != (count ? TypeId::BIGINT : today)) {
             return "column " + q.outputs[k] + " has another type";
         }
     }
@@ -363,9 +376,10 @@ TEST_P(ParallelDifferentialTest, RandomQueriesMatchVectorized) {
                 if (q.keys.empty() && q.limit >= 0) ++unordered_limits;
                 if (q.limit >= 0) {
                     const Outcome all = RunQuery(db, q.Sql(false), ExecutionMode::VECTORIZED);
-                    why = all.threw ? "the unlimited query threw: " + all.error : Difference(q, got.result, all.result);
+                    why = all.threw ? "the unlimited query threw: " + all.error
+                                    : Difference(q, got.result, all.result, CountsOf(db, q.Sql(false)));
                 } else {
-                    why = Difference(q, got.result, want.result);
+                    why = Difference(q, got.result, want.result, CountsOf(db, sql));
                 }
             }
             if (!why.empty()) {

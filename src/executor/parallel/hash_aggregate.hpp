@@ -24,7 +24,7 @@ struct AggregateSpec {
     bool global{false};                               // no GROUP BY: one row, even on empty input
 };
 
-// What an aggregate emits. COUNT: INTEGER. SUM of an integer or decimal: an exact
+// What an aggregate emits. COUNT: BIGINT. SUM of an integer or decimal: an exact
 // wide decimal at the argument's scale; of anything else: DOUBLE. AVG: DOUBLE.
 // MIN / MAX: the argument's type. Throws when a non-COUNT has no argument.
 [[nodiscard]] VType AggregateOutputType(Aggregate::Func func, const CompiledExpr* arg);
@@ -36,5 +36,9 @@ struct AggregateSpec {
 // The source then hands out every group, keys then aggregates as slots 0..n-1,
 // in several morsels and no set order. Throws when out_types disagree with the rest.
 [[nodiscard]] std::pair<std::unique_ptr<Sink>, std::unique_ptr<Source>> MakeHashAggregate(AggregateSpec spec);
+
+// Tests only: the sink adds offset to every COUNT state when it finalizes.
+// Throws when the sink isn't an aggregate's.
+void OffsetCountsForTest(Sink& aggregate_sink, int64_t offset);
 
 }  // namespace shilmandb::parallel

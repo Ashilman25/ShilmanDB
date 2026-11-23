@@ -499,7 +499,8 @@ void ExtractAggregates(std::unique_ptr<Expression>& expr, std::vector<std::uniqu
     }
 }
 
-auto ResolveExprType(const Expression* expr, const Schema& schema) -> TypeId {
+// An expression's result type. COUNT gives count_type: BIGINT in parallel plans, else INTEGER.
+auto ResolveExprType(const Expression* expr, const Schema& schema, TypeId count_type = TypeId::INTEGER) -> TypeId {
     if (const auto* col = dynamic_cast<const ColumnRef*>(expr)) {
         for (uint32_t i = 0; i < schema.GetColumnCount(); ++i) {
             if (schema.GetColumn(i).name == col->column_name) {
@@ -515,32 +516,32 @@ auto ResolveExprType(const Expression* expr, const Schema& schema) -> TypeId {
     if (const auto* agg = dynamic_cast<const Aggregate*>(expr)) {
         switch (agg->func) {
             case Aggregate::Func::COUNT:
-                return TypeId::INTEGER;
+                return count_type;
             case Aggregate::Func::SUM:
                 return TypeId::DECIMAL;
             case Aggregate::Func::AVG:
                 return TypeId::DECIMAL;
             case Aggregate::Func::MIN:
             case Aggregate::Func::MAX:
-                return agg->arg ? ResolveExprType(agg->arg.get(), schema) : TypeId::INTEGER;
+                return agg->arg ? ResolveExprType(agg->arg.get(), schema, count_type) : TypeId::INTEGER;
         }
     }
     if (const auto* ce = dynamic_cast<const CaseExpression*>(expr)) {
         if (ce->when_clauses.empty()) return TypeId::INTEGER;  // guarded by parser
 
-        TypeId resolved = ResolveExprType(ce->when_clauses[0].second.get(), schema);
+        TypeId resolved = ResolveExprType(ce->when_clauses[0].second.get(), schema, count_type);
         for (size_t i = 1; i < ce->when_clauses.size(); ++i) {
-            auto t = ResolveExprType(ce->when_clauses[i].second.get(), schema);
+            auto t = ResolveExprType(ce->when_clauses[i].second.get(), schema, count_type);
             auto merged = CommonType(resolved, t);
 
             if (merged == TypeId::INVALID) {
-                return ResolveExprType(ce->when_clauses[0].second.get(), schema);
+                return ResolveExprType(ce->when_clauses[0].second.get(), schema, count_type);
             }
             resolved = merged;
         }
 
         if (ce->else_clause) {
-            auto t = ResolveExprType(ce->else_clause.get(), schema);
+            auto t = ResolveExprType(ce->else_clause.get(), schema, count_type);
             auto merged = CommonType(resolved, t);
             if (merged != TypeId::INVALID) resolved = merged;
         }
@@ -554,8 +555,8 @@ auto ResolveExprType(const Expression* expr, const Schema& schema) -> TypeId {
             case Op::LIKE:
                 return TypeId::INTEGER;  // boolean result
             case Op::ADD: case Op::SUB: case Op::MUL: case Op::DIV: {
-                auto lt = ResolveExprType(bin->left.get(), schema);
-                auto rt = ResolveExprType(bin->right.get(), schema);
+                auto lt = ResolveExprType(bin->left.get(), schema, count_type);
+                auto rt = ResolveExprType(bin->right.get(), schema, count_type);
                 auto merged = CommonType(lt, rt);
                 return merged == TypeId::INVALID ? lt : merged;
             }
@@ -563,7 +564,7 @@ auto ResolveExprType(const Expression* expr, const Schema& schema) -> TypeId {
     }
     if (const auto* un = dynamic_cast<const UnaryOp*>(expr)) {
         if (un->op == UnaryOp::Op::NOT) return TypeId::INTEGER;
-        return ResolveExprType(un->operand.get(), schema);
+        return ResolveExprType(un->operand.get(), schema, count_type);
     }
     return TypeId::INTEGER;
 }
@@ -977,6 +978,9 @@ auto Planner::Plan(SelectStatement stmt) -> std::unique_ptr<PlanNode> {
         }
     }
 
+    // The parallel executor counts in 64 bits; the other modes keep INTEGER.
+    const TypeId count_type = parallel_planning_ ? TypeId::BIGINT : TypeId::INTEGER;
+
     auto has_aggregate_in_select = [&]() {
         return std::any_of(stmt.select_list.begin(), stmt.select_list.end(),
             [](const SelectItem& item) {
@@ -1023,7 +1027,7 @@ auto Planner::Plan(SelectStatement stmt) -> std::unique_ptr<PlanNode> {
             TypeId col_type = TypeId::INTEGER;
             switch (agg_funcs[i]) {
                 case Aggregate::Func::COUNT:
-                    col_type = TypeId::INTEGER;
+                    col_type = count_type;
                     break;
                 case Aggregate::Func::SUM:
                 case Aggregate::Func::AVG:
@@ -1032,7 +1036,7 @@ auto Planner::Plan(SelectStatement stmt) -> std::unique_ptr<PlanNode> {
                 case Aggregate::Func::MIN:
                 case Aggregate::Func::MAX:
                     col_type = agg_exprs[i]
-                        ? ResolveExprType(agg_exprs[i].get(), current->output_schema)
+                        ? ResolveExprType(agg_exprs[i].get(), current->output_schema, count_type)
                         : TypeId::INTEGER;
                     break;
             }
@@ -1075,7 +1079,7 @@ auto Planner::Plan(SelectStatement stmt) -> std::unique_ptr<PlanNode> {
                 std::string col_name = item.alias.has_value()
                     ? item.alias.value()
                     : DeriveColumnName(item.expr.get());
-                auto col_type = ResolveExprType(item.expr.get(), current->output_schema);
+                auto col_type = ResolveExprType(item.expr.get(), current->output_schema, count_type);
 
                 proj_columns.emplace_back(col_name, col_type);
                 proj_exprs.push_back(std::move(item.expr));

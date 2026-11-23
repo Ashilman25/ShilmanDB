@@ -4,6 +4,9 @@
 #include "engine/database.hpp"
 #include "tpch/tpch_workload.hpp"
 #include "executor/vectorized_parity_harness.hpp"
+#include "parser/parser.hpp"
+#include "planner/plan_dump.hpp"
+#include "planner/planner.hpp"
 
 #include <cstdio>
 #include <filesystem>
@@ -116,7 +119,7 @@ protected:
 
     // Tuple mode against this test's mode: exact for vectorized; parallel sums
     // exactly, so its DECIMAL cells get SameResult's 1e-6 and the rest stay exact.
-    // The parallel executor runs on one thread.
+    // Parallel COUNT columns are BIGINT. The parallel executor runs on one thread.
     void RunParity(const std::string& sql) {
         QueryOptions options;
         options.mode = GetParam().mode;
@@ -130,8 +133,13 @@ protected:
             return;
         }
         ASSERT_EQ(tuple_rs.schema.GetColumnCount(), other_rs.schema.GetColumnCount());
+        const auto tuple_plan = db_->MakePlanner(QueryOptions{}).Plan(std::move(*Parser(sql).Parse()));
+        const std::vector<bool> counts = test::CountColumns(*tuple_plan);
+        ASSERT_EQ(counts.size(), tuple_rs.schema.GetColumnCount());
         for (uint32_t c = 0; c < tuple_rs.schema.GetColumnCount(); ++c) {
-            ASSERT_EQ(tuple_rs.schema.GetColumn(c).type, other_rs.schema.GetColumn(c).type) << "parity: col " << c << " type";
+            const TypeId today = tuple_rs.schema.GetColumn(c).type;
+            if (counts[c]) ASSERT_EQ(today, TypeId::INTEGER) << "parity: col " << c << " is a COUNT";
+            ASSERT_EQ(counts[c] ? TypeId::BIGINT : today, other_rs.schema.GetColumn(c).type) << "parity: col " << c << " type";
         }
         EXPECT_TRUE(tpch::SameResult(tuple_rs, other_rs)) << "parity: " << FirstDifference(tuple_rs, other_rs);
     }

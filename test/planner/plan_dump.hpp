@@ -1,5 +1,6 @@
 #pragma once
-// Shared by the planner tests: a sanctioned exception to per-file test helpers.
+// Shared by the planner tests and the parallel tests that check COUNT types:
+// a sanctioned exception to per-file test helpers.
 
 #include "catalog/schema.hpp"
 #include "parser/ast.hpp"
@@ -242,6 +243,140 @@ inline void DumpNode(const PlanNode& node, int depth, std::string& out) {
     std::string out;
     DumpNode(root, 0, out);
     return out;
+}
+
+// The type a parallel plan gives expr over schema, whose counts columns are BIGINT there.
+// Mirrors the planner's ResolveExprType, early returns included.
+[[nodiscard]] inline TypeId ParallelExprType(const Expression* expr, const Schema& schema, const std::vector<bool>& counts) {
+    if (const auto* col = dynamic_cast<const ColumnRef*>(expr)) {
+        for (uint32_t c = 0; c < schema.GetColumnCount(); ++c) {
+            if (schema.GetColumn(c).name != col->column_name) continue;
+            return c < counts.size() && counts[c] ? TypeId::BIGINT : schema.GetColumn(c).type;
+        }
+        return TypeId::INTEGER;
+    }
+    if (const auto* lit = dynamic_cast<const Literal*>(expr)) return lit->value.type_;
+    if (const auto* agg = dynamic_cast<const Aggregate*>(expr)) {
+        switch (agg->func) {
+            case Aggregate::Func::COUNT: return TypeId::BIGINT;
+            case Aggregate::Func::SUM:
+            case Aggregate::Func::AVG: return TypeId::DECIMAL;
+            case Aggregate::Func::MIN:
+            case Aggregate::Func::MAX: return agg->arg ? ParallelExprType(agg->arg.get(), schema, counts) : TypeId::INTEGER;
+        }
+    }
+    if (const auto* ce = dynamic_cast<const CaseExpression*>(expr)) {
+        if (ce->when_clauses.empty()) return TypeId::INTEGER;
+        // A branch that can't merge gives the first branch's type, ELSE unread.
+        const TypeId first = ParallelExprType(ce->when_clauses[0].second.get(), schema, counts);
+        TypeId resolved = first;
+        for (size_t i = 1; i < ce->when_clauses.size(); ++i) {
+            const TypeId merged = CommonType(resolved, ParallelExprType(ce->when_clauses[i].second.get(), schema, counts));
+            if (merged == TypeId::INVALID) return first;
+            resolved = merged;
+        }
+        if (ce->else_clause) {
+            const TypeId merged = CommonType(resolved, ParallelExprType(ce->else_clause.get(), schema, counts));
+            if (merged != TypeId::INVALID) resolved = merged;
+        }
+        return resolved;
+    }
+    if (const auto* bin = dynamic_cast<const BinaryOp*>(expr)) {
+        using Op = BinaryOp::Op;
+        switch (bin->op) {
+            case Op::EQ: case Op::NEQ: case Op::LT: case Op::GT:
+            case Op::LTE: case Op::GTE: case Op::AND: case Op::OR:
+            case Op::LIKE:
+                return TypeId::INTEGER;
+            case Op::ADD: case Op::SUB: case Op::MUL: case Op::DIV: {
+                const TypeId lt = ParallelExprType(bin->left.get(), schema, counts);
+                const TypeId merged = CommonType(lt, ParallelExprType(bin->right.get(), schema, counts));
+                return merged == TypeId::INVALID ? lt : merged;
+            }
+        }
+    }
+    if (const auto* un = dynamic_cast<const UnaryOp*>(expr)) {
+        if (un->op == UnaryOp::Op::NOT) return TypeId::INTEGER;
+        return ParallelExprType(un->operand.get(), schema, counts);
+    }
+    return TypeId::INTEGER;
+}
+
+// True when expr comes from a COUNT column: INTEGER today, BIGINT in a parallel plan.
+[[nodiscard]] inline bool ComputesFromCount(const Expression* expr, TypeId today, const Schema& schema, const std::vector<bool>& counts) {
+    return today == TypeId::INTEGER && ParallelExprType(expr, schema, counts) == TypeId::BIGINT;
+}
+
+// One node's COUNT columns, given each child's: an aggregate's COUNTs and the INTEGER
+// columns above that come from one. Parallel plans type these BIGINT.
+[[nodiscard]] inline std::vector<bool> NodeCountColumns(const PlanNode& node, const std::vector<std::vector<bool>>& below) {
+    const uint32_t width = node.output_schema.GetColumnCount();
+    std::vector<bool> counts(width, false);
+    switch (node.type) {
+        case PlanNodeType::AGGREGATE: {
+            // The aggregates are the last columns; a GROUP BY expression gets none.
+            const auto& agg = static_cast<const AggregatePlanNode&>(node);
+            const size_t funcs = agg.aggregate_funcs.size();
+            const size_t first = width >= funcs ? width - funcs : 0;
+            for (size_t i = 0; i < funcs && first + i < width; ++i) {
+                counts[first + i] = agg.aggregate_funcs[i] == Aggregate::Func::COUNT;
+            }
+            break;
+        }
+        case PlanNodeType::PROJECTION: {
+            const auto& proj = static_cast<const ProjectionPlanNode&>(node);
+            const Schema& in = node.children[0]->output_schema;
+            for (uint32_t c = 0; c < width && c < proj.expressions.size(); ++c) {
+                counts[c] = ComputesFromCount(proj.expressions[c].get(), node.output_schema.GetColumn(c).type, in, below[0]);
+            }
+            break;
+        }
+        case PlanNodeType::FILTER:
+        case PlanNodeType::SORT:
+        case PlanNodeType::LIMIT:
+            counts = below[0];
+            break;
+        case PlanNodeType::HASH_JOIN:
+        case PlanNodeType::NESTED_LOOP_JOIN:
+            counts = below[0];
+            counts.insert(counts.end(), below[1].begin(), below[1].end());
+            break;
+        default:
+            break;
+    }
+    counts.resize(width, false);
+    for (uint32_t c = 0; c < width; ++c) counts[c] = counts[c] && node.output_schema.GetColumn(c).type == TypeId::INTEGER;
+    return counts;
+}
+
+// The output columns of a TUPLE or VECTORIZED plan that a parallel plan types BIGINT.
+[[nodiscard]] inline std::vector<bool> CountColumns(const PlanNode& node) {
+    std::vector<std::vector<bool>> below;
+    for (const auto& child : node.children) below.push_back(CountColumns(*child));
+    return NodeCountColumns(node, below);
+}
+
+// Retypes node and its subtree's COUNT columns BIGINT; adds how many to retyped.
+inline std::vector<bool> RetypeCountColumns(PlanNode& node, size_t& retyped) {
+    std::vector<std::vector<bool>> below;
+    for (auto& child : node.children) below.push_back(RetypeCountColumns(*child, retyped));
+    const std::vector<bool> counts = NodeCountColumns(node, below);
+    std::vector<Column> columns = node.output_schema.GetColumns();
+    for (size_t c = 0; c < columns.size(); ++c) {
+        if (!counts[c]) continue;
+        columns[c] = Column(columns[c].name, TypeId::BIGINT);
+        ++retyped;
+    }
+    node.output_schema = Schema(std::move(columns));
+    return counts;
+}
+
+// Turns a TUPLE or VECTORIZED plan into the types a parallel plan gives it.
+// Returns how many columns it retyped, across every node.
+inline size_t RetypeCountColumns(PlanNode& root) {
+    size_t retyped = 0;
+    (void)RetypeCountColumns(root, retyped);
+    return retyped;
 }
 
 }  // namespace shilmandb::test

@@ -723,7 +723,7 @@ TEST_F(ParallelScanSourceTest, CountOfANullColumnIsRefused) {
     }
     const QueryResult all = Run("SELECT COUNT(*) FROM cn", ExecutionMode::PARALLEL);
     ASSERT_EQ(all.tuples.size(), 1u);
-    EXPECT_EQ(all.tuples[0].GetValue(all.schema, 0).integer_, 3);
+    EXPECT_EQ(all.tuples[0].GetValue(all.schema, 0).bigint_, 3);
     EXPECT_NO_THROW(db_->GetBufferPoolManager()->DropAllPages());
 }
 
@@ -756,7 +756,7 @@ TEST_F(ParallelScanSourceTest, IndexScanRefusesNullsInListedColumns) {
     EXPECT_EQ(ErrorOf([&] { (void)Run(sql, ExecutionMode::PARALLEL); }), today);
     const QueryResult all = Run("SELECT COUNT(*) FROM ix WHERE y >= 990", ExecutionMode::PARALLEL);
     ASSERT_EQ(all.tuples.size(), 1u);
-    EXPECT_EQ(all.tuples[0].GetValue(all.schema, 0).integer_, 10);
+    EXPECT_EQ(all.tuples[0].GetValue(all.schema, 0).bigint_, 10);
     EXPECT_NO_THROW(db_->GetBufferPoolManager()->DropAllPages());
 }
 

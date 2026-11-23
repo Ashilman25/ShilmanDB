@@ -228,7 +228,7 @@ protected:
         EXPECT_NO_THROW(bpm->DropAllPages());
         const QueryResult parallel = Run("SELECT COUNT(*), SUM(w_amt) FROM wide40 WHERE w_id < 2000000", 18);
         ASSERT_EQ(parallel.tuples.size(), 1u);
-        EXPECT_EQ(parallel.tuples[0].GetValue(parallel.schema, 0).integer_, 2000000);
+        EXPECT_EQ(parallel.tuples[0].GetValue(parallel.schema, 0).bigint_, 2000000);
         EXPECT_GT(Db().LastParallelStats().morsels, 30u) << "the scan spans many row groups";
         const QueryResult tuple = Db().ExecuteSQL("SELECT COUNT(*) FROM wide40 WHERE w_id < 1000", ExecutionMode::TUPLE);
         ASSERT_EQ(tuple.tuples.size(), 1u);
@@ -570,7 +570,7 @@ TEST_F(ParallelThreadsTest, EmptyMorselsAndEmptyWorkers) {
     // A filter that keeps nothing: the aggregate's one zero-default row, and no groups.
     const QueryResult none = Run("SELECT COUNT(*), SUM(w_amt) FROM wide40 WHERE w_grp - 99 = 0", 18);
     ASSERT_EQ(none.tuples.size(), 1u);
-    EXPECT_EQ(none.tuples[0].GetValue(none.schema, 0).integer_, 0);
+    EXPECT_EQ(none.tuples[0].GetValue(none.schema, 0).bigint_, 0);
     EXPECT_EQ(none.tuples[0].GetValue(none.schema, 1).decimal_, 0.0);
     EXPECT_TRUE(SameBits(none, Run("SELECT COUNT(*), SUM(w_amt) FROM wide40 WHERE w_grp - 99 = 0", 1)));
     EXPECT_TRUE(Run("SELECT w_tag, COUNT(*) FROM wide40 WHERE w_grp - 99 = 0 GROUP BY w_tag", 18).tuples.empty());
@@ -656,7 +656,7 @@ TEST_F(ParallelThreadsTest, DeepExpressionOnPoolThreads) {
     EXPECT_GE(Db().LastParallelStats().morsels, 3u) << "each row group is a morsel";
     EXPECT_TRUE(SameBits(many, one));
     ASSERT_EQ(one.tuples.size(), 1u);
-    EXPECT_EQ(one.tuples[0].GetValue(one.schema, 0).integer_, want);
+    EXPECT_EQ(one.tuples[0].GetValue(one.schema, 0).bigint_, want);
 }
 
 TEST_F(ParallelThreadsTest, RandomQueriesAtFourThreads0) { RandomShard(0); }

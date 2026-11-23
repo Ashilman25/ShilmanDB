@@ -382,15 +382,30 @@ TEST_F(PlanDumpTest, WhereJoinsCountInParallelPlanning) {
         // Without the WHERE joins the same order prices as cross products, past the bound.
         EXPECT_TRUE(today_far_off) << name;
 
-        // Parallel planning only picks the order: tuple mode forced to it plans the same tree.
+        // Parallel planning picks the order and types COUNT columns BIGINT: tuple mode forced
+        // to that order plans the same tree once its COUNT columns are retyped.
         // Q19's OR is factored in parallel planning; OrFactoringTest.Q19NewModePlan checks it.
         for (const auto& q : tpch::Queries()) {
             if (q.tag == "Q19") continue;
             const PlannedQuery parallel = PlanThroughDatabase(*db, q.sql, QueryOptions{ExecutionMode::PARALLEL});
             QueryOptions same_order;
             same_order.forced_join_order = parallel.join.order;
-            const PlannedQuery tuple = PlanThroughDatabase(*db, q.sql, same_order);
-            EXPECT_EQ(test::DumpPlan(*tuple.plan), test::DumpPlan(*parallel.plan)) << name << " " << q.tag;
+            PlannedQuery tuple = PlanThroughDatabase(*db, q.sql, same_order);
+            const std::string tuple_dump = test::DumpPlan(*tuple.plan);
+            const std::string parallel_dump = test::DumpPlan(*parallel.plan);
+            const size_t retyped = test::RetypeCountColumns(*tuple.plan);
+            EXPECT_EQ(test::DumpPlan(*tuple.plan), parallel_dump) << name << " " << q.tag;
+
+            // Only Q1 counts: its aggregate, projection and sort each carry count_star.
+            if (q.tag == "Q1") {
+                EXPECT_EQ(retyped, 3u) << name;
+                EXPECT_NE(tuple_dump.find("count_star INTEGER"), std::string::npos) << name;
+                EXPECT_NE(parallel_dump.find("count_star BIGINT"), std::string::npos) << name;
+                EXPECT_NE(tuple_dump, parallel_dump) << name;
+            } else {
+                EXPECT_EQ(retyped, 0u) << name << " " << q.tag;
+                EXPECT_EQ(tuple_dump, parallel_dump) << name << " " << q.tag;
+            }
         }
     }
 }

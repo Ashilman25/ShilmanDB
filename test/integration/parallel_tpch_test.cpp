@@ -19,6 +19,7 @@
 #include "engine/database.hpp"
 #include "executor/parallel/decimal.hpp"
 #include "parser/parser.hpp"
+#include "planner/plan_dump.hpp"
 #include "planner/planner.hpp"
 #include "tpch/tpch_workload.hpp"
 
@@ -128,6 +129,11 @@ protected:
         options.threads = 1;
         return db_->ExecuteSQL(sql, options);
     }
+
+    // sql's COUNT columns in today's plan, which parallel plans type BIGINT.
+    std::vector<bool> Counts(const std::string& sql) const {
+        return test::CountColumns(*db_->MakePlanner(QueryOptions{}).Plan(std::move(*Parser(sql).Parse())));
+    }
 };
 
 std::unique_ptr<Database> ParallelTpchTest::plain_db_;
@@ -143,6 +149,7 @@ INSTANTIATE_TEST_SUITE_P(Indexes, ParallelTpchTest, ::testing::Values(Indexes::k
 
 TEST_P(ParallelTpchTest, AllQueriesMatchVectorized) {
     int index_scans = 0;
+    int count_columns = 0;
     for (const auto& q : tpch::Queries()) {
         SCOPED_TRACE(q.tag);
         const QueryResult want = Run(q.sql, ExecutionMode::VECTORIZED);
@@ -153,14 +160,24 @@ TEST_P(ParallelTpchTest, AllQueriesMatchVectorized) {
         ASSERT_TRUE(ordered || want.tuples.size() == 1u) << "an unordered query with several rows";
         ASSERT_FALSE(want.tuples.empty());
 
+        // Today's types, except COUNT columns: BIGINT here, INTEGER today.
         ASSERT_EQ(got.schema.GetColumnCount(), want.schema.GetColumnCount());
+        const std::vector<bool> counts = Counts(q.sql);
+        ASSERT_EQ(counts.size(), want.schema.GetColumnCount());
         for (uint32_t c = 0; c < want.schema.GetColumnCount(); ++c) {
-            EXPECT_EQ(got.schema.GetColumn(c).type, want.schema.GetColumn(c).type) << "column " << c;
+            const TypeId today = want.schema.GetColumn(c).type;
+            if (counts[c]) {
+                ++count_columns;
+                EXPECT_EQ(today, TypeId::INTEGER) << "column " << c;
+            }
+            EXPECT_EQ(got.schema.GetColumn(c).type, counts[c] ? TypeId::BIGINT : today) << "column " << c;
         }
         EXPECT_EQ(got.tuples.size(), want.tuples.size());
         EXPECT_TRUE(tpch::SameResult(got, want));
         if (PlansIndexScan(*db_, q.sql, ExecutionMode::PARALLEL)) ++index_scans;
     }
+    // Only Q1 counts: its count_star.
+    EXPECT_EQ(count_columns, 1);
     // With the indexes, some queries (Q10, Q14) read through one.
     if (GetParam() == Indexes::kAll) {
         EXPECT_GT(index_scans, 0);
@@ -176,11 +193,20 @@ TEST_P(ParallelTpchTest, ExactWhereTodayIsExact) {
         const QueryResult got = Run(q.sql, ExecutionMode::PARALLEL);
         ASSERT_EQ(got.tuples.size(), want.tuples.size());
         ASSERT_EQ(got.schema.GetColumnCount(), want.schema.GetColumnCount());
+        const std::vector<bool> counts = Counts(q.sql);
+        ASSERT_EQ(counts.size(), want.schema.GetColumnCount());
         for (size_t r = 0; r < want.tuples.size(); ++r) {
             for (uint32_t c = 0; c < want.schema.GetColumnCount(); ++c) {
                 const Value x = got.tuples[r].GetValue(got.schema, c);
                 const Value y = want.tuples[r].GetValue(want.schema, c);
                 if (y.type_ == TypeId::DECIMAL) continue;
+                // A COUNT is the same number, as 64 bits here.
+                if (counts[c]) {
+                    ASSERT_EQ(x.type_, TypeId::BIGINT) << "row " << r << " col " << c;
+                    ASSERT_EQ(y.type_, TypeId::INTEGER) << "row " << r << " col " << c;
+                    EXPECT_EQ(x.bigint_, y.integer_) << "row " << r << " col " << c;
+                    continue;
+                }
                 ASSERT_EQ(x.type_, y.type_) << "row " << r << " col " << c;
                 switch (y.type_) {
                     case TypeId::INTEGER:

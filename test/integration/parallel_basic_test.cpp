@@ -20,6 +20,7 @@
 #include "common/exception.hpp"
 #include "engine/database.hpp"
 #include "parser/parser.hpp"
+#include "planner/plan_dump.hpp"
 #include "planner/planner.hpp"
 
 namespace shilmandb {
@@ -124,10 +125,14 @@ std::vector<Row> SortedRows(const QueryResult& r) {
 }
 
 // How got and want first differ as multisets of rows, or "" when they match.
-std::string Difference(const QueryResult& got, const QueryResult& want) {
+// counts marks want's COUNT columns, which got must have as BIGINT where want has INTEGER.
+std::string Difference(const QueryResult& got, const QueryResult& want, const std::vector<bool>& counts = {}) {
     if (got.schema.GetColumnCount() != want.schema.GetColumnCount()) return "column counts differ";
     for (uint32_t c = 0; c < got.schema.GetColumnCount(); ++c) {
-        if (got.schema.GetColumn(c).type != want.schema.GetColumn(c).type) return "column " + std::to_string(c) + " has another type";
+        const TypeId today = want.schema.GetColumn(c).type;
+        const bool count = c < counts.size() && counts[c];
+        if (count && today != TypeId::INTEGER) return "column " + std::to_string(c) + " is a COUNT but not INTEGER today";
+        if (got.schema.GetColumn(c).type != (count ? TypeId::BIGINT : today)) return "column " + std::to_string(c) + " has another type";
     }
     if (got.tuples.size() != want.tuples.size()) {
         return std::to_string(got.tuples.size()) + " rows, expected " + std::to_string(want.tuples.size());
@@ -213,6 +218,9 @@ protected:
         Planner planner = db_->MakePlanner(options);
         return planner.Plan(std::move(*stmt));
     }
+
+    // sql's COUNT columns in today's plan, which parallel plans type BIGINT.
+    std::vector<bool> Counts(const std::string& sql) { return test::CountColumns(*PlanFor(sql, ExecutionMode::VECTORIZED)); }
 
     // Pages of the listed columns of t in row groups [from, to).
     uint64_t PagesOf(const std::vector<uint32_t>& columns, size_t from, size_t to) {
@@ -377,13 +385,13 @@ TEST_F(ParallelBasicTest, IndexScanReadsTheIndexRange) {
         }
         const QueryResult want = Run(c.sql, ExecutionMode::VECTORIZED);
         EXPECT_EQ(want.tuples.size(), c.rows);
-        EXPECT_EQ(Difference(Run(c.sql, ExecutionMode::PARALLEL), want), "");
+        EXPECT_EQ(Difference(Run(c.sql, ExecutionMode::PARALLEL), want, Counts(c.sql)), "");
     }
     // The counts themselves, so both modes can't be wrong the same way.
     const QueryResult count = Run("SELECT COUNT(*) FROM t WHERE d >= 150000 AND d <= 2150006", ExecutionMode::PARALLEL);
-    EXPECT_EQ(count.tuples[0].GetValue(count.schema, 0).integer_, 3);
+    EXPECT_EQ(count.tuples[0].GetValue(count.schema, 0).bigint_, 3);
     const QueryResult tail = Run("SELECT COUNT(*) FROM t WHERE a >= 199990", ExecutionMode::PARALLEL);
-    EXPECT_EQ(tail.tuples[0].GetValue(tail.schema, 0).integer_, 10);
+    EXPECT_EQ(tail.tuples[0].GetValue(tail.schema, 0).bigint_, 10);
 }
 
 TEST_F(ParallelBasicTest, IntendedDifferenceIntegerBigintCaseIsBigint) {

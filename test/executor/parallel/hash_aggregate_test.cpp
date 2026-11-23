@@ -23,11 +23,16 @@
 #include "catalog/catalog.hpp"
 #include "engine/database.hpp"
 #include "executor/parallel/batch.hpp"
+#include "executor/parallel/compiler.hpp"
 #include "executor/parallel/decimal.hpp"
 #include "executor/parallel/expression.hpp"
 #include "executor/parallel/hash_aggregate.hpp"
+#include "executor/parallel/parallel_executor.hpp"
 #include "executor/parallel/pipeline.hpp"
 #include "parser/ast.hpp"
+#include "parser/parser.hpp"
+#include "planner/plan_dump.hpp"
+#include "planner/planner.hpp"
 #include "storage/columnar/columnar_table.hpp"
 #include "tpch/tpch_workload.hpp"
 
@@ -107,10 +112,14 @@ std::string Describe(const Row& row) {
 }
 
 // "" when the two results have the same column types, else the first difference.
-std::string TypeDifference(const QueryResult& got, const QueryResult& want) {
+// counts marks want's COUNT columns, which got must have as BIGINT where want has INTEGER.
+std::string TypeDifference(const QueryResult& got, const QueryResult& want, const std::vector<bool>& counts = {}) {
     if (got.schema.GetColumnCount() != want.schema.GetColumnCount()) return "column counts differ";
     for (uint32_t c = 0; c < got.schema.GetColumnCount(); ++c) {
-        if (got.schema.GetColumn(c).type != want.schema.GetColumn(c).type) return "column " + std::to_string(c) + " has another type";
+        const TypeId today = want.schema.GetColumn(c).type;
+        const bool count = c < counts.size() && counts[c];
+        if (count && today != TypeId::INTEGER) return "column " + std::to_string(c) + " is a COUNT but not INTEGER today";
+        if (got.schema.GetColumn(c).type != (count ? TypeId::BIGINT : today)) return "column " + std::to_string(c) + " has another type";
     }
     if (got.tuples.size() != want.tuples.size()) {
         return std::to_string(got.tuples.size()) + " rows, expected " + std::to_string(want.tuples.size());
@@ -119,8 +128,8 @@ std::string TypeDifference(const QueryResult& got, const QueryResult& want) {
 }
 
 // How got and want first differ as multisets of rows, or "" when they match.
-std::string Difference(const QueryResult& got, const QueryResult& want) {
-    const std::string types = TypeDifference(got, want);
+std::string Difference(const QueryResult& got, const QueryResult& want, const std::vector<bool>& counts = {}) {
+    const std::string types = TypeDifference(got, want, counts);
     if (!types.empty()) return types;
     std::vector<Row> x;
     std::vector<Row> y;
@@ -135,8 +144,8 @@ std::string Difference(const QueryResult& got, const QueryResult& want) {
 }
 
 // The same, but rows must match in order.
-std::string OrderedDifference(const QueryResult& got, const QueryResult& want) {
-    const std::string types = TypeDifference(got, want);
+std::string OrderedDifference(const QueryResult& got, const QueryResult& want, const std::vector<bool>& counts = {}) {
+    const std::string types = TypeDifference(got, want, counts);
     if (!types.empty()) return types;
     for (size_t i = 0; i < got.tuples.size(); ++i) {
         const Row x = RowOf(got, i);
@@ -474,6 +483,14 @@ protected:
         return db.ExecuteSQL(sql, options);
     }
 
+    // sql's COUNT columns in today's plan on db, which parallel plans type BIGINT.
+    static std::vector<bool> CountsOn(const Database& db, const std::string& sql) {
+        return test::CountColumns(*db.MakePlanner(QueryOptions{}).Plan(std::move(*Parser(sql).Parse())));
+    }
+
+    // The same on this test's database.
+    std::vector<bool> Counts(const std::string& sql) const { return CountsOn(*db_, sql); }
+
     // The SF=0.01 TPC-H data, or "" when it hasn't been generated.
     static std::string FindTpchDir() {
         for (const std::string dir : {"bench/tpch_data/sf0.01/", "../bench/tpch_data/sf0.01/", "../../bench/tpch_data/sf0.01/"}) {
@@ -530,8 +547,8 @@ TEST_F(ParallelHashAggregateTest, OutputTypes) {
         const auto arg = c < 0 ? nullptr : Col(static_cast<uint32_t>(c), in);
         return AggregateOutputType(f, arg.get());
     };
-    EXPECT_EQ(type(Func::COUNT, -1), kInt);
-    EXPECT_EQ(type(Func::COUNT, 5), kInt);
+    EXPECT_EQ(type(Func::COUNT, -1), kBig);
+    EXPECT_EQ(type(Func::COUNT, 5), kBig);
     EXPECT_EQ(type(Func::SUM, 0), (VType{Kind::DECIMAL, 0, true, TypeId::DECIMAL}));
     EXPECT_EQ(type(Func::SUM, 1), (VType{Kind::DECIMAL, 0, true, TypeId::DECIMAL}));
     EXPECT_EQ(type(Func::SUM, 2), kWideMoney);
@@ -622,9 +639,15 @@ TEST_F(ParallelHashAggregateTest, Q1ShapeExactSums) {
         EXPECT_EQ(t.GetValue(got.schema, 2).decimal_, DecimalToDouble(entry.second.quantity, 2));
         EXPECT_EQ(t.GetValue(got.schema, 3).decimal_, DecimalToDouble(entry.second.price, 2)) << Text(entry.second.price);
         EXPECT_EQ(t.GetValue(got.schema, 4).decimal_, DecimalToDouble(entry.second.discount, 2));
-        EXPECT_EQ(t.GetValue(got.schema, 5).integer_, entry.second.count);
+        EXPECT_EQ(t.GetValue(got.schema, 5).type_, TypeId::BIGINT);
+        EXPECT_EQ(t.GetValue(got.schema, 5).bigint_, entry.second.count);
     }
-    EXPECT_EQ(OrderedDifference(got, RunOn(*tpch, q1, ExecutionMode::VECTORIZED)), "");
+    // count_star is BIGINT here and INTEGER today, with the same digits.
+    const QueryResult today = RunOn(*tpch, q1, ExecutionMode::VECTORIZED);
+    ASSERT_EQ(got.schema.GetColumn(5).type, TypeId::BIGINT);
+    ASSERT_EQ(today.schema.GetColumn(5).type, TypeId::INTEGER);
+    EXPECT_TRUE(tpch::SameResult(got, today));
+    EXPECT_EQ(OrderedDifference(got, today, CountsOn(*tpch, q1)), "");
     EXPECT_EQ(OrderedDifference(RunOn(*tpch, q1, ExecutionMode::PARALLEL, 18), got), "");
 }
 
@@ -665,7 +688,7 @@ TEST_F(ParallelHashAggregateTest, ManyGroups) {
             const int64_t k = key == "k" ? kv.integer_ : std::stoll(kv.varchar_.substr(3));
             ASSERT_TRUE(seen.insert(k).second) << "key " << k << " came out twice";
             const auto& want = ref.at(k);
-            ASSERT_EQ(t.GetValue(got.schema, 1).integer_, want.first) << "key " << k;
+            ASSERT_EQ(t.GetValue(got.schema, 1).bigint_, want.first) << "key " << k;
             ASSERT_EQ(t.GetValue(got.schema, 2).decimal_, DecimalToDouble(want.second, 2)) << "key " << k;
         }
     }
@@ -684,15 +707,16 @@ TEST_F(ParallelHashAggregateTest, EmptyInputGlobalRow) {
     for (const unsigned threads : {1u, 3u, 18u}) {
         const QueryResult got = Run(first, ExecutionMode::PARALLEL, threads);
         ASSERT_EQ(got.tuples.size(), 1u);
-        EXPECT_EQ(got.schema.GetColumn(0).type, TypeId::INTEGER);
+        EXPECT_EQ(got.schema.GetColumn(0).type, TypeId::BIGINT);
         EXPECT_EQ(got.schema.GetColumn(1).type, TypeId::DECIMAL);
         EXPECT_EQ(got.schema.GetColumn(2).type, TypeId::INTEGER);
-        EXPECT_EQ(got.tuples[0].GetValue(got.schema, 0).integer_, 0);
+        EXPECT_EQ(got.tuples[0].GetValue(got.schema, 0).type_, TypeId::BIGINT);
+        EXPECT_EQ(got.tuples[0].GetValue(got.schema, 0).bigint_, 0);
         const double sum = got.tuples[0].GetValue(got.schema, 1).decimal_;
         EXPECT_EQ(sum, 0.0);
         EXPECT_FALSE(std::signbit(sum));
         EXPECT_EQ(got.tuples[0].GetValue(got.schema, 2).integer_, 0);
-        EXPECT_EQ(Difference(got, want), "");
+        EXPECT_EQ(Difference(got, want, Counts(first)), "");
     }
 
     // Types whose empty MIN / MAX today reads back well defined, SUM and AVG of
@@ -702,7 +726,7 @@ TEST_F(ParallelHashAggregateTest, EmptyInputGlobalRow) {
         const std::string sql = select + none;
         const QueryResult got = Run(sql, ExecutionMode::PARALLEL);
         ASSERT_EQ(got.tuples.size(), 1u) << sql;
-        EXPECT_EQ(Difference(got, Run(sql, ExecutionMode::VECTORIZED)), "") << sql;
+        EXPECT_EQ(Difference(got, Run(sql, ExecutionMode::VECTORIZED), Counts(sql)), "") << sql;
     }
 
     // BIGINT and DECIMAL get their type's zero (today's are indeterminate).
@@ -754,7 +778,7 @@ TEST_F(ParallelHashAggregateTest, EmptyInputWithGroupByGivesNoRows) {
         EXPECT_TRUE(want.tuples.empty()) << sql;
         const QueryResult got = Run(sql, ExecutionMode::PARALLEL);
         EXPECT_TRUE(got.tuples.empty()) << sql;
-        EXPECT_EQ(Difference(got, want), "") << sql;
+        EXPECT_EQ(Difference(got, want, Counts(sql)), "") << sql;
     }
 
     // Hand-fed: no locals, and locals that saw nothing, emit no groups and no morsels.
@@ -856,14 +880,14 @@ TEST_F(ParallelHashAggregateTest, AvgAndMinMaxMatchTupleMode) {
     for (const std::string& sql : queries) {
         const QueryResult want = Run(sql, ExecutionMode::TUPLE);
         ASSERT_FALSE(want.tuples.empty()) << sql;
-        EXPECT_EQ(Difference(Run(sql, ExecutionMode::PARALLEL), want), "") << sql;
-        EXPECT_EQ(Difference(Run(sql, ExecutionMode::PARALLEL, 18), want), "") << sql;
+        EXPECT_EQ(Difference(Run(sql, ExecutionMode::PARALLEL), want, Counts(sql)), "") << sql;
+        EXPECT_EQ(Difference(Run(sql, ExecutionMode::PARALLEL, 18), want, Counts(sql)), "") << sql;
     }
 
     // A sort above the groups, with and without a top n.
     for (const std::string& sql : {"SELECT g, SUM(m), COUNT(*) FROM a GROUP BY g ORDER BY SUM(m) DESC LIMIT 5",
                                    "SELECT s, MIN(d) FROM a GROUP BY s ORDER BY s"}) {
-        EXPECT_EQ(OrderedDifference(Run(sql, ExecutionMode::PARALLEL), Run(sql, ExecutionMode::TUPLE)), "") << sql;
+        EXPECT_EQ(OrderedDifference(Run(sql, ExecutionMode::PARALLEL), Run(sql, ExecutionMode::TUPLE), Counts(sql)), "") << sql;
     }
 
     // A LIMIT with no order: the right count, and every row one today's result holds.
@@ -900,7 +924,9 @@ TEST_F(ParallelHashAggregateTest, StringKeysOutliveMorsel) {
         "SELECT mode, note, COUNT(*) FROM str GROUP BY mode, note",
         "SELECT MIN(note), MAX(note), MIN(mode), MAX(mode) FROM str",
     };
-    for (const std::string& sql : queries) EXPECT_EQ(Difference(Run(sql, ExecutionMode::PARALLEL), Run(sql, ExecutionMode::VECTORIZED)), "") << sql;
+    for (const std::string& sql : queries) {
+        EXPECT_EQ(Difference(Run(sql, ExecutionMode::PARALLEL), Run(sql, ExecutionMode::VECTORIZED), Counts(sql)), "") << sql;
+    }
 
     // Every key's bytes come back exactly, long ones included.
     const QueryResult got = Run("SELECT note, MIN(id), COUNT(*) FROM str GROUP BY note", ExecutionMode::PARALLEL);
@@ -974,7 +1000,7 @@ TEST_F(ParallelHashAggregateTest, DoubleKeysGroupAsValueDoes) {
         s.out_types.push_back(kDouble);
         s.funcs.push_back(Func::COUNT);
         s.args.push_back(nullptr);
-        s.out_types.push_back(kInt);
+        s.out_types.push_back(kBig);
         return s;
     };
     const std::vector<std::vector<double>> workers = {{0.0, -0.0, 1.5, nan, 2.0}, {-0.0, nan, 1.5}, {0.0}};
@@ -1009,15 +1035,15 @@ TEST_F(ParallelHashAggregateTest, DoubleKeysGroupAsValueDoes) {
     EXPECT_EQ(counts, want);
 }
 
-TEST_F(ParallelHashAggregateTest, CountNarrowsAsToday) {
-    // Just past 2^31 rows over two workers, neither past it alone: COUNT wraps as
-    // static_cast<int32_t> does today, and an expression above sees the same.
+TEST_F(ParallelHashAggregateTest, CountPastInt32MaxOverWorkers) {
+    // Just past 2^31 rows over two workers, neither past it alone: COUNT keeps
+    // all 64 bits through the merge and the emit.
     const InputLayout in = HandLayout();
     AggregateSpec spec;
     spec.funcs = {Func::COUNT, Func::COUNT};
     spec.args.push_back(nullptr);
     spec.args.push_back(Col(0, in));  // COUNT(k) reads no argument either
-    spec.out_types = {kInt, kInt};
+    spec.out_types = {kBig, kBig};
     spec.global = true;
     auto made = MakeHashAggregate(std::move(spec));
     QueryContext ctx{nullptr, nullptr};
@@ -1040,10 +1066,49 @@ TEST_F(ParallelHashAggregateTest, CountNarrowsAsToday) {
     ASSERT_TRUE(made.second->NextBatch(*local, o));
     ASSERT_EQ(o.Active(), 1u);
     const int64_t rows = batches * kBatchSize;
-    EXPECT_EQ(o.slots[0].I64()[0], static_cast<int32_t>(rows));
-    EXPECT_EQ(o.slots[1].I64()[0], static_cast<int32_t>(rows));
-    EXPECT_LT(o.slots[0].I64()[0], 0);
+    ASSERT_GT(rows, int64_t{std::numeric_limits<int32_t>::max()});
+    EXPECT_EQ(o.slots[0].I64()[0], rows);
+    EXPECT_EQ(o.slots[1].I64()[0], rows);
     EXPECT_FALSE(made.second->NextBatch(*local, o));
+}
+
+TEST_F(ParallelHashAggregateTest, CountPastInt32Max) {
+    // A global COUNT(*) over 3 rows, offset by INT32_MAX, and grouped counts the same way.
+    Load("c", Schema({Column("g", ColumnType::Integer()), Column("x", ColumnType::Integer())}), "1|10|\n1|11|\n2|12|\n");
+    const auto run = [&](const std::string& sql) {
+        QueryOptions options;
+        options.mode = ExecutionMode::PARALLEL;
+        const auto plan = db_->MakePlanner(options).Plan(std::move(*Parser(sql).Parse()));
+        QueryContext ctx{db_->GetBufferPoolManager(), db_->GetCatalog()};
+        PhysicalPlan physical = CompilePlan(*plan, ctx);
+        size_t aggregates = 0;
+        for (Pipeline& p : physical.pipelines) {
+            if (p.sink_node == nullptr || p.sink_node->type != PlanNodeType::AGGREGATE) continue;
+            OffsetCountsForTest(*p.sink, std::numeric_limits<int32_t>::max());
+            ++aggregates;
+        }
+        EXPECT_EQ(aggregates, 1u) << sql;
+        return QueryResult{plan->output_schema, RunPhysicalPlan(physical, ctx), {}};
+    };
+
+    const QueryResult result = run("SELECT COUNT(*), COUNT(x) + 1 FROM c");
+    const Schema& schema = result.schema;
+    ASSERT_EQ(result.tuples.size(), 1u);
+    EXPECT_EQ(schema.GetColumn(0).type, TypeId::BIGINT);
+    EXPECT_EQ(result.tuples[0].GetValue(schema, 0).type_, TypeId::BIGINT);
+    EXPECT_EQ(result.tuples[0].GetValue(schema, 0).bigint_, int64_t{2147483650});
+    EXPECT_EQ(schema.GetColumn(1).type, TypeId::BIGINT);
+    EXPECT_EQ(result.tuples[0].GetValue(schema, 1).bigint_, int64_t{2147483651});
+
+    const QueryResult grouped = run("SELECT g, COUNT(*) FROM c GROUP BY g ORDER BY g");
+    ASSERT_EQ(grouped.tuples.size(), 2u);
+    EXPECT_EQ(grouped.tuples[0].GetValue(grouped.schema, 1).bigint_, int64_t{2147483649});
+    EXPECT_EQ(grouped.tuples[1].GetValue(grouped.schema, 1).bigint_, int64_t{2147483648});
+
+    // Without the offset the same query counts its 3 rows.
+    const QueryResult plain = Run("SELECT COUNT(*) FROM c", ExecutionMode::PARALLEL);
+    ASSERT_EQ(plain.tuples.size(), 1u);
+    EXPECT_EQ(plain.tuples[0].GetValue(plain.schema, 0).bigint_, 3);
 }
 
 //  Intended differences
@@ -1103,7 +1168,7 @@ TEST_F(ParallelHashAggregateTest, DistinctKeysWithOneHashStayApart) {
         spec.funcs = {Func::COUNT, Func::MAX};
         spec.args.push_back(nullptr);
         spec.args.push_back(Col(1, in));
-        spec.out_types = {kBig, kBig, kBig, kInt, kBig};
+        spec.out_types = {kBig, kBig, kBig, kBig, kBig};
         auto made = MakeHashAggregate(std::move(spec));
         QueryContext ctx{nullptr, nullptr};
         for (size_t w = 0; w < workers.size(); ++w) {
@@ -1248,7 +1313,7 @@ TEST_F(ParallelHashAggregateTest, DoubleKeysShowTheSameBitsInAnyMergeOrder) {
         spec.out_types.push_back(kDouble);
         spec.funcs.push_back(Func::COUNT);
         spec.args.push_back(nullptr);
-        spec.out_types.push_back(kInt);
+        spec.out_types.push_back(kBig);
         auto made = MakeHashAggregate(std::move(spec));
         QueryContext ctx{nullptr, nullptr};
         for (const auto& keys : workers) {
@@ -1316,7 +1381,8 @@ TEST_F(ParallelHashAggregateTest, IntendedDifferenceDoubleKeyShowsNegativeZero) 
         if (k != 0.0) continue;
         saw_zero = true;
         EXPECT_TRUE(std::signbit(k)) << "the zero group shows +0.0";
-        EXPECT_EQ(row.GetValue(got.schema, 1).integer_, 3);
+        ASSERT_EQ(row.GetValue(got.schema, 1).type_, TypeId::BIGINT);
+        EXPECT_EQ(row.GetValue(got.schema, 1).bigint_, 3);
     }
     EXPECT_TRUE(saw_zero);
     const QueryResult today = Run("SELECT zf, COUNT(*) FROM z GROUP BY zf", ExecutionMode::VECTORIZED);

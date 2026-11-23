@@ -8,6 +8,7 @@
 #include "buffer/lru_eviction_policy.hpp"
 #include "storage/disk_manager.hpp"
 #include "common/exception.hpp"
+#include "engine/database.hpp"
 #include <filesystem>
 #include <functional>
 #include <memory>
@@ -819,6 +820,67 @@ TEST_F(PlannerTest, ImplicitJoinOrderHasNoCrossProduct) {
 
     EXPECT_TRUE(IsConnectedOrder(info.order, info.edges));
     EXPECT_EQ(info.order, (std::vector<int>{0, 1, 2}));
+}
+
+// Plans through the database's own planner for each mode, as ExecuteSQL does.
+class ParallelPlanningTest : public ::testing::Test {
+protected:
+    std::string file_;
+    std::unique_ptr<Database> db_;
+
+    void SetUp() override {
+        file_ = (std::filesystem::temp_directory_path() /
+                 ("shilmandb_parallel_planning_test_" + std::to_string(::getpid()) + ".db")).string();
+        std::filesystem::remove(file_);
+        db_ = std::make_unique<Database>(file_);
+        ASSERT_NE(db_->GetCatalog()->CreateTable("lineitem", Schema({
+            Column("l_returnflag", TypeId::VARCHAR),
+            Column("l_quantity", TypeId::INTEGER)
+        })), nullptr);
+    }
+
+    void TearDown() override {
+        db_.reset();
+        std::filesystem::remove(file_);
+    }
+
+    // The plan ExecuteSQL would run in this mode, running nothing.
+    std::unique_ptr<PlanNode> PlanFor(const std::string& sql, ExecutionMode mode) const {
+        QueryOptions options;
+        options.mode = mode;
+        return db_->MakePlanner(options).Plan(std::move(*Parser(sql).Parse()));
+    }
+
+    // The first node of this type, walking down first children.
+    static const PlanNode* Find(const PlanNode* node, PlanNodeType type) {
+        while (node != nullptr && node->type != type) node = node->children.empty() ? nullptr : node->children[0].get();
+        return node;
+    }
+};
+
+TEST_F(ParallelPlanningTest, CountIsBigintOnlyWhenParallel) {
+    const std::string sql = "SELECT l_returnflag, COUNT(*) FROM lineitem GROUP BY l_returnflag";
+    EXPECT_EQ(PlanFor(sql, ExecutionMode::PARALLEL)->output_schema.GetColumn(1).type, TypeId::BIGINT);
+    EXPECT_EQ(PlanFor(sql, ExecutionMode::TUPLE)->output_schema.GetColumn(1).type, TypeId::INTEGER);
+    EXPECT_EQ(PlanFor(sql, ExecutionMode::VECTORIZED)->output_schema.GetColumn(1).type, TypeId::INTEGER);
+
+    // The aggregate's own columns, an alias, an expression above one and a sort follow.
+    const std::string more = "SELECT COUNT(l_quantity) AS n, COUNT(*) + 1, SUM(l_quantity), MIN(l_quantity) "
+                             "FROM lineitem ORDER BY n";
+    for (const ExecutionMode mode : {ExecutionMode::PARALLEL, ExecutionMode::TUPLE, ExecutionMode::VECTORIZED}) {
+        const std::string what = "mode " + std::to_string(static_cast<int>(mode));
+        const TypeId count = mode == ExecutionMode::PARALLEL ? TypeId::BIGINT : TypeId::INTEGER;
+        const std::vector<TypeId> want = {count, count, TypeId::DECIMAL, TypeId::INTEGER};
+        const auto plan = PlanFor(more, mode);
+        ASSERT_EQ(plan->type, PlanNodeType::SORT) << what;
+        ASSERT_EQ(plan->output_schema.GetColumnCount(), want.size()) << what;
+        for (uint32_t c = 0; c < want.size(); ++c) EXPECT_EQ(plan->output_schema.GetColumn(c).type, want[c]) << what << " column " << c;
+
+        const PlanNode* agg = Find(plan.get(), PlanNodeType::AGGREGATE);
+        ASSERT_NE(agg, nullptr) << what;
+        ASSERT_EQ(agg->output_schema.GetColumnCount(), want.size()) << what;
+        for (uint32_t c = 0; c < want.size(); ++c) EXPECT_EQ(agg->output_schema.GetColumn(c).type, want[c]) << what << " column " << c;
+    }
 }
 
 }  // namespace shilmandb

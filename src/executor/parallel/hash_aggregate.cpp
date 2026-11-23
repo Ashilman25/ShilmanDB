@@ -485,6 +485,16 @@ void UpdateExtremes(const T* x, const Selection& sel, uint32_t n, const uint32_t
     }
 }
 
+// Adds offset to every COUNT state of the merged tables.
+void AddToCounts(std::vector<GroupTable>& tables, const GroupShape& shape, int64_t offset) {
+    for (GroupTable& t : tables) {
+        for (size_t a = 0; a < shape.aggs.size(); ++a) {
+            if (shape.aggs[a].kind != StateKind::COUNT) continue;
+            for (int64_t& count : t.states[a].count) count += offset;
+        }
+    }
+}
+
 // Groups rows per worker and merges the workers' tables in Finalize.
 class AggregateSink final : public Sink {
 public:
@@ -545,8 +555,12 @@ public:
                 ForEachTask(ctx, partitions, [&](size_t p) { out.tables[p] = MergePartition(tables, buckets, p, shape); });
             }
         }
+        if (count_offset_ != 0) AddToCounts(out.tables, shape, count_offset_);
         for (GroupTable& t : tables) out.arenas.push_back(std::move(t.arena));
     }
+
+    // Tests only: what Finalize adds to every COUNT.
+    void OffsetCounts(int64_t offset) { count_offset_ = offset; }
 
 private:
     // Evaluates the keys, hashes them, and finds or adds each active row's group.
@@ -661,6 +675,7 @@ private:
     std::shared_ptr<const GroupShape> shape_;
     SharedOutput<MergedGroups> out_;
     std::vector<std::unique_ptr<LocalState>> parts_;  // one per worker, after Combine
+    int64_t count_offset_{0};                          // tests only
 };
 
 //  Source
@@ -740,7 +755,7 @@ private:
         switch (info.kind) {
             case StateKind::COUNT: {
                 int64_t* o = out.I64();
-                for (uint32_t i = 0; i < n; ++i) o[i] = static_cast<int32_t>(s.count[first + i]);  // wraps as today
+                for (uint32_t i = 0; i < n; ++i) o[i] = s.count[first + i];
                 break;
             }
             case StateKind::SUM_EXACT: {
@@ -790,9 +805,9 @@ private:
 
 }  // namespace
 
-// The planner types COUNT INTEGER, SUM and AVG DECIMAL, MIN / MAX as the argument.
+// Parallel plans type COUNT BIGINT, SUM and AVG DECIMAL, MIN / MAX as the argument.
 VType AggregateOutputType(Aggregate::Func func, const CompiledExpr* arg) {
-    if (func == Aggregate::Func::COUNT) return VType{Kind::INTEGER, 0, false, TypeId::INTEGER};
+    if (func == Aggregate::Func::COUNT) return VType{Kind::INTEGER, 0, false, TypeId::BIGINT};
     if (arg == nullptr) throw DatabaseException("the parallel executor needs an argument for this aggregate");
     const VType t = arg->Type();
     const VType real{Kind::DOUBLE, 0, false, TypeId::DECIMAL};
@@ -850,6 +865,13 @@ std::pair<std::unique_ptr<Sink>, std::unique_ptr<Source>> MakeHashAggregate(Aggr
     auto source = std::make_unique<AggregateSource>(shape, groups.Reader());
     auto sink = std::make_unique<AggregateSink>(std::move(spec), std::move(shape), std::move(groups));
     return {std::move(sink), std::move(source)};
+}
+
+// Only an aggregate's sink has counts to offset.
+void OffsetCountsForTest(Sink& aggregate_sink, int64_t offset) {
+    auto* sink = dynamic_cast<AggregateSink*>(&aggregate_sink);
+    if (sink == nullptr) throw DatabaseException("OffsetCountsForTest needs an aggregate's sink");
+    sink->OffsetCounts(offset);
 }
 
 }  // namespace shilmandb::parallel
