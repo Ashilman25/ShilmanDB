@@ -124,6 +124,7 @@ shilmandb_add_test(parallel_worker_pool_test executor/parallel/worker_pool_test.
 shilmandb_add_test(parallel_index_scan_source_test executor/parallel/index_scan_source_test.cpp)
 target_include_directories(parallel_index_scan_source_test PRIVATE ${CMAKE_SOURCE_DIR}/bench)
 shilmandb_add_test(parallel_memory_budget_test executor/parallel/memory_budget_test.cpp)
+shilmandb_add_test(parallel_temp_file_test executor/parallel/temp_file_test.cpp)
 
 # Integration tests
 shilmandb_add_test(end_to_end_test integration/end_to_end_test.cpp)
