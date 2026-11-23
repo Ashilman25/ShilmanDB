@@ -306,18 +306,22 @@ std::string TextKey(const Row& row) {
     return key;
 }
 
-// The row's cells exactly, each decimal by its bits.
+// The row's cells exactly: each as its byte length, then its bytes
+// (a decimal's 8 bits), so no text can fake a cell boundary.
 std::string ExactKey(const Row& row) {
     std::string key;
+    const auto append = [&key](const void* data, uint32_t length) {
+        char prefix[sizeof(uint32_t)];
+        std::memcpy(prefix, &length, sizeof(uint32_t));
+        key.append(prefix, sizeof(uint32_t));
+        key.append(static_cast<const char*>(data), length);
+    };
     for (const Cell& c : row) {
         if (c.decimal) {
-            char bits[sizeof(double)];
-            std::memcpy(bits, &c.number, sizeof(double));
-            key.append(bits, sizeof(double));
+            append(&c.number, sizeof(double));
         } else {
-            key += c.text;
+            append(c.text.data(), static_cast<uint32_t>(c.text.size()));
         }
-        key += '\x1f';
     }
     return key;
 }
