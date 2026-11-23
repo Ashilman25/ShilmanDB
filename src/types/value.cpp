@@ -316,6 +316,9 @@ Value Value::FromString(TypeId type, const std::string& str) {
             int year = std::stoi(str.substr(0, 4));
             int month = std::stoi(str.substr(5, 2));
             int day = std::stoi(str.substr(8, 2));
+            if (month < 1 || month > 12) {
+                throw DatabaseException("invalid date: '" + str + "'");
+            }
             return MakeDate(DateToDays(year, month, day));
         }
         case TypeId::INVALID:

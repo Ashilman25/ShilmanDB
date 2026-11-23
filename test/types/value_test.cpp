@@ -239,6 +239,19 @@ TEST(ValueTest, NegativeDate) {
     EXPECT_EQ(v.ToString(), "1969-12-31");
 }
 
+TEST(ValueTest, DateMonthOutOfRangeThrows) {
+    for (const char* bad : {"1995-00-10", "1995-13-01", "1995-14-01"}) {
+        try {
+            (void)Value::FromString(TypeId::DATE, bad);
+            ADD_FAILURE() << bad << " parsed without an error";
+        } catch (const DatabaseException& e) {
+            EXPECT_EQ(std::string(e.what()), std::string("invalid date: '") + bad + "'");
+        }
+    }
+    EXPECT_EQ(Value::FromString(TypeId::DATE, "1995-12-31").ToString(), "1995-12-31");
+    EXPECT_EQ(Value::FromString(TypeId::DATE, "1995-01-01").ToString(), "1995-01-01");
+}
+
 // --- Hash ---
 
 TEST(ValueTest, EqualValuesEqualHash) {
