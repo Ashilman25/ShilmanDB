@@ -5,7 +5,10 @@
 #include "executor/parallel/parallel_executor.hpp"
 #include "executor/parallel/pipeline.hpp"
 #include "executor/parallel/vector.hpp"
+#include "executor/parallel/worker_pool.hpp"
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -268,6 +271,44 @@ TEST(ParallelPipelineTest, ResolveThreadsDefaultsAndCaps) {
     EXPECT_EQ(ResolveThreads(256), 256u);
     EXPECT_EQ(ResolveThreads(257), 256u);
     EXPECT_EQ(ResolveThreads(100000), 256u);
+}
+
+TEST(ParallelPipelineTest, ForEachTaskPassesTheWorker) {
+    // Serial: every task runs as worker 0.
+    QueryContext serial = NoDatabase();
+    std::vector<unsigned> seen;
+    ForEachTask(serial, 5, [&](size_t, unsigned worker) { seen.push_back(worker); });
+    EXPECT_EQ(seen, std::vector<unsigned>(5, 0u));
+
+    // Pooled: each worker index is below threads and runs on one thread at a time.
+    constexpr unsigned kThreads = 4;
+    WorkerPool pool(kThreads);
+    QueryContext ctx = NoDatabase();
+    ctx.threads = kThreads;
+    ctx.pool = &pool;
+    constexpr size_t kTasks = 64;
+    std::vector<std::atomic<int>> hits(kTasks);
+    std::vector<std::atomic<int>> inside(kThreads);
+    std::vector<std::atomic<int>> used(kThreads);
+    std::atomic<bool> bad_worker{false};
+    std::atomic<bool> overlapped{false};
+    ForEachTask(ctx, kTasks, [&](size_t i, unsigned worker) {
+        hits[i].fetch_add(1);
+        if (worker >= kThreads) {
+            bad_worker.store(true);
+            return;
+        }
+        if (inside[worker].fetch_add(1) != 0) overlapped.store(true);
+        used[worker].fetch_add(1);
+        std::this_thread::sleep_for(std::chrono::microseconds(200));
+        inside[worker].fetch_sub(1);
+    });
+    EXPECT_FALSE(bad_worker.load()) << "a worker index past threads";
+    EXPECT_FALSE(overlapped.load()) << "one worker index ran on two threads at once";
+    for (size_t i = 0; i < kTasks; ++i) EXPECT_EQ(hits[i].load(), 1) << "task " << i;
+    int workers_used = 0;
+    for (const auto& u : used) workers_used += u.load() > 0 ? 1 : 0;
+    EXPECT_GT(workers_used, 1) << "the pool ran the tasks";
 }
 
 }  // namespace shilmandb::parallel

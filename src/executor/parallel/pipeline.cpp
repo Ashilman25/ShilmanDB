@@ -251,12 +251,17 @@ void RunPipeline(Pipeline& p, QueryContext& ctx) {
     if (stats != nullptr) ChargeTime(*stats, p.sink_node, Clock::now() - start + ctx.task_extra);
 }
 
+// Tasks that don't need the worker index.
+void ForEachTask(QueryContext& ctx, size_t count, const std::function<void(size_t)>& task) {
+    ForEachTask(ctx, count, [&task](size_t i, unsigned) { task(i); });
+}
+
 // Tasks are taken from a shared counter; a failed task stops the others taking more.
 // With analyze on, every worker's busy time is summed into ctx.task_extra.
-void ForEachTask(QueryContext& ctx, size_t count, const std::function<void(size_t)>& task) {
+void ForEachTask(QueryContext& ctx, size_t count, const std::function<void(size_t, unsigned)>& task) {
     const unsigned workers = WorkersFor(ctx, count);
     if (workers == 1) {
-        for (size_t i = 0; i < count; ++i) task(i);
+        for (size_t i = 0; i < count; ++i) task(i, 0);
         return;
     }
     const bool timed = ctx.op_stats != nullptr;
@@ -270,7 +275,7 @@ void ForEachTask(QueryContext& ctx, size_t count, const std::function<void(size_
             while (!stop.load(std::memory_order_relaxed)) {
                 const size_t i = next.fetch_add(1, std::memory_order_relaxed);
                 if (i >= count) return;
-                task(i);
+                task(i, w);
             }
         } catch (...) {
             stop.store(true, std::memory_order_relaxed);

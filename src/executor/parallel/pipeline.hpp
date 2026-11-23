@@ -8,6 +8,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <string>
 #include <vector>
 
 namespace shilmandb {
@@ -17,6 +18,8 @@ struct PlanNode;
 namespace shilmandb::parallel {
 
 class WorkerPool;
+class MemoryBudget;
+struct SpillCounters;
 
 // What every part of a query can reach while it runs.
 struct QueryContext {
@@ -27,6 +30,10 @@ struct QueryContext {
     OperatorStatsMap* op_stats{nullptr};  // set when analyze is on: own times while running, totals after
     uint64_t morsels{0};                  // morsels started so far, added up by RunPipeline
     std::chrono::nanoseconds task_extra{0};  // analyze: pool tasks' thread time beyond the caller's wall time
+    MemoryBudget* budget{nullptr};           // breakers' memory; null means no limit
+    SpillCounters* spill{nullptr};           // spill totals, when someone wants them
+    const std::string* temp_dir{nullptr};    // where spill files go
+    bool spill_everything{false};            // tests: every breaker spills everything it holds
 };
 
 // A sink's output that only non-const code can change, so a const worker call can't.
@@ -143,5 +150,9 @@ void RunPipeline(Pipeline& p, QueryContext& ctx);
 // For Finalize work that never touches the buffer pool. Rethrows the first exception.
 // With analyze on, adds workers' time past the caller's wall time to task_extra.
 void ForEachTask(QueryContext& ctx, size_t count, const std::function<void(size_t)>& task);
+
+// The same, also passing the worker running task i: below ctx.threads, 0 when serial.
+// One worker index runs on one thread at a time, so state indexed by it needs no lock.
+void ForEachTask(QueryContext& ctx, size_t count, const std::function<void(size_t, unsigned)>& task);
 
 }  // namespace shilmandb::parallel

@@ -4,6 +4,7 @@
 #include "planner/planner.hpp"
 #include "executor/executor_factory.hpp"
 #include "executor/executor_context.hpp"
+#include "executor/parallel/memory_budget.hpp"
 #include "executor/parallel/parallel_executor.hpp"
 #include "executor/parallel/worker_pool.hpp"
 #include "common/exception.hpp"
@@ -101,7 +102,8 @@ void FillAnalyzeProfile(const Planner& planner, const PlanNode* root, const Oper
 
 Database::Database(const std::string& db_file, size_t buffer_pool_size) : Database(db_file, buffer_pool_size, EvictionPolicyKind::LRU) {}
 
-Database::Database(const std::string& db_file, size_t buffer_pool_size, EvictionPolicyKind eviction, const std::string& eviction_model_path, const std::string& join_model_path) {
+Database::Database(const std::string& db_file, size_t buffer_pool_size, EvictionPolicyKind eviction, const std::string& eviction_model_path, const std::string& join_model_path)
+    : default_memory_limit_(parallel::DefaultMemoryLimit()), temp_dir_(db_file + ".tmp") {
 #ifndef SHILMANDB_HAS_LIBTORCH
     // Checked first, so nothing is created
     if (!join_model_path.empty()) {
@@ -153,6 +155,9 @@ QueryResult Database::ExecuteSQL(const std::string& sql, const QueryOptions& opt
     // thread time summed over workers, so they may pass the query's wall time.
     if (options.mode == ExecutionMode::PARALLEL) {
         const unsigned threads = parallel::ResolveThreads(options.threads);
+        // Refuses a limit too small for the threads before anything starts.
+        parallel::MemoryBudget budget(options.memory_limit.value_or(default_memory_limit_), threads);
+        parallel::SpillCounters spill;
         if (threads > 1 && (!worker_pool_ || worker_pool_->Size() < threads)) {
             worker_pool_.reset();  // the old threads end before the new ones start
             try {
@@ -163,9 +168,23 @@ QueryResult Database::ExecuteSQL(const std::string& sql, const QueryOptions& opt
         }
         OperatorStatsMap op_stats;
         parallel::QueryContext ctx{bpm_.get(), catalog_.get(), threads, threads > 1 ? worker_pool_.get() : nullptr, options.analyze ? &op_stats : nullptr};
+        ctx.budget = &budget;
+        ctx.spill = &spill;
+        ctx.temp_dir = &temp_dir_;
+        ctx.spill_everything = options.spill_everything;
         const auto latch_before = bpm_->GetLatchWaitTime();
         std::vector<Tuple> tuples = parallel::RunParallelQuery(*plan, ctx);
-        last_parallel_stats_ = ParallelQueryStats{threads, ctx.morsels, std::max(std::chrono::nanoseconds{0}, bpm_->GetLatchWaitTime() - latch_before)};
+        ParallelQueryStats stats{threads, ctx.morsels, std::max(std::chrono::nanoseconds{0}, bpm_->GetLatchWaitTime() - latch_before)};
+
+        stats.memory_limit = budget.Limit();
+        stats.peak_tracked_bytes = budget.PeakBytes();
+        stats.spill_bytes_written = spill.bytes_written.load();
+        stats.spill_bytes_read = spill.bytes_read.load();
+        stats.spill_files = spill.files.load();
+        stats.spill_partitions = spill.partitions.load();
+        stats.spill_time = std::chrono::nanoseconds{spill.nanos.load()};
+        
+        last_parallel_stats_ = stats;
         QueryProfile profile;
         profile.join = planner.GetJoinOrderInfo();
         if (options.analyze) FillAnalyzeProfile(planner, plan.get(), op_stats, profile);

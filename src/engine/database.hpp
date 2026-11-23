@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 #include <memory>
 
@@ -40,6 +41,8 @@ struct QueryOptions {
     bool analyze{false};                                // count rows and time every operator (tuple and parallel modes)
     bool use_learned_join{true};                        // use the learned join model if one is loaded
     unsigned threads{0};                                // PARALLEL only: 0 = one per core, capped at 256
+    std::optional<size_t> memory_limit;                 // PARALLEL only: breakers' memory; unset = the database's default
+    bool spill_everything{false};                       // PARALLEL only, for tests: every breaker spills everything it holds
 };
 
 struct OperatorProfile {
@@ -68,6 +71,13 @@ struct ParallelQueryStats {
     unsigned threads{1};                    // the resolved thread count
     uint64_t morsels{0};                    // morsels started across all its pipelines
     std::chrono::nanoseconds latch_wait{0}; // time workers waited for the buffer pool's latch
+    size_t memory_limit{0};                 // the query's memory limit
+    size_t peak_tracked_bytes{0};           // every worker's floor plus the most granted beyond them
+    uint64_t spill_bytes_written{0};
+    uint64_t spill_bytes_read{0};
+    uint64_t spill_files{0};
+    uint64_t spill_partitions{0};
+    std::chrono::nanoseconds spill_time{0}; // writing and reading spill files, summed over workers
 };
 
 class Database {
@@ -126,6 +136,14 @@ public:
     // Set when a parallel query finishes; an error keeps the last value.
     [[nodiscard]] const ParallelQueryStats& LastParallelStats() const { return last_parallel_stats_; }
 
+    // The memory limit a parallel query gets when its options set none. Starts at a quarter of memory.
+    void SetDefaultMemoryLimit(size_t bytes) { default_memory_limit_ = bytes; }
+    [[nodiscard]] size_t GetDefaultMemoryLimit() const { return default_memory_limit_; }
+
+    // Where parallel queries put spill files. Starts at the database file's path plus ".tmp".
+    void SetTempDirectory(std::string dir) { temp_dir_ = std::move(dir); }
+    [[nodiscard]] const std::string& GetTempDirectory() const { return temp_dir_; }
+
 private:
     std::optional<ScanCosts> scan_costs_;
     std::optional<ColumnarScanCosts> columnar_scan_costs_;
@@ -138,6 +156,8 @@ private:
     std::unique_ptr<LearnedJoinOptimizer> learned_join_optimizer_;
 #endif
     ParallelQueryStats last_parallel_stats_;
+    size_t default_memory_limit_{0};
+    std::string temp_dir_;
 
     // Last, so its threads are joined before anything they could touch goes away.
     // Built on the first query wanting 2+ threads; rebuilt bigger when a query wants more.
