@@ -16,6 +16,9 @@ namespace shilmandb::parallel {
 
 namespace {
 
+// The batch byte cap; 0 means kMaxBatchStringBytes. Only tests change it.
+size_t test_batch_bytes = 0;
+
 // One column's values for a morsel's survivors: entry i belongs to survivor i.
 struct ColumnValues {
     std::vector<int64_t> i64;        // INTEGER, DATE and narrow DECIMAL
@@ -24,9 +27,17 @@ struct ColumnValues {
     std::vector<StringRef> str;      // plain strings, TIMESTAMP text included
     std::vector<uint32_t> codes;     // a DICTIONARY string chunk's codes
     std::vector<StringRef> entries;
+    uint64_t str_bytes{0};           // at least the survivors' string bytes, each row counted
     bool coded{false};               // held as codes over entries
     bool ready{false};               // decoded and lined up with the survivors
 };
+
+// The longest entry's length.
+uint64_t LongestEntry(const std::vector<StringRef>& entries) {
+    uint32_t most = 0;
+    for (const StringRef& e : entries) most = std::max(most, e.size);
+    return most;
+}
 
 // Makes v hold at least n values; it never shrinks, so later groups reuse it.
 template <typename T>
@@ -99,6 +110,7 @@ struct ScanSource::Local : LocalState {
     uint32_t group_rows{0};
     uint32_t count{0};                  // survivors; while it equals group_rows, rows is implied
     uint32_t cursor{0};                 // survivors handed up so far
+    bool capped{false};                 // batches count string bytes against the cap
 };
 
 // Slot types come from the stored column types, as today's scan reads them.
@@ -179,6 +191,11 @@ void ScanSource::Prepare(QueryContext& ctx) {
     }
     std::sort(read_.begin(), read_.end());
     read_.erase(std::unique(read_.begin(), read_.end()), read_.end());
+    string_slots_.clear();
+    for (uint32_t c : spec_.columns) {
+        if (types_[c].kind == Kind::STRING) string_slots_.push_back(c);
+    }
+    byte_cap_ = test_batch_bytes != 0 ? test_batch_bytes : kMaxBatchStringBytes;
 
     // The listed columns first, so the error names the column today's scan names.
     refused_ = spec_.refuse_nulls;
@@ -300,10 +317,18 @@ void ScanSource::StartMorsel(size_t morsel, LocalState& local) const {
         }
         Apply(l, *spec_.multi[i], columns.data(), columns.size(), l.multi[i], singles + i + 1);
     }
+    l.capped = false;
     if (l.count > 0) {
         for (uint32_t c : spec_.columns) {
             if (!l.columns[c].ready) Decode(l, c);
         }
+        // Batches count their string bytes only when the morsel's strings could pass the cap.
+        uint64_t most = 0;
+        for (uint32_t c : string_slots_) {
+            const ColumnValues& col = l.columns[c];
+            most += col.coded ? uint64_t{kBatchSize} * LongestEntry(col.entries) : col.str_bytes;
+        }
+        l.capped = most > byte_cap_;
     }
 
     rows_considered_.fetch_add(considered, std::memory_order_relaxed);
@@ -328,6 +353,8 @@ void ScanSource::Decode(Local& l, uint32_t column) const {
     const uint32_t* rows = whole ? nullptr : l.rows.data();
     const uint32_t count = whole ? l.group_rows : n;
     const bool gather = whole && !all;
+
+    const size_t arena_before = l.arena.BytesUsed();
 
     // read writes count values: straight into target, or into scratch to gather from.
     auto fill = [&](auto& target, auto& scratch, auto read) {
@@ -368,6 +395,9 @@ void ScanSource::Decode(Local& l, uint32_t column) const {
             break;
     }
     col.ready = true;
+    // A CONSTANT chunk's rows all point at one copy, so it counts once per survivor.
+    const bool shared = PhysicalKindOf(type) == PhysicalKind::STRING && table_->ChunkAt(l.group, column).encoding == Encoding::CONSTANT;
+    col.str_bytes = shared && n > 0 ? uint64_t{n} * col.str[0].size : l.arena.BytesUsed() - arena_before;
     l.decoded[column] += count;
 }
 
@@ -406,15 +436,32 @@ void ScanSource::Narrow(Local& l, size_t step) const {
 }
 
 // With no columns to hand up, a batch still carries its row count.
+// Rows the byte cap leaves out start the next batch.
 bool ScanSource::NextBatch(LocalState& local, Batch& out) const {
     auto& l = static_cast<Local&>(local);
     if (l.cursor >= l.count) return false;
-    const uint32_t n = std::min(kBatchSize, l.count - l.cursor);
+    uint32_t n = std::min(kBatchSize, l.count - l.cursor);
+    if (l.capped) n = RowsWithinCap(l, n);
     ShapeBatch(out, slot_types_);
     out.Reset(n);
     for (size_t k = 0; k < spec_.columns.size(); ++k) FillSlot(l.columns[spec_.columns[k]], l.cursor, n, out.slots[k]);
     l.cursor += n;
     return true;
+}
+
+// A batch ends once its string bytes pass the cap, keeping the row that
+// passed it, so it always holds at least one row.
+uint32_t ScanSource::RowsWithinCap(const Local& l, uint32_t n) const {
+    uint64_t bytes = 0;
+    for (uint32_t i = 0; i < n; ++i) {
+        const uint32_t row = l.cursor + i;
+        for (uint32_t c : string_slots_) {
+            const ColumnValues& col = l.columns[c];
+            bytes += col.coded ? col.entries[col.codes[row]].size : col.str[row].size;
+        }
+        if (bytes > byte_cap_) return i + 1;
+    }
+    return n;
 }
 
 // Relaxed loads: a snapshot, exact once the workers are done.
@@ -433,6 +480,9 @@ ScanCounters ScanSource::Counters() const {
 std::optional<uint64_t> ScanSource::RowsRead() const {
     return rows_considered_.load(std::memory_order_relaxed);
 }
+
+// Read by Prepare, on the calling thread.
+void BatchStringBytesForTest(size_t bytes) { test_batch_bytes = bytes; }
 
 // A ScanSource behind the Source interface.
 std::unique_ptr<Source> MakeScanSource(ScanSpec spec) {

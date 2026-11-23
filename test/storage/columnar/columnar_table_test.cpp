@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include "buffer/buffer_pool_manager.hpp"
+#include "buffer/eviction_policy.hpp"
 #include "buffer/lru_eviction_policy.hpp"
 #include "common/exception.hpp"
 #include "storage/columnar/columnar_table.hpp"
@@ -7,13 +8,17 @@
 #include "storage/page.hpp"
 #include "types/value.hpp"
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <random>
 #include <string>
+#include <thread>
 #include <unistd.h>
+#include <utility>
 #include <vector>
 
 namespace shilmandb {
@@ -47,6 +52,51 @@ const char* const kWords[] = {"alpha", "bravo", "charlie", "delta", "echo", "fox
     }
     return ::testing::AssertionSuccess();
 }
+
+// n bytes whose letters change from page to page, set by seed.
+std::string BigText(size_t n, size_t seed) {
+    std::string s(n, 'a');
+    for (size_t i = 0; i < n; ++i) s[i] = static_cast<char>('a' + (i * 31 + seed * 7 + i / 8160) % 26);
+    return s;
+}
+
+// The rows of the big-value chunk that hold big values, with their sizes.
+const std::vector<std::pair<uint16_t, size_t>>& BigRows() {
+    static const std::vector<std::pair<uint16_t, size_t>> rows = {
+        {5, kMaxValueBytes + 1}, {6, kMaxValueBytes}, {777, size_t{3} << 20}, {1500, 20000}, {1501, 70000}, {2999, 9000}};
+    return rows;
+}
+
+// One time a page became pinned, or fully unpinned.
+struct PinEvent {
+    page_id_t page;
+    bool pinned;
+};
+
+// LRU that also logs each page's pins and unpins, as the pool reports them.
+class PinWatcher : public EvictionPolicy {
+public:
+    PinWatcher(size_t frames, std::vector<PinEvent>* log) : inner_(frames), pages_(frames, INVALID_PAGE_ID), log_(log) {}
+
+    void RecordAccess(frame_id_t frame) override { inner_.RecordAccess(frame); }
+    void RecordAccess(frame_id_t frame, page_id_t page) override {
+        pages_[frame] = page;
+        inner_.RecordAccess(frame);
+    }
+    void SetEvictable(frame_id_t frame, bool evictable) override {
+        log_->push_back(PinEvent{pages_[frame], !evictable});
+        inner_.SetEvictable(frame, evictable);
+    }
+    std::optional<frame_id_t> Evict() override { return inner_.Evict(); }
+    void Remove(frame_id_t frame) override { inner_.Remove(frame); }
+    size_t Size() const override { return inner_.Size(); }
+    void Reset() override { inner_.Reset(); }
+
+private:
+    LRUEvictionPolicy inner_;
+    std::vector<page_id_t> pages_;  // the page each frame holds
+    std::vector<PinEvent>* log_;
+};
 
 // Appends row i of src to out.
 void AppendRow(const ColumnVector& src, size_t i, ColumnVector& out) {
@@ -127,6 +177,31 @@ protected:
         const ChunkMeta& chunk = meta_.row_groups[group].chunks[column];
         EXPECT_GT(chunk.page_count, chunk.dict_page_count);
         return chunk.first_page + chunk.dict_page_count;
+    }
+
+    // Short strings on dozens of data pages, with BigRows() between them.
+    // The 3 MiB value spans far more pages than the small pools hold.
+    ColumnarTableMeta WriteBigChunk(std::vector<std::string>& values) {
+        values.assign(3000, "");
+        for (size_t i = 0; i < values.size(); ++i) values[i] = "row-" + std::to_string(i) + std::string(90, static_cast<char>('a' + i % 26));
+        for (const auto& [row, bytes] : BigRows()) values[row] = BigText(bytes, row);
+        ColumnVector col(ColumnType::Text());
+        for (const std::string& v : values) col.AppendString(v);
+
+        ColumnarTableMeta meta;
+        meta.oid = 2;
+        meta.name = "docs";
+        meta.columns = {{"body", 1, ColumnType::Text(), false}};
+        RowGroupMeta group;
+        group.row_count = static_cast<uint32_t>(values.size());
+        group.chunks.push_back(WriteChunk(disk_.get(), col));
+        meta.row_count = group.row_count;
+        meta.row_groups.push_back(std::move(group));
+        const ChunkMeta& chunk = meta.row_groups[0].chunks[0];
+        EXPECT_EQ(chunk.encoding, Encoding::PLAIN);
+        EXPECT_GT(chunk.page_first_rows.size(), 2 * kPinBatch);
+        EXPECT_GT(chunk.big_page_count, 384u);
+        return meta;
     }
 
     // Flips one bit of a chunk's first data page on disk.
@@ -356,6 +431,119 @@ TEST_F(ColumnarTableTest, FixtureEncodings) {
     EXPECT_EQ(chunks[kDate].encoding, Encoding::BITPACK);
     EXPECT_EQ(chunks[kText].encoding, Encoding::DICTIONARY);
     EXPECT_GT(chunks[kText].dict_page_count, 0u);
+}
+
+TEST_F(ColumnarTableTest, BigValuesPinOnePageAtATime) {
+    std::vector<std::string> values;
+    const ColumnarTableMeta meta = WriteBigChunk(values);
+    const auto& big = BigRows();
+
+    // Each check reads every value, then a list of rows, and leaves nothing pinned.
+    const std::vector<uint32_t> some = {0, 5, 6, 7, 776, 777, 778, 1500, 1501, 2000, 2999};
+    auto check_reads = [&](const ColumnarTable& table) {
+        std::vector<StringRef> refs(values.size());
+        StringArena arena;
+        table.ReadRows(0, 0, nullptr, static_cast<uint32_t>(values.size()), refs.data(), arena);
+        for (size_t i = 0; i < values.size(); ++i) ASSERT_EQ(View(refs[i]), values[i]) << "row " << i;
+        table.ReadRows(0, 0, some.data(), static_cast<uint32_t>(some.size()), refs.data(), arena);
+        for (size_t k = 0; k < some.size(); ++k) ASSERT_EQ(View(refs[k]), values[some[k]]) << "row " << some[k];
+    };
+
+    // Two frames hold a data page and a big-value page;
+    // 34 hold a batch of 16 and one more.
+    for (const size_t frames : {size_t{2}, size_t{34}}) {
+        SCOPED_TRACE("frames " + std::to_string(frames));
+        auto bpm = MakePool(frames);
+        const ColumnarTable table(bpm.get(), meta);
+        check_reads(table);
+        ColumnVector whole(ColumnType::Text());
+        table.ReadChunk(0, 0, whole);
+        for (size_t i = 0; i < values.size(); ++i) ASSERT_EQ(whole.GetString(i), values[i]) << "row " << i;
+        for (const auto& [row, bytes] : big) {
+            ColumnVector one(ColumnType::Text());
+            table.ReadValue(RowPosition{0, row}, 0, one);
+            EXPECT_EQ(one.GetString(0), values[row]) << "row " << row;
+        }
+        EXPECT_NO_THROW(bpm->DropAllPages());
+    }
+
+    // Four readers at once with the pool's latch on, as parallel scans read.
+    auto bpm = MakePool(40);
+    const ColumnarTable table(bpm.get(), meta);
+    std::atomic<int> failures{0};
+    bpm->SetConcurrent(true, 4);
+    std::vector<std::thread> readers;
+    for (int t = 0; t < 4; ++t) {
+        readers.emplace_back([&] {
+            try {
+                std::vector<StringRef> refs(values.size());
+                StringArena arena;
+                table.ReadRows(0, 0, nullptr, static_cast<uint32_t>(values.size()), refs.data(), arena);
+                for (size_t i = 0; i < values.size(); ++i) {
+                    if (View(refs[i]) != values[i]) ++failures;
+                }
+            } catch (const std::exception&) {
+                ++failures;
+            }
+        });
+    }
+    for (std::thread& r : readers) r.join();
+    bpm->SetConcurrent(false);
+    EXPECT_EQ(failures.load(), 0);
+    EXPECT_NO_THROW(bpm->DropAllPages());
+}
+
+// Holds in Release too: the pool's own pin log, not a Debug assert.
+TEST_F(ColumnarTableTest, BigValuePagesNeverJoinABatch) {
+    std::vector<std::string> values;
+    const ColumnarTableMeta meta = WriteBigChunk(values);
+    const ChunkMeta& chunk = meta.row_groups[0].chunks[0];
+    const page_id_t first_big = chunk.first_page + chunk.page_count - chunk.big_page_count;
+    const page_id_t past_chunk = chunk.first_page + chunk.page_count;
+
+    // 64 frames, so data pages come in batches of kPinBatch.
+    std::vector<PinEvent> log;
+    BufferPoolManager bpm(64, disk_.get(), std::make_unique<PinWatcher>(64, &log));
+    const ColumnarTable table(&bpm, meta);
+    const std::vector<uint32_t> some = {0, 5, 6, 7, 776, 777, 778, 1500, 1501, 2000, 2999};
+    for (const bool whole : {true, false}) {
+        SCOPED_TRACE(whole ? "every row" : "a list of rows");
+        log.clear();
+        const uint32_t n = whole ? static_cast<uint32_t>(values.size()) : static_cast<uint32_t>(some.size());
+        std::vector<StringRef> refs(n);
+        StringArena arena;
+        table.ReadRows(0, 0, whole ? nullptr : some.data(), n, refs.data(), arena);
+        for (uint32_t k = 0; k < n; ++k) ASSERT_EQ(View(refs[k]), values[whole ? k : some[k]]) << "row " << k;
+
+        std::vector<page_id_t> data_pinned;
+        size_t most_data = 0;
+        uint64_t big_pins = 0;
+        for (size_t i = 0; i < log.size(); ++i) {
+            const PinEvent& e = log[i];
+            if (e.page < first_big || e.page >= past_chunk) {
+                if (e.pinned) {
+                    data_pinned.push_back(e.page);
+                } else {
+                    data_pinned.erase(std::remove(data_pinned.begin(), data_pinned.end(), e.page), data_pinned.end());
+                }
+                most_data = std::max(most_data, data_pinned.size());
+                continue;
+            }
+            // A big-value page is pinned alone, beside the data page in use,
+            // and unpinned before anything else is pinned or unpinned.
+            ASSERT_TRUE(e.pinned) << "event " << i;
+            ASSERT_LT(i + 1, log.size());
+            EXPECT_EQ(log[i + 1].page, e.page) << "event " << i;
+            EXPECT_FALSE(log[i + 1].pinned) << "event " << i;
+            EXPECT_FALSE(data_pinned.empty()) << "event " << i;
+            ++big_pins;
+            ++i;
+        }
+        EXPECT_EQ(big_pins, chunk.big_page_count);
+        EXPECT_GT(most_data, 1u);
+        EXPECT_LE(most_data, kPinBatch);
+        EXPECT_TRUE(data_pinned.empty());
+    }
 }
 
 }  // namespace

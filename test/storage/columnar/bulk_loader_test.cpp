@@ -1,8 +1,10 @@
 #include <gtest/gtest.h>
 #include "buffer/buffer_pool_manager.hpp"
 #include "buffer/lru_eviction_policy.hpp"
+#include "catalog/catalog.hpp"
 #include "catalog/schema.hpp"
 #include "common/exception.hpp"
+#include "engine/database.hpp"
 #include "storage/columnar/bulk_loader.hpp"
 #include "storage/columnar/columnar_table.hpp"
 #include "storage/columnar/field_parser.hpp"
@@ -115,6 +117,30 @@ Schema IntSchema() { return Schema({Column("a", ColumnType::Integer()), Column("
 Schema TextSchema() { return Schema({Column("a", ColumnType::Integer()), Column("b", ColumnType::Text())}); }
 
 constexpr size_t kBlock = size_t{1} << 20;  // the reader's block size
+
+// Lowers the loader's value cap for one test, and a text schema's line limit.
+class ValueCapScope {
+public:
+    explicit ValueCapScope(size_t bytes) { BulkLoadValueCapForTest(bytes); }
+    ~ValueCapScope() { BulkLoadValueCapForTest(0); }
+    ValueCapScope(const ValueCapScope&) = delete;
+    ValueCapScope& operator=(const ValueCapScope&) = delete;
+};
+
+// The line limit for a cap and a column count, as the loader sets it.
+// A schema with no string column gets cap 0.
+size_t LineLimit(size_t cap, size_t columns) { return cap + columns * (kMaxValueBytes + 1); }
+
+// n letters that never repeat in a short cycle, set by seed.
+std::string Letters(size_t n, uint32_t seed) {
+    std::string s(n, 'a');
+    uint32_t x = seed * 2654435761u + 1;
+    for (char& c : s) {
+        x = x * 1664525u + 1013904223u;
+        c = static_cast<char>('a' + (x >> 24) % 26);
+    }
+    return s;
+}
 
 // Valid TextSchema lines totalling exactly `bytes` bytes (at least 4).
 std::string FillerLines(size_t bytes, size_t& lines) {
@@ -401,7 +427,8 @@ TEST_F(BulkLoaderTest, LastLineEndsAtBlockEdge) {
 
 // A line of exactly the limit whose \r ends a block still reaches the parser.
 TEST_F(BulkLoaderTest, CarriageReturnAllowanceAtBlockEdge) {
-    const size_t limit = 2 * (kMaxValueBytes + 1);
+    const ValueCapScope cap(kMaxValueBytes);
+    const size_t limit = LineLimit(kMaxValueBytes, 2);
     size_t lines = 0;
     const std::string line = "1|" + std::string(limit - 2, 'x');
     const std::string at_limit = FillerLines(kBlock - line.size() - 1, lines) + line + "\r\n2|end\n";
@@ -409,7 +436,7 @@ TEST_F(BulkLoaderTest, CarriageReturnAllowanceAtBlockEdge) {
     ASSERT_EQ(at_limit[kBlock], '\n');
     const std::string msg = LoadError(TextSchema(), WriteFile("cr_edge.tbl", at_limit), Threads(2));
     const std::string want = "t: line " + std::to_string(lines + 1) + ", column b: value of " +
-                             std::to_string(limit - 2) + " bytes is bigger than a page";
+                             std::to_string(limit - 2) + " bytes is over the 1 GiB limit for one value";
     EXPECT_EQ(msg, want);
 
     // One byte longer, and the block's end already holds too much.
@@ -421,7 +448,8 @@ TEST_F(BulkLoaderTest, CarriageReturnAllowanceAtBlockEdge) {
 }
 
 TEST_F(BulkLoaderTest, LongLineRefused) {
-    const size_t limit = 2 * (kMaxValueBytes + 1);
+    // Numbers only, so no value can be big: an in-line value per column.
+    const size_t limit = LineLimit(0, 2);
     const std::string refused = " line is longer than " + std::to_string(limit) + " bytes";
     // A file with no newline at all is refused, not read whole into memory.
     EXPECT_EQ(LoadError(IntSchema(), WriteFile("one_line.tbl", std::string(size_t{3} << 20, '7')), Threads(2)),
@@ -441,6 +469,21 @@ TEST_F(BulkLoaderTest, LongLineRefused) {
         const std::string msg = LoadError(IntSchema(), WriteFile("at_limit.tbl", text), Threads(2));
         EXPECT_EQ(msg.rfind("t: line 2, column b: ", 0), 0u) << msg;
     }
+}
+
+TEST_F(BulkLoaderTest, NumbersOnlyKeepTheInLineLimit) {
+    const size_t in_line = LineLimit(0, 2);
+    const std::string over = "1|2\n" + std::string(in_line + 1, '9') + "\n";
+    const std::string refused = "t: line 2: line is longer than " + std::to_string(in_line) + " bytes";
+    // The value cap, default or lowered, never widens a numbers-only line.
+    EXPECT_EQ(LoadError(IntSchema(), WriteFile("numbers.tbl", over), Threads(1)), refused);
+    {
+        const ValueCapScope cap(20000);
+        EXPECT_EQ(LoadError(IntSchema(), WriteFile("numbers.tbl", over), Threads(1)), refused);
+    }
+    // A text column gets room for one value at the cap.
+    const std::string text = "1|" + std::string(in_line + 1, 't') + "\n";
+    EXPECT_EQ(LoadError(TextSchema(), WriteFile("text.tbl", text), Threads(1)), "");
 }
 
 TEST_F(BulkLoaderTest, HugeThreadCountIsCapped) {
@@ -493,11 +536,79 @@ TEST_F(BulkLoaderTest, NullInColumnThatIsNotNullable) {
               "t: line 2, column b: NULL in a column that isn't nullable");
 }
 
-TEST_F(BulkLoaderTest, HugeFieldRefused) {
+TEST_F(BulkLoaderTest, LoadsValuesBiggerThanAPage) {
+    const Schema schema({Column("id", ColumnType::Integer()), Column("body", ColumnType::Text()),
+                         Column("tag", ColumnType::Varchar(8))});
+    // Sizes around the in-line limit and values over many pages, beside short ones.
+    const std::vector<std::pair<size_t, size_t>> sized = {{10, 0}, {20, 7}, {30, kMaxValueBytes}, {40, kMaxValueBytes + 1},
+                                                         {50, size_t{2} << 20}, {51, kMaxValueBytes + 1}, {52, 9000},
+                                                         {299, size_t{2} << 20}};
+    std::vector<std::string> bodies(300);
+    for (size_t i = 0; i < bodies.size(); ++i) bodies[i] = "b" + std::to_string(i);
+    for (const auto& [row, bytes] : sized) bodies[row] = Letters(bytes, static_cast<uint32_t>(row));
+    std::string text;
+    for (size_t i = 0; i < bodies.size(); ++i) text += std::to_string(i) + "|" + bodies[i] + "|t" + std::to_string(i % 3) + "\n";
+    const std::string path = WriteFile("big.tbl", text);
+
+    // Read back exactly, and the same table at any thread count.
+    const ColumnarTableMeta one = BulkLoad(disk_.get(), "t", schema, path, Threads(1));
+    const ColumnarTableMeta four = BulkLoad(disk_.get(), "t", schema, path, Threads(4));
+    ASSERT_EQ(one.row_groups.size(), 1u);
+    const ChunkMeta& body = one.row_groups[0].chunks[1];
+    EXPECT_EQ(body.encoding, Encoding::PLAIN);
+    EXPECT_GT(body.big_page_count, 2u * ((size_t{2} << 20) / PAGE_SIZE));
+    for (size_t c = 0; c < schema.GetColumnCount(); ++c) {
+        EXPECT_TRUE(SameChunk(one.row_groups[0].chunks[c], four.row_groups[0].chunks[c])) << "column " << c;
+        EXPECT_EQ(one.row_groups[0].chunks[c].big_page_count, four.row_groups[0].chunks[c].big_page_count);
+    }
+    for (const ColumnarTableMeta* meta : {&one, &four}) {
+        const auto got = ReadAll(*meta);
+        ASSERT_EQ(got[1].Size(), bodies.size());
+        for (size_t i = 0; i < bodies.size(); ++i) ASSERT_EQ(got[1].GetString(i), bodies[i]) << "row " << i;
+        EXPECT_EQ(got[2].GetString(299), "t2");
+    }
+
+    // Committed by a database, closed, and read back after the reopen.
+    const std::string file = (dir_ / "big.db").string();
+    {
+        Database db(file, 64);
+        LoadOptions options;
+        options.storage = StorageKind::COLUMNAR;
+        options.threads = 2;
+        db.LoadTable("t", schema, path, options);
+    }
+    Database db(file, 64);
+    const ColumnarTable& table = *db.GetCatalog()->GetTable("t")->columnar;
+    ColumnVector whole(ColumnType::Text());
+    table.ReadChunk(0, 1, whole);
+    std::vector<StringRef> refs(bodies.size());
+    StringArena arena;
+    table.ReadRows(0, 1, nullptr, static_cast<uint32_t>(bodies.size()), refs.data(), arena);
+    for (size_t i = 0; i < bodies.size(); ++i) {
+        ASSERT_EQ(whole.GetString(i), bodies[i]) << "row " << i;
+        ASSERT_EQ(View(refs[i]), bodies[i]) << "row " << i;
+    }
+    for (const auto& [row, bytes] : sized) {
+        ColumnVector one_value(ColumnType::Text());
+        table.ReadValue(RowPosition{0, static_cast<uint16_t>(row)}, 1, one_value);
+        EXPECT_EQ(one_value.GetString(0), bodies[row]) << "row " << row;
+    }
+}
+
+TEST_F(BulkLoaderTest, RefusesAValueOverTheCap) {
     const Schema schema({Column("id", ColumnType::Integer()), Column("body", ColumnType::Text())});
-    const std::string text = "1|short\n2|" + std::string(9000, 'z') + "\n3|end\n";
-    EXPECT_EQ(LoadError(schema, WriteFile("huge.tbl", text), Threads(1)),
-              "t: line 2, column body: value of 9000 bytes is bigger than a page");
+    const std::string over = "1|short\n2|" + std::string(20001, 'z') + "\n3|end\n";
+    {
+        const ValueCapScope cap(20000);
+        // A value of exactly the cap loads.
+        const auto meta = BulkLoad(disk_.get(), "t", schema, WriteFile("at_cap.tbl", "1|" + std::string(20000, 'z') + "\n"), Threads(1));
+        EXPECT_EQ(meta.row_count, 1u);
+        // One byte more is refused, naming the table, line and column.
+        EXPECT_EQ(LoadError(schema, WriteFile("over.tbl", over), Threads(2)),
+                  "t: line 2, column body: value of 20001 bytes is over the 1 GiB limit for one value");
+    }
+    // The cap is back to 1 GiB once the test is done with it.
+    EXPECT_EQ(LoadError(schema, WriteFile("over.tbl", over), Threads(2)), "");
 }
 
 TEST_F(BulkLoaderTest, StatsMatchRowStoreRules) {

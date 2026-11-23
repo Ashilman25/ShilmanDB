@@ -30,6 +30,9 @@ constexpr size_t kReadBlockBytes = size_t{1} << 20;               // the reader 
 constexpr uint64_t kNoFailure = std::numeric_limits<uint64_t>::max();
 constexpr size_t kAbortCheckRows = 4096;                          // how often a worker looks for a failure
 
+// The biggest value a load takes; 0 means kMaxBigValueBytes. Only tests change it.
+size_t test_value_cap = 0;
+
 // One row group's lines, cut by the reader and parsed by one worker.
 struct Batch {
     uint64_t number{0};
@@ -72,6 +75,12 @@ void AddToSketch(const ColumnVector& col, HyperLogLog& sketch) {
             case PhysicalKind::STRING: sketch.Add(HashString(col.GetString(i))); break;
         }
     }
+}
+
+// Whether any column stores strings, the only values that can be big.
+bool HasStringColumn(const Schema& schema) {
+    const auto& columns = schema.GetColumns();
+    return std::any_of(columns.begin(), columns.end(), [](const Column& c) { return PhysicalKindOf(c.storage_type) == PhysicalKind::STRING; });
 }
 
 // Only these executor types get a range, as in the row store's stats.
@@ -132,13 +141,15 @@ private:
 // Every field below the mutex is shared and guarded by it.
 // Memory: at most 2 x workers batches in flight, plus the one being read.
 // Each holds up to 65,536 lines of at most the line cap.
-// There is no byte budget.
+// A worker drops a batch's text once parsed, so it holds the parsed
+// values plus one encoded chunk. There is no byte budget.
 class Pipeline {
 public:
     Pipeline(DiskManager* disk, const std::string& table, const std::string& path, const Schema& schema, const BulkLoadOptions& options, std::ifstream file, unsigned workers)
         : disk_(disk), table_(table), path_(path), schema_(schema), options_(options), file_(std::move(file)),
           workers_(workers), max_in_flight_(2 * static_cast<uint64_t>(workers)),
-          max_line_bytes_(static_cast<uint64_t>(schema.GetColumnCount()) * (kMaxValueBytes + 1)) {}
+          value_cap_(test_value_cap != 0 ? test_value_cap : kMaxBigValueBytes),
+          max_line_bytes_((HasStringColumn(schema) ? value_cap_ : 0) + static_cast<uint64_t>(schema.GetColumnCount()) * (kMaxValueBytes + 1)) {}
 
     Pipeline(const Pipeline&) = delete;
     Pipeline& operator=(const Pipeline&) = delete;
@@ -353,6 +364,7 @@ private:
     }
 
     // Parses one field into its column; throws the line's error.
+    // A string is stored as written, so it is refused before it is copied.
     void ParseCell(std::string_view field, uint32_t c, uint64_t line, ColumnVector& col) const {
         const Column& column = schema_.GetColumn(c);
         if (options_.null_text && field == *options_.null_text) {
@@ -360,17 +372,19 @@ private:
             col.AppendNull();
             return;
         }
-        if (auto reason = ParseField(field, col)) throw LineError(line, column.name, *reason);
-        if (col.Kind() == PhysicalKind::STRING) {
-            const size_t bytes = col.GetString(col.Size() - 1).size();
-            if (bytes > kMaxValueBytes) {
-                throw LineError(line, column.name, "value of " + std::to_string(bytes) + " bytes is bigger than a page");
+        if (col.Kind() == PhysicalKind::STRING && field.size() > value_cap_) {
+            try {
+                CheckValueSize(field.size(), value_cap_);
+            } catch (const DatabaseException& e) {
+                throw LineError(line, column.name, e.what());
             }
         }
+        if (auto reason = ParseField(field, col)) throw LineError(line, column.name, *reason);
     }
 
     // Parses, sketches and writes one batch; nothing when it was abandoned midway.
-    [[nodiscard]] std::optional<BatchResult> Process(const Batch& batch, std::vector<ColumnVector>& cols) const {
+    // The text is dropped once parsed, before the chunks are encoded.
+    [[nodiscard]] std::optional<BatchResult> Process(Batch& batch, std::vector<ColumnVector>& cols) const {
         const size_t rows = batch.ends.size();
         const auto width = static_cast<uint32_t>(cols.size());
         for (ColumnVector& col : cols) {
@@ -392,6 +406,7 @@ private:
             for (uint32_t c = 0; c < width; ++c) ParseCell(fields[c], c, batch.line_numbers[r], cols[c]);
         }
         if (batch.tail_error) std::rethrow_exception(batch.tail_error);
+        std::string().swap(batch.text);
 
         BatchResult result;
         result.group.row_count = static_cast<uint32_t>(rows);
@@ -423,8 +438,9 @@ private:
     std::ifstream file_;  // the reader's alone once Run starts
     const unsigned workers_;
     const uint64_t max_in_flight_;
-    // Longer lines are refused. Such a line has a field bigger than a page,
-    // or absurdly padded number fields; the cap refuses those too.
+    const size_t value_cap_;  // the biggest string a field may hold
+    // Longer lines are refused: an in-line value per column, plus one value
+    // at the cap when a column holds strings. Absurdly padded numbers too.
     const uint64_t max_line_bytes_;
     std::vector<std::thread> threads_;  // the calling thread's alone
 
@@ -441,6 +457,9 @@ private:
 };
 
 }  // namespace
+
+// Read when a load starts, on the calling thread.
+void BulkLoadValueCapForTest(size_t bytes) { test_value_cap = bytes; }
 
 // Checks the schema and opens the file before any thread starts.
 ColumnarTableMeta BulkLoad(DiskManager* disk, const std::string& table_name, const Schema& schema, const std::string& path, const BulkLoadOptions& options) {

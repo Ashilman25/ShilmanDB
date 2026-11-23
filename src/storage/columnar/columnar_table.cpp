@@ -62,10 +62,21 @@ private:
 
 // Pins the pages a walk expects in batches, one pool call per batch.
 // Pages are used one at a time; a batch stays pinned until the next one.
+// A big-value page is pinned alone beside the batch, never in it.
 class BatchPoolPages : public ChunkPages {
 public:
-    BatchPoolPages(BufferPoolManager* bpm, const ChunkMeta& chunk, const std::string& table) : bpm_(bpm), chunk_(chunk), table_(table), limit_(PinLimit(*bpm)) {}
+    BatchPoolPages(BufferPoolManager* bpm, const ChunkMeta& chunk, const std::string& table)
+        : bpm_(bpm), chunk_(chunk), table_(table), limit_(PinLimit(*bpm)),
+          first_big_(chunk.big_page_count <= chunk.page_count ? chunk.page_count - chunk.big_page_count : chunk.page_count) {}
+    // Each release has its own try, so one failing can't keep the other's pins.
     ~BatchPoolPages() override {
+        if (big_ != INVALID_PAGE_ID) {
+            try {
+                (void)bpm_->UnpinPage(big_, false);
+            } catch (...) {
+                // nothing to do from a destructor
+            }
+        }
         try {
             Release();
         } catch (...) {
@@ -77,29 +88,35 @@ public:
 
     // A new walk: the last one is done with its pages.
     void Expect(const uint32_t* indexes, size_t n) override {
+        assert(std::none_of(indexes, indexes + n, [&](uint32_t i) { return i >= first_big_; }) && "big-value pages are never batched");
         Release();
         expected_.assign(indexes, indexes + n);
         next_ = 0;
     }
 
     const char* Pin(uint32_t index) override {
-        assert(!in_use_ && "one page at a time");
         if (index >= chunk_.page_count) {
             throw DatabaseException(table_ + ": page " + std::to_string(index) + " is past the chunk's " + std::to_string(chunk_.page_count));
         }
+        if (index >= first_big_) return PinBig(index);
+        assert(!in_use_ && "one page at a time");
         const page_id_t pid = chunk_.first_page + index;
         if (cursor_ >= held_ || batch_[cursor_] != pid) Load(index);
         Page* page = pages_[cursor_];
-        if (!page->IsVerified()) {
-            if (!VerifyPage(page->GetData(), pid)) throw DatabaseException(table_ + ": page " + std::to_string(pid) + " failed its checksum");
-            page->MarkVerified();
-        }
+        Verify(page, pid);
         in_use_ = true;
         return page->GetData();
     }
 
-    // The page stays pinned with its batch; the walk moves on.
-    void Unpin(uint32_t) override {
+    // A batch page stays pinned with its batch; the walk moves on.
+    void Unpin(uint32_t index) override {
+        if (index >= first_big_) {
+            assert(big_ == static_cast<page_id_t>(chunk_.first_page + index) && "Unpin of a big-value page that isn't pinned");
+            const page_id_t pid = big_;
+            big_ = INVALID_PAGE_ID;
+            (void)bpm_->UnpinPage(pid, false);
+            return;
+        }
         assert(in_use_ && "Unpin without Pin");
         in_use_ = false;
         ++cursor_;
@@ -125,6 +142,27 @@ private:
         if (expected) next_ += held_;
     }
 
+    // Checks a page's checksum the first time it is read from disk.
+    void Verify(Page* page, page_id_t pid) const {
+        if (!page->IsVerified()) {
+            if (!VerifyPage(page->GetData(), pid)) throw DatabaseException(table_ + ": page " + std::to_string(pid) + " failed its checksum");
+            page->MarkVerified();
+        }
+    }
+
+    // Pins one big-value page on its own, leaving the batch as it is.
+    const char* PinBig(uint32_t index) {
+        assert(big_ == INVALID_PAGE_ID && "one big-value page at a time");
+        const page_id_t pid = chunk_.first_page + index;
+        Page* page = bpm_->FetchPage(pid);
+        if (page == nullptr) throw DatabaseException(table_ + ": no free frame for page " + std::to_string(pid));
+        PinGuard guard(bpm_, pid);
+        Verify(page, pid);
+        guard.Keep();
+        big_ = pid;
+        return page->GetData();
+    }
+
     // Unpins the held batch in one pool call.
     void Release() {
         const size_t held = held_;
@@ -137,6 +175,7 @@ private:
     const ChunkMeta& chunk_;
     const std::string& table_;
     const size_t limit_;
+    const uint32_t first_big_;        // big-value pages are this index and after
     std::vector<uint32_t> expected_;  // the walk's page indexes
     size_t next_{0};                  // the first expected page not yet pinned
     std::vector<page_id_t> batch_;    // the batch asked for; the first held_ are pinned
@@ -144,6 +183,7 @@ private:
     size_t held_{0};
     size_t cursor_{0};                // the batch entry the walk is on
     bool in_use_{false};
+    page_id_t big_{INVALID_PAGE_ID};  // the big-value page pinned now, if any
 };
 
 }  // namespace

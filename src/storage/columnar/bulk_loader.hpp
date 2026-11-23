@@ -1,6 +1,7 @@
 #pragma once
 #include "catalog/schema.hpp"
 #include "storage/columnar/columnar_meta.hpp"
+#include <cstddef>
 #include <optional>
 #include <string>
 
@@ -16,6 +17,10 @@ struct BulkLoadOptions {
     unsigned threads{0};                    // 0 = std::thread::hardware_concurrency(); at most kMaxLoadThreads
     std::optional<std::string> null_text;   // a field equal to this is NULL; unset = no NULLs
 };
+
+// Tests only: the biggest value a load takes; also the line limit with text columns.
+// 0 puts back kMaxBigValueBytes.
+void BulkLoadValueCapForTest(size_t bytes);
 
 // Reads a delimited text file into row groups written straight to disk. Nothing is committed.
 // Fills row_groups, row_count, columns and stats; leaves oid 0. Throws DatabaseException on bad input.

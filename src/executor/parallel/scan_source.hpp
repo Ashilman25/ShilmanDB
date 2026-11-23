@@ -17,6 +17,13 @@ namespace shilmandb::parallel {
 // Above this share of a row group's rows, a column is decoded whole.
 inline constexpr double kDenseFraction = 0.125;
 
+// A scan batch ends early once its rows' string bytes pass this.
+// It always holds at least one row, however big.
+inline constexpr size_t kMaxBatchStringBytes = size_t{64} << 20;
+
+// Tests only: the byte cap for scans prepared after this; 0 puts back the default.
+void BatchStringBytesForTest(size_t bytes);
+
 // One columnar table scan, with the filter right above it fused in.
 // Conjunct i of single reads slot 0, holding single_column[i];
 // conjunct i of multi reads slot k, holding multi_columns[i][k] (see ScanLayout).
@@ -99,6 +106,9 @@ private:
     // Walks the index range; fills groups_ and each group's sorted offsets.
     void FindMatches(QueryContext& ctx);
 
+    // How many of the next n survivors the batch byte cap lets one batch take.
+    [[nodiscard]] uint32_t RowsWithinCap(const Local& l, uint32_t n) const;
+
     ScanSpec spec_;
     const ColumnarTable* table_{nullptr};
     std::vector<VType> types_;       // per table column
@@ -108,6 +118,8 @@ private:
     std::vector<bool> handed_;       // per table column: handed up
     std::vector<size_t> last_use_;   // per table column: the last conjunct step reading it, 0 for none
     std::vector<size_t> groups_;     // the row groups to read, one per morsel
+    std::vector<uint32_t> string_slots_;  // per handed-up string slot, its table column
+    size_t byte_cap_{kMaxBatchStringBytes};
 
     // Index matches: morsel m starts from offsets_[first_[m]] up to offsets_[first_[m + 1]].
     std::optional<IndexBounds> bounds_;
