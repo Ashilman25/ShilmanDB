@@ -465,6 +465,16 @@ TEST(ParallelMemoryBudgetDeathTest, ShrinkingMoreThanHeldAsserts) {
     ASSERT_TRUE(r.Grow(10));
     EXPECT_DEATH(r.Shrink(11), "Shrink past what the reservation holds");
 }
+
+TEST(ParallelMemoryBudgetDeathTest, ReservationOutlivingItsBudgetAsserts) {
+    const auto outlive = [] {
+        std::optional<MemoryReservation> r;
+        MemoryBudget b(64 * kMiB, 1);
+        r.emplace(&b, 0);
+        (void)r->Grow(10);
+    };
+    EXPECT_DEATH(outlive(), "a reservation outlived its memory budget");
+}
 #endif
 
 }  // namespace shilmandb::parallel

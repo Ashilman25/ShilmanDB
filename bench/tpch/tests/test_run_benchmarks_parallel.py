@@ -17,7 +17,12 @@ sys.modules["run_benchmarks_parallel_under_test"] = mod
 spec.loader.exec_module(mod)
 
 PARALLEL_FLAGS = ["--create-indexes", "true", "--execution-mode", "parallel", "--storage", "columnar"]
-PARALLEL_STATS = "query,run,threads,morsels,latch_wait_ms\nQ1,0,18,4,0.125\n"
+# load_tpch's parallel_stats.csv, with the memory and spill columns.
+PARALLEL_STATS = ("query,run,threads,morsels,latch_wait_ms,memory_limit,peak_tracked_bytes,"
+                  "spill_bytes_written,spill_bytes_read,spill_files,spill_partitions,spill_ms\n"
+                  "Q5,0,18,27,0.000,150994944,150994944,3943119,3943119,95,215,2698.199\n")
+# The keys load_tpch's run_info.csv ends with: peak memory and the memory limit.
+RUN_INFO_MEMORY = "storage,columnar\nreuse_db,true\npeak_rss_bytes,192888832\nmemory_limit,150994944\n"
 
 
 # The value after a flag in a command.
@@ -49,9 +54,11 @@ def _fake_load_tpch(commands: List[List[str]]):
         (results / "latencies.csv").write_text(
             "query,run,rows,latency_ms,hits,misses,visits,reads,read_ms\n"
             + "".join(f"{q},0,1,1.0,10,1,2,1,0.1\n" for q in mod.QUERIES))
-        (results / "run_info.csv").write_text("key,value\nsf,0.01\ndb_pages,7\neviction,lru\n")
+        info = "key,value\nsf,0.01\ndb_pages,7\neviction,lru\n"
         if _flag(cmd, "--execution-mode") == "parallel":
+            info += RUN_INFO_MEMORY
             (results / "parallel_stats.csv").write_text(PARALLEL_STATS)
+        (results / "run_info.csv").write_text(info)
         return mod.subprocess.CompletedProcess(cmd, 0, "", "")
     return run
 
@@ -151,6 +158,15 @@ def test_parallel_stats_copied(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
         "parallel_stats_columnar+parallel_2thread_sf0.01.csv",
         "parallel_stats_columnar+parallel_sf0.01.csv"]
     assert (out / "parallel_stats_columnar+parallel_sf0.01.csv").read_text() == PARALLEL_STATS
+
+
+def test_run_info_keeps_the_memory_keys(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    out = tmp_path / "out"
+    _run_main(monkeypatch, out, "columnar+parallel")
+    info = mod.read_run_info(out / "shilmandb_results" / "columnar+parallel" / "run_info_sf0.01.csv")
+    assert info["peak_rss_bytes"] == "192888832"
+    assert info["memory_limit"] == "150994944"
+    assert info["eviction"] == "lru"
 
 
 def test_sweep_rows_in_latencies(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

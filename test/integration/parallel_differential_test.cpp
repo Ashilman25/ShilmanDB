@@ -11,7 +11,9 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <optional>
 #include <random>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -19,6 +21,7 @@
 
 #include "catalog/catalog.hpp"
 #include "engine/database.hpp"
+#include "executor/parallel/memory_budget.hpp"
 #include "integration/parallel_random_queries.hpp"
 #include "parser/parser.hpp"
 #include "planner/plan_dump.hpp"
@@ -37,6 +40,7 @@ constexpr int kShards = kSeedShards;     // each a gtest of its own, so ctest -j
 constexpr int kQueriesPerSeed = 8;
 constexpr double kRelTol = 1e-6;         // SameResult's tolerance for DECIMAL cells
 constexpr int kMaxFailures = 20;         // per shard, then stop printing
+constexpr size_t kTinyLimit = parallel::kWorkerMinimumBytes;  // the floor of one thread
 
 // ---- Comparing answers ----
 
@@ -239,6 +243,42 @@ std::string OrderedBlocks(const std::vector<Row>& got, size_t g0, size_t g1, con
     return "";
 }
 
+// Every tuple's bytes, one string per row.
+std::vector<std::string> RowBytes(const QueryResult& r) {
+    std::vector<std::string> rows;
+    rows.reserve(r.tuples.size());
+    for (const Tuple& t : r.tuples) rows.emplace_back(t.GetData(), t.GetLength());
+    return rows;
+}
+
+// How got differs from want bit for bit, or "": in order when ordered,
+// else as a multiset; an unordered LIMIT's rows must all be in want_all.
+std::string ExactDifference(const GeneratedQuery& q, const QueryResult& got, const QueryResult& want, const QueryResult& want_all) {
+    if (got.schema.GetColumnCount() != want.schema.GetColumnCount()) return "column counts differ";
+    for (uint32_t c = 0; c < want.schema.GetColumnCount(); ++c) {
+        const Column& a = got.schema.GetColumn(c);
+        const Column& b = want.schema.GetColumn(c);
+        if (a.name != b.name || a.type != b.type) return "column " + std::to_string(c) + " differs";
+    }
+    if (got.tuples.size() != want.tuples.size()) return std::to_string(got.tuples.size()) + " rows, expected " + std::to_string(want.tuples.size());
+    const std::vector<std::string> g = RowBytes(got);
+    if (!q.keys.empty()) {
+        const std::vector<std::string> w = RowBytes(want);
+        for (size_t i = 0; i < g.size(); ++i) {
+            if (g[i] != w[i]) return "row " + std::to_string(i) + " differs in its bits or order";
+        }
+        return "";
+    }
+    const std::vector<std::string> w = RowBytes(q.limit >= 0 ? want_all : want);
+    std::multiset<std::string> pool(w.begin(), w.end());
+    for (const std::string& row : g) {
+        auto it = pool.find(row);
+        if (it == pool.end()) return "a row with no bit-equal match";
+        pool.erase(it);
+    }
+    return "";
+}
+
 // Over empty input today's MIN / MAX of BIGINT or DECIMAL is undefined, so those
 // cells are set aside in a row whose COUNT(*) is 0.
 void SkipEmptyInputCells(const GeneratedQuery& q, std::vector<Row>& rows) {
@@ -295,12 +335,16 @@ struct Outcome {
     bool threw{false};
 };
 
-// Runs sql in one mode, catching what it throws; the parallel executor on `threads` threads.
-Outcome RunQuery(Database& db, const std::string& sql, ExecutionMode mode, unsigned threads = 1) {
+// Runs sql in one mode, catching what it throws; the parallel executor on `threads` threads,
+// with this memory limit (unset = the database's default) and spilling everything or not.
+Outcome RunQuery(Database& db, const std::string& sql, ExecutionMode mode, unsigned threads = 1,
+                 std::optional<size_t> memory_limit = std::nullopt, bool spill_everything = false) {
     Outcome out;
     QueryOptions options;
     options.mode = mode;
     options.threads = threads;
+    options.memory_limit = memory_limit;
+    options.spill_everything = spill_everything;
     try {
         out.result = db.ExecuteSQL(sql, options);
     } catch (const std::exception& e) {
@@ -340,6 +384,9 @@ TEST_P(ParallelDifferentialTest, RandomQueriesMatchVectorized) {
     int unordered_limits = 0;
     int star_joins = 0;
     int empty_unsafe = 0;
+    int tiny_runs[2] = {0, 0};     // by spill_everything
+    int tiny_spilled[2] = {0, 0};
+    int tiny_exact = 0;            // tiny-budget answers compared bit for bit
     for (int seed = 1 + GetParam(); seed <= kSeeds; seed += kShards) {
         Rng rng = SeedRng(seed);
         const std::vector<TableData> tables = SeedTables(rng, seed);
@@ -364,23 +411,45 @@ TEST_P(ParallelDifferentialTest, RandomQueriesMatchVectorized) {
             const std::string sql = q.Sql();
             const Outcome want = RunQuery(db, sql, ExecutionMode::VECTORIZED);
             const Outcome got = RunQuery(db, sql, ExecutionMode::PARALLEL);
+            // The smallest budget one thread allows; every other seed spills everything too.
+            const bool spill_all = seed % 2 == 0;
+            const Outcome tiny = RunQuery(db, sql, ExecutionMode::PARALLEL, 1, kTinyLimit, spill_all);
+            const ParallelQueryStats tiny_stats = db.LastParallelStats();
+            ++tiny_runs[spill_all];
+            if (!tiny.threw && tiny_stats.spill_files > 0) ++tiny_spilled[spill_all];
 
-            std::string why;
-            if (want.threw || got.threw) {
-                ++errors;
-                if (!want.threw) why = "the parallel executor threw: " + got.error;
-                else if (!got.threw) why = "the parallel executor didn't throw; vectorized threw: " + want.error;
-                else if (got.error != want.error) why = "threw '" + got.error + "', vectorized threw '" + want.error + "'";
-            } else {
+            if (want.threw || got.threw) ++errors;
+            if (!want.threw && !got.threw) {
                 if (!q.keys.empty()) ++ordered;
                 if (q.keys.empty() && q.limit >= 0) ++unordered_limits;
-                if (q.limit >= 0) {
-                    const Outcome all = RunQuery(db, q.Sql(false), ExecutionMode::VECTORIZED);
-                    why = all.threw ? "the unlimited query threw: " + all.error
-                                    : Difference(q, got.result, all.result, CountsOf(db, q.Sql(false)));
-                } else {
-                    why = Difference(q, got.result, want.result, CountsOf(db, sql));
+            }
+            Outcome all;
+            if (!want.threw && q.limit >= 0) all = RunQuery(db, q.Sql(false), ExecutionMode::VECTORIZED);
+            // How a parallel outcome differs from vectorized mode's, or "".
+            const auto differs = [&](const Outcome& out, const std::string& who) -> std::string {
+                if (want.threw || out.threw) {
+                    if (!want.threw) return who + " threw: " + out.error;
+                    if (!out.threw) return who + " didn't throw; vectorized threw: " + want.error;
+                    if (out.error != want.error) return who + " threw '" + out.error + "', vectorized threw '" + want.error + "'";
+                    return "";
                 }
+                if (q.limit >= 0) {
+                    return all.threw ? "the unlimited query threw: " + all.error : Difference(q, out.result, all.result, CountsOf(db, q.Sql(false)));
+                }
+                return Difference(q, out.result, want.result, CountsOf(db, sql));
+            };
+            std::string why = differs(got, "the parallel executor");
+            if (why.empty()) why = differs(tiny, "the parallel executor at the tiny budget");
+            if (why.empty() && !tiny.threw && tiny_stats.memory_limit != kTinyLimit) {
+                why = "the tiny-budget run had a memory limit of " + std::to_string(tiny_stats.memory_limit);
+            }
+            // Exact types: the tiny budget against the default, both on one thread, bit for bit.
+            if (why.empty() && !got.threw && !tiny.threw && !q.uses_double) {
+                ++tiny_exact;
+                Outcome got_all;
+                if (q.keys.empty() && q.limit >= 0) got_all = RunQuery(db, q.Sql(false), ExecutionMode::PARALLEL);
+                why = got_all.threw ? "the unlimited parallel query threw: " + got_all.error : ExactDifference(q, tiny.result, got.result, got_all.result);
+                if (!why.empty()) why = "the tiny budget against the default one: " + why;
             }
             if (!why.empty()) {
                 ++failures;
@@ -397,12 +466,19 @@ TEST_P(ParallelDifferentialTest, RandomQueriesMatchVectorized) {
     EXPECT_GT(ordered, 0);
     EXPECT_GT(unordered_limits, 0);
     EXPECT_GT(errors, 0);
+    EXPECT_GT(tiny_spilled[1], 0) << "some runs spill everything";
+    EXPECT_GT(tiny_exact, 0) << "some tiny-budget answers are compared bit for bit";
     // Counts for the record, read from --gtest_output=xml.
     RecordProperty("errors", errors);
     RecordProperty("ordered", ordered);
     RecordProperty("unordered_limits", unordered_limits);
     RecordProperty("star_joins", star_joins);
     RecordProperty("global_min_max_with_count", empty_unsafe);
+    RecordProperty("tiny_runs", tiny_runs[0]);
+    RecordProperty("tiny_spilled", tiny_spilled[0]);
+    RecordProperty("tiny_everything_runs", tiny_runs[1]);
+    RecordProperty("tiny_everything_spilled", tiny_spilled[1]);
+    RecordProperty("tiny_exact", tiny_exact);
     for (const auto& [shape, count] : shapes) RecordProperty(shape, count);
 }
 

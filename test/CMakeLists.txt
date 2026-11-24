@@ -155,6 +155,8 @@ target_include_directories(parallel_threads_test PRIVATE ${CMAKE_SOURCE_DIR}/ben
 shilmandb_add_test(parallel_analyze_test integration/parallel_analyze_test.cpp)
 target_include_directories(parallel_analyze_test PRIVATE ${CMAKE_SOURCE_DIR}/bench)
 shilmandb_add_test(parallel_big_values_test integration/parallel_big_values_test.cpp)
+shilmandb_add_test(parallel_spill_test integration/parallel_spill_test.cpp)
+target_include_directories(parallel_spill_test PRIVATE ${CMAKE_SOURCE_DIR}/bench)
 shilmandb_add_test(page_owners_test integration/page_owners_test.cpp)
 target_include_directories(page_owners_test PRIVATE ${CMAKE_SOURCE_DIR}/bench)
 shilmandb_add_test(eviction_sim_test integration/eviction_sim_test.cpp)

@@ -36,6 +36,11 @@ MemoryBudget::MemoryBudget(size_t limit_bytes, unsigned workers) : limit_(limit_
     for (unsigned w = 0; w < workers; ++w) floor_used_[w].store(0, kRelaxed);
 }
 
+// Every reservation must go before its budget; Debug checks that all grants came back.
+MemoryBudget::~MemoryBudget() {
+    assert(HeldBytes() == 0 && "a reservation outlived its memory budget");
+}
+
 // Each part stays within its share of the limit, so the sum can't pass it.
 size_t MemoryBudget::HeldBytes() const {
     size_t held = shared_used_.load(kRelaxed);

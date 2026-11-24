@@ -25,6 +25,7 @@ struct SpillCounters {
 class MemoryBudget {
 public:
     MemoryBudget(size_t limit_bytes, unsigned workers);  // throws the too-small error
+    ~MemoryBudget();                                     // Debug: every grant came back
 
     MemoryBudget(const MemoryBudget&) = delete;
     MemoryBudget& operator=(const MemoryBudget&) = delete;

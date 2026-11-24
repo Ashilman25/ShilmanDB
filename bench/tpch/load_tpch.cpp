@@ -8,6 +8,8 @@
 #include "tpch/tpch_streams.hpp"
 #include "tpch/tpch_workload.hpp"
 
+#include <sys/resource.h>
+
 #include <iostream>
 #include <fstream>
 #include <iomanip>
@@ -22,6 +24,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -46,6 +49,8 @@ struct Args {
     int timed_runs{5};
     ExecutionMode exec_mode{ExecutionMode::TUPLE};
     unsigned threads{0};  // parallel mode only; 0 = one per core
+    std::optional<size_t> memory_limit;  // parallel mode only; unset = the database's default
+    std::string temp_dir;                // parallel mode only; not given = the database's default
     int64_t miss_penalty_us{0};
     bool direct_io{false};
     bool policy_timing{false};
@@ -72,7 +77,7 @@ static void PrintUsage(const char* prog) {
               << " [--enable-tracing <path> [--trace-collapse]] [--pool-size <N>] [--create-indexes <true|false>]"
               << " [--warmup <N>] [--runs <N>]"
               << " [--results-dir <path>]"
-              << " [--execution-mode <tuple|vectorized|parallel> [--threads <N>]]"
+              << " [--execution-mode <tuple|vectorized|parallel> [--threads <N>] [--memory-limit <bytes>[K|M|G]] [--temp-dir <path>]]"
               << " [--miss-penalty-us <N>] [--direct-io] [--policy-timing] [--planner-read-us <X>]"
               << " [--workload <single|stream|lookup|mixed>] [--stream-length <N>] [--seed <S>] [--keep-load-pool]"
               << " [--dump-page-owners <path>]"
@@ -111,6 +116,23 @@ static std::optional<uint64_t> ParseUnsigned(const std::string& text) {
     } catch (const std::out_of_range&) {
         return std::nullopt;
     }
+}
+
+// Bytes with an optional K, M or G suffix, powers of 1024.
+// Nothing for anything else, or a number too big.
+static std::optional<size_t> ParseBytes(const std::string& text) {
+    std::string digits = text;
+    uint64_t unit = 1;
+    if (!digits.empty()) {
+        const char suffix = digits.back();
+        if (suffix == 'K' || suffix == 'M' || suffix == 'G') {
+            unit = uint64_t{1} << (suffix == 'K' ? 10 : suffix == 'M' ? 20 : 30);
+            digits.pop_back();
+        }
+    }
+    const auto number = ParseUnsigned(digits);
+    if (!number || *number > std::numeric_limits<size_t>::max() / unit) return std::nullopt;
+    return static_cast<size_t>(*number * unit);
 }
 
 static Args ParseArgs(int argc, char* argv[]) {
@@ -183,6 +205,13 @@ static Args ParseArgs(int argc, char* argv[]) {
             }
             args.threads = static_cast<unsigned>(*threads);
             threads_given = true;
+        } else if (arg == "--memory-limit" && i + 1 < argc) {
+            const std::string val = argv[++i];
+            args.memory_limit = ParseBytes(val);
+            if (!args.memory_limit) ExitWithError("--memory-limit expects bytes with an optional K, M or G suffix, got '" + val + "'");
+        } else if (arg == "--temp-dir" && i + 1 < argc) {
+            args.temp_dir = argv[++i];
+            if (args.temp_dir.empty()) ExitWithError("--temp-dir expects a directory, got ''");
         } else if (arg == "--miss-penalty-us" && i + 1 < argc) {
             std::string val = argv[++i];
             try {
@@ -320,6 +349,8 @@ static Args ParseArgs(int argc, char* argv[]) {
     if (args.reuse_db && !columnar) ExitWithError("--reuse-db needs --storage columnar");
     const bool parallel_mode = args.exec_mode == ExecutionMode::PARALLEL;
     if (threads_given && !parallel_mode) ExitWithError("--threads needs --execution-mode parallel");
+    if (args.memory_limit && !parallel_mode) ExitWithError("--memory-limit needs --execution-mode parallel");
+    if (!args.temp_dir.empty() && !parallel_mode) ExitWithError("--temp-dir needs --execution-mode parallel");
     // The parallel executor reads only columnar tables, so every query would fail
     if (parallel_mode && !columnar) ExitWithError("--execution-mode parallel needs --storage columnar");
     // Page owners walk heap pages, which a columnar table doesn't have
@@ -374,11 +405,12 @@ static const char* ModeName(ExecutionMode mode) {
     return mode == ExecutionMode::VECTORIZED ? "vectorized" : "tuple";
 }
 
-// The mode and thread count every query of this run gets.
+// The mode, thread count and memory limit every query of this run gets.
 static QueryOptions MakeQueryOptions(const Args& args) {
     QueryOptions options;
     options.mode = args.exec_mode;
     options.threads = args.threads;
+    options.memory_limit = args.memory_limit;
     return options;
 }
 
@@ -462,6 +494,7 @@ struct RunInfo {
     page_id_t db_pages_total;  // after the indexes
     std::string eviction;
     double planner_read_us;  // the page read cost the planner priced scans with
+    size_t memory_limit;     // the limit parallel queries run with; 0 in the other modes
 };
 
 // The keys every run_info.csv starts with. `reads` are the timed runs' page reads.
@@ -495,6 +528,24 @@ static const char* StorageName(StorageKind storage) {
 static void WriteStorageInfo(std::ostream& ofs, const Args& args) {
     ofs << "storage," << StorageName(args.storage) << "\n"
         << "reuse_db," << BoolText(args.reuse_db) << "\n";
+}
+
+// The most memory this process has held, in bytes.
+// ru_maxrss is bytes on macOS and KiB on Linux.
+static uint64_t PeakRssBytes() {
+    rusage usage{};
+    if (::getrusage(RUSAGE_SELF, &usage) != 0) return 0;
+#ifdef __APPLE__
+    return static_cast<uint64_t>(usage.ru_maxrss);
+#else
+    return static_cast<uint64_t>(usage.ru_maxrss) * 1024;
+#endif
+}
+
+// The last keys: peak memory, read after the queries, and the parallel memory limit.
+static void WriteMemoryInfo(std::ostream& ofs, const RunInfo& info) {
+    ofs << "peak_rss_bytes," << PeakRssBytes() << "\n"
+        << "memory_limit," << info.memory_limit << "\n";
 }
 
 // Writes load_times.csv: one row per table, then a TOTAL row.
@@ -817,6 +868,7 @@ static int RunWorkload(Database& db, const Args& args, const RunInfo& info) {
         ofs << "trace_collapse," << BoolText(args.trace_collapse) << "\n"
             << "cold_start," << BoolText(!args.keep_load_pool) << "\n";
         WriteStorageInfo(ofs, args);
+        WriteMemoryInfo(ofs, info);
     });
     if (!info_ok) return 1;
 
@@ -880,6 +932,7 @@ int main(int argc, char* argv[]) {
         ExitWithError(std::string("could not open the database: ") + e.what());
     }
     Database& db = *db_owner;
+    if (!args.temp_dir.empty()) db.SetTempDirectory(args.temp_dir);
 #ifdef SHILMANDB_HAS_LIBTORCH
     if (args.use_learned_join) {
         std::cout << "Learned join optimizer: ON (model: " << args.join_model_path << ")\n";
@@ -964,7 +1017,8 @@ int main(int argc, char* argv[]) {
     const bool penalty_leads = static_cast<double>(args.miss_penalty_us) > ScanCosts::kCachedPageReadUs && (!args.direct_io || static_cast<double>(args.miss_penalty_us) >= ScanCosts::kDirectPageReadUs);
     const char* planner_why = args.planner_read_us ? "set by --planner-read-us" : penalty_leads ? "follows the read penalty" : args.direct_io ? "follows direct I/O" : "file cache";
     std::cout << "Planner page read cost: " << Fixed(planner_read_us, 2) << " us (" << planner_why << ")\n";
-    const RunInfo run_info{db_pages, db_pages_total, eviction_name, planner_read_us};
+    const size_t memory_limit = args.exec_mode == ExecutionMode::PARALLEL ? args.memory_limit.value_or(db.GetDefaultMemoryLimit()) : 0;
+    const RunInfo run_info{db_pages, db_pages_total, eviction_name, planner_read_us, memory_limit};
 
     const bool single = args.workload == tpch::Workload::SINGLE;
     bool run_queries = !single || args.verify || !args.trace_path.empty() || !args.results_dir.empty();
@@ -1179,13 +1233,17 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        // Threads, morsels and latch wait per timed run, beside latencies.csv
+        // Threads, morsels, latch wait, memory and spilling per timed run, beside latencies.csv
         if (export_csv && parallel_mode && !parallel_records.empty()) {
             const auto stats_path = fs::path(args.results_dir) / "parallel_stats.csv";
-            const bool stats_ok = WriteCsv(stats_path, "query,run,threads,morsels,latch_wait_ms", [&](std::ostream& ofs) {
+            const std::string header =
+                "query,run,threads,morsels,latch_wait_ms,memory_limit,peak_tracked_bytes,spill_bytes_written,spill_bytes_read,spill_files,spill_partitions,spill_ms";
+            const bool stats_ok = WriteCsv(stats_path, header, [&](std::ostream& ofs) {
                 for (const auto& rec : parallel_records) {
-                    ofs << rec.tag << "," << rec.run << "," << rec.stats.threads << "," << rec.stats.morsels << ","
-                        << Fixed(ToMs(rec.stats.latch_wait), 3) << "\n";
+                    const ParallelQueryStats& st = rec.stats;
+                    ofs << rec.tag << "," << rec.run << "," << st.threads << "," << st.morsels << "," << Fixed(ToMs(st.latch_wait), 3) << ","
+                        << st.memory_limit << "," << st.peak_tracked_bytes << "," << st.spill_bytes_written << "," << st.spill_bytes_read << ","
+                        << st.spill_files << "," << st.spill_partitions << "," << Fixed(ToMs(st.spill_time), 3) << "\n";
                 }
             });
             if (stats_ok) std::cout << "Parallel stats written to " << stats_path.string() << "\n";
@@ -1200,6 +1258,7 @@ int main(int argc, char* argv[]) {
                 WriteRunInfo(ofs, args, run_info, ReadStats{total_reads, total_read_time});
                 if (args.trace_collapse) ofs << "trace_collapse,true\n";
                 WriteStorageInfo(ofs, args);
+                WriteMemoryInfo(ofs, run_info);
                 std::cout << "Run info written to " << info_path.string() << "\n";
             } else {
                 std::cerr << "Warning: could not open " << info_path.string() << " for writing\n";

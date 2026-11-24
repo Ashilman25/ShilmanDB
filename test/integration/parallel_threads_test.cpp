@@ -11,6 +11,7 @@
 #include <map>
 #include <set>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -18,6 +19,7 @@
 #include "buffer/buffer_pool_manager.hpp"
 #include "catalog/catalog.hpp"
 #include "engine/database.hpp"
+#include "executor/parallel/memory_budget.hpp"
 #include "executor/parallel/parallel_executor.hpp"
 #include "integration/parallel_random_queries.hpp"
 #include "tpch/tpch_workload.hpp"
@@ -37,6 +39,7 @@ constexpr unsigned kThreadCounts[] = {1, 2, 4, 8, 18};
 constexpr int kRandomShards = 5;
 constexpr int kRandomSeeds = 100;
 constexpr int kRandomQueriesPerSeed = 8;
+constexpr size_t kTinyLimit = 4 * parallel::kWorkerMinimumBytes;  // the floors of 4 threads
 constexpr size_t kDeepRows = 3 * 65536;  // three row groups, so three workers
 // Overflows a 512 KiB stack in Debug; fits 8 MiB with room, even under ASan.
 constexpr int kDeepTerms = 2000;
@@ -435,11 +438,15 @@ struct Outcome {
 };
 
 // Runs sql on a database in the parallel executor, catching what it throws.
-Outcome RunCaught(Database& db, const std::string& sql, unsigned threads) {
+// memory_limit unset = the database's default.
+Outcome RunCaught(Database& db, const std::string& sql, unsigned threads, std::optional<size_t> memory_limit = std::nullopt,
+                  bool spill_everything = false) {
     Outcome out;
     QueryOptions options;
     options.mode = ExecutionMode::PARALLEL;
     options.threads = threads;
+    options.memory_limit = memory_limit;
+    options.spill_everything = spill_everything;
     try {
         out.result = db.ExecuteSQL(sql, options);
     } catch (const std::exception& e) {
@@ -454,6 +461,8 @@ void ParallelThreadsTest::RandomShard(int shard) {
     int failures = 0;
     int compared = 0;
     int exact = 0;
+    int tiny_runs[2] = {0, 0};     // by spill_everything
+    int tiny_spilled[2] = {0, 0};
     for (int seed = 1 + shard; seed <= kRandomSeeds; seed += kRandomShards) {
         test::Rng rng = test::SeedRng(seed);
         // Each seed gets a table of 2 or 3 row groups, so 4 threads use several workers.
@@ -476,21 +485,33 @@ void ParallelThreadsTest::RandomShard(int shard) {
                 const std::string sql = q.Sql();
                 const Outcome one = RunCaught(db, sql, 1);
                 const Outcome four = RunCaught(db, sql, 4);
-                std::string why;
-                if (one.threw || four.threw) {
-                    if (!one.threw) why = "4 threads threw: " + four.error;
-                    else if (!four.threw) why = "4 threads didn't throw; 1 thread threw: " + one.error;
-                    else if (four.error != one.error) why = "threw '" + four.error + "', 1 thread threw '" + one.error + "'";
-                } else {
+                // The smallest budget 4 threads allow; every other seed spills everything too.
+                const bool spill_all = seed % 2 == 0;
+                const Outcome tiny = RunCaught(db, sql, 4, kTinyLimit, spill_all);
+                const ParallelQueryStats tiny_stats = db.LastParallelStats();
+                ++tiny_runs[spill_all];
+                if (!tiny.threw && tiny_stats.spill_files > 0) ++tiny_spilled[spill_all];
+                Outcome unlimited;
+                if (q.limit >= 0 && !one.threw) unlimited = RunCaught(db, q.Sql(false), 1);
+                // How a 4-thread outcome differs from the 1-thread one, or "".
+                const auto differs = [&](const Outcome& got, const std::string& who) -> std::string {
+                    if (one.threw || got.threw) {
+                        if (!one.threw) return who + " threw: " + got.error;
+                        if (!got.threw) return who + " didn't throw; 1 thread threw: " + one.error;
+                        if (got.error != one.error) return who + " threw '" + got.error + "', 1 thread threw '" + one.error + "'";
+                        return "";
+                    }
+                    if (unlimited.threw) return "the unlimited query threw: " + unlimited.error;
+                    return Difference(q, got.result, one.result, &unlimited.result);
+                };
+                if (!one.threw && !four.threw) {
                     ++compared;
                     if (!q.uses_double) ++exact;
-                    Outcome unlimited;
-                    if (q.limit >= 0) unlimited = RunCaught(db, q.Sql(false), 1);
-                    if (unlimited.threw) {
-                        why = "the unlimited query threw: " + unlimited.error;
-                    } else {
-                        why = Difference(q, four.result, one.result, &unlimited.result);
-                    }
+                }
+                std::string why = differs(four, "4 threads");
+                if (why.empty()) why = differs(tiny, "4 threads at the tiny budget");
+                if (why.empty() && !tiny.threw && tiny_stats.memory_limit != kTinyLimit) {
+                    why = "the tiny-budget run had a memory limit of " + std::to_string(tiny_stats.memory_limit);
                 }
                 if (!why.empty()) {
                     ++failures;
@@ -503,8 +524,13 @@ void ParallelThreadsTest::RandomShard(int shard) {
     EXPECT_EQ(failures, 0);
     EXPECT_GT(compared, 0);
     EXPECT_GT(exact, 0) << "some queries are compared bit for bit";
+    EXPECT_GT(tiny_spilled[1], 0) << "some runs spill everything";
     RecordProperty("compared", compared);
     RecordProperty("exact", exact);
+    RecordProperty("tiny_runs", tiny_runs[0]);
+    RecordProperty("tiny_spilled", tiny_spilled[0]);
+    RecordProperty("tiny_everything_runs", tiny_runs[1]);
+    RecordProperty("tiny_everything_spilled", tiny_spilled[1]);
 }
 
 }  // namespace
