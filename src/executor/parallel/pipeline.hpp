@@ -77,6 +77,10 @@ public:
 
     [[nodiscard]] virtual std::unique_ptr<LocalState> MakeLocal() const = 0;
 
+    // The local for one worker of this query; MakeLocal() unless a source needs more.
+    // worker is below ctx.threads, 0 when serial.
+    [[nodiscard]] virtual std::unique_ptr<LocalState> MakeWorkerLocal(const QueryContext& ctx, unsigned worker) const;
+
     // Starts reading one morsel into this worker's state.
     virtual void StartMorsel(size_t morsel, LocalState& local) const = 0;
 
@@ -97,6 +101,9 @@ public:
     // Per-worker state; none by default.
     [[nodiscard]] virtual std::unique_ptr<LocalState> MakeLocal() const;
 
+    // The local for one worker of this query; MakeLocal() unless overridden.
+    [[nodiscard]] virtual std::unique_ptr<LocalState> MakeWorkerLocal(const QueryContext& ctx, unsigned worker) const;
+
     // HAVE_MORE_OUTPUT: call again with the same input after `out` is passed on.
     // An operator that answers NEED_INPUT may swap in and out instead of copying.
     // Const, since workers share the operator; their own state goes in local.
@@ -109,6 +116,10 @@ public:
     virtual ~Sink() = default;
 
     [[nodiscard]] virtual std::unique_ptr<LocalState> MakeLocal() const = 0;
+
+    // The local for one worker of this query; MakeLocal() unless a sink needs more.
+    // worker is below ctx.threads, 0 when serial.
+    [[nodiscard]] virtual std::unique_ptr<LocalState> MakeWorkerLocal(const QueryContext& ctx, unsigned worker) const;
 
     // Workers call this at the same time, so it writes only their local.
     virtual void Consume(Batch& in, LocalState& local) const = 0;

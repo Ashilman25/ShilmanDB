@@ -3,6 +3,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -16,16 +17,22 @@
 #include <optional>
 #include <random>
 #include <string>
+#include <system_error>
 #include <tuple>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include "catalog/catalog.hpp"
 #include "engine/database.hpp"
 #include "executor/parallel/batch.hpp"
+#include "executor/parallel/column_buffer.hpp"
 #include "executor/parallel/expression.hpp"
+#include "executor/parallel/memory_budget.hpp"
 #include "executor/parallel/pipeline.hpp"
 #include "executor/parallel/sort.hpp"
+#include "executor/parallel/temp_file.hpp"
+#include "executor/parallel/worker_pool.hpp"
 #include "parser/ast.hpp"
 #include "storage/columnar/columnar_table.hpp"
 
@@ -108,6 +115,26 @@ std::string OrderedDifference(const QueryResult& got, const QueryResult& want) {
         const Row x = RowOf(got, i);
         const Row y = RowOf(want, i);
         if (!SameRow(x, y)) return "row " + std::to_string(i) + ": got " + Describe(x) + "expected " + Describe(y);
+    }
+    return "";
+}
+
+// "" when types and rows match in order, byte for byte; else the first difference.
+// For spilled against unspilled: the sort does no arithmetic, so nothing may differ.
+std::string ExactDifference(const QueryResult& got, const QueryResult& want) {
+    if (got.schema.GetColumnCount() != want.schema.GetColumnCount()) return "column counts differ";
+    for (uint32_t c = 0; c < got.schema.GetColumnCount(); ++c) {
+        if (got.schema.GetColumn(c).type != want.schema.GetColumn(c).type) return "column " + std::to_string(c) + " has another type";
+    }
+    if (got.tuples.size() != want.tuples.size()) {
+        return std::to_string(got.tuples.size()) + " rows, expected " + std::to_string(want.tuples.size());
+    }
+    for (size_t i = 0; i < got.tuples.size(); ++i) {
+        const Tuple& x = got.tuples[i];
+        const Tuple& y = want.tuples[i];
+        if (x.GetLength() != y.GetLength() || std::memcmp(x.GetData(), y.GetData(), x.GetLength()) != 0) {
+            return "row " + std::to_string(i) + ": got " + Describe(RowOf(got, i)) + "expected " + Describe(RowOf(want, i));
+        }
     }
     return "";
 }
@@ -777,6 +804,763 @@ TEST_F(ParallelSortTest, WorkersCombineIntoOneOrder) {
     narrowed.sel.Resize(3);
     EXPECT_EQ(RunSort(KeyedSpec(true, std::nullopt), {{&narrowed}}, few),
               (std::vector<KeyedRow>{{1, "a"}, {2, "b"}, {3, "c"}}));
+}
+
+// ---------------------------------------------------------------------------
+// Spilling: sorted runs on disk, merged back, byte for byte the in-memory sort.
+
+const VType kF64{Kind::DOUBLE, 0, false, TypeId::DECIMAL};
+const VType kWide{Kind::DECIMAL, 2, true, TypeId::DECIMAL};
+
+constexpr unsigned kSpillThreads = 4;
+constexpr size_t kSpillMorsels = 8;  // enough for every worker
+
+// One input row: a value for every array the sort keeps.
+struct SpillRow {
+    int64_t k{0};
+    std::string s;
+    double f{0.0};
+    __int128 w{0};
+    int64_t id{0};
+};
+
+using RowMaker = std::function<SpillRow(uint32_t)>;
+
+// The input slots k, s, f, w and id.
+const std::vector<VType>& SpillTypes() {
+    static const std::vector<VType> types = {kInt, kStr, kF64, kWide, kInt};
+    return types;
+}
+
+// About 300 bytes a row: 1,000 keys, unique strings, wide decimals past 64 bits.
+SpillRow WideRow(uint32_t i) {
+    SpillRow r;
+    r.k = static_cast<int64_t>((uint64_t{i} * 7919) % 1000);
+    r.s = std::string(kWords[i % 7]) + std::to_string((uint64_t{i} * 104729) % 1000003) +
+          std::string(240 + i % 64, static_cast<char>('a' + i % 26));
+    r.f = static_cast<double>((uint64_t{i} * 31) % 977) / 8.0 - 50.0;
+    r.w = static_cast<__int128>(i % 89) * 1000000000000000000LL * 1000 - 7;
+    r.id = i;
+    return r;
+}
+
+// Short rows, so many runs stay small on disk.
+SpillRow SmallRow(uint32_t i) {
+    SpillRow r;
+    r.k = static_cast<int64_t>((uint64_t{i} * 7919) % 5000);
+    r.s = kModes[i % 7];
+    r.f = (i % 13) * 0.5;
+    r.w = i % 1000;
+    r.id = i;
+    return r;
+}
+
+// Every key the same, few values per column, whole rows repeated.
+SpillRow TieRowOf(uint32_t i) {
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const double inf = std::numeric_limits<double>::infinity();
+    const double values[] = {0.0, -0.0, 1.5, nan, -inf, 2.25};
+    SpillRow r;
+    r.k = 7;
+    r.s = kWords[(i * 3) % 7];
+    r.f = values[(i / 7) % 6];
+    r.w = static_cast<__int128>((i / 3) % 4) - 1;
+    r.id = (i * 13) % 997;
+    return r;
+}
+
+// Empty, multibyte, 8,000-byte and plain strings.
+SpillRow NoteRow(uint32_t i) {
+    SpillRow r;
+    r.k = i % 5;
+    if (i % 1009 == 3) {
+        r.s = std::string(8000 + i % 100, static_cast<char>('a' + i % 26)) + "-" + std::to_string(i);
+    } else if (i % 11 == 0) {
+        r.s = "";
+    } else if (i % 7 == 0) {
+        r.s = "ñandú-" + std::to_string(i % 500) + " ünï";
+    } else {
+        r.s = "note-" + std::to_string(i % 3000);
+    }
+    r.f = i % 3;
+    r.w = i;
+    r.id = i;
+    return r;
+}
+
+// Every 40th string is past 300,000 bytes, a row bigger than a run block.
+SpillRow BigRow(uint32_t i) {
+    SpillRow r = NoteRow(i);
+    if (i % 40 == 1) r.s = std::string(300000 + i, static_cast<char>('A' + i % 26)) + std::to_string(i);
+    return r;
+}
+
+// Appends one cell's exact bytes: numbers raw, strings with their length first.
+void AppendBytes(const Vector& v, uint32_t row, std::string& out) {
+    const auto raw = [&out](const void* p, size_t n) { out.append(static_cast<const char*>(p), n); };
+    switch (ArrayOf(v.Type())) {
+        case ValueArray::I64: raw(&v.I64()[row], sizeof(int64_t)); break;
+        case ValueArray::I128: raw(&v.I128()[row], sizeof(__int128)); break;
+        case ValueArray::F64: raw(&v.F64()[row], sizeof(double)); break;
+        case ValueArray::STR: {
+            const StringRef s = v.StrAt(row);
+            raw(&s.size, sizeof(s.size));
+            raw(s.data, s.size);
+            break;
+        }
+    }
+}
+
+// A row's kept slots in AppendBytes' form, for references built without the sort.
+std::string EncodeRow(const SpillRow& r, const std::vector<uint32_t>& kept) {
+    std::string out;
+    const auto raw = [&out](const void* p, size_t n) { out.append(static_cast<const char*>(p), n); };
+    for (const uint32_t slot : kept) {
+        switch (slot) {
+            case 0: raw(&r.k, sizeof(r.k)); break;
+            case 1: {
+                const auto size = static_cast<uint32_t>(r.s.size());
+                raw(&size, sizeof(size));
+                raw(r.s.data(), r.s.size());
+                break;
+            }
+            case 2: raw(&r.f, sizeof(r.f)); break;
+            case 3: raw(&r.w, sizeof(r.w)); break;
+            default: raw(&r.id, sizeof(r.id)); break;
+        }
+    }
+    return out;
+}
+
+// Hands out rows 0..n-1 in morsels, strings plain or dictionary-coded.
+// A morsel's strings are wiped when its worker starts another or finishes,
+// so a sort that kept a pointer instead of a copy reads '#'.
+class SpillSource : public Source {
+public:
+    struct Local : LocalState {
+        std::vector<SpillRow> rows;         // this morsel's rows
+        std::vector<std::string> distinct;  // dictionary strings
+        std::vector<StringRef> entries;     // dictionary entries over distinct
+        std::vector<uint32_t> codes;        // one per row
+        size_t next{0};
+        size_t batch{0};
+
+        ~Local() override { Wipe(); }
+
+        void Wipe() {
+            for (SpillRow& r : rows) std::fill(r.s.begin(), r.s.end(), '#');
+            for (std::string& s : distinct) std::fill(s.begin(), s.end(), '#');
+        }
+    };
+
+    SpillSource(uint32_t rows, size_t morsels, RowMaker make, bool dictionary)
+        : rows_(rows), morsels_(morsels), make_(std::move(make)), dictionary_(dictionary) {}
+
+    void Prepare(QueryContext&) override {}
+    size_t MorselCount() const override { return morsels_; }
+    std::unique_ptr<LocalState> MakeLocal() const override { return std::make_unique<Local>(); }
+
+    void StartMorsel(size_t morsel, LocalState& local) const override {
+        auto& l = static_cast<Local&>(local);
+        l.Wipe();
+        l.rows.clear();
+        l.distinct.clear();
+        l.entries.clear();
+        l.codes.clear();
+        const auto begin = static_cast<uint32_t>(uint64_t{rows_} * morsel / morsels_);
+        const auto end = static_cast<uint32_t>(uint64_t{rows_} * (morsel + 1) / morsels_);
+        for (uint32_t i = begin; i < end; ++i) l.rows.push_back(make_(i));
+        if (dictionary_) {
+            std::unordered_map<std::string, uint32_t> code_of;
+            for (const SpillRow& r : l.rows) {
+                const auto found = code_of.find(r.s);
+                if (found != code_of.end()) {
+                    l.codes.push_back(found->second);
+                    continue;
+                }
+                const auto code = static_cast<uint32_t>(l.distinct.size());
+                code_of.emplace(r.s, code);
+                l.distinct.push_back(r.s);
+                l.codes.push_back(code);
+            }
+            for (const std::string& s : l.distinct) l.entries.push_back(StringRef{s.data(), static_cast<uint32_t>(s.size())});
+        }
+        l.next = 0;
+        l.batch = 0;
+    }
+
+    // Batches of 2,048, 1,000, 7 and 333 rows in turn.
+    bool NextBatch(LocalState& local, Batch& out) const override {
+        auto& l = static_cast<Local&>(local);
+        if (l.next >= l.rows.size()) return false;
+        static constexpr uint32_t kSizes[] = {kBatchSize, 1000, 7, 333};
+        const auto n = static_cast<uint32_t>(std::min<size_t>(kSizes[l.batch++ % 4], l.rows.size() - l.next));
+        ShapeBatch(out, SpillTypes());
+        out.Reset(n);
+        for (uint32_t i = 0; i < n; ++i) {
+            const SpillRow& r = l.rows[l.next + i];
+            out.slots[0].I64()[i] = r.k;
+            out.slots[2].F64()[i] = r.f;
+            out.slots[3].I128()[i] = r.w;
+            out.slots[4].I64()[i] = r.id;
+            if (!dictionary_) out.slots[1].Str()[i] = StringRef{r.s.data(), static_cast<uint32_t>(r.s.size())};
+        }
+        if (dictionary_) {
+            out.slots[1].SetDictionary(&l.entries);
+            for (uint32_t i = 0; i < n; ++i) out.slots[1].Codes()[i] = l.codes[l.next + i];
+        }
+        l.next += n;
+        return true;
+    }
+
+private:
+    uint32_t rows_;
+    size_t morsels_;
+    RowMaker make_;
+    bool dictionary_;
+};
+
+// Keeps every row it's given as exact bytes, in the order they came.
+class ByteSink : public Sink {
+public:
+    struct Local : LocalState {
+        std::vector<std::string> rows;
+    };
+
+    std::unique_ptr<LocalState> MakeLocal() const override { return std::make_unique<Local>(); }
+
+    void Consume(Batch& in, LocalState& local) const override {
+        auto& l = static_cast<Local&>(local);
+        for (uint32_t k = 0; k < in.Active(); ++k) {
+            std::string row;
+            for (const Vector& v : in.slots) AppendBytes(v, in.sel[k], row);
+            l.rows.push_back(std::move(row));
+        }
+    }
+
+    void Combine(std::unique_ptr<LocalState> local) override {
+        auto& l = static_cast<Local&>(*local);
+        rows.insert(rows.end(), std::make_move_iterator(l.rows.begin()), std::make_move_iterator(l.rows.end()));
+    }
+
+    void Finalize(QueryContext&) override {}
+
+    std::vector<std::string> rows;
+};
+
+// A sort over the spill input: (slot, ascending) keys, kept slots and a limit.
+struct SortCase {
+    std::vector<std::pair<uint32_t, bool>> keys;
+    std::vector<uint32_t> kept{0, 1, 2, 3, 4};
+    std::optional<int64_t> limit;
+    std::string label;
+};
+
+// The case compiled over the input slots.
+SortSpec SpecFor(const SortCase& c) {
+    InputLayout in;
+    in.slot_of_column = {0, 1, 2, 3, 4};
+    in.slot_types = SpillTypes();
+    in.slot_precision = {0, 0, 0, 30, 0};
+    SortSpec spec;
+    for (const auto& [slot, ascending] : c.keys) {
+        ColumnRef key;
+        key.column_name = "c" + std::to_string(slot);
+        key.bound_index = slot;
+        spec.keys.push_back(CompiledExpr::Compile(key, in));
+        spec.ascending.push_back(ascending);
+    }
+    for (const uint32_t slot : c.kept) {
+        spec.columns.push_back(slot);
+        spec.types.push_back(SpillTypes()[slot]);
+    }
+    spec.limit = c.limit;
+    return spec;
+}
+
+// How one run of the sort is set up.
+struct SpillConfig {
+    unsigned threads{1};
+    bool spill_everything{false};
+    std::optional<size_t> limit;  // the budget's limit; none means no budget
+    size_t held{0};               // bytes the test holds on every worker's floor first
+    int fail_writes{0};           // errno every temp write fails with; 0 for none
+};
+
+// No budget at all.
+SpillConfig Unspilled(unsigned threads) {
+    SpillConfig c;
+    c.threads = threads;
+    return c;
+}
+
+// A budget of just the floors, with `held` of each floor taken by the test.
+SpillConfig FloorsOnly(unsigned threads, size_t held) {
+    SpillConfig c;
+    c.threads = threads;
+    c.limit = threads * kWorkerMinimumBytes;
+    c.held = held;
+    return c;
+}
+
+// Every breaker spills everything it holds; `held` as above.
+SpillConfig Everything(unsigned threads, size_t held = 0) {
+    SpillConfig c = FloorsOnly(threads, held);
+    c.spill_everything = true;
+    return c;
+}
+
+// The rows a run gave and what it spilled.
+struct SpillResult {
+    std::vector<std::string> rows;
+    uint64_t files{0};
+    uint64_t written{0};
+    uint64_t read{0};
+    std::string error;  // what the run threw, if it did
+};
+
+// Descriptors this process has open, counted from /dev/fd.
+size_t OpenDescriptors() {
+    std::error_code ec;
+    size_t n = 0;
+    for (std::filesystem::directory_iterator it("/dev/fd", ec), end; !ec && it != end; it.increment(ec)) ++n;
+    return n;
+}
+
+// Makes every temp write fail with this errno while alive.
+class FailWritesScope {
+public:
+    explicit FailWritesScope(int error_number) { TempFile::FailWritesForTest(error_number); }
+    ~FailWritesScope() { TempFile::FailWritesForTest(0); }
+    FailWritesScope(const FailWritesScope&) = delete;
+    FailWritesScope& operator=(const FailWritesScope&) = delete;
+};
+
+// "" when both hold the same rows in the same order, else where they part.
+std::string FirstDifference(const std::vector<std::string>& got, const std::vector<std::string>& want) {
+    if (got.size() != want.size()) return std::to_string(got.size()) + " rows, expected " + std::to_string(want.size());
+    for (size_t i = 0; i < got.size(); ++i) {
+        if (got[i] != want[i]) return "row " + std::to_string(i) + " differs";
+    }
+    return "";
+}
+
+// The first n rows.
+std::vector<std::string> FirstRows(const std::vector<std::string>& rows, size_t n) {
+    return {rows.begin(), rows.begin() + static_cast<std::ptrdiff_t>(std::min(n, rows.size()))};
+}
+
+// Caps the merge's fan-in while alive.
+class FanInScope {
+public:
+    explicit FanInScope(size_t most) { SetSortFanInForTest(most); }
+    ~FanInScope() { SetSortFanInForTest(0); }
+    FanInScope(const FanInScope&) = delete;
+    FanInScope& operator=(const FanInScope&) = delete;
+};
+
+class ParallelSortSpillTest : public ParallelSortTest {
+protected:
+    std::string temp_dir_;
+    std::unique_ptr<WorkerPool> pool_;
+
+    void SetUp() override {
+        ParallelSortTest::SetUp();
+        temp_dir_ = TempPath("_spill_dir");
+        std::filesystem::remove_all(temp_dir_);
+        db_->SetTempDirectory(temp_dir_);
+        pool_ = std::make_unique<WorkerPool>(kSpillThreads);
+    }
+
+    void TearDown() override {
+        pool_.reset();
+        ParallelSortTest::TearDown();
+        std::filesystem::remove_all(temp_dir_);
+    }
+
+    // The temp directory has no entries, or doesn't exist yet.
+    bool TempDirEmpty() const {
+        std::error_code ec;
+        return !std::filesystem::exists(temp_dir_, ec) || std::filesystem::is_empty(temp_dir_, ec);
+    }
+
+    // Sorts the source's rows through two pipelines, as a query would; after_sink runs between.
+    // Once the sort is gone, no grant, file or descriptor is left.
+    SpillResult RunSpill(const SortCase& c, uint32_t rows, size_t morsels, const RowMaker& make, bool dictionary,
+                         const SpillConfig& cfg, const std::function<void(MemoryBudget&)>& after_sink = {}) {
+        const std::string label = c.label + ", " + std::to_string(cfg.threads) + " threads" +
+                                  (cfg.spill_everything ? ", everything" : "") +
+                                  (cfg.limit ? ", limit " + std::to_string(*cfg.limit) : "") +
+                                  ", held " + std::to_string(cfg.held);
+        const size_t descriptors = OpenDescriptors();
+        EXPECT_GT(descriptors, 0u) << "can't list /dev/fd";
+        // The budget comes first, so everything counted in it goes before it.
+        std::optional<MemoryBudget> budget;
+        if (cfg.limit) budget.emplace(*cfg.limit, cfg.threads);
+        MemoryBudget* b = budget ? &*budget : nullptr;
+        std::vector<MemoryReservation> held;
+        for (unsigned w = 0; w < cfg.threads && cfg.held > 0; ++w) {
+            held.emplace_back(b, w);
+            EXPECT_TRUE(held.back().Grow(cfg.held)) << label;
+        }
+        SpillCounters counters;
+        auto made = MakeSort(SpecFor(c));
+        SpillSource input(rows, morsels, make, dictionary);
+        ByteSink out;
+        QueryContext ctx{nullptr, nullptr, cfg.threads, cfg.threads > 1 ? pool_.get() : nullptr};
+        ctx.budget = b;
+        ctx.spill = &counters;
+        ctx.temp_dir = &temp_dir_;
+        ctx.spill_everything = cfg.spill_everything;
+
+        Pipeline sort_in{&input, {}, made.first.get(), {}};
+        Pipeline sort_out{made.second.get(), {}, &out, {0}};
+        std::string error;
+        try {
+            std::optional<FailWritesScope> fail;
+            if (cfg.fail_writes != 0) fail.emplace(cfg.fail_writes);
+            RunPipeline(sort_in, ctx);
+            if (after_sink && b != nullptr) after_sink(*b);
+            RunPipeline(sort_out, ctx);
+        } catch (const std::exception& e) {
+            error = e.what();
+        }
+
+        made.first.reset();
+        made.second.reset();
+        held.clear();
+        EXPECT_EQ(error.empty(), cfg.fail_writes == 0) << label << ": " << error;
+        if (!cfg.limit && !cfg.spill_everything) EXPECT_EQ(counters.files.load(), 0u) << label;
+        if (b != nullptr) EXPECT_EQ(b->HeldBytes(), 0u) << label;
+        EXPECT_TRUE(TempDirEmpty()) << label;
+        EXPECT_EQ(OpenDescriptors(), descriptors) << label;
+        return SpillResult{std::move(out.rows), counters.files.load(), counters.bytes_written.load(), counters.bytes_read.load(), error};
+    }
+
+    // A query with these threads, spilling everything or not.
+    QueryResult RunWith(const std::string& sql, unsigned threads, bool spill_everything) {
+        QueryOptions options;
+        options.mode = ExecutionMode::PARALLEL;
+        options.threads = threads;
+        options.spill_everything = spill_everything;
+        return db_->ExecuteSQL(sql, options);
+    }
+};
+
+TEST_F(ParallelSortSpillTest, ManyRunsMergeToTheSameOrder) {
+    // 100,000 rows of about 300 bytes. The test holds all but one grant of each
+    // worker's floor, so each worker sorts in 4 MiB, the least a grant allows.
+    constexpr uint32_t kRows = 100000;
+    const std::vector<SortCase> cases = {
+        {{{0, true}, {1, false}}, {0, 1, 2, 3, 4}, std::nullopt, "k, s DESC"},
+        {{{3, false}}, {1, 2, 4}, std::nullopt, "w DESC, key not kept"},
+    };
+    for (const SortCase& c : cases) {
+        const SpillResult want = RunSpill(c, kRows, kSpillMorsels, WideRow, false, Unspilled(1));
+        ASSERT_EQ(want.rows.size(), kRows) << c.label;
+        EXPECT_EQ(want.files, 0u) << c.label;
+        for (const unsigned threads : {1u, kSpillThreads}) {
+            EXPECT_EQ(FirstDifference(RunSpill(c, kRows, kSpillMorsels, WideRow, false, Unspilled(threads)).rows, want.rows), "")
+                << c.label << ", " << threads << " threads, unspilled";
+            const SpillResult got = RunSpill(c, kRows, kSpillMorsels, WideRow, false, FloorsOnly(threads, kWorkerMinimumBytes - kGrantBytes));
+            EXPECT_EQ(FirstDifference(got.rows, want.rows), "") << c.label << ", " << threads << " threads";
+            EXPECT_GT(got.files, 0u) << c.label << ", " << threads << " threads";
+            EXPECT_GT(got.written, 0u) << c.label << ", " << threads << " threads";
+            EXPECT_GT(got.read, 0u) << c.label << ", " << threads << " threads";
+        }
+    }
+}
+
+TEST_F(ParallelSortSpillTest, MultiPassMerge) {
+    // A run per batch (over 100), more than one merge reads at once.
+    constexpr uint32_t kRows = 100000;
+    const SortCase c{{{0, false}}, {0, 1, 2, 3, 4}, std::nullopt, "k DESC"};
+    const SpillResult want = RunSpill(c, kRows, kSpillMorsels, SmallRow, false, Unspilled(1));
+    ASSERT_EQ(want.rows.size(), kRows);
+    for (const unsigned threads : {1u, kSpillThreads}) {
+        // At most two runs per merge: many passes, each in a new file.
+        {
+            const FanInScope two(2);
+            const SpillResult got = RunSpill(c, kRows, kSpillMorsels, SmallRow, false, Everything(threads));
+            EXPECT_EQ(FirstDifference(got.rows, want.rows), "") << threads << " threads, fan-in 2";
+            EXPECT_GT(got.files, threads) << threads << " threads, fan-in 2";
+            EXPECT_GT(got.written, 0u) << threads << " threads, fan-in 2";
+            EXPECT_EQ(got.read, got.written) << threads << " threads, fan-in 2";
+        }
+        // No cap: one free grant holds fewer blocks than there are runs.
+        const SpillResult got = RunSpill(c, kRows, kSpillMorsels, SmallRow, false, Everything(threads, kWorkerMinimumBytes - kGrantBytes));
+        EXPECT_EQ(FirstDifference(got.rows, want.rows), "") << threads << " threads, one grant";
+        EXPECT_GT(got.files, threads) << threads << " threads, one grant";
+        EXPECT_GT(got.written, 0u) << threads << " threads, one grant";
+    }
+}
+
+TEST_F(ParallelSortSpillTest, AllKeysEqualTieBreaksOnColumns) {
+    // Every key is 7, so kept columns decide: k, s, f (total order), w, id.
+    constexpr uint32_t kRows = 30000;
+    std::vector<SpillRow> rows;
+    for (uint32_t i = 0; i < kRows; ++i) rows.push_back(TieRowOf(i));
+    std::sort(rows.begin(), rows.end(), [](const SpillRow& a, const SpillRow& b) {
+        if (a.s != b.s) return a.s < b.s;
+        if (const int c = TotalOrder(a.f, b.f); c != 0) return c < 0;
+        if (a.w != b.w) return a.w < b.w;
+        return a.id < b.id;
+    });
+    std::vector<std::string> want;
+    for (const SpillRow& r : rows) want.push_back(EncodeRow(r, {0, 1, 2, 3, 4}));
+
+    for (const bool ascending : {true, false}) {
+        const SortCase c{{{0, ascending}}, {0, 1, 2, 3, 4}, std::nullopt, ascending ? "k" : "k DESC"};
+        for (const unsigned threads : {1u, kSpillThreads}) {
+            EXPECT_EQ(FirstDifference(RunSpill(c, kRows, kSpillMorsels, TieRowOf, false, Unspilled(threads)).rows, want), "")
+                << c.label << ", " << threads << " threads, unspilled";
+            for (const SpillConfig& cfg : {Everything(threads), FloorsOnly(threads, kWorkerMinimumBytes)}) {
+                const SpillResult got = RunSpill(c, kRows, kSpillMorsels, TieRowOf, false, cfg);
+                EXPECT_EQ(FirstDifference(got.rows, want), "") << c.label << ", " << threads << " threads";
+                EXPECT_GT(got.files, 0u) << c.label << ", " << threads << " threads";
+                EXPECT_GT(got.written, 0u) << c.label << ", " << threads << " threads";
+            }
+        }
+    }
+}
+
+TEST_F(ParallelSortSpillTest, TopNSpillsOnlyWhenNRowsDontFit) {
+    // The test holds every floor; the sort gets one shared grant per worker.
+    constexpr uint32_t kRows = 100000;
+    const SortCase all{{{1, true}}, {1, 4}, std::nullopt, "s"};
+    const SpillResult full = RunSpill(all, kRows, kSpillMorsels, WideRow, false, Unspilled(1));
+    ASSERT_EQ(full.rows.size(), kRows);
+    for (const unsigned threads : {1u, kSpillThreads}) {
+        SpillConfig tight;
+        tight.threads = threads;
+        tight.limit = threads * (kWorkerMinimumBytes + kGrantBytes);
+        tight.held = kWorkerMinimumBytes;
+
+        // Ten rows fit: no file.
+        SortCase ten = all;
+        ten.limit = 10;
+        ten.label = "s LIMIT 10";
+        const SpillResult few = RunSpill(ten, kRows, kSpillMorsels, WideRow, false, tight);
+        EXPECT_EQ(FirstDifference(few.rows, FirstRows(full.rows, 10)), "") << threads << " threads";
+        EXPECT_EQ(few.files, 0u) << threads << " threads";
+
+        // 50,000 rows don't: runs, and the merge stops after 50,000.
+        SortCase many = all;
+        many.limit = 50000;
+        many.label = "s LIMIT 50000";
+        const SpillResult got = RunSpill(many, kRows, kSpillMorsels, WideRow, false, tight);
+        EXPECT_EQ(FirstDifference(got.rows, FirstRows(full.rows, 50000)), "") << threads << " threads";
+        EXPECT_GT(got.files, 0u) << threads << " threads";
+        EXPECT_GT(got.written, 0u) << threads << " threads";
+    }
+}
+
+TEST_F(ParallelSortSpillTest, EmptyInputAndLimitZero) {
+    constexpr uint32_t kRows = 10000;
+    const SortCase c{{{0, true}, {4, false}}, {0, 1, 2, 3, 4}, std::nullopt, "k, id DESC"};
+    SortCase zero = c;
+    zero.limit = 0;
+    zero.label = "LIMIT 0";
+    const SpillResult want = RunSpill(c, kRows, kSpillMorsels, WideRow, false, Unspilled(1));
+    ASSERT_EQ(want.rows.size(), kRows);
+
+    for (const unsigned threads : {1u, kSpillThreads}) {
+        for (const bool everything : {false, true}) {
+            SpillConfig free_floors = FloorsOnly(threads, 0);
+            SpillConfig held_floors = FloorsOnly(threads, kWorkerMinimumBytes);
+            free_floors.spill_everything = everything;
+            held_floors.spill_everything = everything;
+            const std::string label = std::to_string(threads) + " threads" + (everything ? ", everything" : "");
+
+            // No rows at all, and LIMIT 0: nothing kept, nothing written.
+            for (const SpillConfig& cfg : {free_floors, held_floors}) {
+                const SpillResult none = RunSpill(c, 0, kSpillMorsels, WideRow, false, cfg);
+                EXPECT_TRUE(none.rows.empty()) << label;
+                EXPECT_EQ(none.files, 0u) << label;
+                const SpillResult limited = RunSpill(zero, kRows, kSpillMorsels, WideRow, false, cfg);
+                EXPECT_TRUE(limited.rows.empty()) << label;
+                EXPECT_EQ(limited.files, 0u) << label;
+            }
+
+            // Floors held from the first row, on one morsel and eight: each batch a run.
+            for (const size_t morsels : {size_t{1}, kSpillMorsels}) {
+                const SpillResult got = RunSpill(c, kRows, morsels, WideRow, false, held_floors);
+                EXPECT_EQ(FirstDifference(got.rows, want.rows), "") << label << ", " << morsels << " morsels";
+                EXPECT_GT(got.files, 0u) << label << ", " << morsels << " morsels";
+                EXPECT_GT(got.written, 0u) << label << ", " << morsels << " morsels";
+            }
+        }
+    }
+}
+
+TEST_F(ParallelSortSpillTest, StringsSurviveTheirMorsel) {
+    constexpr uint32_t kRows = 20000;
+    std::vector<SpillRow> rows;
+    for (uint32_t i = 0; i < kRows; ++i) rows.push_back(NoteRow(i));
+    const std::vector<SortCase> cases = {
+        {{{1, true}, {4, true}}, {0, 1, 2, 3, 4}, std::nullopt, "s, id"},
+        {{{4, false}}, {1, 4}, std::nullopt, "id DESC keeping s"},
+    };
+    // Written without the sort: by string bytes then id, or by id descending.
+    std::vector<std::vector<std::string>> wants;
+    for (size_t i = 0; i < cases.size(); ++i) {
+        std::vector<SpillRow> sorted = rows;
+        std::sort(sorted.begin(), sorted.end(), [&](const SpillRow& a, const SpillRow& b) {
+            return i == 0 ? std::tie(a.s, a.id) < std::tie(b.s, b.id) : a.id > b.id;
+        });
+        std::vector<std::string> want;
+        for (const SpillRow& r : sorted) want.push_back(EncodeRow(r, cases[i].kept));
+        wants.push_back(std::move(want));
+    }
+
+    for (const bool dictionary : {false, true}) {
+        for (size_t i = 0; i < cases.size(); ++i) {
+            for (const unsigned threads : {1u, kSpillThreads}) {
+                const std::string label = cases[i].label + (dictionary ? ", dictionary, " : ", plain, ") + std::to_string(threads) + " threads";
+                EXPECT_EQ(FirstDifference(RunSpill(cases[i], kRows, kSpillMorsels, NoteRow, dictionary, Unspilled(threads)).rows, wants[i]), "")
+                    << label << ", unspilled";
+                for (const SpillConfig& cfg : {Everything(threads), FloorsOnly(threads, kWorkerMinimumBytes)}) {
+                    const SpillResult got = RunSpill(cases[i], kRows, kSpillMorsels, NoteRow, dictionary, cfg);
+                    EXPECT_EQ(FirstDifference(got.rows, wants[i]), "") << label;
+                    EXPECT_GT(got.files, 0u) << label;
+                    EXPECT_GT(got.written, 0u) << label;
+                }
+            }
+        }
+    }
+
+    // Rows bigger than a run block go in blocks of their own, read back exact.
+    constexpr uint32_t kBigRows = 2000;
+    const SortCase big{{{1, false}, {4, true}}, {1, 4}, std::nullopt, "big s DESC, id"};
+    std::vector<SpillRow> big_rows;
+    for (uint32_t i = 0; i < kBigRows; ++i) big_rows.push_back(BigRow(i));
+    std::sort(big_rows.begin(), big_rows.end(), [](const SpillRow& a, const SpillRow& b) { return a.s != b.s ? a.s > b.s : a.id < b.id; });
+    std::vector<std::string> want_big;
+    for (const SpillRow& r : big_rows) want_big.push_back(EncodeRow(r, big.kept));
+    for (const unsigned threads : {1u, kSpillThreads}) {
+        EXPECT_EQ(FirstDifference(RunSpill(big, kBigRows, kSpillMorsels, BigRow, false, Unspilled(threads)).rows, want_big), "")
+            << threads << " threads, unspilled";
+        for (const SpillConfig& cfg : {Everything(threads), FloorsOnly(threads, kWorkerMinimumBytes)}) {
+            const SpillResult got = RunSpill(big, kBigRows, kSpillMorsels, BigRow, false, cfg);
+            EXPECT_EQ(FirstDifference(got.rows, want_big), "") << threads << " threads, big rows";
+            EXPECT_GT(got.files, 0u) << threads << " threads, big rows";
+            EXPECT_GT(got.written, 0u) << threads << " threads, big rows";
+        }
+    }
+
+    // A columnar table's dictionary-coded and plain strings, through the whole query.
+    std::string text;
+    for (uint32_t r = 0; r < kStrRows; ++r) text += std::to_string(r) + "|" + kModes[r % 7] + "|" + Note(r) + "|\n";
+    Load("str", StrSchema(), text);
+    for (const std::string sql : {"SELECT id, mode, note FROM str ORDER BY note, id", "SELECT id, mode, note FROM str ORDER BY mode DESC, id DESC LIMIT 5000"}) {
+        const QueryResult want = RunWith(sql, 1, false);
+        EXPECT_EQ(db_->LastParallelStats().spill_files, 0u) << sql << ", unspilled";
+        for (const unsigned threads : {1u, 2u}) {
+            EXPECT_EQ(ExactDifference(RunWith(sql, threads, true), want), "") << sql << ", " << threads << " threads";
+            EXPECT_GT(db_->LastParallelStats().spill_files, 0u) << sql << ", " << threads << " threads";
+            EXPECT_GT(db_->LastParallelStats().spill_bytes_written, 0u) << sql << ", " << threads << " threads";
+            EXPECT_GT(db_->LastParallelStats().spill_bytes_read, 0u) << sql << ", " << threads << " threads";
+        }
+    }
+    EXPECT_TRUE(TempDirEmpty());
+}
+
+TEST_F(ParallelSortSpillTest, FailedWriteLeavesNothingBehind) {
+    constexpr uint32_t kRows = 20000;
+    const SortCase c{{{0, true}, {1, false}}, {0, 1, 2, 3, 4}, std::nullopt, "k, s DESC"};
+    const SpillResult want = RunSpill(c, kRows, kSpillMorsels, WideRow, false, Unspilled(1));
+    const std::string prefix = "out of temp space in " + temp_dir_ + " while spilling: ";
+    for (const unsigned threads : {1u, kSpillThreads}) {
+        for (const SpillConfig& base : {Everything(threads), FloorsOnly(threads, kWorkerMinimumBytes)}) {
+            // Every write fails with ENOSPC; the first fails partway through a run.
+            SpillConfig failing = base;
+            failing.fail_writes = ENOSPC;
+            const SpillResult failed = RunSpill(c, kRows, kSpillMorsels, WideRow, false, failing);
+            EXPECT_EQ(failed.error, prefix + std::strerror(ENOSPC)) << threads << " threads";
+            EXPECT_TRUE(failed.rows.empty()) << threads << " threads";
+
+            // The next sort, on fresh objects with writes working, answers.
+            const SpillResult next = RunSpill(c, kRows, kSpillMorsels, WideRow, false, base);
+            EXPECT_EQ(FirstDifference(next.rows, want.rows), "") << threads << " threads";
+            EXPECT_GT(next.files, 0u) << threads << " threads";
+            EXPECT_GT(next.written, 0u) << threads << " threads";
+        }
+    }
+}
+
+TEST_F(ParallelSortSpillTest, RowsStayInMemoryOffTheFloor) {
+    // Each worker's rows fit one floor grant; the shared pool has a grant per worker.
+    constexpr uint32_t kRows = 4000;
+    const SortCase c{{{0, true}}, {0, 1, 2, 3, 4}, std::nullopt, "k"};
+    const SpillResult want = RunSpill(c, kRows, kSpillMorsels, WideRow, false, Unspilled(1));
+    for (const unsigned threads : {1u, kSpillThreads}) {
+        SpillConfig roomy;
+        roomy.threads = threads;
+        roomy.limit = threads * (kWorkerMinimumBytes + kGrantBytes);
+        // Between the pipelines the rows are held, moved off the floors into the shared pool.
+        const auto moved = [threads](MemoryBudget& budget) {
+            EXPECT_GT(budget.HeldBytes(), 0u) << threads << " threads";
+            EXPECT_GT(budget.PeakBytes(), threads * kWorkerMinimumBytes) << threads << " threads";
+        };
+        const SpillResult got = RunSpill(c, kRows, kSpillMorsels, WideRow, false, roomy, moved);
+        EXPECT_EQ(FirstDifference(got.rows, want.rows), "") << threads << " threads";
+        EXPECT_EQ(got.files, 0u) << threads << " threads";
+    }
+}
+
+TEST_F(ParallelSortSpillTest, SpillEverythingMatches) {
+    // Every input above, spilling everything, against the unspilled sort.
+    struct Input {
+        RowMaker make;
+        uint32_t rows;
+        bool dictionary;
+        std::vector<SortCase> cases;
+    };
+    std::vector<SortCase> wide = {
+        {{{0, true}, {1, false}}, {0, 1, 2, 3, 4}, std::nullopt, "k, s DESC"},
+        {{{0, false}}, {1, 2, 3, 4}, std::nullopt, "k DESC, key not kept"},
+    };
+    for (const int64_t n : {0, 1, 10, 2047, 2048, 2049, 15000, 20005}) {
+        wide.push_back(SortCase{{{1, true}}, {1, 4}, n, "s LIMIT " + std::to_string(n)});
+    }
+    const std::vector<Input> inputs = {
+        {WideRow, 20000, false, wide},
+        {TieRowOf, 20000, false, {{{{0, true}}, {0, 1, 2, 3, 4}, std::nullopt, "ties"}, {{{0, false}}, {0, 1, 2, 3, 4}, 100, "ties LIMIT 100"}}},
+        {NoteRow, 20000, false, {{{{1, true}, {4, true}}, {0, 1, 2, 3, 4}, std::nullopt, "notes"}}},
+        {NoteRow, 20000, true, {{{{1, false}, {4, true}}, {1, 4}, 3000, "coded notes LIMIT 3000"}}},
+        {WideRow, 0, false, {{{{0, true}}, {0, 1, 2, 3, 4}, std::nullopt, "no rows"}}},
+    };
+    for (const Input& input : inputs) {
+        for (const SortCase& c : input.cases) {
+            const SpillResult want = RunSpill(c, input.rows, kSpillMorsels, input.make, input.dictionary, Unspilled(1));
+            const bool writes = input.rows > 0 && c.limit != std::optional<int64_t>{0};
+            for (const unsigned threads : {1u, kSpillThreads}) {
+                const SpillResult got = RunSpill(c, input.rows, kSpillMorsels, input.make, input.dictionary, Everything(threads));
+                EXPECT_EQ(FirstDifference(got.rows, want.rows), "") << c.label << ", " << threads << " threads";
+                if (writes) {
+                    EXPECT_GT(got.files, 0u) << c.label << ", " << threads << " threads";
+                    EXPECT_GT(got.written, 0u) << c.label << ", " << threads << " threads";
+                } else {
+                    EXPECT_EQ(got.files, 0u) << c.label << ", " << threads << " threads";
+                }
+            }
+        }
+    }
+
+    // Through whole queries, top n included, on two row groups.
+    Load("u", UniqueSchema(), UniqueText(kUniqueRows));
+    Load("t1", TieSchema(), TieText(TieRows()));
+    for (const std::string sql : {"SELECT k, g, m, f, d, s FROM u ORDER BY g DESC, s", "SELECT k, s, m FROM u ORDER BY s DESC LIMIT 333",
+                                  "SELECT s, m, k, x FROM t1 ORDER BY x DESC", "SELECT k, x, s, m FROM t1 ORDER BY k DESC, s LIMIT 2049"}) {
+        const QueryResult want = RunWith(sql, 1, false);
+        EXPECT_EQ(db_->LastParallelStats().spill_files, 0u) << sql << ", unspilled";
+        for (const unsigned threads : {1u, kSpillThreads}) {
+            EXPECT_EQ(ExactDifference(RunWith(sql, threads, true), want), "") << sql << ", " << threads << " threads";
+            EXPECT_GT(db_->LastParallelStats().spill_files, 0u) << sql << ", " << threads << " threads";
+            EXPECT_GT(db_->LastParallelStats().spill_bytes_written, 0u) << sql << ", " << threads << " threads";
+        }
+    }
+    EXPECT_TRUE(TempDirEmpty());
 }
 
 }  // namespace

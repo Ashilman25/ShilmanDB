@@ -12,8 +12,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
+#include <numeric>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace shilmandb::parallel {
@@ -153,6 +156,112 @@ std::vector<int64_t> Sorted(std::vector<int64_t> v) {
 QueryContext NoDatabase() {
     return QueryContext{nullptr, nullptr};
 }
+
+// The worker and context each local was made for; safe from any thread.
+struct LocalLog {
+    std::mutex mutex;
+    std::vector<unsigned> workers;
+    std::vector<const QueryContext*> contexts;
+
+    void Add(unsigned worker, const QueryContext& ctx) {
+        std::lock_guard<std::mutex> lock(mutex);
+        workers.push_back(worker);
+        contexts.push_back(&ctx);
+    }
+
+    // The workers seen, sorted.
+    std::vector<unsigned> Workers() {
+        std::lock_guard<std::mutex> lock(mutex);
+        std::vector<unsigned> sorted = workers;
+        std::sort(sorted.begin(), sorted.end());
+        return sorted;
+    }
+};
+
+// A local that knows its worker and the threads that used it.
+struct WorkerLocal : LocalState {
+    unsigned worker{0};
+    bool batch_left{false};
+    std::vector<std::thread::id> threads;  // one thread uses a local at a time
+
+    void Touch() {
+        const auto id = std::this_thread::get_id();
+        if (std::find(threads.begin(), threads.end(), id) == threads.end()) threads.push_back(id);
+    }
+};
+
+// A local for this worker, logged.
+std::unique_ptr<LocalState> LoggedLocal(LocalLog& log, const QueryContext& ctx, unsigned worker) {
+    log.Add(worker, ctx);
+    auto local = std::make_unique<WorkerLocal>();
+    local->worker = worker;
+    return local;
+}
+
+// One batch of one row per morsel.
+class WorkerSource : public Source {
+public:
+    explicit WorkerSource(size_t morsels) : morsels_(morsels) {}
+    void Prepare(QueryContext&) override {}
+    size_t MorselCount() const override { return morsels_; }
+    std::unique_ptr<LocalState> MakeLocal() const override { return std::make_unique<WorkerLocal>(); }
+    std::unique_ptr<LocalState> MakeWorkerLocal(const QueryContext& ctx, unsigned worker) const override {
+        return LoggedLocal(log, ctx, worker);
+    }
+    void StartMorsel(size_t, LocalState& local) const override {
+        auto& l = static_cast<WorkerLocal&>(local);
+        l.Touch();
+        l.batch_left = true;
+    }
+    bool NextBatch(LocalState& local, Batch& out) const override {
+        auto& l = static_cast<WorkerLocal&>(local);
+        if (!l.batch_left) return false;
+        l.batch_left = false;
+        ShapeBatch(out, {VType{}});
+        out.Reset(1);
+        out.slots[0].I64()[0] = 1;
+        return true;
+    }
+    mutable LocalLog log;
+
+private:
+    size_t morsels_;
+};
+
+// Passes each batch on.
+class WorkerOperator : public Operator {
+public:
+    std::unique_ptr<LocalState> MakeWorkerLocal(const QueryContext& ctx, unsigned worker) const override {
+        return LoggedLocal(log, ctx, worker);
+    }
+    OpResult Execute(Batch& in, Batch& out, LocalState* local) const override {
+        if (local != nullptr) static_cast<WorkerLocal*>(local)->Touch();
+        std::swap(in, out);
+        return OpResult::NEED_INPUT;
+    }
+    mutable LocalLog log;
+};
+
+// Counts rows and keeps each local's worker and threads.
+class WorkerSink : public Sink {
+public:
+    std::unique_ptr<LocalState> MakeLocal() const override { return std::make_unique<WorkerLocal>(); }
+    std::unique_ptr<LocalState> MakeWorkerLocal(const QueryContext& ctx, unsigned worker) const override {
+        return LoggedLocal(log, ctx, worker);
+    }
+    void Consume(Batch& in, LocalState& local) const override {
+        static_cast<WorkerLocal&>(local).Touch();
+        rows.fetch_add(in.Active());
+    }
+    void Combine(std::unique_ptr<LocalState> local) override {
+        const auto& l = static_cast<const WorkerLocal&>(*local);
+        combined.emplace_back(l.worker, l.threads);
+    }
+    void Finalize(QueryContext&) override {}
+    mutable LocalLog log;
+    mutable std::atomic<uint64_t> rows{0};
+    std::vector<std::pair<unsigned, std::vector<std::thread::id>>> combined;
+};
 
 }  // namespace
 
@@ -309,6 +418,41 @@ TEST(ParallelPipelineTest, ForEachTaskPassesTheWorker) {
     int workers_used = 0;
     for (const auto& u : used) workers_used += u.load() > 0 ? 1 : 0;
     EXPECT_GT(workers_used, 1) << "the pool ran the tasks";
+}
+
+TEST(ParallelPipelineTest, LocalsKnowTheirWorkerAndContext) {
+    constexpr unsigned kThreads = 4;
+    WorkerPool pool(kThreads);
+    for (const unsigned threads : {1u, kThreads}) {
+        WorkerSource source(8);
+        WorkerOperator op;
+        WorkerSink sink;
+        Pipeline p{&source, {&op}, &sink, {}};
+        QueryContext ctx = NoDatabase();
+        ctx.threads = threads;
+        ctx.pool = threads > 1 ? &pool : nullptr;
+        RunPipeline(p, ctx);
+
+        // Every step made one local per worker, each told its worker and this context.
+        std::vector<unsigned> want(threads);
+        std::iota(want.begin(), want.end(), 0u);
+        for (LocalLog* log : {&source.log, &op.log, &sink.log}) {
+            EXPECT_EQ(log->Workers(), want) << threads << " threads";
+            for (const QueryContext* seen : log->contexts) EXPECT_EQ(seen, &ctx) << threads << " threads";
+        }
+
+        // Each local ran on one thread: worker 0 on the caller's, no two sharing one.
+        EXPECT_EQ(sink.rows.load(), 8u);
+        ASSERT_EQ(sink.combined.size(), threads);
+        std::vector<std::thread::id> used;
+        for (const auto& [worker, seen] : sink.combined) {
+            ASSERT_LE(seen.size(), 1u) << "worker " << worker;
+            if (seen.empty()) continue;
+            if (worker == 0) EXPECT_EQ(seen[0], std::this_thread::get_id());
+            EXPECT_EQ(std::count(used.begin(), used.end(), seen[0]), 0) << "worker " << worker;
+            used.push_back(seen[0]);
+        }
+    }
 }
 
 }  // namespace shilmandb::parallel

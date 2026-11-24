@@ -25,6 +25,12 @@ struct SortSpec {
 // at most max(limit, 0) of them, in one morsel so the order holds.
 // Keys compare as Value's < and > do: integers and dates as integers,
 // decimals exactly, doubles as doubles, strings bytewise.
+// Rows past a worker's budget go to temp files as sorted runs;
+// the source merges them into the same order, byte for byte.
 [[nodiscard]] std::pair<std::unique_ptr<Sink>, std::unique_ptr<Source>> MakeSort(SortSpec spec);
+
+// For tests: caps a merge's fan-in, at least 2; 0 turns the cap off.
+// Read when a sort's source is prepared, on the calling thread.
+void SetSortFanInForTest(size_t most);
 
 }  // namespace shilmandb::parallel

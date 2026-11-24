@@ -28,12 +28,12 @@ struct Worker {
     std::unique_ptr<StepProfile> profile;  // only when analyze is on
 };
 
-// A fresh local for every step, and empty batches the steps shape on first use.
-Worker MakeWorker(const Pipeline& p, bool profile) {
+// A fresh local per step for this worker, and empty batches shaped on first use.
+Worker MakeWorker(const Pipeline& p, const QueryContext& ctx, unsigned worker, bool profile) {
     Worker w;
-    w.source = p.source->MakeLocal();
-    for (const Operator* op : p.operators) w.operators.push_back(op->MakeLocal());
-    w.sink = p.sink->MakeLocal();
+    w.source = p.source->MakeWorkerLocal(ctx, worker);
+    for (const Operator* op : p.operators) w.operators.push_back(op->MakeWorkerLocal(ctx, worker));
+    w.sink = p.sink->MakeWorkerLocal(ctx, worker);
     w.batches.resize(p.operators.size() + 1);
     if (profile) {
         w.profile = std::make_unique<StepProfile>();
@@ -194,6 +194,21 @@ std::unique_ptr<LocalState> Operator::MakeLocal() const {
     return nullptr;
 }
 
+// Most locals need neither the query nor the worker.
+std::unique_ptr<LocalState> Source::MakeWorkerLocal(const QueryContext&, unsigned) const {
+    return MakeLocal();
+}
+
+// Most locals need neither the query nor the worker.
+std::unique_ptr<LocalState> Operator::MakeWorkerLocal(const QueryContext&, unsigned) const {
+    return MakeLocal();
+}
+
+// Most locals need neither the query nor the worker.
+std::unique_ptr<LocalState> Sink::MakeWorkerLocal(const QueryContext&, unsigned) const {
+    return MakeLocal();
+}
+
 // Batches are reused across morsels, so this rebuilds at most a few times per worker.
 void ShapeBatch(Batch& batch, const std::vector<VType>& types) {
     bool same = batch.slots.size() == types.size();
@@ -218,7 +233,7 @@ void RunPipeline(Pipeline& p, QueryContext& ctx) {
     const unsigned workers = WorkersFor(ctx, morsels);
     std::vector<Worker> locals;
     locals.reserve(workers);
-    for (unsigned w = 0; w < workers; ++w) locals.push_back(MakeWorker(p, stats != nullptr));
+    for (unsigned w = 0; w < workers; ++w) locals.push_back(MakeWorker(p, ctx, w, stats != nullptr));
 
     std::atomic<size_t> next{0};
     std::atomic<bool> stop{false};
