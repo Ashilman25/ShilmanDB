@@ -111,6 +111,50 @@ void RunMorsels(Pipeline& p, Worker& w, std::atomic<size_t>& next, const std::at
     }
 }
 
+// Lets operators first.. flush what they buffered, timed into their steps when profiling.
+// Skipped after a failure or once the sink is done, since nothing reads it then.
+void FinishOperators(const Pipeline& p, Worker& w, size_t first, const std::atomic<bool>& stop) {
+    if (stop.load(std::memory_order_relaxed) || p.sink->Done()) return;
+    for (size_t i = first; i < p.operators.size(); ++i) {
+        if (w.profile == nullptr) {
+            p.operators[i]->FinishMorsels(w.operators[i].get());
+            continue;
+        }
+        const auto start = Clock::now();
+        p.operators[i]->FinishMorsels(w.operators[i].get());
+        w.profile->time[i + 1] += Clock::now() - start;
+    }
+}
+
+// Operator k's next spilled batch, timed and counted into its step when profiling.
+bool NextSpilledBatch(const Pipeline& p, Worker& w, size_t k) {
+    Batch& out = w.batches[k + 1];
+    if (w.profile == nullptr) return p.operators[k]->NextSpilledBatch(w.operators[k].get(), out);
+    const auto start = Clock::now();
+    const bool more = p.operators[k]->NextSpilledBatch(w.operators[k].get(), out);
+    w.profile->time[k + 1] += Clock::now() - start;
+    if (more) w.profile->rows[k + 1] += out.Active();
+    return more;
+}
+
+// Takes operator k's spilled partitions until none are left, the sink is done, or another
+// worker failed. Each batch goes through the operators after k, as a morsel's would.
+void RunSpilled(Pipeline& p, Worker& w, size_t k, std::atomic<size_t>& next, const std::atomic<bool>& stop, size_t parts) {
+    const Operator& op = *p.operators[k];
+    while (!stop.load(std::memory_order_relaxed) && !p.sink->Done()) {
+        const size_t part = next.fetch_add(1, std::memory_order_relaxed);
+        if (part >= parts) return;
+        if (w.profile == nullptr) {
+            op.StartSpilledPartition(part, w.operators[k].get());
+        } else {
+            const auto start = Clock::now();
+            op.StartSpilledPartition(part, w.operators[k].get());
+            w.profile->time[k + 1] += Clock::now() - start;
+        }
+        while (!stop.load(std::memory_order_relaxed) && !p.sink->Done() && NextSpilledBatch(p, w, k)) Push(p, w, k + 1);
+    }
+}
+
 // Turns the buffer pool's concurrent mode on, and off again on every exit.
 class ConcurrentScope {
 public:
@@ -187,6 +231,24 @@ unsigned WorkersFor(const QueryContext& ctx, size_t count) {
     return static_cast<unsigned>(std::min<size_t>({ctx.threads, count, ctx.pool->Size()}));
 }
 
+// Runs fn(w) on every worker: on the calling thread for one, else on the pool.
+// The first worker to throw stops the others; the pool rethrows it.
+void OnWorkers(QueryContext& ctx, unsigned workers, std::atomic<bool>& stop, const std::function<void(unsigned)>& fn) {
+    if (workers == 1) {
+        fn(0);
+        return;
+    }
+    
+    ctx.pool->Run(workers, [&](unsigned w) {
+        try {
+            fn(w);
+        } catch (...) {
+            stop.store(true, std::memory_order_relaxed);
+            throw;
+        }
+    });
+}
+
 }  // namespace
 
 // Operators without per-worker state need nothing here.
@@ -209,6 +271,25 @@ std::unique_ptr<LocalState> Sink::MakeWorkerLocal(const QueryContext&, unsigned)
     return MakeLocal();
 }
 
+// Operators that never spill buffer nothing.
+void Operator::FinishMorsels(LocalState*) const {}
+
+// Operators that never spill have no partitions waiting.
+size_t Operator::SpilledPartitionCount() const {
+    return 0;
+}
+
+// Never called on an operator with no spilled partitions.
+void Operator::StartSpilledPartition(size_t, LocalState*) const {}
+
+// No spilled partitions, so no batches.
+bool Operator::NextSpilledBatch(LocalState*, Batch&) const {
+    return false;
+}
+
+// Most operators hold nothing past their pipeline.
+void Operator::PipelineDone() {}
+
 // Batches are reused across morsels, so this rebuilds at most a few times per worker.
 void ShapeBatch(Batch& batch, const std::vector<VType>& types) {
     bool same = batch.slots.size() == types.size();
@@ -219,37 +300,45 @@ void ShapeBatch(Batch& batch, const std::vector<VType>& types) {
     for (const VType& t : types) batch.slots.emplace_back(t);
 }
 
-// One worker runs on the calling thread with no latch, as a serial loop.
-// Several share an atomic morsel counter; the first to throw stops the rest.
-// Combine then goes in worker order, so exact results never depend on timing.
-// With analyze on, each step's own thread time and rows go to its plan node.
+// Morsels, then each spilled operator's partitions, shared by atomic counters; a phase
+// starts once every worker finishes the last. Combine goes in worker order, as before.
 void RunPipeline(Pipeline& p, QueryContext& ctx) {
     OperatorStatsMap* stats = ctx.op_stats;
     auto start = NowIf(stats != nullptr);
     p.source->Prepare(ctx);
     if (stats != nullptr) ChargeTime(*stats, p.source_node, Clock::now() - start);
 
+    // Spilled partitions are known up front, so the workers are sized once for both.
     const size_t morsels = p.source->MorselCount();
-    const unsigned workers = WorkersFor(ctx, morsels);
+    std::vector<size_t> spilled(p.operators.size(), 0);
+    size_t most = morsels;
+    for (size_t k = 0; k < p.operators.size(); ++k) {
+        spilled[k] = p.operators[k]->SpilledPartitionCount();
+        most = std::max(most, spilled[k]);
+    }
+    const unsigned workers = WorkersFor(ctx, most);
     std::vector<Worker> locals;
     locals.reserve(workers);
     for (unsigned w = 0; w < workers; ++w) locals.push_back(MakeWorker(p, ctx, w, stats != nullptr));
 
-    std::atomic<size_t> next{0};
     std::atomic<bool> stop{false};
     std::vector<uint64_t> started(workers, 0);  // each worker writes only its own entry
-    if (workers == 1) {
-        RunMorsels(p, locals[0], next, stop, morsels, started[0]);
-    } else {
-        ConcurrentScope concurrent(ctx.bpm, workers);
-        ctx.pool->Run(workers, [&](unsigned w) {
-            try {
-                RunMorsels(p, locals[w], next, stop, morsels, started[w]);
-            } catch (...) {
-                stop.store(true, std::memory_order_relaxed);
-                throw;
-            }
+    {
+        std::optional<ConcurrentScope> concurrent;
+        if (workers > 1) concurrent.emplace(ctx.bpm, workers);
+        std::atomic<size_t> next{0};
+        OnWorkers(ctx, workers, stop, [&](unsigned w) {
+            RunMorsels(p, locals[w], next, stop, morsels, started[w]);
+            FinishOperators(p, locals[w], 0, stop);
         });
+        for (size_t k = 0; k < p.operators.size(); ++k) {
+            if (spilled[k] == 0) continue;
+            std::atomic<size_t> next_part{0};
+            OnWorkers(ctx, workers, stop, [&](unsigned w) {
+                RunSpilled(p, locals[w], k, next_part, stop, spilled[k]);
+                FinishOperators(p, locals[w], k + 1, stop);
+            });
+        }
     }
 
     for (uint64_t n : started) ctx.morsels += n;
@@ -264,6 +353,7 @@ void RunPipeline(Pipeline& p, QueryContext& ctx) {
     start = NowIf(stats != nullptr);
     p.sink->Finalize(ctx);
     if (stats != nullptr) ChargeTime(*stats, p.sink_node, Clock::now() - start + ctx.task_extra);
+    for (Operator* op : p.operators) op->PipelineDone();
 }
 
 // Tasks that don't need the worker index.

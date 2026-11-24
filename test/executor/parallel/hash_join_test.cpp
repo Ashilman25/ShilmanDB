@@ -1,31 +1,46 @@
 #include <gtest/gtest.h>
 
+#include <fcntl.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iterator>
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
+#include <system_error>
 #include <tuple>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include "catalog/catalog.hpp"
 #include "engine/database.hpp"
+#include "executor/parallel/basic_operators.hpp"
 #include "executor/parallel/batch.hpp"
+#include "executor/parallel/column_buffer.hpp"
 #include "executor/parallel/compiler.hpp"
 #include "executor/parallel/expression.hpp"
+#include "executor/parallel/hash_aggregate.hpp"
 #include "executor/parallel/hash_join.hpp"
+#include "executor/parallel/key_hash.hpp"
+#include "executor/parallel/memory_budget.hpp"
 #include "executor/parallel/parallel_executor.hpp"
 #include "executor/parallel/pipeline.hpp"
+#include "executor/parallel/spill_partitions.hpp"
+#include "executor/parallel/temp_file.hpp"
+#include "executor/parallel/worker_pool.hpp"
 #include "parser/ast.hpp"
 #include "parser/parser.hpp"
 #include "planner/planner.hpp"
@@ -1104,6 +1119,1170 @@ TEST_F(ParallelHashJoinTest, Q10BuildsOrdersSide) {
         const QueryResult got = RunOn(*tpch, q10, ExecutionMode::PARALLEL, threads);
         EXPECT_TRUE(tpch::SameResult(got, want)) << "threads " << threads << ": " << Difference(got, want);
     }
+}
+
+//  Spilling
+
+constexpr unsigned kSpillThreads = 4;
+constexpr size_t kSpillMorsels = 8;  // enough for every worker
+
+const VType kDouble{Kind::DOUBLE, 0, false, TypeId::DECIMAL};
+const VType kWide3{Kind::DECIMAL, 3, true, TypeId::DECIMAL};
+
+// One row of a hand-fed join side: slots k, s, v, f, w.
+struct JoinRow {
+    int64_t k{0};
+    std::string s;
+    int64_t v{0};
+    double f{0.0};
+    __int128 w{0};
+};
+
+using JoinRowMaker = std::function<JoinRow(uint32_t)>;
+
+// Slots: k INTEGER, s VARCHAR, v INTEGER, f DOUBLE, w NUMERIC(30,3).
+const std::vector<VType>& SideTypes() {
+    static const std::vector<VType> types = {kInt, kStr, kInt, kDouble, kWide3};
+    return types;
+}
+
+// One side's rows: how many, made how, and whether s is dictionary-coded.
+struct SideData {
+    uint32_t rows{0};
+    JoinRowMaker make;
+    bool dictionary{false};
+    size_t morsels{kSpillMorsels};
+};
+
+// Hands out a side's rows in morsels, s plain or dictionary-coded.
+// Batches of 2,048, 1,000, 7 and 333 rows in turn.
+// A morsel's strings are wiped when its worker starts another or finishes,
+// so a join that kept a pointer instead of a copy reads '#'.
+class SideInput : public Source {
+public:
+    struct Local : LocalState {
+        std::vector<JoinRow> rows;
+        std::vector<std::string> distinct;
+        std::vector<StringRef> entries;
+        std::vector<uint32_t> codes;
+        size_t next{0};
+        size_t batch{0};
+
+        ~Local() override { Wipe(); }
+
+        void Wipe() {
+            for (JoinRow& r : rows) std::fill(r.s.begin(), r.s.end(), '#');
+            for (std::string& s : distinct) std::fill(s.begin(), s.end(), '#');
+        }
+    };
+
+    explicit SideInput(SideData data) : data_(std::move(data)) {}
+
+    void Prepare(QueryContext&) override {}
+    size_t MorselCount() const override { return data_.morsels; }
+    std::unique_ptr<LocalState> MakeLocal() const override { return std::make_unique<Local>(); }
+
+    void StartMorsel(size_t morsel, LocalState& local) const override {
+        auto& l = static_cast<Local&>(local);
+        l.Wipe();
+        l.rows.clear();
+        l.distinct.clear();
+        l.entries.clear();
+        l.codes.clear();
+        const auto begin = static_cast<uint32_t>(uint64_t{data_.rows} * morsel / data_.morsels);
+        const auto end = static_cast<uint32_t>(uint64_t{data_.rows} * (morsel + 1) / data_.morsels);
+        for (uint32_t i = begin; i < end; ++i) l.rows.push_back(data_.make(i));
+        if (data_.dictionary) {
+            std::unordered_map<std::string, uint32_t> code_of;
+            for (const JoinRow& r : l.rows) {
+                const auto found = code_of.find(r.s);
+                if (found != code_of.end()) {
+                    l.codes.push_back(found->second);
+                    continue;
+                }
+                const auto code = static_cast<uint32_t>(l.distinct.size());
+                code_of.emplace(r.s, code);
+                l.distinct.push_back(r.s);
+                l.codes.push_back(code);
+            }
+            for (const std::string& s : l.distinct) l.entries.push_back(Ref(s));
+        }
+        l.next = 0;
+        l.batch = 0;
+    }
+
+    bool NextBatch(LocalState& local, Batch& out) const override {
+        auto& l = static_cast<Local&>(local);
+        if (l.next >= l.rows.size()) return false;
+        static constexpr uint32_t kSizes[] = {kBatchSize, 1000, 7, 333};
+        const auto n = static_cast<uint32_t>(std::min<size_t>(kSizes[l.batch++ % 4], l.rows.size() - l.next));
+        ShapeBatch(out, SideTypes());
+        out.Reset(n);
+        for (uint32_t i = 0; i < n; ++i) {
+            const JoinRow& r = l.rows[l.next + i];
+            out.slots[0].I64()[i] = r.k;
+            out.slots[2].I64()[i] = r.v;
+            out.slots[3].F64()[i] = r.f;
+            out.slots[4].I128()[i] = r.w;
+            if (!data_.dictionary) out.slots[1].Str()[i] = Ref(r.s);
+        }
+        if (data_.dictionary) {
+            out.slots[1].SetDictionary(&l.entries);
+            for (uint32_t i = 0; i < n; ++i) out.slots[1].Codes()[i] = l.codes[l.next + i];
+        }
+        l.next += n;
+        return true;
+    }
+
+private:
+    SideData data_;
+};
+
+// Appends raw bytes.
+void AppendRaw(std::string& out, const void* data, size_t n) {
+    out.append(static_cast<const char*>(data), n);
+}
+
+// Appends a cell's exact bytes: numbers raw, strings length-prefixed.
+void AppendCell(const Vector& v, uint32_t row, std::string& out) {
+    switch (ArrayOf(v.Type())) {
+        case ValueArray::I64: AppendRaw(out, &v.I64()[row], sizeof(int64_t)); break;
+        case ValueArray::I128: AppendRaw(out, &v.I128()[row], sizeof(__int128)); break;
+        case ValueArray::F64: AppendRaw(out, &v.F64()[row], sizeof(double)); break;
+        case ValueArray::STR: {
+            const StringRef s = v.StrAt(row);
+            AppendRaw(out, &s.size, sizeof(s.size));
+            AppendRaw(out, s.data, s.size);
+            break;
+        }
+    }
+}
+
+// Keeps every row as its cells' exact bytes;
+// done once a watched limit is used up.
+class BytesSink : public Sink {
+public:
+    struct Local : LocalState {
+        std::vector<std::string> rows;
+    };
+
+    explicit BytesSink(const LimitCounter* limit = nullptr) : limit_(limit) {}
+
+    std::unique_ptr<LocalState> MakeLocal() const override { return std::make_unique<Local>(); }
+
+    void Consume(Batch& in, LocalState& local) const override {
+        auto& l = static_cast<Local&>(local);
+        for (uint32_t i = 0; i < in.Active(); ++i) {
+            std::string row;
+            for (const Vector& v : in.slots) AppendCell(v, in.sel[i], row);
+            l.rows.push_back(std::move(row));
+        }
+    }
+
+    void Combine(std::unique_ptr<LocalState> local) override {
+        auto& l = static_cast<Local&>(*local);
+        rows.insert(rows.end(), std::make_move_iterator(l.rows.begin()), std::make_move_iterator(l.rows.end()));
+    }
+
+    void Finalize(QueryContext&) override {}
+
+    bool Done() const override { return limit_ != nullptr && limit_->Reached(); }
+
+    std::vector<std::string> rows;
+
+private:
+    const LimitCounter* limit_;
+};
+
+// "" when both hold the same rows, byte for byte, in any order.
+std::string BytesDifference(std::vector<std::string> got, std::vector<std::string> want) {
+    if (got.size() != want.size()) return std::to_string(got.size()) + " rows, expected " + std::to_string(want.size());
+    std::sort(got.begin(), got.end());
+    std::sort(want.begin(), want.end());
+    for (size_t i = 0; i < got.size(); ++i) {
+        if (got[i] != want[i]) return "sorted row " + std::to_string(i) + " differs";
+    }
+    return "";
+}
+
+// "" when both results have the same types and tuples byte for byte, any order.
+std::string ExactMultisetDifference(const QueryResult& got, const QueryResult& want) {
+    if (got.schema.GetColumnCount() != want.schema.GetColumnCount()) return "column counts differ";
+    for (uint32_t c = 0; c < got.schema.GetColumnCount(); ++c) {
+        if (got.schema.GetColumn(c).type != want.schema.GetColumn(c).type) return "column " + std::to_string(c) + " has another type";
+    }
+    const auto bytes = [](const QueryResult& r) {
+        std::vector<std::string> out;
+        for (const Tuple& t : r.tuples) out.emplace_back(t.GetData(), t.GetLength());
+        return out;
+    };
+    return BytesDifference(bytes(got), bytes(want));
+}
+
+// A column reference bound to plan column c, uncompiled.
+std::unique_ptr<Expression> RefTo(uint32_t c) {
+    auto ref = std::make_unique<ColumnRef>();
+    ref->column_name = "c" + std::to_string(c);
+    ref->bound_index = c;
+    return ref;
+}
+
+// An integer literal.
+std::unique_ptr<Expression> IntLiteral(int32_t v) {
+    auto lit = std::make_unique<Literal>();
+    lit->value = Value(v);
+    return lit;
+}
+
+// left op right over the layout.
+std::unique_ptr<CompiledExpr> Compare(BinaryOp::Op op, std::unique_ptr<Expression> left, std::unique_ptr<Expression> right, const InputLayout& in) {
+    BinaryOp cmp;
+    cmp.op = op;
+    cmp.left = std::move(left);
+    cmp.right = std::move(right);
+    return CompiledExpr::Compile(cmp, in);
+}
+
+// A join of two hand-fed sides, on slot 0 by default, keeping every slot.
+struct JoinCase {
+    SideData build;
+    SideData probe;
+    bool build_left{false};
+    bool residual{false};  // keeps pairs whose left v is below their right v
+    std::string label;
+    uint32_t build_key_slot{0};
+    uint32_t probe_key_slot{0};
+};
+
+// The join's output types: the left side's slots, then the right side's.
+std::vector<VType> JoinTypes() {
+    std::vector<VType> types = SideTypes();
+    types.insert(types.end(), SideTypes().begin(), SideTypes().end());
+    return types;
+}
+
+// The case's join spec over SideInput batches.
+JoinSpec SpecOf(const JoinCase& c) {
+    const InputLayout side = LayoutOf(SideTypes());
+    JoinSpec spec;
+    spec.build_key = Col(c.build_key_slot, side);
+    spec.probe_key = Col(c.probe_key_slot, side);
+    spec.build_payload = {0, 1, 2, 3, 4};
+    spec.probe_slots = {0, 1, 2, 3, 4};
+    spec.types = JoinTypes();
+    spec.build_left = c.build_left;
+    if (c.residual) spec.residual = Compare(BinaryOp::Op::LT, RefTo(2), RefTo(7), LayoutOf(spec.types));
+    return spec;
+}
+
+// How one spill run is set up.
+struct JoinSpillConfig {
+    unsigned threads{1};
+    bool spill_everything{false};
+    std::optional<size_t> limit;  // the budget's limit; none means no budget
+    size_t held_build{0};         // bytes the test holds on every worker's floor while the builds run
+    size_t held_probe{0};         // the same while the probe pipelines run
+    int fail_writes{0};           // errno every temp write fails with; 0 for none
+    size_t fail_from{0};          // the pipeline whose writes fail first
+    bool expect_error{false};     // the run should throw even without failing writes
+    size_t load_cap{0};           // most build rows a spilled load holds; 0 for no cap
+};
+
+// No budget at all.
+JoinSpillConfig Unspilled(unsigned threads) {
+    JoinSpillConfig c;
+    c.threads = threads;
+    return c;
+}
+
+// Every breaker spills everything it holds; a budget of just the floors.
+JoinSpillConfig Everything(unsigned threads) {
+    JoinSpillConfig c = Unspilled(threads);
+    c.spill_everything = true;
+    c.limit = threads * kWorkerMinimumBytes;
+    return c;
+}
+
+// The builds get `grants` of shared room between
+// them: every floor is held until the probe.
+JoinSpillConfig Squeezed(unsigned threads, size_t grants) {
+    JoinSpillConfig c = Unspilled(threads);
+    c.limit = threads * kWorkerMinimumBytes + grants * kGrantBytes;
+    c.held_build = kWorkerMinimumBytes;
+    return c;
+}
+
+// The pipelines one run executes in order, and what owns their parts.
+struct SpillPlan {
+    std::vector<std::unique_ptr<Source>> sources;
+    std::vector<std::unique_ptr<Operator>> operators;
+    std::vector<std::unique_ptr<Sink>> sinks;
+    std::vector<Pipeline> pipelines;
+    size_t first_probe{1};               // pipelines before this one are builds
+    std::vector<const Operator*> joins;  // probe operators, inspected after the run
+    BytesSink* out{nullptr};
+};
+
+// What a run gave and spilled.
+struct JoinSpillResult {
+    std::vector<std::string> rows;
+    std::vector<HashJoinInfo> joins;  // one per probe operator, in plan order
+    uint64_t files{0};
+    uint64_t written{0};
+    uint64_t read{0};
+    uint64_t partitions{0};
+    std::string error;  // what the run threw, if it did
+
+    [[nodiscard]] const HashJoinInfo& Join() const { return joins.at(0); }
+};
+
+// Descriptors this process has open, counted from /dev/fd.
+size_t OpenDescriptors() {
+    std::error_code ec;
+    size_t n = 0;
+    for (std::filesystem::directory_iterator it("/dev/fd", ec), end; !ec && it != end; it.increment(ec)) ++n;
+    return n;
+}
+
+// Makes every temp write fail with this errno while alive.
+class FailWritesScope {
+public:
+    explicit FailWritesScope(int error_number) { TempFile::FailWritesForTest(error_number); }
+    ~FailWritesScope() { TempFile::FailWritesForTest(0); }
+    FailWritesScope(const FailWritesScope&) = delete;
+    FailWritesScope& operator=(const FailWritesScope&) = delete;
+};
+
+// Caps the build rows a spilled load holds, while alive.
+class LoadCapScope {
+public:
+    explicit LoadCapScope(size_t most) { SetHashJoinLoadRowsForTest(most); }
+    ~LoadCapScope() { SetHashJoinLoadRowsForTest(0); }
+    LoadCapScope(const LoadCapScope&) = delete;
+    LoadCapScope& operator=(const LoadCapScope&) = delete;
+};
+
+// Runs a hook with each new temp file's path while alive.
+class OpenHookScope {
+public:
+    explicit OpenHookScope(std::function<void(const std::string&)> hook) { TempFile::SetOpenHookForTest(std::move(hook)); }
+    ~OpenHookScope() { TempFile::SetOpenHookForTest(nullptr); }
+    OpenHookScope(const OpenHookScope&) = delete;
+    OpenHookScope& operator=(const OpenHookScope&) = delete;
+};
+
+// Opens a second descriptor on every new temp file while alive; closes them when done.
+class SecondDescriptors {
+public:
+    SecondDescriptors() {
+        TempFile::SetOpenHookForTest([this](const std::string& path) {
+            const int fd = ::open(path.c_str(), O_RDWR);
+            const std::lock_guard<std::mutex> lock(mutex_);
+            fds_.push_back(fd);
+        });
+    }
+    ~SecondDescriptors() { Close(); }
+    SecondDescriptors(const SecondDescriptors&) = delete;
+    SecondDescriptors& operator=(const SecondDescriptors&) = delete;
+
+    // Flips every bit of the byte at offset in
+    // each file open so far; how many it flipped.
+    size_t FlipByte(uint64_t offset) {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        size_t flipped = 0;
+        for (const int fd : fds_) {
+            unsigned char b = 0;
+            if (fd < 0 || ::pread(fd, &b, 1, static_cast<off_t>(offset)) != 1) continue;
+            b = static_cast<unsigned char>(~b);
+            if (::pwrite(fd, &b, 1, static_cast<off_t>(offset)) == 1) ++flipped;
+        }
+        return flipped;
+    }
+
+    // Stops watching and closes every descriptor.
+    void Close() {
+        TempFile::SetOpenHookForTest(nullptr);
+        const std::lock_guard<std::mutex> lock(mutex_);
+        for (const int fd : fds_) {
+            if (fd >= 0) ::close(fd);
+        }
+        fds_.clear();
+    }
+
+private:
+    std::mutex mutex_;
+    std::vector<int> fds_;
+};
+
+// The spill partition of a lone INTEGER key at one level.
+size_t KeyPartition(int64_t k, int level = 0) {
+    return SpillPartitionOf(detail::FoldKey(0, static_cast<uint64_t>(k)), level);
+}
+
+// The first `per` keys from 0 up that land in each level-0 partition.
+std::vector<std::vector<int64_t>> KeysByPartition(size_t per) {
+    std::vector<std::vector<int64_t>> keys(kSpillPartitions);
+    size_t full = 0;
+    for (int64_t k = 0; full < kSpillPartitions; ++k) {
+        std::vector<int64_t>& mine = keys[KeyPartition(k)];
+        if (mine.size() == per) continue;
+        mine.push_back(k);
+        if (mine.size() == per) ++full;
+    }
+    return keys;
+}
+
+// The first n keys from 0 up that land in level-0 partition q.
+std::vector<int64_t> KeysIn(size_t q, size_t n) {
+    std::vector<int64_t> keys;
+    for (int64_t k = 0; keys.size() < n; ++k) {
+        if (KeyPartition(k) == q) keys.push_back(k);
+    }
+    return keys;
+}
+
+// A plain side row: strings of `len` bytes that change
+// with i, v = i, f and w from i.
+JoinRow PlainRow(int64_t k, uint32_t i, size_t len = 12) {
+    std::string s = "s" + std::to_string(i) + "-";
+    s.resize(len, static_cast<char>('a' + i % 26));
+    return JoinRow{k, s, static_cast<int64_t>(i), i * 0.25 - 7.5, static_cast<__int128>(i) * 1000003 - 4000000};
+}
+
+class ParallelHashJoinSpillTest : public ParallelHashJoinTest {
+protected:
+    std::string temp_dir_;
+    std::unique_ptr<WorkerPool> pool_;
+
+    void SetUp() override {
+        ParallelHashJoinTest::SetUp();
+        temp_dir_ = TempPath("_spill_dir");
+        std::filesystem::remove_all(temp_dir_);
+        db_->SetTempDirectory(temp_dir_);
+        pool_ = std::make_unique<WorkerPool>(kSpillThreads);
+    }
+
+    void TearDown() override {
+        pool_.reset();
+        ParallelHashJoinTest::TearDown();
+        std::filesystem::remove_all(temp_dir_);
+    }
+
+    // The temp directory has no entries, or doesn't exist yet.
+    bool TempDirEmpty() const {
+        std::error_code ec;
+        return !std::filesystem::exists(temp_dir_, ec) || std::filesystem::is_empty(temp_dir_, ec);
+    }
+
+    // Runs a plan's pipelines in order under the config; between(i, budget) runs before
+    // pipeline i > 0. Afterwards no grant, temp file or descriptor is left.
+    JoinSpillResult RunSpill(const std::string& label, const JoinSpillConfig& cfg, const std::function<SpillPlan()>& make,
+                             const std::function<void(size_t, MemoryBudget*)>& between = {}) {
+        const std::string where = label + ", " + std::to_string(cfg.threads) + " threads" + (cfg.spill_everything ? ", everything" : "") +
+                                  (cfg.limit ? ", limit " + std::to_string(*cfg.limit) : "") + ", held " + std::to_string(cfg.held_build) + " / " +
+                                  std::to_string(cfg.held_probe);
+        const size_t descriptors = OpenDescriptors();
+        EXPECT_GT(descriptors, 0u) << "can't list /dev/fd";
+        // The budget comes first, so everything counted in it goes before it.
+        std::optional<MemoryBudget> budget;
+        if (cfg.limit) budget.emplace(*cfg.limit, cfg.threads);
+        MemoryBudget* b = budget ? &*budget : nullptr;
+        std::vector<MemoryReservation> held;
+        const auto hold = [&](size_t bytes) {
+            held.clear();
+            for (unsigned w = 0; w < cfg.threads && bytes > 0; ++w) {
+                held.emplace_back(b, w);
+                EXPECT_TRUE(held.back().Grow(bytes)) << where;
+            }
+        };
+        SpillCounters counters;
+        JoinSpillResult result;
+        {
+            const LoadCapScope cap(cfg.load_cap);
+            SpillPlan plan = make();
+            QueryContext ctx{nullptr, nullptr, cfg.threads, cfg.threads > 1 ? pool_.get() : nullptr};
+            ctx.budget = b;
+            ctx.spill = &counters;
+            ctx.temp_dir = &temp_dir_;
+            ctx.spill_everything = cfg.spill_everything;
+            try {
+                std::optional<FailWritesScope> fail;
+                hold(cfg.held_build);
+                for (size_t i = 0; i < plan.pipelines.size(); ++i) {
+                    if (i == plan.first_probe) hold(cfg.held_probe);
+                    if (i > 0 && between) between(i, b);
+                    if (cfg.fail_writes != 0 && i == cfg.fail_from) fail.emplace(cfg.fail_writes);
+                    RunPipeline(plan.pipelines[i], ctx);
+                }
+            } catch (const std::exception& e) {
+                result.error = e.what();
+            }
+            for (const Operator* op : plan.joins) result.joins.push_back(InspectHashJoin(*op).value_or(HashJoinInfo{}));
+            if (plan.out != nullptr) result.rows = std::move(plan.out->rows);
+        }
+        held.clear();
+        EXPECT_EQ(result.error.empty(), cfg.fail_writes == 0 && !cfg.expect_error) << where << ": " << result.error;
+        if (!cfg.limit && !cfg.spill_everything) EXPECT_EQ(counters.files.load(), 0u) << where;
+        if (b != nullptr) EXPECT_EQ(b->HeldBytes(), 0u) << where;
+        EXPECT_TRUE(TempDirEmpty()) << where;
+        EXPECT_EQ(OpenDescriptors(), descriptors) << where;
+        result.files = counters.files.load();
+        result.written = counters.bytes_written.load();
+        result.read = counters.bytes_read.load();
+        result.partitions = counters.partitions.load();
+        return result;
+    }
+
+    // The build pipeline, then the probe pipeline through `above` into a bytes sink.
+    static SpillPlan OneJoin(const JoinCase& c, std::vector<std::unique_ptr<Operator>> above = {}, const LimitCounter* limit = nullptr) {
+        SpillPlan plan;
+        auto made = MakeHashJoin(SpecOf(c));
+        plan.sources.push_back(std::make_unique<SideInput>(c.build));
+        plan.sources.push_back(std::make_unique<SideInput>(c.probe));
+        plan.joins.push_back(made.second.get());
+        auto out = std::make_unique<BytesSink>(limit);
+        plan.out = out.get();
+        plan.pipelines.push_back(Pipeline{plan.sources[0].get(), {}, made.first.get(), {}});
+        Pipeline probe{plan.sources[1].get(), {made.second.get()}, out.get(), {0}};
+        for (auto& op : above) probe.operators.push_back(op.get());
+        plan.pipelines.push_back(std::move(probe));
+        plan.sinks.push_back(std::move(made.first));
+        plan.sinks.push_back(std::move(out));
+        plan.operators.push_back(std::move(made.second));
+        for (auto& op : above) plan.operators.push_back(std::move(op));
+        return plan;
+    }
+
+    // One join's run with no extra steps.
+    JoinSpillResult RunJoin(const JoinCase& c, const JoinSpillConfig& cfg, const std::function<void(size_t, MemoryBudget*)>& between = {}) {
+        return RunSpill(c.label, cfg, [&c] { return OneJoin(c); }, between);
+    }
+
+    // A query with these threads, spilling everything or not.
+    QueryResult RunWith(const std::string& sql, unsigned threads, bool spill_everything, bool analyze = false) {
+        QueryOptions options;
+        options.mode = ExecutionMode::PARALLEL;
+        options.threads = threads;
+        options.spill_everything = spill_everything;
+        options.analyze = analyze;
+        return db_->ExecuteSQL(sql, options);
+    }
+};
+
+TEST_F(ParallelHashJoinSpillTest, BuildSpillsLargestPartitionsFirst) {
+    // Partition q holds (q + 1) * 40 build rows over 10 keys. Each partition's
+    // rows arrive at its share's pace, so at any moment the higher partition holds more.
+    const auto keys = KeysByPartition(10);
+    struct Placed {
+        double at;
+        int64_t k;
+    };
+    std::vector<Placed> placed;
+    for (size_t q = 0; q < kSpillPartitions; ++q) {
+        const size_t n = (q + 1) * 40;
+        for (size_t j = 0; j < n; ++j) placed.push_back(Placed{(static_cast<double>(j) + 0.5) / static_cast<double>(n), keys[q][j % 10]});
+    }
+    std::stable_sort(placed.begin(), placed.end(), [](const Placed& a, const Placed& b) { return a.at < b.at; });
+    std::vector<int64_t> build_keys;
+    for (const Placed& p : placed) build_keys.push_back(p.k);
+    std::vector<int64_t> probe_keys;
+    for (const auto& mine : keys) probe_keys.insert(probe_keys.end(), mine.begin(), mine.end());
+
+    JoinCase c;
+    c.label = "largest first";
+    c.build = SideData{static_cast<uint32_t>(build_keys.size()), [&build_keys](uint32_t i) { return PlainRow(build_keys[i], i, 24); }};
+    c.probe = SideData{static_cast<uint32_t>(probe_keys.size()), [&probe_keys](uint32_t i) { return PlainRow(probe_keys[i], i); }};
+    const JoinSpillResult want = RunJoin(c, Unspilled(1));
+    ASSERT_EQ(want.rows.size(), build_keys.size());
+
+    for (const unsigned threads : {1u, kSpillThreads}) {
+        // The builds get one shared grant between them.
+        const JoinSpillResult got = RunJoin(c, Squeezed(threads, 1));
+        EXPECT_EQ(BytesDifference(got.rows, want.rows), "") << threads << " threads";
+        EXPECT_GT(got.files, 0u);
+        EXPECT_GT(got.written, 0u);
+        const HashJoinInfo& info = got.Join();
+        EXPECT_GT(info.spilled_partitions, 0u);
+        EXPECT_EQ(got.partitions, info.spilled_partitions);
+        EXPECT_EQ(static_cast<size_t>(__builtin_popcountll(info.spilled_mask)), info.spilled_partitions);
+        EXPECT_EQ(info.build_rows, build_keys.size());
+        // Several workers sharing one grant may each spill all they hold; one worker keeps some.
+        if (threads > 1) continue;
+        EXPECT_LT(info.spilled_partitions, kSpillPartitions);
+        // One worker marks the largest partition each time, so the spilled ones are the highest.
+        const size_t kept = kSpillPartitions - info.spilled_partitions;
+        EXPECT_EQ(info.spilled_mask, ~uint64_t{0} << kept) << std::hex << info.spilled_mask;
+    }
+}
+
+TEST_F(ParallelHashJoinSpillTest, ProbeRowsOfSpilledPartitionsReenter) {
+    // 600 keys, 12 build rows of about 1,100 bytes
+    // and 3 probe rows each, in every partition.
+    JoinCase c;
+    c.label = "reenter";
+    c.build = SideData{7200, [](uint32_t i) { return PlainRow(i % 600, i, 1000); }};
+    c.probe = SideData{1800, [](uint32_t i) { return PlainRow(i % 600, i, 30); }, true};
+
+    // A filter on the build side's v, then COUNT,
+    // SUM(v), MIN(s), SUM(w) of it by the probe key.
+    const auto make = [&c] {
+        SpillPlan plan;
+        auto join = MakeHashJoin(SpecOf(c));
+        const InputLayout out = LayoutOf(JoinTypes());
+        auto filter = std::make_unique<FilterOperator>(Compare(BinaryOp::Op::LT, RefTo(7), IntLiteral(5000), out));
+        AggregateSpec agg;
+        agg.keys.push_back(Col(0, out));
+        agg.out_types.push_back(kInt);
+        for (const auto& [func, col] : std::vector<std::pair<Aggregate::Func, int>>{
+                 {Aggregate::Func::COUNT, -1}, {Aggregate::Func::SUM, 7}, {Aggregate::Func::MIN, 6}, {Aggregate::Func::SUM, 9}}) {
+            agg.funcs.push_back(func);
+            agg.args.push_back(col < 0 ? nullptr : Col(static_cast<uint32_t>(col), out));
+            agg.out_types.push_back(AggregateOutputType(func, agg.args.back().get()));
+        }
+        auto grouped = MakeHashAggregate(std::move(agg));
+        auto rows = std::make_unique<BytesSink>();
+        plan.out = rows.get();
+        plan.sources.push_back(std::make_unique<SideInput>(c.build));
+        plan.sources.push_back(std::make_unique<SideInput>(c.probe));
+        plan.joins.push_back(join.second.get());
+        plan.pipelines.push_back(Pipeline{plan.sources[0].get(), {}, join.first.get(), {}});
+        plan.pipelines.push_back(Pipeline{plan.sources[1].get(), {join.second.get(), filter.get()}, grouped.first.get(), {0}});
+        plan.pipelines.push_back(Pipeline{grouped.second.get(), {}, rows.get(), {1}});
+        plan.sources.push_back(std::move(grouped.second));
+        plan.sinks.push_back(std::move(join.first));
+        plan.sinks.push_back(std::move(grouped.first));
+        plan.sinks.push_back(std::move(rows));
+        plan.operators.push_back(std::move(join.second));
+        plan.operators.push_back(std::move(filter));
+        return plan;
+    };
+    const JoinSpillResult want = RunSpill(c.label, Unspilled(1), make);
+    ASSERT_EQ(want.rows.size(), 600u);
+
+    for (const unsigned threads : {1u, kSpillThreads}) {
+        EXPECT_EQ(BytesDifference(RunSpill(c.label, Unspilled(threads), make).rows, want.rows), "") << threads << " threads";
+        for (const JoinSpillConfig& cfg : {Everything(threads), Squeezed(threads, 1)}) {
+            const JoinSpillResult got = RunSpill(c.label, cfg, make);
+            EXPECT_EQ(BytesDifference(got.rows, want.rows), "") << threads << " threads, everything " << cfg.spill_everything;
+            EXPECT_GT(got.files, 0u);
+            EXPECT_GT(got.written, 0u);
+            EXPECT_GT(got.Join().spilled_partitions, 0u);
+            EXPECT_GT(got.Join().partitions_started, 0u);
+        }
+    }
+}
+
+TEST_F(ParallelHashJoinSpillTest, TwoSpilledJoinsInOnePipeline) {
+    // The first join's output meets the second build on the first build's v.
+    const SideData first_build{6000, [](uint32_t i) { return JoinRow{i % 500, "a" + std::to_string(i), i % 300, i * 0.5, i}; }};
+    const SideData second_build{600, [](uint32_t i) { return PlainRow(i % 300, i, 20); }, true};
+    const SideData probe{2000, [](uint32_t i) { return PlainRow(i % 600, i); }};
+    const auto make = [&] {
+        SpillPlan plan;
+        JoinCase first;
+        first.build = first_build;
+        auto a = MakeHashJoin(SpecOf(first));
+        std::vector<VType> a_out = JoinTypes();
+        JoinSpec spec;
+        spec.build_key = Col(0, LayoutOf(SideTypes()));
+        spec.probe_key = Col(7, LayoutOf(a_out));
+        spec.build_payload = {0, 1, 2, 3, 4};
+        spec.probe_slots = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+        spec.types = a_out;
+        spec.types.insert(spec.types.end(), SideTypes().begin(), SideTypes().end());
+        auto b = MakeHashJoin(std::move(spec));
+        auto rows = std::make_unique<BytesSink>();
+        plan.out = rows.get();
+        plan.sources.push_back(std::make_unique<SideInput>(first_build));
+        plan.sources.push_back(std::make_unique<SideInput>(second_build));
+        plan.sources.push_back(std::make_unique<SideInput>(probe));
+        plan.joins = {a.second.get(), b.second.get()};
+        plan.pipelines.push_back(Pipeline{plan.sources[0].get(), {}, a.first.get(), {}});
+        plan.pipelines.push_back(Pipeline{plan.sources[1].get(), {}, b.first.get(), {}});
+        plan.pipelines.push_back(Pipeline{plan.sources[2].get(), {a.second.get(), b.second.get()}, rows.get(), {0, 1}});
+        plan.first_probe = 2;
+        plan.sinks.push_back(std::move(a.first));
+        plan.sinks.push_back(std::move(b.first));
+        plan.sinks.push_back(std::move(rows));
+        plan.operators.push_back(std::move(a.second));
+        plan.operators.push_back(std::move(b.second));
+        return plan;
+    };
+    const JoinSpillResult want = RunSpill("two joins", Unspilled(1), make);
+    ASSERT_GT(want.rows.size(), 10000u);
+
+    for (const unsigned threads : {1u, kSpillThreads}) {
+        EXPECT_EQ(BytesDifference(RunSpill("two joins", Unspilled(threads), make).rows, want.rows), "") << threads << " threads";
+        // Both builds spill everything, so every row the second join sees came out of the
+        // first join's spill phase, and the second join spills those in turn.
+        const JoinSpillResult got = RunSpill("two joins", Everything(threads), make);
+        EXPECT_EQ(BytesDifference(got.rows, want.rows), "") << threads << " threads";
+        ASSERT_EQ(got.joins.size(), 2u);
+        for (const HashJoinInfo& info : got.joins) {
+            EXPECT_GT(info.spilled_partitions, 0u);
+            EXPECT_EQ(info.spilled_partitions, static_cast<size_t>(__builtin_popcountll(info.spilled_mask)));
+            EXPECT_GT(info.partitions_started, 0u);
+        }
+        EXPECT_GT(got.files, 0u);
+        EXPECT_GT(got.written, 0u);
+        EXPECT_EQ(got.partitions, got.joins[0].spilled_partitions + got.joins[1].spilled_partitions);
+    }
+}
+
+TEST_F(ParallelHashJoinSpillTest, RecursiveSplit) {
+    // 2,000 keys of one level-0 partition, 4 build rows and 2 probe rows each.
+    const std::vector<int64_t> keys = KeysIn(5, 2000);
+    JoinCase c;
+    c.label = "split";
+    c.build = SideData{8000, [&keys](uint32_t i) { return PlainRow(keys[i % 2000], i); }};
+    c.probe = SideData{4000, [&keys](uint32_t i) { return PlainRow(keys[(i * 7) % 2000], i); }};
+    c.residual = true;
+    const JoinSpillResult want = RunJoin(c, Unspilled(1));
+    ASSERT_GT(want.rows.size(), 1000u);
+
+    for (const unsigned threads : {1u, kSpillThreads}) {
+        // The test cap: the partition's 8,000 rows won't load whole, so it splits once.
+        JoinSpillConfig capped = Everything(threads);
+        capped.load_cap = 1000;
+        const JoinSpillResult got = RunJoin(c, capped);
+        EXPECT_EQ(BytesDifference(got.rows, want.rows), "") << threads << " threads";
+        EXPECT_EQ(got.Join().spilled_partitions, 1u);
+        EXPECT_EQ(got.Join().partitions_started, 1u);
+        EXPECT_EQ(got.Join().splits, 1u);
+        EXPECT_EQ(got.Join().chunked_pieces, 0u);
+        EXPECT_EQ(got.partitions, 1u);
+        EXPECT_GT(got.files, 0u);
+        EXPECT_GT(got.written, 0u);
+        if (threads == 1) EXPECT_EQ(got.files, 4u) << "a build and a probe file, then one of each from the split";
+
+        // The budget: the probe's worker has one grant, less than the partition needs,
+        // but enough for each piece of a split.
+        JoinSpillConfig tight = Everything(threads);
+        tight.held_probe = kWorkerMinimumBytes - kGrantBytes;
+        JoinCase wide = c;
+        wide.build = SideData{40000, [&keys](uint32_t i) { return PlainRow(keys[i % 2000], i, 40); }};
+        const JoinSpillResult wide_want = RunJoin(wide, Unspilled(1));
+        const JoinSpillResult split = RunJoin(wide, tight);
+        EXPECT_EQ(BytesDifference(split.rows, wide_want.rows), "") << threads << " threads";
+        EXPECT_EQ(split.Join().splits, 1u);
+        EXPECT_EQ(split.Join().chunked_pieces, 0u);
+        EXPECT_GT(split.written, 0u);
+    }
+}
+
+TEST_F(ParallelHashJoinSpillTest, OneKeyBiggerThanTheBudget) {
+    // Key 7 holds 30,000 of 33,334 build rows (90%), about 9 MB, past one grant.
+    // The other keys share its level-0 partition.
+    std::vector<int64_t> others;
+    for (const int64_t k : KeysIn(KeyPartition(7), 601)) {
+        if (k != 7) others.push_back(k);
+    }
+    ASSERT_GE(others.size(), 600u);
+    JoinCase c;
+    c.label = "one big key";
+    c.build = SideData{33334, [&others](uint32_t i) { return PlainRow(i < 30000 ? 7 : others[i % 500], i, 200); }};
+    c.probe = SideData{2002, [&others](uint32_t i) { return PlainRow(i < 2 ? 7 : others[i % 600], i); }};
+    const JoinSpillResult want = RunJoin(c, Unspilled(1));
+    ASSERT_GT(want.rows.size(), 60000u);
+
+    for (const unsigned threads : {1u, kSpillThreads}) {
+        // Each probe worker has one grant, so key 7's rows load in chunks.
+        JoinSpillConfig cfg = Everything(threads);
+        cfg.held_probe = kWorkerMinimumBytes - kGrantBytes;
+        const JoinSpillResult got = RunJoin(c, cfg);
+        EXPECT_EQ(BytesDifference(got.rows, want.rows), "") << threads << " threads";
+        EXPECT_EQ(got.Join().spilled_partitions, 1u);
+        EXPECT_GE(got.Join().chunked_pieces, 1u);
+        EXPECT_GE(got.Join().loads, got.Join().chunked_pieces + 2) << "key 7's piece loads in several chunks";
+        EXPECT_GT(got.files, 0u);
+        EXPECT_GT(got.written, 0u);
+
+        // With the test cap instead of the budget: a
+        // split that leaves every row in one piece.
+        JoinCase alone = c;
+        alone.build = SideData{3000, [](uint32_t i) { return PlainRow(7, i); }};
+        alone.probe = SideData{50, [](uint32_t i) { return PlainRow(i % 2 == 0 ? 7 : 8, i); }};
+        const JoinSpillResult alone_want = RunJoin(alone, Unspilled(1));
+        JoinSpillConfig capped = Everything(threads);
+        capped.load_cap = 300;
+        const JoinSpillResult chunked = RunJoin(alone, capped);
+        EXPECT_EQ(BytesDifference(chunked.rows, alone_want.rows), "") << threads << " threads";
+        EXPECT_EQ(chunked.Join().splits, 1u);
+        EXPECT_EQ(chunked.Join().chunked_pieces, 1u);
+        EXPECT_GE(chunked.Join().loads, 3u) << "a block or two per chunk";
+        EXPECT_GT(chunked.files, 0u);
+        EXPECT_GT(chunked.written, 0u);
+    }
+}
+
+TEST_F(ParallelHashJoinSpillTest, EmptyBuildAndAlmostNoBudget) {
+    const SideData probe{5000, [](uint32_t i) { return PlainRow(i % 700, i); }};
+    for (const unsigned threads : {1u, kSpillThreads}) {
+        // A budget whose floors are all held, from the first row to the last.
+        JoinSpillConfig none = Unspilled(threads);
+        none.limit = threads * kWorkerMinimumBytes;
+        none.held_build = kWorkerMinimumBytes;
+        none.held_probe = kWorkerMinimumBytes;
+        JoinSpillConfig none_everything = none;
+        none_everything.spill_everything = true;
+
+        // An empty build side never spills, whatever the budget.
+        JoinCase empty;
+        empty.label = "empty build";
+        empty.build = SideData{0, [](uint32_t i) { return PlainRow(0, i); }};
+        empty.probe = probe;
+        for (const JoinSpillConfig& cfg : {Unspilled(threads), Everything(threads), none, none_everything}) {
+            const JoinSpillResult got = RunJoin(empty, cfg);
+            EXPECT_TRUE(got.rows.empty()) << threads << " threads";
+            EXPECT_EQ(got.files, 0u);
+            EXPECT_EQ(got.Join().spilled_partitions, 0u);
+            EXPECT_EQ(got.Join().build_rows, 0u);
+        }
+
+        // A few build rows with no memory at all: every row
+        // spills, and the phase loads one block at a time.
+        JoinCase few = empty;
+        few.label = "few rows";
+        few.build = SideData{50, [](uint32_t i) { return PlainRow(i * 13 % 700, i); }};
+        const JoinSpillResult want = RunJoin(few, Unspilled(1));
+        ASSERT_GT(want.rows.size(), 0u);
+        for (const JoinSpillConfig& cfg : {none, none_everything}) {
+            const JoinSpillResult got = RunJoin(few, cfg);
+            EXPECT_EQ(BytesDifference(got.rows, want.rows), "") << threads << " threads";
+            EXPECT_GT(got.files, 0u);
+            EXPECT_GT(got.written, 0u);
+            EXPECT_GT(got.Join().spilled_partitions, 0u);
+        }
+    }
+}
+
+TEST_F(ParallelHashJoinSpillTest, PayloadStringsSurvive) {
+    // Strings on both sides: empty, multibyte, 8,000 bytes and short, plain and coded.
+    const auto text = [](uint32_t i) -> std::string {
+        switch (i % 5) {
+            case 0: return "";
+            case 1: return "épée ünï " + std::to_string(i % 7);
+            case 2: return BigText(i % 3);
+            case 3: return "w" + std::to_string(i % 11);
+            default: return kWords[i % 5];
+        }
+    };
+    for (const bool dictionary : {false, true}) {
+        for (const bool build_left : {false, true}) {
+            JoinCase c;
+            c.label = std::string("strings") + (dictionary ? ", coded" : "") + (build_left ? ", build left" : "");
+            c.build_left = build_left;
+            c.build = SideData{3000, [&text](uint32_t i) { return JoinRow{i % 300, text(i), i, -0.0, -static_cast<__int128>(i)}; }, dictionary};
+            c.probe = SideData{3000, [&text](uint32_t i) { return JoinRow{(i * 7) % 350, text(i + 2), i, i * 1.5, i}; }, dictionary};
+            const JoinSpillResult want = RunJoin(c, Unspilled(1));
+            ASSERT_GT(want.rows.size(), 1000u);
+            for (const unsigned threads : {1u, kSpillThreads}) {
+                for (const JoinSpillConfig& cfg : {Everything(threads), Squeezed(threads, 1)}) {
+                    const JoinSpillResult got = RunJoin(c, cfg);
+                    EXPECT_EQ(BytesDifference(got.rows, want.rows), "") << c.label << ", " << threads << " threads";
+                    EXPECT_GT(got.files, 0u);
+                    EXPECT_GT(got.written, 0u);
+                    EXPECT_GT(got.Join().spilled_partitions, 0u);
+                }
+            }
+        }
+    }
+
+    // Through SQL: the l and r tables, spilled against unspilled, byte for byte.
+    const std::string sql = "SELECT l_k, l_v, l_s, r_k, r_w, r_t FROM l JOIN r ON l_k = r_k";
+    const QueryResult want = RunWith(sql, 1, false, true);
+    for (const unsigned threads : {1u, 2u}) {
+        const QueryResult got = RunWith(sql, threads, true, true);
+        EXPECT_EQ(ExactMultisetDifference(got, want), "") << threads << " threads";
+        const ParallelQueryStats& stats = db_->LastParallelStats();
+        EXPECT_GT(stats.spill_files, 0u);
+        EXPECT_GT(stats.spill_bytes_written, 0u);
+        EXPECT_GT(stats.spill_partitions, 0u);
+        // Analyze charges the spill phase's rows to the join, as morsels' are.
+        ASSERT_EQ(got.profile.operators.size(), want.profile.operators.size());
+        for (size_t i = 0; i < got.profile.operators.size(); ++i) {
+            EXPECT_EQ(got.profile.operators[i].name, want.profile.operators[i].name);
+            EXPECT_EQ(got.profile.operators[i].rows, want.profile.operators[i].rows) << got.profile.operators[i].name;
+        }
+    }
+    EXPECT_TRUE(TempDirEmpty());
+}
+
+TEST_F(ParallelHashJoinSpillTest, LimitStopsTheSpillPhase) {
+    // 640 keys over every partition, 10 build rows each; a LIMIT 5 above the join.
+    const auto keys = KeysByPartition(10);
+    std::vector<int64_t> all;
+    for (const auto& mine : keys) all.insert(all.end(), mine.begin(), mine.end());
+    JoinCase c;
+    c.label = "limit";
+    c.build = SideData{6400, [&all](uint32_t i) { return PlainRow(all[i % 640], i); }};
+    c.probe = SideData{640, [&all](uint32_t i) { return PlainRow(all[i], i); }};
+    const JoinSpillResult every = RunJoin(c, Unspilled(1));
+    ASSERT_EQ(every.rows.size(), 6400u);
+
+    const auto make = [&c] {
+        std::vector<std::unique_ptr<Operator>> above;
+        auto limit = std::make_unique<LimitOperator>(5);
+        const LimitCounter* counter = &limit->Counter();
+        above.push_back(std::move(limit));
+        return OneJoin(c, std::move(above), counter);
+    };
+    for (const unsigned threads : {1u, kSpillThreads}) {
+        const JoinSpillResult got = RunSpill(c.label, Everything(threads), make);
+        ASSERT_EQ(got.rows.size(), 5u) << threads << " threads";
+        for (const std::string& row : got.rows) EXPECT_NE(std::find(every.rows.begin(), every.rows.end(), row), every.rows.end());
+        EXPECT_EQ(got.Join().spilled_partitions, kSpillPartitions);
+        EXPECT_GT(got.Join().partitions_started, 0u);
+        EXPECT_LT(got.Join().partitions_started, kSpillPartitions / 2) << threads << " threads";
+        EXPECT_LT(got.read, got.written);
+    }
+}
+
+TEST_F(ParallelHashJoinSpillTest, FailedWriteLeavesNothingBehind) {
+    const std::string reason = "out of temp space in " + temp_dir_ + " while spilling: " + std::strerror(ENOSPC);
+    JoinCase c;
+    c.label = "failing";
+    c.build = SideData{20000, [](uint32_t i) { return PlainRow(i % 700, i, 300); }};
+    c.probe = SideData{3000, [](uint32_t i) { return PlainRow(i % 700, i, 300); }};
+    const JoinSpillResult want = RunJoin(c, Unspilled(1));
+
+    // One partition and one morsel per side: the
+    // third temp file is the spill phase's split.
+    const std::vector<int64_t> keys = KeysIn(9, 500);
+    JoinCase one = c;
+    one.build = SideData{20000, [&keys](uint32_t i) { return PlainRow(keys[i % 500], i, 300); }, false, 1};
+    one.probe = SideData{3000, [&keys](uint32_t i) { return PlainRow(keys[i % 500], i, 300); }, false, 1};
+
+    for (const unsigned threads : {1u, kSpillThreads}) {
+        // In the build, then in the probe's morsels.
+        for (const size_t from : {size_t{0}, size_t{1}}) {
+            JoinSpillConfig cfg = Everything(threads);
+            cfg.fail_writes = ENOSPC;
+            cfg.fail_from = from;
+            const JoinSpillResult failed = RunJoin(c, cfg);
+            EXPECT_EQ(failed.error, reason) << threads << " threads, from " << from;
+            EXPECT_TRUE(failed.rows.empty());
+        }
+        // In the spill phase, splitting a partition past the cap.
+        {
+            JoinSpillConfig cfg = Everything(threads);
+            cfg.expect_error = true;
+            cfg.load_cap = 2000;
+            std::atomic<int> opened{0};
+            const OpenHookScope hook([&opened](const std::string&) {
+                if (opened.fetch_add(1) == 2) TempFile::FailWritesForTest(ENOSPC);
+            });
+            const JoinSpillResult failed = RunJoin(one, cfg);
+            TempFile::FailWritesForTest(0);
+            EXPECT_GE(opened.load(), 3) << threads << " threads";
+            EXPECT_EQ(failed.error, reason) << threads << " threads, in the split";
+        }
+        // The next join answers.
+        const JoinSpillResult next = RunJoin(c, Everything(threads));
+        EXPECT_EQ(BytesDifference(next.rows, want.rows), "") << threads << " threads";
+        EXPECT_GT(next.files, 0u);
+    }
+}
+
+TEST_F(ParallelHashJoinSpillTest, DamagedSpillIsRefused) {
+    JoinCase c;
+    c.label = "damaged";
+    c.build = SideData{4000, [](uint32_t i) { return PlainRow(i % 400, i); }};
+    c.probe = SideData{1000, [](uint32_t i) { return PlainRow(i % 400, i); }};
+    for (const unsigned threads : {1u, kSpillThreads}) {
+        SecondDescriptors second;
+        size_t flipped = 0;
+        JoinSpillConfig cfg = Everything(threads);
+        cfg.expect_error = true;
+        // Between the pipelines, a byte of every build file's first block's payload flips.
+        const JoinSpillResult got = RunSpill(c.label, cfg, [&c] { return OneJoin(c); }, [&](size_t, MemoryBudget*) {
+            flipped = second.FlipByte(sizeof(TempBlockHeader) + 3);
+            second.Close();
+        });
+        EXPECT_GT(flipped, 0u);
+        EXPECT_EQ(got.error, "damaged temp file: checksum mismatch") << threads << " threads";
+    }
+}
+
+TEST_F(ParallelHashJoinSpillTest, BuildStaysInMemoryOffTheFloor) {
+    JoinCase c;
+    c.label = "off the floor";
+    c.build = SideData{16000, [](uint32_t i) { return PlainRow(i % 2000, i); }};
+    c.probe = SideData{2000, [](uint32_t i) { return PlainRow(i, i); }};
+    const JoinSpillResult want = RunJoin(c, Unspilled(1));
+    for (const unsigned threads : {1u, kSpillThreads}) {
+        // Each worker's rows fit one grant, and there
+        // is a grant of shared room per worker.
+        JoinSpillConfig cfg = Unspilled(threads);
+        cfg.limit = threads * (kWorkerMinimumBytes + kGrantBytes);
+        bool checked = false;
+        const JoinSpillResult got = RunJoin(c, cfg, [&](size_t, MemoryBudget* b) {
+            EXPECT_GT(b->HeldBytes(), 0u);
+            EXPECT_GT(b->PeakBytes(), threads * kWorkerMinimumBytes) << "LeaveFloor moved the table to the shared pool";
+            checked = true;
+        });
+        EXPECT_TRUE(checked);
+        EXPECT_EQ(BytesDifference(got.rows, want.rows), "") << threads << " threads";
+        EXPECT_EQ(got.files, 0u);
+        EXPECT_EQ(got.Join().spilled_partitions, 0u);
+    }
+}
+
+TEST_F(ParallelHashJoinSpillTest, SpilledKeysOfEveryForm) {
+    // Keys: strings (some multibyte), doubles (-0.0 and +0.0 meet; NaN meets nothing),
+    // wide decimals, and integers against wide decimals.
+    const auto make = [](uint32_t i, uint32_t keys) {
+        const uint32_t k = i % keys;
+        JoinRow r;
+        r.k = k;
+        r.s = (k % 3 == 0 ? "ключ " : "key ") + std::to_string(k);
+        r.v = i;
+        r.f = k == 0 ? (i % 2 == 0 ? -0.0 : 0.0) : (k == 1 ? std::nan("") : k * 0.5);
+        r.w = static_cast<__int128>(k) * 1000;
+        return r;
+    };
+    struct Form {
+        uint32_t build_slot;
+        uint32_t probe_slot;
+        const char* label;
+    };
+    for (const Form& form : {Form{1, 1, "string keys"}, Form{3, 3, "double keys"}, Form{4, 4, "wide decimal keys"},
+                             Form{0, 4, "integer against wide decimal keys"}}) {
+        JoinCase c;
+        c.label = form.label;
+        c.build_key_slot = form.build_slot;
+        c.probe_key_slot = form.probe_slot;
+        c.build = SideData{6000, [make](uint32_t i) { return make(i, 400); }, true};
+        c.probe = SideData{1500, [make](uint32_t i) { return make(i * 7, 450); }};
+        const JoinSpillResult want = RunJoin(c, Unspilled(1));
+        ASSERT_GT(want.rows.size(), 1000u) << c.label;
+        for (const unsigned threads : {1u, kSpillThreads}) {
+            // Everything spilled, or no room at all while building.
+            for (const JoinSpillConfig& cfg : {Everything(threads), Squeezed(threads, 0)}) {
+                const JoinSpillResult got = RunJoin(c, cfg);
+                EXPECT_EQ(BytesDifference(got.rows, want.rows), "") << c.label << ", " << threads << " threads";
+                EXPECT_GT(got.files, 0u);
+                EXPECT_GT(got.written, 0u);
+                EXPECT_GT(got.Join().spilled_partitions, 0u);
+            }
+        }
+    }
+}
+
+TEST_F(ParallelHashJoinSpillTest, TablesKeepWorkerAndArrivalOrder) {
+    // Nothing spills: key 7's pairs come in worker order, then each worker's arrival order.
+    {
+        MemoryBudget budget(2 * (kWorkerMinimumBytes + kGrantBytes), 2);
+        SpillCounters counters;
+        {
+            auto made = IntJoin(false);
+            QueryContext ctx{nullptr, nullptr, 2};
+            ctx.budget = &budget;
+            ctx.spill = &counters;
+            ctx.temp_dir = &temp_dir_;
+            auto w0 = made.first->MakeWorkerLocal(ctx, 0);
+            auto w1 = made.first->MakeWorkerLocal(ctx, 1);
+            Batch a = PairBatch({{7, 10}, {8, 1}, {7, 11}});
+            Batch b = PairBatch({{7, 20}, {7, 21}});
+            Batch c = PairBatch({{7, 12}});
+            made.first->Consume(a, *w0);
+            made.first->Consume(b, *w1);
+            made.first->Consume(c, *w0);
+            made.first->Combine(std::move(w0));
+            made.first->Combine(std::move(w1));
+            made.first->Finalize(ctx);
+            EXPECT_GT(budget.HeldBytes(), 0u);
+            Batch probe = PairBatch({{7, -7}});
+            auto local = made.second->MakeLocal();
+            EXPECT_EQ(Drain(*made.second, probe, local.get()), (std::vector<std::pair<int64_t, int64_t>>{{-7, 10}, {-7, 11}, {-7, 12}, {-7, 20}, {-7, 21}}));
+            EXPECT_EQ(InspectHashJoin(*made.second)->spilled_partitions, 0u);
+        }
+        EXPECT_EQ(budget.HeldBytes(), 0u);
+        EXPECT_EQ(counters.files.load(), 0u);
+    }
+
+    // One worker whose build spills switches to rows by partition; key 7's partition stays
+    // in memory, and its rows keep their arrival order.
+    MemoryBudget budget(kWorkerMinimumBytes + 2 * kGrantBytes, 1);
+    SpillCounters counters;
+    {
+        MemoryReservation floor(&budget, 0);
+        ASSERT_TRUE(floor.Grow(kWorkerMinimumBytes));
+        auto made = IntJoin(false);
+        QueryContext ctx{nullptr, nullptr, 1};
+        ctx.budget = &budget;
+        ctx.spill = &counters;
+        ctx.temp_dir = &temp_dir_;
+        auto w = made.first->MakeWorkerLocal(ctx, 0);
+        const size_t seven = KeyPartition(7);
+        int64_t filler = 1000;
+        for (int64_t batch = 0; batch < 150; ++batch) {
+            std::vector<std::pair<int64_t, int64_t>> rows;
+            rows.emplace_back(7, batch);
+            while (rows.size() < kBatchSize) {
+                if (KeyPartition(++filler) != seven) rows.emplace_back(filler, filler);
+            }
+            Batch b = PairBatch(rows);
+            made.first->Consume(b, *w);
+        }
+        made.first->Combine(std::move(w));
+        made.first->Finalize(ctx);
+        const HashJoinInfo info = *InspectHashJoin(*made.second);
+        EXPECT_GT(info.spilled_partitions, 0u);
+        ASSERT_EQ(info.spilled_mask >> seven & 1, 0u) << "key 7's partition stays in memory";
+        Batch probe = PairBatch({{7, -7}});
+        auto local = made.second->MakeLocal();
+        std::vector<std::pair<int64_t, int64_t>> want;
+        for (int64_t batch = 0; batch < 150; ++batch) want.emplace_back(-7, batch);
+        EXPECT_EQ(Drain(*made.second, probe, local.get()), want);
+        EXPECT_GT(counters.files.load(), 0u);
+    }
+    EXPECT_EQ(budget.HeldBytes(), 0u);
+    EXPECT_TRUE(TempDirEmpty());
+}
+
+TEST_F(ParallelHashJoinSpillTest, FinalizeSpillsWhatCantLeaveTheFloor) {
+    // Each worker's rows fit its floor, so Consume never spills; with no shared room
+    // they can't leave the floor at Finalize, so they go to disk there.
+    JoinCase c;
+    c.label = "finalize spill";
+    c.build = SideData{20000, [](uint32_t i) { return PlainRow(i % 2000, i); }};
+    c.probe = SideData{3000, [](uint32_t i) { return PlainRow(i % 2500, i); }};
+    const JoinSpillResult want = RunJoin(c, Unspilled(1));
+    ASSERT_GT(want.rows.size(), 10000u);
+    for (const unsigned threads : {1u, kSpillThreads}) {
+        JoinSpillConfig cfg = Unspilled(threads);
+        cfg.limit = threads * kWorkerMinimumBytes;
+        const JoinSpillResult got = RunJoin(c, cfg);
+        EXPECT_EQ(BytesDifference(got.rows, want.rows), "") << threads << " threads";
+        EXPECT_GT(got.files, 0u);
+        EXPECT_GT(got.written, 0u);
+        EXPECT_GT(got.Join().spilled_partitions, 0u);
+    }
+}
+
+TEST_F(ParallelHashJoinSpillTest, FinishedTableHoldsNoSpareGrant) {
+    // 95,000 rows of 48 bytes need two grants; without their 8-byte hashes, one.
+    MemoryBudget budget(kWorkerMinimumBytes + 2 * kGrantBytes, 1);
+    {
+        auto made = IntJoin(false);
+        QueryContext ctx{nullptr, nullptr, 1};
+        ctx.budget = &budget;
+        ctx.temp_dir = &temp_dir_;
+        auto w = made.first->MakeWorkerLocal(ctx, 0);
+        for (int64_t first = 0; first < 95000; first += kBatchSize) {
+            std::vector<std::pair<int64_t, int64_t>> rows;
+            for (int64_t i = first; i < std::min<int64_t>(first + kBatchSize, 95000); ++i) rows.emplace_back(i, i);
+            Batch b = PairBatch(rows);
+            made.first->Consume(b, *w);
+        }
+        made.first->Combine(std::move(w));
+        made.first->Finalize(ctx);
+        EXPECT_EQ(InspectHashJoin(*made.second)->build_rows, 95000u);
+        EXPECT_EQ(InspectHashJoin(*made.second)->spilled_partitions, 0u);
+        EXPECT_EQ(budget.HeldBytes(), kGrantBytes) << "the table keeps the one grant it uses, no spare";
+    }
+    EXPECT_EQ(budget.HeldBytes(), 0u);
 }
 
 }  // namespace

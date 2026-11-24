@@ -33,6 +33,9 @@ public:
     // Bytes copied in since the last Clear(), not the memory the blocks hold.
     [[nodiscard]] size_t BytesUsed() const { return bytes_used_; }
 
+    // Memory the blocks take, filled or not.
+    [[nodiscard]] size_t BytesHeld() const { return blocks_.size() * kBlockSize + large_bytes_; }
+
 private:
     // Room for n bytes that stays put until Clear().
     char* Allocate(size_t n);
@@ -41,6 +44,7 @@ private:
     std::vector<std::unique_ptr<char[]>> large_;   // one per value over kBlockSize
     size_t block_used_{0};                         // bytes taken in blocks_.back()
     size_t bytes_used_{0};
+    size_t large_bytes_{0};                        // bytes in large_
 };
 
 }  // namespace shilmandb

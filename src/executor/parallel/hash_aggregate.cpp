@@ -36,9 +36,6 @@ constexpr size_t kGroupsPerPartition = 65536;
 // The most partitions a merge splits into.
 constexpr size_t kMaxPartitions = 1024;
 
-// The deepest a spilled partition splits; a piece this deep merges even past the budget.
-constexpr int kMaxSpillLevel = 4;
-
 // Set only by tests, on the calling thread.
 // A merge of spilled groups splits past this many groups; 0 means no cap.
 size_t test_merge_groups = 0;
@@ -476,6 +473,7 @@ void FillSpillLayout(GroupShape& shape) {
         shape.spill_arrays.push_back(a);
         bytes += ArrayWidth(a);
     };
+
     for (const VType& t : shape.keys) column(ArrayOf(t));
     column(ValueArray::I64);  // the hash
     for (const AggInfo& info : shape.aggs) {
@@ -549,26 +547,16 @@ void WriteGroups(const GroupTable& t, const GroupShape& shape, size_t n, IdAt id
     std::vector<const ColumnBuffer*> parts;
     for (const ColumnBuffer& col : cols) parts.push_back(&col);
     std::vector<uint8_t> partition_of;
-    std::vector<uint32_t> order;
     for (size_t at = 0; at < n; at += kBatchSize) {
         const size_t m = std::min<size_t>(kBatchSize, n - at);
         for (ColumnBuffer& col : cols) ClearBuffer(col);
         partition_of.resize(m);
-        std::array<uint32_t, kSpillPartitions + 1> offsets{};
         for (size_t i = 0; i < m; ++i) {
             const uint32_t g = id_at(at + i);
             AppendSpilledGroup(t, g, shape, cols);
             partition_of[i] = static_cast<uint8_t>(SpillPartitionOf(t.hashes[g], level));
-            ++offsets[partition_of[i] + 1];
         }
-        for (size_t p = 0; p < kSpillPartitions; ++p) offsets[p + 1] += offsets[p];
-        std::array<uint32_t, kSpillPartitions> next{};
-        std::copy(offsets.begin(), offsets.end() - 1, next.begin());
-        order.resize(m);
-        for (size_t i = 0; i < m; ++i) order[next[partition_of[i]]++] = static_cast<uint32_t>(i);
-        for (size_t p = 0; p < kSpillPartitions; ++p) {
-            if (offsets[p + 1] > offsets[p]) writer.Add(p, parts, order.data() + offsets[p], offsets[p + 1] - offsets[p]);
-        }
+        writer.AddByPartition(parts, partition_of.data(), m);
     }
 }
 
@@ -581,6 +569,7 @@ GroupTable FromBlock(std::vector<ColumnBuffer>& block, const GroupShape& shape) 
     for (const int64_t h : block[c++].i64) t.hashes.push_back(static_cast<uint64_t>(h));
     t.size = t.hashes.size();
     t.states.resize(shape.aggs.size());
+    
     for (size_t a = 0; a < shape.aggs.size(); ++a) {
         StateColumn& s = t.states[a];
         switch (shape.aggs[a].kind) {
@@ -609,11 +598,7 @@ GroupTable FromBlock(std::vector<ColumnBuffer>& block, const GroupShape& shape) 
 // Reads the spilled block at `at` as a table of groups, strings into arena.
 GroupTable ReadGroups(const SpillFile& file, uint64_t at, const GroupShape& shape, std::vector<ColumnBuffer>& block, StringArena& arena) {
     for (ColumnBuffer& b : block) ClearBuffer(b);
-    uint64_t offset = at;
-    if (!file.file.ReadBlock(&offset, block, file.arrays, arena)) {
-        assert(false && "a spilled block offset past the file's end");
-        throw DatabaseException("damaged temp file: a spilled block past the file's end");
-    }
+    file.ReadBlockAt(at, block, arena);
     return FromBlock(block, shape);
 }
 

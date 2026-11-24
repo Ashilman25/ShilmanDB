@@ -108,6 +108,22 @@ public:
     // An operator that answers NEED_INPUT may swap in and out instead of copying.
     // Const, since workers share the operator; their own state goes in local.
     virtual OpResult Execute(Batch& in, Batch& out, LocalState* local) const = 0;
+
+    // After this worker's last morsel (and after each
+    // spill phase): flush what it buffered for later.
+    virtual void FinishMorsels(LocalState* local) const;
+
+    // Spilled partitions waiting after the source's morsels and earlier spill phases.
+    // Known before the pipeline starts.
+    [[nodiscard]] virtual size_t SpilledPartitionCount() const;
+
+    // Joins partition p for this worker; NextSpilledBatch then hands out its output batches.
+    // Strings in a batch stay valid until the next NextSpilledBatch call.
+    virtual void StartSpilledPartition(size_t p, LocalState* local) const;
+    virtual bool NextSpilledBatch(LocalState* local, Batch& out) const;
+
+    // Once the pipeline's sink is finalized: frees what the operator still holds (a build table).
+    virtual void PipelineDone();
 };
 
 // Where a pipeline's rows end up: each worker fills its own local, then they're combined.
@@ -151,10 +167,10 @@ struct Pipeline {
 // Gives batch one slot per type, rebuilding the slots only when they differ.
 void ShapeBatch(Batch& batch, const std::vector<VType>& types);
 
-// Runs one pipeline: every morsel through the operators into the sink, then Combine and Finalize.
-// Several workers take morsels when ctx has a pool, 2+ threads and 2+ morsels.
-// The buffer pool is concurrent only while they run.
-// With ctx.op_stats set, each step's own thread time and rows go to its plan node.
+// Runs one pipeline: morsels through the operators into the sink, then each spilled operator's
+// partitions, then Combine, Finalize and every operator's PipelineDone.
+// Several workers run with a pool, 2+ threads and 2+ morsels or spilled partitions; the
+// buffer pool is concurrent only while they run. With ctx.op_stats set, steps charge their nodes.
 void RunPipeline(Pipeline& p, QueryContext& ctx);
 
 // Runs task(0..count-1) once each, across the pool's workers when there is one.

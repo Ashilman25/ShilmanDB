@@ -33,6 +33,7 @@ char* StringArena::Allocate(size_t n) {
     if (n > kBlockSize) {
         std::unique_ptr<char[]> own(new char[n]);
         large_.push_back(std::move(own));
+        large_bytes_ += n;
         return large_.back().get();
     }
     if (blocks_.empty() || kBlockSize - block_used_ < n) {
@@ -48,6 +49,7 @@ char* StringArena::Allocate(size_t n) {
 // Frees every block but the first, which starts filling again from the top.
 void StringArena::Clear() {
     large_.clear();
+    large_bytes_ = 0;
     if (blocks_.size() > 1) {
         blocks_.erase(blocks_.begin() + 1, blocks_.end());
     }

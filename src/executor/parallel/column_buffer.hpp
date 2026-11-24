@@ -65,6 +65,9 @@ void Gather(const Vector& from, const uint32_t* rows, uint32_t n, Vector& out);
 // Moves from's values after to's; strings keep pointing where they did.
 void Extend(ColumnBuffer& to, ColumnBuffer&& from);
 
+// Appends from's rows[0..n), in that order, to `to`; strings are copied into arena.
+void CopyRows(const ColumnBuffer& from, ValueArray a, const uint32_t* rows, size_t n, ColumnBuffer& to, StringArena& arena);
+
 // Rows kept past their batches: one buffer per column. New strings go into arena;
 // arenas taken from other stores keep those stores' strings valid.
 struct ColumnStore {

@@ -363,7 +363,8 @@ bool TempFile::ReadBlock(uint64_t* offset, std::vector<ColumnBuffer>& out, const
             case ValueArray::STR: {
                 const char* lengths = p;
                 const char* bytes = p + rows * sizeof(uint32_t);
-                col.str.reserve(col.str.size() + rows);
+                // Doubling, since a caller may append many blocks to one buffer.
+                if (col.str.capacity() < col.str.size() + rows) col.str.reserve(std::max<size_t>(col.str.size() + rows, 2 * col.str.capacity()));
                 for (uint64_t r = 0; r < rows; ++r) {
                     uint32_t len = 0;
                     std::memcpy(&len, lengths + r * sizeof(uint32_t), sizeof(len));

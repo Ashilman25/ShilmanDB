@@ -37,14 +37,25 @@ struct JoinSpec {
 [[nodiscard]] size_t JoinPartitionCount(size_t rows, unsigned threads);
 
 // What a hash join's probe operator knows about its build side.
+// Still answers once the probe pipeline is done and the table is freed.
 struct HashJoinInfo {
     bool build_left{false};
     bool has_residual{false};
-    size_t build_rows{0};  // 0 until the build side is finalized
-    size_t partitions{0};
+    size_t build_rows{0};          // in memory and on disk; 0 until the build side is finalized
+    size_t partitions{0};          // in-memory hash partitions
+    size_t spilled_partitions{0};  // level-0 spill partitions whose build rows went to disk
+    uint64_t spilled_mask{0};      // bit q set when partition q went to disk
+    size_t partitions_started{0};  // spilled partitions the spill phase started
+    size_t splits{0};              // pieces the spill phase split at the next level
+    size_t chunked_pieces{0};      // pieces whose build rows loaded in chunks
+    size_t loads{0};               // build tables the spill phase loaded: one per piece or chunk
 };
 
 // For tests: a hash join probe operator's info; nullopt for any other operator.
 [[nodiscard]] std::optional<HashJoinInfo> InspectHashJoin(const Operator& op);
+
+// Tests only: a spilled load past `most` build rows splits, or ends
+// its chunk; 0 turns it off. Read when the build side finalizes.
+void SetHashJoinLoadRowsForTest(size_t most);
 
 }  // namespace shilmandb::parallel

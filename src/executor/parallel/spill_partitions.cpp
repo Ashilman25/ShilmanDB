@@ -34,11 +34,16 @@ void AppendBytes(std::vector<char>& stream, const void* data, size_t n) {
 // Reads the partition's blocks in the order they were written.
 void SpillFile::ReadPartition(size_t partition, std::vector<ColumnBuffer>& out, StringArena& arena) const {
     out.resize(arrays.size());
-    for (const uint64_t at : blocks.at(partition)) {
-        uint64_t offset = at;
-        const bool read = file.ReadBlock(&offset, out, arrays, arena);
-        assert(read && "a recorded block offset is past the file's end");
-        (void)read;
+    for (const uint64_t at : blocks.at(partition)) ReadBlockAt(at, out, arena);
+}
+
+// A recorded offset at the file's end means the
+// record is wrong, so it never reads on.
+void SpillFile::ReadBlockAt(uint64_t at, std::vector<ColumnBuffer>& out, StringArena& arena) const {
+    uint64_t offset = at;
+    if (!file.ReadBlock(&offset, out, arrays, arena)) {
+        assert(false && "a recorded block offset is past the file's end");
+        throw DatabaseException("damaged temp file: a spilled block past the file's end");
     }
 }
 
@@ -63,6 +68,22 @@ void PartitionedWriter::Add(size_t partition, const std::vector<const ColumnBuff
     if (partition >= kSpillPartitions) throw DatabaseException("spill partition " + std::to_string(partition) + " is out of range");
     if (columns.size() != arrays_.size()) throw DatabaseException("a spilled row needs one column per array kind");
     for (size_t i = 0; i < n; ++i) AddRow(partition, columns, rows[i]);
+}
+
+// A counting sort by partition, then one Add per partition.
+void PartitionedWriter::AddByPartition(const std::vector<const ColumnBuffer*>& columns, const uint8_t* partition_of, size_t n) {
+    std::array<size_t, kSpillPartitions + 1> offsets{};
+    for (size_t i = 0; i < n; ++i) ++offsets[partition_of[i] + 1];
+    for (size_t p = 0; p < kSpillPartitions; ++p) offsets[p + 1] += offsets[p];
+
+    std::array<size_t, kSpillPartitions> next{};
+    std::copy(offsets.begin(), offsets.end() - 1, next.begin());
+    order_.resize(n);
+    
+    for (size_t i = 0; i < n; ++i) order_[next[partition_of[i]]++] = static_cast<uint32_t>(i);
+    for (size_t p = 0; p < kSpillPartitions; ++p) {
+        if (offsets[p + 1] > offsets[p]) Add(p, columns, order_.data() + offsets[p], offsets[p + 1] - offsets[p]);
+    }
 }
 
 // Sizes the row per stream, finds it room, then appends its values.

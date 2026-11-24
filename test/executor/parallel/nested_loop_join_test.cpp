@@ -8,7 +8,10 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <functional>
+#include <atomic>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -19,8 +22,10 @@
 #include "executor/parallel/basic_operators.hpp"
 #include "executor/parallel/batch.hpp"
 #include "executor/parallel/compiler.hpp"
+#include "executor/parallel/memory_budget.hpp"
 #include "executor/parallel/nested_loop_join.hpp"
 #include "executor/parallel/pipeline.hpp"
+#include "executor/parallel/worker_pool.hpp"
 #include "parser/parser.hpp"
 #include "planner/planner.hpp"
 
@@ -134,6 +139,61 @@ void Collect(const Batch& out, Seen& seen) {
         seen.names.emplace_back(View(out.slots[2].StrAt(r)));
     }
 }
+
+// Rows 0..rows-1 in morsels, one batch each: slot 0
+// the row, slot 1 a string of `len` bytes.
+class IntTextInput : public Source {
+public:
+    struct Local : LocalState {
+        std::vector<std::string> text;
+        uint32_t first{0};
+        uint32_t count{0};
+        bool left{false};
+    };
+
+    IntTextInput(uint32_t rows, size_t morsels, size_t len) : rows_(rows), morsels_(morsels), len_(len) {}
+
+    void Prepare(QueryContext&) override {}
+    size_t MorselCount() const override { return morsels_; }
+    std::unique_ptr<LocalState> MakeLocal() const override { return std::make_unique<Local>(); }
+
+    void StartMorsel(size_t morsel, LocalState& local) const override {
+        auto& l = static_cast<Local&>(local);
+        l.first = static_cast<uint32_t>(uint64_t{rows_} * morsel / morsels_);
+        l.count = static_cast<uint32_t>(uint64_t{rows_} * (morsel + 1) / morsels_) - l.first;
+        l.text.assign(l.count, std::string());
+        for (uint32_t i = 0; i < l.count; ++i) l.text[i] = std::string(len_, static_cast<char>('a' + (l.first + i) % 26));
+        l.left = l.count > 0;
+    }
+
+    bool NextBatch(LocalState& local, Batch& out) const override {
+        auto& l = static_cast<Local&>(local);
+        if (!l.left) return false;
+        l.left = false;
+        ShapeBatch(out, {kInt, kStr});
+        out.Reset(l.count);
+        for (uint32_t i = 0; i < l.count; ++i) {
+            out.slots[0].I64()[i] = l.first + i;
+            out.slots[1].Str()[i] = StringRef{l.text[i].data(), static_cast<uint32_t>(l.text[i].size())};
+        }
+        return true;
+    }
+
+private:
+    uint32_t rows_;
+    size_t morsels_;
+    size_t len_;
+};
+
+// Counts the rows it's given; safe from any thread.
+class CountSink : public Sink {
+public:
+    std::unique_ptr<LocalState> MakeLocal() const override { return std::make_unique<LocalState>(); }
+    void Consume(Batch& in, LocalState&) const override { rows.fetch_add(in.Active()); }
+    void Combine(std::unique_ptr<LocalState>) override {}
+    void Finalize(QueryContext&) override {}
+    mutable std::atomic<uint64_t> rows{0};
+};
 
 class ParallelNestedLoopJoinTest : public ::testing::Test {
 protected:
@@ -448,6 +508,69 @@ TEST_F(ParallelNestedLoopJoinTest, EmptyRightSideGivesNothing) {
     auto local = made.second->MakeLocal();
     EXPECT_EQ(made.second->Execute(left, out, local.get()), OpResult::NEED_INPUT);
     EXPECT_EQ(out.Active(), 0u);
+}
+
+TEST_F(ParallelNestedLoopJoinTest, RightSideOverTheBudgetThrows) {
+    WorkerPool pool(4);
+    // Joins 20 left rows with `right` rows of 8,000-byte strings under a limit; how many
+    // pairs came out, or what it threw. between runs after the right side is finalized.
+    const auto run = [&](unsigned threads, std::optional<size_t> limit, uint32_t right, const std::function<void(MemoryBudget*)>& between = {}) {
+        std::optional<MemoryBudget> budget;
+        if (limit) budget.emplace(*limit, threads);
+        MemoryBudget* b = budget ? &*budget : nullptr;
+        std::string error;
+        uint64_t pairs = 0;
+        {
+            NestedLoopSpec spec;
+            spec.left_slots = {0};
+            spec.right_slots = {0, 1};
+            spec.types = {kInt, kInt, kStr};
+            auto made = MakeNestedLoopJoin(std::move(spec));
+            IntTextInput right_input(right, 8, 8000);
+            IntTextInput left_input(20, 2, 3);
+            CountSink out;
+            QueryContext ctx{nullptr, nullptr, threads, threads > 1 ? &pool : nullptr};
+            ctx.budget = b;
+            Pipeline right_side{&right_input, {}, made.first.get(), {}};
+            Pipeline left_side{&left_input, {made.second.get()}, &out, {0}};
+            try {
+                RunPipeline(right_side, ctx);
+                if (between) between(b);
+                RunPipeline(left_side, ctx);
+                if (b != nullptr) EXPECT_EQ(b->HeldBytes(), 0u) << "the right rows go once the join's pipeline ends";
+            } catch (const std::exception& e) {
+                error = e.what();
+            }
+            pairs = out.rows.load();
+        }
+        if (b != nullptr) EXPECT_EQ(b->HeldBytes(), 0u);
+        return std::make_pair(pairs, error);
+    };
+
+    for (const unsigned threads : {1u, 4u}) {
+        // 1,500 rows of about 8 KB per thread pass the floors
+        // summed, so some worker passes its own; there's no shared room.
+        const size_t limit = threads * kWorkerMinimumBytes;
+        const uint32_t rows = threads * 1500;
+        const auto over = run(threads, limit, rows);
+        EXPECT_EQ(over.second, "the nested-loop join's right side needs more than the memory limit (" + std::to_string(limit) + " bytes)")
+            << threads << " threads";
+
+        // No budget never throws.
+        const auto unlimited = run(threads, std::nullopt, rows);
+        EXPECT_EQ(unlimited.second, "");
+        EXPECT_EQ(unlimited.first, 20u * rows);
+
+        // Rows that fit stay counted between the pipelines,
+        // on the floor when there's no shared room.
+        for (const size_t room : {size_t{0}, threads * kGrantBytes}) {
+            bool held = false;
+            const auto fits = run(threads, limit + room, 400, [&](MemoryBudget* b) { held = b->HeldBytes() > 0; });
+            EXPECT_EQ(fits.second, "") << threads << " threads, room " << room;
+            EXPECT_EQ(fits.first, 8000u);
+            EXPECT_TRUE(held);
+        }
+    }
 }
 
 }  // namespace

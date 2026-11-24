@@ -18,6 +18,9 @@ struct SpillCounters;
 inline constexpr int kSpillPartitionBits = 6;
 inline constexpr size_t kSpillPartitions = size_t{1} << kSpillPartitionBits;
 
+// The deepest level a spilled partition splits to; past it, no more splits.
+inline constexpr int kMaxSpillLevel = 4;
+
 // A hash's spill partition: 6 bits of a remix keyed by the level.
 // Independent of the in-memory tables' bits and of every other level.
 [[nodiscard]] constexpr size_t SpillPartitionOf(uint64_t hash, int level) {
@@ -39,6 +42,10 @@ struct SpillFile {
 
     // Appends a partition's rows to out (one buffer per column), strings into arena.
     void ReadPartition(size_t partition, std::vector<ColumnBuffer>& out, StringArena& arena) const;
+
+    // Appends the block this file recorded at `at` to out, strings into arena.
+    // One it can't give back throws "damaged temp file: ...".
+    void ReadBlockAt(uint64_t at, std::vector<ColumnBuffer>& out, StringArena& arena) const;
 };
 
 // One worker's rows for kSpillPartitions partitions, buffered and written to one file.
@@ -57,6 +64,9 @@ public:
     // Copies rows[0..n) of these columns into a partition's buffer; strings are copied too.
     // Full or refused buffers are written out; an oversized row is its own block.
     void Add(size_t partition, const std::vector<const ColumnBuffer*>& columns, const uint32_t* rows, size_t n);
+
+    // Adds rows 0..n-1 of these columns, row i to partition_of[i], each partition's in order.
+    void AddByPartition(const std::vector<const ColumnBuffer*>& columns, const uint8_t* partition_of, size_t n);
 
     // Writes out every buffered row and frees the buffers; more rows may follow.
     void Flush();
@@ -93,6 +103,7 @@ private:
     std::array<Buffer, kSpillPartitions> buffers_;
     std::vector<size_t> adds_;  // per stream, the bytes the current row adds
     std::vector<size_t> plan_;  // per stream, the room MakeRoom plans
+    std::vector<uint32_t> order_;  // AddByPartition's rows, grouped by partition
     std::optional<SpillFile> spilled_;
     bool file_buffer_charged_{false};
     size_t charged_{0};

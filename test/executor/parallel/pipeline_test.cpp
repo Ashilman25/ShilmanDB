@@ -2,10 +2,14 @@
 #include "common/exception.hpp"
 #include "executor/parallel/batch.hpp"
 #include "executor/parallel/compiler.hpp"
+#include "executor/parallel/expression.hpp"
+#include "executor/parallel/hash_join.hpp"
+#include "executor/parallel/memory_budget.hpp"
 #include "executor/parallel/parallel_executor.hpp"
 #include "executor/parallel/pipeline.hpp"
 #include "executor/parallel/vector.hpp"
 #include "executor/parallel/worker_pool.hpp"
+#include "parser/ast.hpp"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -263,6 +267,126 @@ public:
     std::vector<std::pair<unsigned, std::vector<std::thread::id>>> combined;
 };
 
+// Passes batches on; after the morsels hands out `parts` spilled partitions of
+// one batch each. Partition p's batch holds base + 10 * p
+// and base + 10 * p + 1. Safe from any thread.
+class SpillingOperator : public Operator {
+public:
+    struct Local : LocalState {
+        unsigned worker{0};
+        size_t part{0};
+        bool batch_left{false};
+    };
+
+    SpillingOperator(size_t parts, int64_t base, std::atomic<int>& clock) : parts_(parts), base_(base), clock_(clock) {}
+
+    std::unique_ptr<LocalState> MakeWorkerLocal(const QueryContext&, unsigned worker) const override {
+        auto local = std::make_unique<Local>();
+        local->worker = worker;
+        return local;
+    }
+    OpResult Execute(Batch& in, Batch& out, LocalState*) const override {
+        std::swap(in, out);
+        return OpResult::NEED_INPUT;
+    }
+    void FinishMorsels(LocalState* local) const override {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        finishes.push_back({static_cast<Local*>(local)->worker, clock_.fetch_add(1)});
+    }
+    size_t SpilledPartitionCount() const override { return parts_; }
+    void StartSpilledPartition(size_t p, LocalState* local) const override {
+        auto& l = *static_cast<Local*>(local);
+        l.part = p;
+        l.batch_left = true;
+        const std::lock_guard<std::mutex> lock(mutex_);
+        starts.push_back({static_cast<unsigned>(p), clock_.fetch_add(1)});
+    }
+    bool NextSpilledBatch(LocalState* local, Batch& out) const override {
+        auto& l = *static_cast<Local*>(local);
+        if (!l.batch_left) return false;
+        l.batch_left = false;
+        ShapeBatch(out, {VType{}});
+        out.Reset(2);
+        out.slots[0].I64()[0] = base_ + static_cast<int64_t>(10 * l.part);
+        out.slots[0].I64()[1] = base_ + static_cast<int64_t>(10 * l.part) + 1;
+        return true;
+    }
+    void PipelineDone() override { done_at.push_back(clock_.fetch_add(1)); }
+
+    // (worker or partition, time) per call, in the order they happened.
+    mutable std::vector<std::pair<unsigned, int>> finishes;
+    mutable std::vector<std::pair<unsigned, int>> starts;
+    std::vector<int> done_at;
+
+private:
+    size_t parts_;
+    int64_t base_;
+    std::atomic<int>& clock_;
+    mutable std::mutex mutex_;
+};
+
+// Keeps every value; safe from any thread. Records when Finalize ran.
+class ValueSink : public Sink {
+public:
+    struct Local : LocalState {
+        std::vector<int64_t> values;
+    };
+
+    explicit ValueSink(std::atomic<int>& clock) : clock_(clock) {}
+
+    std::unique_ptr<LocalState> MakeLocal() const override { return std::make_unique<Local>(); }
+    void Consume(Batch& in, LocalState& local) const override {
+        auto& l = static_cast<Local&>(local);
+        const int64_t* v = in.slots[0].I64();
+        for (uint32_t k = 0; k < in.Active(); ++k) l.values.push_back(v[in.sel[k]]);
+    }
+    void Combine(std::unique_ptr<LocalState> local) override {
+        ++combines;
+        const auto& l = static_cast<const Local&>(*local);
+        values.insert(values.end(), l.values.begin(), l.values.end());
+    }
+    void Finalize(QueryContext&) override { finalized_at = clock_.fetch_add(1); }
+
+    int combines{0};
+    int finalized_at{-1};
+    std::vector<int64_t> values;
+
+private:
+    std::atomic<int>& clock_;
+};
+
+// A column reference bound to plan column c.
+std::unique_ptr<CompiledExpr> Col(uint32_t c, const InputLayout& in) {
+    ColumnRef ref;
+    ref.column_name = "c" + std::to_string(c);
+    ref.bound_index = c;
+    return CompiledExpr::Compile(ref, in);
+}
+
+// One integer column in slot 0.
+InputLayout OneInt() {
+    InputLayout in;
+    in.slot_of_column = {0};
+    in.slot_types = {VType{}};
+    in.slot_precision = {0};
+    return in;
+}
+
+// The times in a call log.
+std::vector<int> Times(const std::vector<std::pair<unsigned, int>>& log) {
+    std::vector<int> out;
+    for (const auto& entry : log) out.push_back(entry.second);
+    return out;
+}
+
+// The partitions in a start log, sorted.
+std::vector<unsigned> Parts(const std::vector<std::pair<unsigned, int>>& log) {
+    std::vector<unsigned> out;
+    for (const auto& entry : log) out.push_back(entry.first);
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
 }  // namespace
 
 TEST(ParallelPipelineTest, RunPipelineVisitsEveryMorselOnce) {
@@ -453,6 +577,93 @@ TEST(ParallelPipelineTest, LocalsKnowTheirWorkerAndContext) {
             used.push_back(seen[0]);
         }
     }
+}
+
+TEST(ParallelPipelineTest, SpillPhasesRunAfterTheMorsels) {
+    constexpr unsigned kThreads = 4;
+    WorkerPool pool(kThreads);
+    for (const unsigned threads : {1u, kThreads}) {
+        std::atomic<int> clock{0};
+        FakeSource source(1, 2);
+        SpillingOperator first(3, 1000000, clock);
+        SpillingOperator second(2, 2000000, clock);
+        ValueSink sink(clock);
+        Pipeline p{&source, {&first, &second}, &sink, {}};
+        QueryContext ctx = NoDatabase();
+        ctx.threads = threads;
+        ctx.pool = threads > 1 ? &pool : nullptr;
+        RunPipeline(p, ctx);
+
+        // One morsel, but three spilled partitions: three workers run, and all are combined.
+        const size_t workers = threads == 1 ? 1 : 3;
+        EXPECT_EQ(sink.combines, static_cast<int>(workers)) << threads << " threads";
+
+        // The first operator's partitions pass through the second; the second's go to the sink.
+        std::vector<int64_t> want = SourceValues(1, 2);
+        for (int64_t p0 = 0; p0 < 3; ++p0) want.insert(want.end(), {1000000 + 10 * p0, 1000001 + 10 * p0});
+        for (int64_t p1 = 0; p1 < 2; ++p1) want.insert(want.end(), {2000000 + 10 * p1, 2000001 + 10 * p1});
+        EXPECT_EQ(Sorted(sink.values), Sorted(want)) << threads << " threads";
+        EXPECT_EQ(Parts(first.starts), (std::vector<unsigned>{0, 1, 2}));
+        EXPECT_EQ(Parts(second.starts), (std::vector<unsigned>{0, 1}));
+
+        // Every worker finishes its morsels on both operators,
+        // then the second again after the first phase.
+        ASSERT_EQ(first.finishes.size(), workers);
+        ASSERT_EQ(second.finishes.size(), 2 * workers);
+        const std::vector<int> first_finishes = Times(first.finishes);
+        const std::vector<int> first_starts = Times(first.starts);
+        const std::vector<int> second_finishes = Times(second.finishes);
+        const std::vector<int> second_starts = Times(second.starts);
+        const int first_phase = *std::min_element(first_starts.begin(), first_starts.end());
+        EXPECT_GT(first_phase, *std::max_element(first_finishes.begin(), first_finishes.end()));
+        const auto before_first_phase = std::count_if(second_finishes.begin(), second_finishes.end(), [&](int t) { return t < first_phase; });
+        EXPECT_EQ(static_cast<size_t>(before_first_phase), workers);
+        EXPECT_GT(*std::min_element(second_starts.begin(), second_starts.end()), *std::max_element(second_finishes.begin(), second_finishes.end()));
+
+        // PipelineDone once per operator, after Finalize.
+        ASSERT_EQ(first.done_at.size(), 1u);
+        ASSERT_EQ(second.done_at.size(), 1u);
+        EXPECT_GT(first.done_at[0], sink.finalized_at);
+        EXPECT_GT(second.done_at[0], sink.finalized_at);
+    }
+}
+
+TEST(ParallelPipelineTest, FinishedBuildFreedWhenItsProbeEnds) {
+    MemoryBudget budget(kWorkerMinimumBytes + 2 * kGrantBytes, 1);
+    std::atomic<int> clock{0};
+    {
+        const InputLayout one = OneInt();
+        JoinSpec spec;
+        spec.build_key = Col(0, one);
+        spec.probe_key = Col(0, one);
+        spec.build_payload = {0};
+        spec.probe_slots = {0};
+        spec.types = {VType{}, VType{}};
+        auto made = MakeHashJoin(std::move(spec));
+
+        // Build keys m * 1000 + 0..299 for
+        // m = 0..4; probe keys 0..99 and 1000..1099.
+        FakeSource build(5, 3);
+        FakeSource probe(2, 1);
+        ValueSink out(clock);
+        QueryContext ctx = NoDatabase();
+        ctx.budget = &budget;
+        Pipeline build_side{&build, {}, made.first.get(), {}};
+        RunPipeline(build_side, ctx);
+        EXPECT_GT(budget.HeldBytes(), 0u) << "the finished table keeps its memory until it's probed";
+
+        Pipeline probe_side{&probe, {made.second.get()}, &out, {0}};
+        RunPipeline(probe_side, ctx);
+        EXPECT_EQ(budget.HeldBytes(), 0u) << "the table goes once its probe pipeline ends";
+        EXPECT_EQ(out.values.size(), 200u);
+
+        // The operator still answers for tests.
+        const std::optional<HashJoinInfo> info = InspectHashJoin(*made.second);
+        ASSERT_TRUE(info.has_value());
+        EXPECT_EQ(info->build_rows, 1500u);
+        EXPECT_EQ(info->spilled_partitions, 0u);
+    }
+    EXPECT_EQ(budget.HeldBytes(), 0u);
 }
 
 }  // namespace shilmandb::parallel

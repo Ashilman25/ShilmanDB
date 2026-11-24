@@ -109,6 +109,24 @@ void Extend(ColumnBuffer& to, ColumnBuffer&& from) {
     MoveAfter(to.str, from.str);
 }
 
+// One switch per call, then a plain loop over the rows.
+void CopyRows(const ColumnBuffer& from, ValueArray a, const uint32_t* rows, size_t n, ColumnBuffer& to, StringArena& arena) {
+    const auto copy = [&](auto member) {
+        const auto& in = from.*member;
+        auto& out = to.*member;
+        for (size_t i = 0; i < n; ++i) out.push_back(in[rows[i]]);
+    };
+    
+    switch (a) {
+        case ValueArray::I64: copy(&ColumnBuffer::i64); break;
+        case ValueArray::I128: copy(&ColumnBuffer::i128); break;
+        case ValueArray::F64: copy(&ColumnBuffer::f64); break;
+        case ValueArray::STR:
+            for (size_t i = 0; i < n; ++i) to.str.push_back(arena.Copy(View(from.str[rows[i]])));
+            break;
+    }
+}
+
 // Signs, then NaN bits, break the ties that < leaves.
 int TotalOrder(double a, double b) {
     const auto order = [](auto x, auto y) { return x < y ? -1 : (y < x ? 1 : 0); };

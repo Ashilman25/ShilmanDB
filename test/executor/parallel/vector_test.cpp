@@ -82,6 +82,29 @@ TEST(ParallelVectorTest, StringArenaKeepsBytesUntilClear) {
     EXPECT_EQ(View(full), fill);
 }
 
+TEST(ParallelVectorTest, StringArenaBytesHeldCountsBlocks) {
+    StringArena arena;
+    EXPECT_EQ(arena.BytesHeld(), 0u);
+    EXPECT_EQ(View(arena.Copy("")), "");
+    EXPECT_EQ(arena.BytesHeld(), 0u) << "an empty copy takes no block";
+
+    // One short string takes a whole block; a big value takes exactly its bytes.
+    (void)arena.Copy("abc");
+    EXPECT_EQ(arena.BytesUsed(), 3u);
+    EXPECT_EQ(arena.BytesHeld(), StringArena::kBlockSize);
+    const std::string big(100'000, 'b');
+    (void)arena.Copy(big);
+    EXPECT_EQ(arena.BytesHeld(), StringArena::kBlockSize + big.size());
+
+    // A string that won't fit the rest of the block starts a second one.
+    (void)arena.Copy(std::string(StringArena::kBlockSize - 2, 'c'));
+    EXPECT_EQ(arena.BytesHeld(), 2 * StringArena::kBlockSize + big.size());
+
+    // Clear keeps the first block only.
+    arena.Clear();
+    EXPECT_EQ(arena.BytesHeld(), StringArena::kBlockSize);
+}
+
 TEST(ParallelVectorTest, VTypeOfCoversEveryStorageType) {
     struct Case {
         ColumnType storage;
