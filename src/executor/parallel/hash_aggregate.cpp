@@ -3,12 +3,18 @@
 #include "executor/parallel/batch.hpp"
 #include "executor/parallel/column_buffer.hpp"
 #include "executor/parallel/decimal.hpp"
+#include "executor/parallel/memory_budget.hpp"
+#include "executor/parallel/spill_partitions.hpp"
+#include "executor/parallel/temp_file.hpp"
 #include "storage/columnar/string_arena.hpp"
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <optional>
+#include <string>
 #include <string_view>
 
 namespace shilmandb::parallel {
@@ -29,6 +35,13 @@ constexpr size_t kGroupsPerPartition = 65536;
 
 // The most partitions a merge splits into.
 constexpr size_t kMaxPartitions = 1024;
+
+// The deepest a spilled partition splits; a piece this deep merges even past the budget.
+constexpr int kMaxSpillLevel = 4;
+
+// Set only by tests, on the calling thread.
+// A merge of spilled groups splits past this many groups; 0 means no cap.
+size_t test_merge_groups = 0;
 
 // How an aggregate keeps its state.
 enum class StateKind : uint8_t { COUNT, SUM_EXACT, SUM_DOUBLE, AVG_EXACT, AVG_DOUBLE, MIN, MAX, NOT_NUMERIC };
@@ -59,6 +72,8 @@ struct GroupShape {
     std::vector<size_t> double_keys;  // indexes of the DOUBLE keys
     std::vector<AggInfo> aggs;
     bool global{false};
+    std::vector<ValueArray> spill_arrays;  // a spilled group's columns: keys, hash, each state's fields
+    size_t group_bytes{0};                 // one group's fixed bytes in a table, for the budget
 };
 
 // One aggregate's state for every group, in the arrays its kind uses.
@@ -418,16 +433,22 @@ inline size_t PartitionOf(uint64_t h, int bits) {
     return bits == 0 ? 0 : static_cast<size_t>(h >> (64 - bits));
 }
 
-// Counting-sorts one table's groups by partition.
-Buckets BucketByPartition(const GroupTable& t, size_t partitions, int bits) {
+// Counting-sorts one table's groups by partition_of(hash), each below `partitions`.
+template <typename PartitionOfHash>
+Buckets BucketBy(const GroupTable& t, size_t partitions, PartitionOfHash partition_of) {
     Buckets b;
     b.offsets.assign(partitions + 1, 0);
-    for (uint32_t g = 0; g < t.size; ++g) ++b.offsets[PartitionOf(t.hashes[g], bits) + 1];
+    for (uint32_t g = 0; g < t.size; ++g) ++b.offsets[partition_of(t.hashes[g]) + 1];
     for (size_t p = 0; p < partitions; ++p) b.offsets[p + 1] += b.offsets[p];
     std::vector<size_t> next(b.offsets.begin(), b.offsets.end() - 1);
     b.order.resize(t.size);
-    for (uint32_t g = 0; g < t.size; ++g) b.order[next[PartitionOf(t.hashes[g], bits)]++] = g;
+    for (uint32_t g = 0; g < t.size; ++g) b.order[next[partition_of(t.hashes[g])]++] = g;
     return b;
+}
+
+// Counting-sorts one table's groups by partition.
+Buckets BucketByPartition(const GroupTable& t, size_t partitions, int bits) {
+    return BucketBy(t, partitions, [bits](uint64_t h) { return PartitionOf(h, bits); });
 }
 
 // One partition's groups from every table, merged into a table of its own.
@@ -444,10 +465,170 @@ GroupTable MergePartition(const std::vector<GroupTable>& tables, const std::vect
     return out;
 }
 
+//  Spilling
+
+// A spilled group's columns: keys, the hash, then each state's fields as kept.
+// Also one group's fixed bytes in memory, MIN / MAX's seen flag as one byte.
+void FillSpillLayout(GroupShape& shape) {
+    size_t bytes = 0;
+    // A column kept in memory at its array's width.
+    const auto column = [&](ValueArray a) {
+        shape.spill_arrays.push_back(a);
+        bytes += ArrayWidth(a);
+    };
+    for (const VType& t : shape.keys) column(ArrayOf(t));
+    column(ValueArray::I64);  // the hash
+    for (const AggInfo& info : shape.aggs) {
+        switch (info.kind) {
+            case StateKind::COUNT: column(ValueArray::I64); break;
+            case StateKind::SUM_EXACT: column(ValueArray::I128); break;
+            case StateKind::SUM_DOUBLE: column(ValueArray::F64); break;
+            case StateKind::AVG_EXACT:
+                column(ValueArray::I128);
+                column(ValueArray::I64);
+                break;
+            case StateKind::AVG_DOUBLE:
+                column(ValueArray::F64);
+                column(ValueArray::I64);
+                break;
+            case StateKind::MIN:
+            case StateKind::MAX:
+                column(ArrayOf(info.arg));
+                shape.spill_arrays.push_back(ValueArray::I64);  // the seen flag
+                bytes += sizeof(uint8_t);
+                break;
+            case StateKind::NOT_NUMERIC: break;
+        }
+    }
+    shape.group_bytes = bytes;
+}
+
+// A table's bytes by the estimate: fixed bytes per group, index slots, copied strings.
+// Vectors' spare capacity isn't counted.
+size_t TableBytes(const GroupTable& t, const GroupShape& shape) {
+    return t.size * shape.group_bytes + t.index.size() * sizeof(uint32_t) + t.arena.BytesUsed();
+}
+
+// Appends group g as a spilled row: keys, hash, then each state's fields as kept.
+// Strings still point into t's arenas; the writer copies them.
+void AppendSpilledGroup(const GroupTable& t, uint32_t g, const GroupShape& shape, std::vector<ColumnBuffer>& cols) {
+    size_t c = 0;
+    for (size_t k = 0; k < shape.keys.size(); ++k) PushCell(cols[c++], t.keys[k], g, shape.keys[k]);
+    cols[c++].i64.push_back(static_cast<int64_t>(t.hashes[g]));
+    for (size_t a = 0; a < shape.aggs.size(); ++a) {
+        const StateColumn& s = t.states[a];
+        switch (shape.aggs[a].kind) {
+            case StateKind::COUNT: cols[c++].i64.push_back(s.count[g]); break;
+            case StateKind::SUM_EXACT: cols[c++].i128.push_back(s.exact[g]); break;
+            case StateKind::SUM_DOUBLE: cols[c++].f64.push_back(s.real[g]); break;
+            case StateKind::AVG_EXACT:
+                cols[c++].i128.push_back(s.exact[g]);
+                cols[c++].i64.push_back(s.count[g]);
+                break;
+            case StateKind::AVG_DOUBLE:
+                cols[c++].f64.push_back(s.real[g]);
+                cols[c++].i64.push_back(s.count[g]);
+                break;
+            case StateKind::MIN:
+            case StateKind::MAX:
+                // A batch's winning string is copied before Consume returns, so 2 never gets here.
+                assert(s.seen[g] != 2 && "a MIN / MAX string not yet copied");
+                PushCell(cols[c++], s.extreme, g, shape.aggs[a].arg);
+                cols[c++].i64.push_back(s.seen[g]);
+                break;
+            case StateKind::NOT_NUMERIC: break;
+        }
+    }
+}
+
+// Writes n groups of t through the writer, each to its spill partition at level.
+// id_at(i) is the i-th group's id. Rows are gathered a batch at a time.
+template <typename IdAt>
+void WriteGroups(const GroupTable& t, const GroupShape& shape, size_t n, IdAt id_at, int level, PartitionedWriter& writer) {
+    std::vector<ColumnBuffer> cols(shape.spill_arrays.size());
+    std::vector<const ColumnBuffer*> parts;
+    for (const ColumnBuffer& col : cols) parts.push_back(&col);
+    std::vector<uint8_t> partition_of;
+    std::vector<uint32_t> order;
+    for (size_t at = 0; at < n; at += kBatchSize) {
+        const size_t m = std::min<size_t>(kBatchSize, n - at);
+        for (ColumnBuffer& col : cols) ClearBuffer(col);
+        partition_of.resize(m);
+        std::array<uint32_t, kSpillPartitions + 1> offsets{};
+        for (size_t i = 0; i < m; ++i) {
+            const uint32_t g = id_at(at + i);
+            AppendSpilledGroup(t, g, shape, cols);
+            partition_of[i] = static_cast<uint8_t>(SpillPartitionOf(t.hashes[g], level));
+            ++offsets[partition_of[i] + 1];
+        }
+        for (size_t p = 0; p < kSpillPartitions; ++p) offsets[p + 1] += offsets[p];
+        std::array<uint32_t, kSpillPartitions> next{};
+        std::copy(offsets.begin(), offsets.end() - 1, next.begin());
+        order.resize(m);
+        for (size_t i = 0; i < m; ++i) order[next[partition_of[i]]++] = static_cast<uint32_t>(i);
+        for (size_t p = 0; p < kSpillPartitions; ++p) {
+            if (offsets[p + 1] > offsets[p]) writer.Add(p, parts, order.data() + offsets[p], offsets[p + 1] - offsets[p]);
+        }
+    }
+}
+
+// A spilled block's rows as a table of groups, its columns moved out of block.
+// The table has no index: it's only merged from.
+GroupTable FromBlock(std::vector<ColumnBuffer>& block, const GroupShape& shape) {
+    GroupTable t;
+    size_t c = 0;
+    for (size_t k = 0; k < shape.keys.size(); ++k) t.keys.push_back(std::move(block[c++]));
+    for (const int64_t h : block[c++].i64) t.hashes.push_back(static_cast<uint64_t>(h));
+    t.size = t.hashes.size();
+    t.states.resize(shape.aggs.size());
+    for (size_t a = 0; a < shape.aggs.size(); ++a) {
+        StateColumn& s = t.states[a];
+        switch (shape.aggs[a].kind) {
+            case StateKind::COUNT: s.count = std::move(block[c++].i64); break;
+            case StateKind::SUM_EXACT: s.exact = std::move(block[c++].i128); break;
+            case StateKind::SUM_DOUBLE: s.real = std::move(block[c++].f64); break;
+            case StateKind::AVG_EXACT:
+                s.exact = std::move(block[c++].i128);
+                s.count = std::move(block[c++].i64);
+                break;
+            case StateKind::AVG_DOUBLE:
+                s.real = std::move(block[c++].f64);
+                s.count = std::move(block[c++].i64);
+                break;
+            case StateKind::MIN:
+            case StateKind::MAX:
+                s.extreme = std::move(block[c++]);
+                for (const int64_t seen : block[c++].i64) s.seen.push_back(static_cast<uint8_t>(seen));
+                break;
+            case StateKind::NOT_NUMERIC: break;
+        }
+    }
+    return t;
+}
+
+// Reads the spilled block at `at` as a table of groups, strings into arena.
+GroupTable ReadGroups(const SpillFile& file, uint64_t at, const GroupShape& shape, std::vector<ColumnBuffer>& block, StringArena& arena) {
+    for (ColumnBuffer& b : block) ClearBuffer(b);
+    uint64_t offset = at;
+    if (!file.file.ReadBlock(&offset, block, file.arrays, arena)) {
+        assert(false && "a spilled block offset past the file's end");
+        throw DatabaseException("damaged temp file: a spilled block past the file's end");
+    }
+    return FromBlock(block, shape);
+}
+
 // The groups once merged, written by the sink's Finalize and read by the source.
+// After a spill nothing is merged yet: the source merges one spill partition per morsel.
 struct MergedGroups {
-    std::vector<GroupTable> tables;   // one per partition, or one in all
-    std::vector<StringArena> arenas;  // the workers' arenas their strings point into
+    std::vector<GroupTable> tables;               // one per partition, or one in all
+    std::vector<StringArena> arenas;              // the workers' arenas their strings point into
+    std::vector<MemoryReservation> reservations;  // the workers' counts, kept with their groups
+    bool spilled{false};
+    std::vector<GroupTable> parts;   // after a spill: each worker's groups still in memory
+    std::vector<Buckets> buckets;    // each part's groups by level 0 spill partition
+    std::vector<SpillFile> files;    // each spilling worker's partial states
+    std::vector<size_t> morsels;     // the spill partitions holding any group
+    int64_t count_offset{0};         // tests only: added to every COUNT the source emits
 };
 
 //  Sink
@@ -461,6 +642,12 @@ struct AggLocal : LocalState {
     std::vector<uint32_t> group_of;  // per active row
     std::vector<uint32_t> pending;   // groups holding a batch's MIN / MAX string
     EvalScratch scratch;
+    MemoryReservation reservation;   // the table's estimated bytes, and the writer's buffers while it writes
+    size_t counted{0};               // the part of the reservation that counts the table
+    const std::string* temp_dir{nullptr};
+    SpillCounters* counters{nullptr};
+    bool spill_everything{false};
+    std::unique_ptr<PartitionedWriter> writer;  // made on the first spill; after the reservation it counts in
 };
 
 // Counts each active row in its group; a global aggregate has just group 0.
@@ -485,13 +672,11 @@ void UpdateExtremes(const T* x, const Selection& sel, uint32_t n, const uint32_t
     }
 }
 
-// Adds offset to every COUNT state of the merged tables.
-void AddToCounts(std::vector<GroupTable>& tables, const GroupShape& shape, int64_t offset) {
-    for (GroupTable& t : tables) {
-        for (size_t a = 0; a < shape.aggs.size(); ++a) {
-            if (shape.aggs[a].kind != StateKind::COUNT) continue;
-            for (int64_t& count : t.states[a].count) count += offset;
-        }
+// Adds offset to every COUNT state of one merged table.
+void AddToCounts(GroupTable& t, const GroupShape& shape, int64_t offset) {
+    for (size_t a = 0; a < shape.aggs.size(); ++a) {
+        if (shape.aggs[a].kind != StateKind::COUNT) continue;
+        for (int64_t& count : t.states[a].count) count += offset;
     }
 }
 
@@ -500,38 +685,60 @@ class AggregateSink final : public Sink {
 public:
     AggregateSink(AggregateSpec spec, std::shared_ptr<const GroupShape> shape, SharedOutput<MergedGroups> out) : spec_(std::move(spec)), shape_(std::move(shape)), out_(std::move(out)) {}
 
-    // A global local starts with its one group, so empty input still gives a row.
-    [[nodiscard]] std::unique_ptr<LocalState> MakeLocal() const override {
-        auto local = std::make_unique<AggLocal>();
-        local->table = MakeTable(*shape_);
-        for (const VType& t : shape_->keys) local->key_values.emplace_back(t);
-        for (size_t a = 0; a < shape_->aggs.size(); ++a) local->arg_values.emplace_back(spec_.args[a] ? spec_.args[a]->Type() : VType{});
-        local->hashes.resize(kBatchSize);
-        local->group_of.assign(kBatchSize, 0);
-        if (shape_->global) AddGlobalGroup(local->table, *shape_);
+    // A local without a budget, so it never spills.
+    [[nodiscard]] std::unique_ptr<LocalState> MakeLocal() const override { return NewLocal(); }
+
+    // A local counted against this worker's budget, spilling to the query's temp directory.
+    // A fresh global group is counted from the first batch, so empty input never spills.
+    [[nodiscard]] std::unique_ptr<LocalState> MakeWorkerLocal(const QueryContext& ctx, unsigned worker) const override {
+        auto local = NewLocal();
+        local->reservation = MemoryReservation(ctx.budget, worker);
+        local->temp_dir = ctx.temp_dir;
+        local->counters = ctx.spill;
+        local->spill_everything = ctx.spill_everything;
         return local;
     }
 
     // Finds each active row's group, then folds the rows into every aggregate.
+    // Past the budget, or with spill_everything, the table goes to disk.
     void Consume(Batch& in, LocalState& local) const override {
         auto& l = static_cast<AggLocal&>(local);
         const uint32_t n = in.Active();
         if (n == 0) return;
         if (!shape_->global) AssignGroups(in, l, n);
         for (size_t a = 0; a < shape_->aggs.size(); ++a) Update(a, in, l, n);
+        if (l.spill_everything || !Recount(l)) SpillTable(l, true);
     }
 
     // Keeps the worker's table, arena and all, until Finalize.
     void Combine(std::unique_ptr<LocalState> local) override { parts_.push_back(std::move(local)); }
 
-    // Merges the workers' tables: into one up to kMergeIntoOneMaxGroups summed groups,
-    // else into hash partitions, each merged on its own.
-    // Partitions merge on the pool when there is one.
+    // The tables outlive this pipeline, so each part leaves its worker's floor, spilling what
+    // must stay there. With no spill anywhere they merge as before: into one up to
+    // kMergeIntoOneMaxGroups summed groups, else by hash partition on the pool.
+    // After a spill the source merges them with the runs, one spill partition per morsel.
     void Finalize(QueryContext& ctx) override {
-        std::vector<GroupTable> tables;
-        for (auto& part : parts_) tables.push_back(std::move(static_cast<AggLocal&>(*part).table));
-        parts_.clear();
+        ForEachTask(ctx, parts_.size(), [this](size_t i) {
+            AggLocal& p = Part(i);
+            for (size_t left = p.reservation.LeaveFloor(); left > 0; left = p.reservation.LeaveFloor()) SpillTable(p, false);
+        });
+        const bool spilled = std::any_of(parts_.begin(), parts_.end(), [](const std::unique_ptr<LocalState>& part) {
+            return static_cast<const AggLocal&>(*part).writer != nullptr;
+        });
+        if (spilled) {
+            FinishSpilled(ctx);
+            parts_.clear();
+            return;
+        }
+
         MergedGroups& out = out_.Mutable();
+        std::vector<GroupTable> tables;
+        for (auto& part : parts_) {
+            AggLocal& p = static_cast<AggLocal&>(*part);
+            tables.push_back(std::move(p.table));
+            out.reservations.push_back(std::move(p.reservation));
+        }
+        parts_.clear();
         out.tables.clear();
 
         const GroupShape& shape = *shape_;
@@ -555,7 +762,9 @@ public:
                 ForEachTask(ctx, partitions, [&](size_t p) { out.tables[p] = MergePartition(tables, buckets, p, shape); });
             }
         }
-        if (count_offset_ != 0) AddToCounts(out.tables, shape, count_offset_);
+        if (count_offset_ != 0) {
+            for (GroupTable& t : out.tables) AddToCounts(t, shape, count_offset_);
+        }
         for (GroupTable& t : tables) out.arenas.push_back(std::move(t.arena));
     }
 
@@ -563,6 +772,79 @@ public:
     void OffsetCounts(int64_t offset) { count_offset_ = offset; }
 
 private:
+    // A global local starts with its one group, so empty input still gives a row.
+    [[nodiscard]] std::unique_ptr<AggLocal> NewLocal() const {
+        auto local = std::make_unique<AggLocal>();
+        local->table = MakeTable(*shape_);
+        for (const VType& t : shape_->keys) local->key_values.emplace_back(t);
+        for (size_t a = 0; a < shape_->aggs.size(); ++a) local->arg_values.emplace_back(spec_.args[a] ? spec_.args[a]->Type() : VType{});
+        local->hashes.resize(kBatchSize);
+        local->group_of.assign(kBatchSize, 0);
+        if (shape_->global) AddGlobalGroup(local->table, *shape_);
+        return local;
+    }
+
+    // Combined part i.
+    [[nodiscard]] AggLocal& Part(size_t i) { return static_cast<AggLocal&>(*parts_[i]); }
+
+    // Brings the table's share of the reservation to its bytes; false when the budget refuses.
+    [[nodiscard]] bool Recount(AggLocal& l) const {
+        const size_t held = TableBytes(l.table, *shape_);
+        if (held < l.counted) {
+            l.reservation.Shrink(l.counted - held);
+        } else if (held > l.counted && !l.reservation.Grow(held - l.counted)) {
+            return false;
+        }
+        l.counted = held;
+        return true;
+    }
+
+    // Writes every group to disk by spill partition, then starts a fresh table; refill gives
+    // a global table its one group back, counted from the next batch.
+    // The table is uncounted first, so the writer finds room.
+    void SpillTable(AggLocal& l, bool refill) const {
+        const GroupShape& shape = *shape_;
+        if (l.counted > 0) l.reservation.Shrink(std::exchange(l.counted, 0));
+        if (l.table.size > 0) {
+            if (!l.writer) l.writer = std::make_unique<PartitionedWriter>(shape.spill_arrays, SpillDirectory(l.temp_dir), l.counters, &l.reservation);
+            WriteGroups(l.table, shape, l.table.size, [](size_t g) { return static_cast<uint32_t>(g); }, 0, *l.writer);
+            l.writer->Flush();
+        }
+        l.table = MakeTable(shape);
+        if (refill && shape.global) AddGlobalGroup(l.table, shape);
+    }
+
+    // Hands the source every worker's table, its spill file and its count, unmerged.
+    // Each spill partition with runs counts once in the query's spill totals.
+    void FinishSpilled(QueryContext& ctx) {
+        MergedGroups& out = out_.Mutable();
+        out.spilled = true;
+        out.count_offset = count_offset_;
+        for (size_t i = 0; i < parts_.size(); ++i) {
+            AggLocal& p = Part(i);
+            if (p.writer) {
+                std::optional<SpillFile> file = p.writer->TakeFile();
+                p.writer.reset();  // before its reservation moves
+                if (file) out.files.push_back(std::move(*file));
+            }
+            out.parts.push_back(std::move(p.table));
+            out.reservations.push_back(std::move(p.reservation));
+        }
+        // Each task writes only its own slot.
+        out.buckets.resize(out.parts.size());
+        ForEachTask(ctx, out.parts.size(), [&out](size_t i) {
+            out.buckets[i] = BucketBy(out.parts[i], kSpillPartitions, [](uint64_t h) { return SpillPartitionOf(h, 0); });
+        });
+        uint64_t with_runs = 0;
+        for (size_t p = 0; p < kSpillPartitions; ++p) {
+            const bool runs = std::any_of(out.files.begin(), out.files.end(), [p](const SpillFile& f) { return f.rows[p] > 0; });
+            const bool groups = std::any_of(out.buckets.begin(), out.buckets.end(), [p](const Buckets& b) { return b.offsets[p + 1] > b.offsets[p]; });
+            with_runs += runs ? 1 : 0;
+            if (runs || groups) out.morsels.push_back(p);
+        }
+        if (ctx.spill != nullptr) ctx.spill->partitions += with_runs;
+    }
+
     // Evaluates the keys, hashes them, and finds or adds each active row's group.
     void AssignGroups(const Batch& in, AggLocal& l, uint32_t n) const {
         for (size_t k = 0; k < spec_.keys.size(); ++k) spec_.keys[k]->Evaluate(in, in.sel, l.key_values[k], l.scratch);
@@ -687,11 +969,31 @@ struct GroupRange {
     uint32_t count;
 };
 
+// One piece of a spill partition to merge: the partition itself, from the workers'
+// tables and spill files, or a piece a split wrote to its own file.
+struct MergeInput {
+    const SpillFile* file{nullptr};  // null: the sink's partition
+    size_t partition{0};
+    int level{0};
+    bool forced{false};  // merged even past the budget
+};
+
 // Which range a worker emits next, and the row ids to gather.
+// After a spill: the partition this worker merges and emits, piece by piece.
 struct AggSourceLocal : LocalState {
     GroupRange range{0, 0, 0};
     bool done{true};
     std::vector<uint32_t> rows;
+    MemoryReservation reservation;  // the piece being merged, or a split's buffers
+    const std::string* temp_dir{nullptr};
+    SpillCounters* counters{nullptr};
+    std::vector<MergeInput> pending;                // pieces of this morsel not merged yet
+    std::vector<std::unique_ptr<SpillFile>> files;  // this morsel's splits
+    GroupTable piece;                               // merged groups being emitted
+    StringArena arena;                              // strings read from runs, which piece points into
+    size_t counted{0};                              // what the reservation holds for piece and arena
+    uint32_t next{0};                               // the piece's next group to emit
+    std::vector<ColumnBuffer> block;                // one spilled block as read
 };
 
 // Hands out the merged groups, a batch per morsel.
@@ -704,8 +1006,11 @@ public:
     }
 
     // Cuts every merged table into ranges of at most a batch.
+    // After a spill the morsels are spill partitions. The merge's test cap is read here.
     void Prepare(QueryContext&) override {
         ranges_.clear();
+        merge_cap_ = test_merge_groups;
+        if (groups_->spilled) return;
         for (size_t t = 0; t < groups_->tables.size(); ++t) {
             const size_t size = groups_->tables[t].size;
             for (size_t first = 0; first < size; first += kBatchSize) {
@@ -715,18 +1020,27 @@ public:
         }
     }
 
-    [[nodiscard]] size_t MorselCount() const override { return ranges_.size(); }
+    [[nodiscard]] size_t MorselCount() const override { return groups_->spilled ? groups_->morsels.size() : ranges_.size(); }
 
-    // Room for a batch of row ids.
-    [[nodiscard]] std::unique_ptr<LocalState> MakeLocal() const override {
-        auto local = std::make_unique<AggSourceLocal>();
-        local->rows.resize(kBatchSize);
+    // Room for a batch of row ids; a merge after a spill goes uncounted.
+    [[nodiscard]] std::unique_ptr<LocalState> MakeLocal() const override { return NewLocal(); }
+
+    // A local whose merges count against this worker's budget and split to the temp directory.
+    [[nodiscard]] std::unique_ptr<LocalState> MakeWorkerLocal(const QueryContext& ctx, unsigned worker) const override {
+        auto local = NewLocal();
+        local->reservation = MemoryReservation(ctx.budget, worker);
+        local->temp_dir = ctx.temp_dir;
+        local->counters = ctx.spill;
         return local;
     }
 
-    // Points the worker at one range.
+    // Points the worker at one range, or after a spill at one spill partition.
     void StartMorsel(size_t morsel, LocalState& local) const override {
         auto& l = static_cast<AggSourceLocal&>(local);
+        if (groups_->spilled) {
+            StartPartition(groups_->morsels[morsel], l);
+            return;
+        }
         l.range = ranges_[morsel];
         l.done = false;
         for (uint32_t i = 0; i < l.range.count; ++i) l.rows[i] = l.range.first + i;
@@ -735,21 +1049,175 @@ public:
     // The range's keys, then each aggregate's value; strings point into the merged arenas.
     bool NextBatch(LocalState& local, Batch& out) const override {
         auto& l = static_cast<AggSourceLocal&>(local);
+        if (groups_->spilled) return NextMerged(l, out);
         if (l.done) return false;
         l.done = true;
-        const GroupTable& t = groups_->tables[l.range.table];
-        const uint32_t n = l.range.count;
-        ShapeBatch(out, types_);
-        out.Reset(n);
-        const size_t key_count = shape_->keys.size();
-        for (size_t k = 0; k < key_count; ++k) Gather(t.keys[k], l.rows.data(), n, out.slots[k]);
-        for (size_t a = 0; a < shape_->aggs.size(); ++a) {
-            Emit(shape_->aggs[a], t.states[a], l.range.first, n, l.rows.data(), out.slots[key_count + a]);
-        }
+        FillBatch(groups_->tables[l.range.table], l.range.first, l.range.count, l.rows.data(), out);
         return true;
     }
 
 private:
+    // Room for a batch of row ids.
+    [[nodiscard]] static std::unique_ptr<AggSourceLocal> NewLocal() {
+        auto local = std::make_unique<AggSourceLocal>();
+        local->rows.resize(kBatchSize);
+        return local;
+    }
+
+    // Groups first..first+n-1 of t into out: keys, then each aggregate's value.
+    void FillBatch(const GroupTable& t, uint32_t first, uint32_t n, const uint32_t* rows, Batch& out) const {
+        ShapeBatch(out, types_);
+        out.Reset(n);
+        const size_t key_count = shape_->keys.size();
+        for (size_t k = 0; k < key_count; ++k) Gather(t.keys[k], rows, n, out.slots[k]);
+        for (size_t a = 0; a < shape_->aggs.size(); ++a) Emit(shape_->aggs[a], t.states[a], first, n, rows, out.slots[key_count + a]);
+    }
+
+    // Frees the last morsel's piece and splits, then queues partition p.
+    // A global aggregate's rows share one hash, so no split could part them.
+    void StartPartition(size_t p, AggSourceLocal& l) const {
+        ResetPiece(l);
+        l.pending.clear();
+        l.files.clear();
+        l.pending.push_back(MergeInput{nullptr, p, 0, shape_->global});
+    }
+
+    // The piece's next groups. A finished piece is freed and the next one merged,
+    // so strings (in the workers' tables and this arena) stay valid until the next call.
+    bool NextMerged(AggSourceLocal& l, Batch& out) const {
+        while (l.next >= l.piece.size) {
+            if (l.pending.empty()) return false;
+            const MergeInput in = l.pending.back();
+            l.pending.pop_back();
+            MergePiece(in, l);
+        }
+        const auto n = static_cast<uint32_t>(std::min<size_t>(kBatchSize, l.piece.size - l.next));
+        for (uint32_t i = 0; i < n; ++i) l.rows[i] = l.next + i;
+        FillBatch(l.piece, l.next, n, l.rows.data(), out);
+        l.next += n;
+        return true;
+    }
+
+    // Frees the piece and the strings its runs brought in, and uncounts them.
+    static void ResetPiece(AggSourceLocal& l) {
+        l.piece = GroupTable();
+        l.arena.Clear();
+        l.next = 0;
+        if (l.counted > 0) l.reservation.Shrink(std::exchange(l.counted, 0));
+    }
+
+    // Merges one piece; a piece that won't fit is split at the next level instead.
+    void MergePiece(const MergeInput& in, AggSourceLocal& l) const {
+        ResetPiece(l);
+        if (MergeInto(in, l)) {
+            if (groups_->count_offset != 0) AddToCounts(l.piece, *shape_, groups_->count_offset);
+            return;
+        }
+        ResetPiece(l);  // uncounted before the split writes, so its buffers find room
+        Split(in, l);
+    }
+
+    // Brings the reservation to the piece's bytes and its strings; false when the budget refuses.
+    [[nodiscard]] bool RecountPiece(AggSourceLocal& l) const {
+        const size_t held = TableBytes(l.piece, *shape_) + l.arena.BytesUsed();
+        if (held <= l.counted) return true;
+        if (!l.reservation.Grow(held - l.counted)) return false;
+        l.counted = held;
+        return true;
+    }
+
+    // True when the reservation holds a grant, or the budget can give one.
+    // Without one no split could fit, so the piece merges anyway.
+    [[nodiscard]] static bool CanHoldAGrant(AggSourceLocal& l) {
+        if (l.counted > 0) return true;
+        if (!l.reservation.Grow(1)) return false;
+        l.reservation.Shrink(1);  // keeps the grant as a spare for the split
+        return true;
+    }
+
+    // Merges the piece's groups into l.piece with MergeGroup, counting as it grows.
+    // False when the budget or test cap refuses more and the piece may still split.
+    bool MergeInto(const MergeInput& in, AggSourceLocal& l) const {
+        const GroupShape& shape = *shape_;
+        l.piece = MakeTable(shape);
+        if (shape.global) AddGlobalGroup(l.piece, shape);
+        bool forced = in.forced;
+        // True while merging may go on.
+        const auto room = [&] {
+            if (!forced && merge_cap_ != 0 && l.piece.size > merge_cap_) return false;
+            if (RecountPiece(l)) return true;
+            if (!forced && !CanHoldAGrant(l)) forced = true;
+            return forced;
+        };
+        if (in.file != nullptr) return MergeRuns(*in.file, in.partition, l, room);
+        // Counted across every worker's part, so room is checked every batch of groups.
+        size_t merged = 0;
+        for (size_t i = 0; i < groups_->parts.size(); ++i) {
+            const GroupTable& part = groups_->parts[i];
+            const Buckets& b = groups_->buckets[i];
+            for (size_t at = b.offsets[in.partition]; at < b.offsets[in.partition + 1]; ++at) {
+                MergeGroup(l.piece, shape, part, b.order[at]);
+                if (++merged % kBatchSize == 0 && !room()) return false;
+            }
+        }
+        if (!room()) return false;
+        for (const SpillFile& file : groups_->files) {
+            if (!MergeRuns(file, in.partition, l, room)) return false;
+        }
+        return true;
+    }
+
+    // Merges each block of one spill file partition into l.piece, checking room after each.
+    template <typename Room>
+    bool MergeRuns(const SpillFile& file, size_t partition, AggSourceLocal& l, Room& room) const {
+        for (const uint64_t at : file.blocks[partition]) {
+            const GroupTable from = ReadGroups(file, at, *shape_, l.block, l.arena);
+            for (uint32_t g = 0; g < from.size; ++g) MergeGroup(l.piece, *shape_, from, g);
+            if (!room()) return false;
+        }
+        return true;
+    }
+
+    // Writes the piece's groups to a new file by next-level partition, queuing each part.
+    // A part holding every group, or at the deepest level, merges even past the budget.
+    void Split(const MergeInput& in, AggSourceLocal& l) const {
+        const GroupShape& shape = *shape_;
+        const int level = in.level + 1;
+        std::optional<SpillFile> written;
+        {
+            PartitionedWriter writer(shape.spill_arrays, SpillDirectory(l.temp_dir), l.counters, &l.reservation);
+            if (in.file != nullptr) {
+                SplitRuns(*in.file, in.partition, level, writer, l);
+            } else {
+                for (size_t i = 0; i < groups_->parts.size(); ++i) {
+                    const Buckets& b = groups_->buckets[i];
+                    const size_t first = b.offsets[in.partition];
+                    const auto id_at = [&b, first](size_t j) { return b.order[first + j]; };
+                    WriteGroups(groups_->parts[i], shape, b.offsets[in.partition + 1] - first, id_at, level, writer);
+                }
+                for (const SpillFile& file : groups_->files) SplitRuns(file, in.partition, level, writer, l);
+            }
+            written = writer.TakeFile();
+        }
+        if (!written) return;
+        l.files.push_back(std::make_unique<SpillFile>(std::move(*written)));
+        const SpillFile& file = *l.files.back();
+        const auto parts = std::count_if(file.rows.begin(), file.rows.end(), [](uint64_t rows) { return rows > 0; });
+        for (size_t q = 0; q < kSpillPartitions; ++q) {
+            if (file.rows[q] > 0) l.pending.push_back(MergeInput{&file, q, level, parts == 1 || level >= kMaxSpillLevel});
+        }
+    }
+
+    // Writes one spill file partition through writer at level, a block at a time.
+    void SplitRuns(const SpillFile& file, size_t partition, int level, PartitionedWriter& writer, AggSourceLocal& l) const {
+        StringArena strings;
+        for (const uint64_t at : file.blocks[partition]) {
+            strings.Clear();
+            const GroupTable from = ReadGroups(file, at, *shape_, l.block, strings);
+            WriteGroups(from, *shape_, from.size, [](size_t g) { return static_cast<uint32_t>(g); }, level, writer);
+        }
+    }
+
     // Writes groups first..first+n-1 of one aggregate into out's rows 0..n-1.
     static void Emit(const AggInfo& info, const StateColumn& s, uint32_t first, uint32_t n, const uint32_t* rows, Vector& out) {
         switch (info.kind) {
@@ -801,6 +1269,7 @@ private:
     std::shared_ptr<const MergedGroups> groups_;
     std::vector<VType> types_;
     std::vector<GroupRange> ranges_;
+    size_t merge_cap_{0};  // set by Prepare
 };
 
 }  // namespace
@@ -860,6 +1329,7 @@ std::pair<std::unique_ptr<Sink>, std::unique_ptr<Source>> MakeHashAggregate(Aggr
         if (info.kind == StateKind::COUNT) spec.args[a].reset();  // COUNT never reads its argument
         shape->aggs.push_back(info);
     }
+    FillSpillLayout(*shape);
 
     SharedOutput<MergedGroups> groups;
     auto source = std::make_unique<AggregateSource>(shape, groups.Reader());
@@ -872,6 +1342,11 @@ void OffsetCountsForTest(Sink& aggregate_sink, int64_t offset) {
     auto* sink = dynamic_cast<AggregateSink*>(&aggregate_sink);
     if (sink == nullptr) throw DatabaseException("OffsetCountsForTest needs an aggregate's sink");
     sink->OffsetCounts(offset);
+}
+
+// Read once per aggregate, by its source's Prepare.
+void SetAggregateMergeGroupsForTest(size_t most) {
+    test_merge_groups = most;
 }
 
 }  // namespace shilmandb::parallel

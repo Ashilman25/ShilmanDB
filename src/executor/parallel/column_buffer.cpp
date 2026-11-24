@@ -38,6 +38,14 @@ void MoveAfter(std::vector<T>& to, std::vector<T>& from) {
 
 }  // namespace
 
+// Clears every array; a buffer uses only one, but this needn't know which.
+void ClearBuffer(ColumnBuffer& b) {
+    b.i64.clear();
+    b.i128.clear();
+    b.f64.clear();
+    b.str.clear();
+}
+
 // Strings go through StrAt, so plain and dictionary vectors both work.
 void Append(const Vector& v, const Selection& sel, ColumnBuffer& buf, StringArena& arena) {
     switch (ArrayOf(v.Type())) {

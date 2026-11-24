@@ -392,4 +392,11 @@ void TempFile::SetOpenHookForTest(std::function<void(const std::string& path)> h
     test_open_hook = std::move(hook);
 }
 
+// Breakers call this before opening their first spill file.
+const std::string& SpillDirectory(const std::string* dir) {
+    assert(dir != nullptr && "spilling needs a temp directory");
+    if (dir == nullptr) throw DatabaseException("spilling needs a temp directory");
+    return *dir;
+}
+
 }  // namespace shilmandb::parallel

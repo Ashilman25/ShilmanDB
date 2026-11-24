@@ -68,25 +68,6 @@ int TieCompareAt(const ColumnBuffer& x, uint32_t a, const ColumnBuffer& y, uint3
     return t.kind == Kind::DOUBLE ? TotalOrder(x.f64[a], y.f64[b]) : CompareAt(x, a, y, b, t);
 }
 
-// Bytes one value takes in its array; a string counts its reference, not its bytes.
-size_t WidthOf(ValueArray a) {
-    switch (a) {
-        case ValueArray::I64: return sizeof(int64_t);
-        case ValueArray::I128: return sizeof(__int128);
-        case ValueArray::F64: return sizeof(double);
-        case ValueArray::STR: return sizeof(StringRef);
-    }
-    return 0;
-}
-
-// Empties a buffer, keeping its memory for the next block.
-void ClearBuffer(ColumnBuffer& b) {
-    b.i64.clear();
-    b.i128.clear();
-    b.f64.clear();
-    b.str.clear();
-}
-
 // to = from's listed rows, in that order; strings still point where from's do.
 void GatherRows(const ColumnBuffer& from, ValueArray a, const uint32_t* rows, size_t n, ColumnBuffer& to) {
     ClearBuffer(to);
@@ -149,7 +130,7 @@ struct SortLayout {
         for (const VType& t : key_types) arrays.push_back(ArrayOf(t));
         for (const VType& t : kept_types) arrays.push_back(ArrayOf(t));
         for (size_t c = 0; c < arrays.size(); ++c) {
-            row_bytes += WidthOf(arrays[c]);
+            row_bytes += ArrayWidth(arrays[c]);
             if (c + 1 == key_types.size()) key_bytes = row_bytes;
             if (arrays[c] == ValueArray::STR) string_columns.push_back(c);
         }
@@ -194,6 +175,7 @@ std::vector<uint32_t> SortedOrder(const SortLayout& layout, const SortColumns& c
     std::vector<uint32_t> order(rows);
     std::iota(order.begin(), order.end(), 0u);
     const auto before = [&](uint32_t a, uint32_t b) { return layout.Before(cols, a, cols, b); };
+
     if (layout.limit && *layout.limit < rows) {
         std::partial_sort(order.begin(), order.begin() + static_cast<std::ptrdiff_t>(*layout.limit), order.end(), before);
         order.resize(*layout.limit);
@@ -222,6 +204,7 @@ Run WriteRunBlocks(const SortLayout& layout, const SortColumns& cols, const std:
     for (const ColumnBuffer& b : block) parts.push_back(&b);
     Run run;
     run.file = &file;
+
     for (size_t at = 0; at < order.size();) {
         size_t end = at;
         for (size_t bytes = 0; end < order.size(); ++end) {
@@ -242,11 +225,7 @@ struct SpillPlace {
     SpillCounters* counters{nullptr};
 
     // A new temp file; spilling without a directory is a bug.
-    [[nodiscard]] std::unique_ptr<TempFile> Open() const {
-        assert(dir != nullptr && "spilling needs a temp directory");
-        if (dir == nullptr) throw DatabaseException("spilling needs a temp directory");
-        return std::make_unique<TempFile>(*dir, counters);
-    }
+    [[nodiscard]] std::unique_ptr<TempFile> Open() const { return std::make_unique<TempFile>(SpillDirectory(dir), counters); }
 };
 
 // One row picked by a merge: a cursor and a row of its loaded block.
@@ -261,8 +240,7 @@ class RunMerge {
 public:
     // Reads each run's first block. Blocks are counted in the caller's slots;
     // an oversized block's excess goes in reservation when the budget allows.
-    RunMerge(const SortLayout& layout, const std::vector<const Run*>& runs, MemoryReservation& reservation)
-        : layout_(layout), reservation_(reservation), cursors_(runs.size()) {
+    RunMerge(const SortLayout& layout, const std::vector<const Run*>& runs, MemoryReservation& reservation) : layout_(layout), reservation_(reservation), cursors_(runs.size()) {
         for (size_t i = 0; i < runs.size(); ++i) {
             Cursor& c = cursors_[i];
             c.run = runs[i];
@@ -296,6 +274,7 @@ public:
                 if (!picks.empty() && bytes + row > max_bytes) break;
                 bytes += row;
             }
+
             std::pop_heap(heap_.begin(), heap_.end(), after);
             const uint32_t id = heap_.back();
             picks.push_back(Pick{id, c.row});
@@ -331,6 +310,7 @@ private:
         if (c.extra > 0) reservation_.Shrink(std::exchange(c.extra, 0));
         const RunBlock& block = c.run->blocks[c.next_block++];
         uint64_t offset = block.offset;
+
         if (!c.run->file->ReadBlock(&offset, c.block, layout_.arrays, c.arena)) {
             assert(false && "a run block offset past the file's end");
             throw DatabaseException("damaged temp file: a run block past the file's end");
@@ -447,8 +427,7 @@ struct SortLocal : LocalState {
 // Rows past the worker's budget go to disk as sorted runs.
 class SortSink final : public Sink {
 public:
-    SortSink(SortSpec spec, std::shared_ptr<const SortLayout> layout, SharedOutput<SortedRows> out)
-        : spec_(std::move(spec)), layout_(std::move(layout)), out_(std::move(out)) {}
+    SortSink(SortSpec spec, std::shared_ptr<const SortLayout> layout, SharedOutput<SortedRows> out) : spec_(std::move(spec)), layout_(std::move(layout)), out_(std::move(out)) {}
 
     // A local without a budget, so it never spills.
     [[nodiscard]] std::unique_ptr<LocalState> MakeLocal() const override { return NewLocal(); }
@@ -634,8 +613,7 @@ struct SortSourceLocal : LocalState {
 // Hands out the sorted rows in order, kBatchSize at a time, merging any runs.
 class SortSource final : public Source {
 public:
-    SortSource(std::shared_ptr<const SortLayout> layout, std::shared_ptr<const SortedRows> rows)
-        : layout_(std::move(layout)), rows_(std::move(rows)) {}
+    SortSource(std::shared_ptr<const SortLayout> layout, std::shared_ptr<const SortedRows> rows) : layout_(std::move(layout)), rows_(std::move(rows)) {}
 
     // The sink's Finalize did the sorting; the fan-in's test cap is read here.
     void Prepare(QueryContext&) override { fan_in_ = test_fan_in != 0 ? std::clamp<size_t>(test_fan_in, 2, kMaxFanIn) : kMaxFanIn; }
@@ -697,6 +675,7 @@ private:
             l.slots = 0;
             return false;
         }
+        
         const auto n = static_cast<uint32_t>(l.picks.size());
         ShapeBatch(out, layout_->kept_types);
         out.Reset(n);

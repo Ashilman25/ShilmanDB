@@ -36,6 +36,20 @@ struct ColumnBuffer {
     std::vector<StringRef> str;  // STRING
 };
 
+// Bytes one value takes in its array; a string counts its reference, not its bytes.
+[[nodiscard]] constexpr size_t ArrayWidth(ValueArray a) {
+    switch (a) {
+        case ValueArray::I64: return sizeof(int64_t);
+        case ValueArray::I128: return sizeof(__int128);
+        case ValueArray::F64: return sizeof(double);
+        case ValueArray::STR: return sizeof(StringRef);
+    }
+    return 0;
+}
+
+// Empties a buffer, keeping its memory for reuse.
+void ClearBuffer(ColumnBuffer& b);
+
 // Appends v's active rows to buf. Strings are copied into arena,
 // since a morsel's bytes die when its worker starts the next one.
 void Append(const Vector& v, const Selection& sel, ColumnBuffer& buf, StringArena& arena);

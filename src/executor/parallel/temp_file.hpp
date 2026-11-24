@@ -104,4 +104,8 @@ private:
     bool in_block_{false};
 };
 
+// The query's temp directory for a spill; spilling without one is a bug
+// (a Debug assert, else DatabaseException).
+[[nodiscard]] const std::string& SpillDirectory(const std::string* dir);
+
 }  // namespace shilmandb::parallel
