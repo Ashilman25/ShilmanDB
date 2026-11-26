@@ -1,8 +1,10 @@
 #include <gtest/gtest.h>
 
+#include <fcntl.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <cmath>
 #include <cstdint>
@@ -13,6 +15,7 @@
 #include <functional>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <numeric>
 #include <optional>
 #include <random>
@@ -895,6 +898,16 @@ SpillRow BigRow(uint32_t i) {
     return r;
 }
 
+// Bytes of string in every HugeRow, at least.
+constexpr size_t kHugeBytes = 1100000;
+
+// Every string is past 1 MB, so every run block holds one row.
+SpillRow HugeRow(uint32_t i) {
+    SpillRow r = SmallRow(i);
+    r.s = std::string(kHugeBytes + i % 97, static_cast<char>('a' + i % 26)) + std::to_string(i);
+    return r;
+}
+
 // Appends one cell's exact bytes: numbers raw, strings with their length first.
 void AppendBytes(const Vector& v, uint32_t row, std::string& out) {
     const auto raw = [&out](const void* p, size_t n) { out.append(static_cast<const char*>(p), n); };
@@ -1085,6 +1098,8 @@ struct SpillConfig {
     std::optional<size_t> limit;  // the budget's limit; none means no budget
     size_t held{0};               // bytes the test holds on every worker's floor first
     int fail_writes{0};           // errno every temp write fails with; 0 for none
+    bool damaged{false};          // the test damages a temp file, so the run must fail
+    std::function<void(MemoryBudget*, const std::string&)> on_open;  // told of each new temp file
 };
 
 // No budget at all.
@@ -1159,6 +1174,80 @@ public:
     FanInScope& operator=(const FanInScope&) = delete;
 };
 
+// Passes each new temp file's path to hook while alive.
+class OpenHookScope {
+public:
+    explicit OpenHookScope(std::function<void(const std::string&)> hook) { TempFile::SetOpenHookForTest(std::move(hook)); }
+    ~OpenHookScope() { TempFile::SetOpenHookForTest(nullptr); }
+    OpenHookScope(const OpenHookScope&) = delete;
+    OpenHookScope& operator=(const OpenHookScope&) = delete;
+};
+
+// Tells hook what each sort merge holds while alive.
+class MergeHookScope {
+public:
+    explicit MergeHookScope(std::function<void(const SortMergeState&)> hook) { SetSortMergeHookForTest(std::move(hook)); }
+    ~MergeHookScope() { SetSortMergeHookForTest(nullptr); }
+    MergeHookScope(const MergeHookScope&) = delete;
+    MergeHookScope& operator=(const MergeHookScope&) = delete;
+};
+
+// Flips CRC bits in every block of a temp file, or only in its last.
+// Returns how many blocks it damaged.
+size_t DamageBlocks(int fd, bool last_only) {
+    const off_t size = ::lseek(fd, 0, SEEK_END);
+    std::vector<off_t> starts;
+    for (off_t at = 0; at + static_cast<off_t>(sizeof(TempBlockHeader)) <= size;) {
+        TempBlockHeader h{};
+        if (::pread(fd, &h, sizeof(h), at) != static_cast<ssize_t>(sizeof(h))) break;
+        starts.push_back(at);
+        at += static_cast<off_t>(sizeof(h) + h.payload_bytes);
+    }
+    if (last_only && !starts.empty()) starts.erase(starts.begin(), starts.end() - 1);
+    for (const off_t at : starts) {
+        TempBlockHeader h{};
+        if (::pread(fd, &h, sizeof(h), at) != static_cast<ssize_t>(sizeof(h))) return 0;
+        h.crc ^= 0xFFu;
+        if (::pwrite(fd, &h, sizeof(h), at) != static_cast<ssize_t>(sizeof(h))) return 0;
+    }
+    return starts.size();
+}
+
+// Keeps a descriptor to each temp file opened before Damage, which damages and closes them.
+// Files opened after Damage are left alone.
+class TempFileDamage {
+public:
+    ~TempFileDamage() {
+        for (const int fd : fds_) ::close(fd);
+    }
+
+    // Called from any worker as a file opens, before it's unlinked.
+    void Opened(const std::string& path) {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (done_) return;
+        const int fd = ::open(path.c_str(), O_RDWR | O_CLOEXEC);
+        if (fd >= 0) fds_.push_back(fd);
+    }
+
+    // Damages every block of each kept file, or only its last; returns blocks damaged.
+    size_t Damage(bool last_only) {
+        std::lock_guard<std::mutex> lock(mu_);
+        done_ = true;
+        size_t damaged = 0;
+        for (const int fd : fds_) {
+            damaged += DamageBlocks(fd, last_only);
+            ::close(fd);
+        }
+        fds_.clear();
+        return damaged;
+    }
+
+private:
+    std::mutex mu_;
+    std::vector<int> fds_;
+    bool done_{false};
+};
+
 class ParallelSortSpillTest : public ParallelSortTest {
 protected:
     std::string temp_dir_;
@@ -1219,6 +1308,8 @@ protected:
         try {
             std::optional<FailWritesScope> fail;
             if (cfg.fail_writes != 0) fail.emplace(cfg.fail_writes);
+            std::optional<OpenHookScope> opens;
+            if (cfg.on_open) opens.emplace([&cfg, b](const std::string& path) { cfg.on_open(b, path); });
             RunPipeline(sort_in, ctx);
             if (after_sink && b != nullptr) after_sink(*b);
             RunPipeline(sort_out, ctx);
@@ -1229,7 +1320,7 @@ protected:
         made.first.reset();
         made.second.reset();
         held.clear();
-        EXPECT_EQ(error.empty(), cfg.fail_writes == 0) << label << ": " << error;
+        EXPECT_EQ(error.empty(), cfg.fail_writes == 0 && !cfg.damaged) << label << ": " << error;
         if (!cfg.limit && !cfg.spill_everything) EXPECT_EQ(counters.files.load(), 0u) << label;
         if (b != nullptr) EXPECT_EQ(b->HeldBytes(), 0u) << label;
         EXPECT_TRUE(TempDirEmpty()) << label;
@@ -1561,6 +1652,157 @@ TEST_F(ParallelSortSpillTest, SpillEverythingMatches) {
         }
     }
     EXPECT_TRUE(TempDirEmpty());
+}
+
+TEST_F(ParallelSortSpillTest, HugeRowsNarrowTheMerge) {
+    // Each block is one row past 1 MB; each morsel makes one 3-row run.
+    // Holding half of each floor leaves a merge 4 MiB, room for three such blocks.
+    // Holding all of it leaves nothing, so every merge reads two runs, uncounted.
+    constexpr uint32_t kRows = 24;
+    const SortCase c{{{0, false}}, {0, 1, 2, 3, 4}, std::nullopt, "k DESC, huge s"};
+    const SpillResult want = RunSpill(c, kRows, kSpillMorsels, HugeRow, false, Unspilled(1));
+    ASSERT_EQ(want.rows.size(), kRows);
+    const size_t two_blocks = 2 * (kHugeBytes + 4096);  // two of the biggest rows, with room to spare
+
+    for (const unsigned threads : {1u, kSpillThreads}) {
+        for (const size_t held : {kWorkerMinimumBytes - kGrantBytes, kWorkerMinimumBytes}) {
+            const std::string label = std::to_string(threads) + " threads, held " + std::to_string(held);
+            size_t widest = 0;
+            size_t uncounted_wide = 0;  // most a merge of 3+ runs held past its count
+            size_t uncounted_two = 0;   // the same for merges of two runs
+            const MergeHookScope hook([&](const SortMergeState& m) {
+                widest = std::max(widest, m.runs);
+                const size_t over = m.loaded_bytes > m.counted_bytes ? m.loaded_bytes - m.counted_bytes : 0;
+                size_t& most = m.runs > 2 ? uncounted_wide : uncounted_two;
+                most = std::max(most, over);
+            });
+            const SpillResult got = RunSpill(c, kRows, kSpillMorsels, HugeRow, false, Everything(threads, held));
+            EXPECT_EQ(FirstDifference(got.rows, want.rows), "") << label;
+            EXPECT_EQ(uncounted_wide, 0u) << label;
+            EXPECT_LE(uncounted_two, two_blocks) << label;
+            EXPECT_GE(widest, 2u) << label;
+            EXPECT_LE(widest, held == kWorkerMinimumBytes ? 2u : 3u) << label;
+            // One thread writes one sink file, so more files mean merge passes ran.
+            if (threads == 1) EXPECT_GT(got.files, 1u) << label;
+        }
+    }
+}
+
+TEST_F(ParallelSortSpillTest, RowsStayCountedWhileWritten) {
+    // One worker, two grants of floor; its rows pass one grant before its first run.
+    // That run's file opens while its rows are being written, and they're still counted.
+    constexpr uint32_t kRows = 40000;
+    const SortCase c{{{0, true}}, {0, 1, 2, 3, 4}, std::nullopt, "k"};
+    const SpillResult want = RunSpill(c, kRows, kSpillMorsels, WideRow, false, Unspilled(1));
+    bool opened = false;
+    size_t held_at_open = 0;
+    SpillConfig cfg = FloorsOnly(1, 0);
+    cfg.on_open = [&](MemoryBudget* budget, const std::string&) {
+        if (opened) return;
+        opened = true;
+        held_at_open = budget->HeldBytes();
+    };
+    const SpillResult got = RunSpill(c, kRows, kSpillMorsels, WideRow, false, cfg);
+    EXPECT_EQ(FirstDifference(got.rows, want.rows), "");
+    EXPECT_GT(got.files, 0u);
+    ASSERT_TRUE(opened);
+    EXPECT_GT(held_at_open, kGrantBytes);
+}
+
+TEST_F(ParallelSortSpillTest, TopNTrimCountsItsCopy) {
+    // One worker, its floor held by the test, two shared grants for the sort.
+    // 2n rows fit, but not beside a copy of the top n: a run instead.
+    // Nothing sits on the floor, so Finalize writes nothing for want of room.
+    constexpr uint32_t kRows = 40000;
+    constexpr int64_t kTop = 9000;
+    const SortCase all{{{0, true}}, {0, 1, 2, 3, 4}, std::nullopt, "k"};
+    SortCase top = all;
+    top.limit = kTop;
+    top.label = "k LIMIT 9000";
+    SpillConfig two_grants;
+    two_grants.limit = kWorkerMinimumBytes + 2 * kGrantBytes;
+    two_grants.held = kWorkerMinimumBytes;
+    const SpillResult full = RunSpill(all, kRows, kSpillMorsels, WideRow, false, Unspilled(1));
+    const SpillResult got = RunSpill(top, kRows, kSpillMorsels, WideRow, false, two_grants);
+    EXPECT_EQ(FirstDifference(got.rows, FirstRows(full.rows, kTop)), "");
+    EXPECT_GT(got.files, 0u);
+}
+
+TEST_F(ParallelSortSpillTest, MultiPassMergeCutsAtTheLimit) {
+    // A run per batch, 2 or 5 runs a merge: passes, each cut at n.
+    struct Input {
+        RowMaker make;
+        uint32_t rows;
+        std::vector<int64_t> limits;
+        const char* name;
+    };
+    const std::vector<Input> inputs = {
+        {SmallRow, 20000, {1, 2049, 9001}, "small"},
+        {TieRowOf, 12000, {7, 2047}, "ties"},
+        {BigRow, 1600, {1, 1001}, "big"},
+    };
+    for (const Input& input : inputs) {
+        for (const int64_t n : input.limits) {
+            const SortCase c{{{0, false}, {1, true}}, {0, 1, 2, 3, 4}, n, std::string(input.name) + " LIMIT " + std::to_string(n)};
+            const SpillResult want = RunSpill(c, input.rows, kSpillMorsels, input.make, false, Unspilled(1));
+            ASSERT_EQ(want.rows.size(), static_cast<size_t>(n)) << c.label;
+            for (const size_t fan_in : {size_t{2}, size_t{5}}) {
+                const FanInScope cap(fan_in);
+                for (const unsigned threads : {1u, kSpillThreads}) {
+                    const std::string label = c.label + ", fan-in " + std::to_string(fan_in) + ", " + std::to_string(threads) + " threads";
+                    const SpillResult got = RunSpill(c, input.rows, kSpillMorsels, input.make, false, Everything(threads));
+                    EXPECT_EQ(FirstDifference(got.rows, want.rows), "") << label;
+                    if (threads == 1) EXPECT_GT(got.files, 1u) << label;
+                }
+            }
+        }
+    }
+
+    // With n = 1 each of the 16 sink runs is one row. Fan-in 2 takes passes of 8, 4
+    // and 2 runs: 14 rows when cut at n, against 48 if each pass kept every row.
+    const SortCase one{{{0, false}, {1, true}}, {0, 1, 2, 3, 4}, 1, "small LIMIT 1"};
+    for (const unsigned threads : {1u, kSpillThreads}) {
+        const SpillResult one_merge = RunSpill(one, 20000, kSpillMorsels, SmallRow, false, Everything(threads));
+        const FanInScope two(2);
+        const SpillResult passes = RunSpill(one, 20000, kSpillMorsels, SmallRow, false, Everything(threads));
+        EXPECT_EQ(FirstDifference(passes.rows, one_merge.rows), "") << threads << " threads";
+        EXPECT_LT(passes.written, 2 * one_merge.written) << threads << " threads";
+    }
+}
+
+TEST_F(ParallelSortSpillTest, DamagedRunBlockLeavesNothing) {
+    // Morsels make runs of 2,048 then 1,000 rows: each file ends in a multi-block run.
+    // Damaged blocks fail a merge as it starts; a damaged last block fails a refill.
+    // With a fan-in of 2, it's a merge pass that fails.
+    constexpr size_t kMorsels = 4;
+    constexpr uint32_t kRows = kMorsels * 3048;
+    const SortCase c{{{0, true}, {1, false}}, {0, 1, 2, 3, 4}, std::nullopt, "k, s DESC"};
+    const SpillResult want = RunSpill(c, kRows, kMorsels, WideRow, false, Unspilled(1));
+    for (const unsigned threads : {1u, kSpillThreads}) {
+        for (const size_t fan_in : {size_t{0}, size_t{2}}) {
+            for (const bool last_only : {false, true}) {
+                const std::string label = std::to_string(threads) + " threads, fan-in " + std::to_string(fan_in) +
+                                          (last_only ? ", last block" : ", every block");
+                std::optional<FanInScope> cap;
+                if (fan_in != 0) cap.emplace(fan_in);
+                TempFileDamage damage;
+                SpillConfig cfg = Everything(threads);
+                cfg.damaged = true;
+                cfg.on_open = [&damage](MemoryBudget*, const std::string& path) { damage.Opened(path); };
+                size_t damaged = 0;
+                // The sink's files are done once its pipeline is; damage them before the merge.
+                const SpillResult failed = RunSpill(c, kRows, kMorsels, WideRow, false, cfg,
+                                                    [&](MemoryBudget&) { damaged = damage.Damage(last_only); });
+                EXPECT_GT(damaged, 0u) << label;
+                EXPECT_EQ(failed.error, "damaged temp file: checksum mismatch") << label;
+
+                // The next sort, on fresh objects, answers.
+                const SpillResult next = RunSpill(c, kRows, kMorsels, WideRow, false, Everything(threads));
+                EXPECT_EQ(FirstDifference(next.rows, want.rows), "") << label;
+                EXPECT_GT(next.files, 0u) << label;
+            }
+        }
+    }
 }
 
 }  // namespace

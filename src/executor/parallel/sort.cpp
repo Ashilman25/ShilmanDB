@@ -9,6 +9,7 @@
 #include <cassert>
 #include <cmath>
 #include <cstddef>
+#include <functional>
 #include <iterator>
 #include <limits>
 #include <numeric>
@@ -23,7 +24,7 @@ namespace {
 // An 8 MiB floor holds 32, so a tight merge still reads many runs.
 constexpr size_t kRunBlockBytes = size_t{256} << 10;
 
-// The most runs one merge reads at once: 16 MiB of blocks.
+// The most runs one merge reads at once: 16 MiB of 256 KiB slots.
 constexpr size_t kMaxFanIn = 64;
 
 // No byte cap on a merge's picks.
@@ -32,6 +33,9 @@ constexpr size_t kNoByteLimit = std::numeric_limits<size_t>::max();
 // Set only by tests, on the calling thread.
 // The most runs one merge reads; 0 means no cap.
 size_t test_fan_in = 0;
+
+// Set only by tests, while no sort runs; told what each merge holds.
+std::function<void(const SortMergeState&)> test_merge_hook;
 
 // -1, 0 or 1 using < alone, as Value does.
 template <typename T>
@@ -87,16 +91,52 @@ void GatherRows(const ColumnBuffer& from, ValueArray a, const uint32_t* rows, si
     }
 }
 
-// Appends the listed rows of from to to, strings copied into arena.
-void CopyRows(const ColumnBuffer& from, const VType& t, const std::vector<uint32_t>& rows, ColumnBuffer& to, StringArena& arena) {
-    Vector v(t);
-    Selection all;
-    for (size_t at = 0; at < rows.size(); at += kBatchSize) {
-        const auto n = static_cast<uint32_t>(std::min<size_t>(kBatchSize, rows.size() - at));
-        Gather(from, rows.data() + at, n, v);
-        all.SetAll(n);
-        Append(v, all, to, arena);
+// Room for n more values in the array a, so appending them leaves no slack.
+void ReserveRows(ColumnBuffer& b, ValueArray a, size_t n) {
+    switch (a) {
+        case ValueArray::I64: b.i64.reserve(b.i64.size() + n); break;
+        case ValueArray::I128: b.i128.reserve(b.i128.size() + n); break;
+        case ValueArray::F64: b.f64.reserve(b.f64.size() + n); break;
+        case ValueArray::STR: b.str.reserve(b.str.size() + n); break;
     }
+}
+
+// n empty columns, each with room for rows values; arrays has one entry per column.
+ColumnStore SizedStore(const ValueArray* arrays, size_t n, size_t rows) {
+    ColumnStore store(n);
+    for (size_t c = 0; c < n; ++c) ReserveRows(store.columns[c], arrays[c], rows);
+    return store;
+}
+
+// A new store of from's listed rows, in order, their strings in its own arena.
+ColumnStore CopyStore(const ColumnStore& from, const ValueArray* arrays, const std::vector<uint32_t>& rows) {
+    ColumnStore to = SizedStore(arrays, from.columns.size(), rows.size());
+    for (size_t c = 0; c < to.columns.size(); ++c) CopyRows(from.columns[c], arrays[c], rows.data(), rows.size(), to.columns[c], to.arena);
+    to.rows = rows.size();
+    return to;
+}
+
+// Appends from's values to to's, then frees from's memory, not just its values.
+template <typename T>
+void MoveAndFree(std::vector<T>& to, std::vector<T>& from) {
+    to.insert(to.end(), from.begin(), from.end());
+    std::vector<T>().swap(from);
+}
+
+// Moves from's rows after to's, freeing each of from's columns once it's copied.
+// from's arenas move too, so its strings stay where they are.
+void MoveRows(ColumnStore& to, ColumnStore& from) {
+    assert(to.columns.size() == from.columns.size() && "moving rows between stores of other columns");
+    for (size_t c = 0; c < to.columns.size(); ++c) {
+        MoveAndFree(to.columns[c].i64, from.columns[c].i64);
+        MoveAndFree(to.columns[c].i128, from.columns[c].i128);
+        MoveAndFree(to.columns[c].f64, from.columns[c].f64);
+        MoveAndFree(to.columns[c].str, from.columns[c].str);
+    }
+    to.absorbed.push_back(std::move(from.arena));
+    for (StringArena& a : from.absorbed) to.absorbed.push_back(std::move(a));
+    from.absorbed.clear();
+    to.rows += std::exchange(from.rows, 0);
 }
 
 // A worker's key and kept columns, or a run block's (keys, then kept).
@@ -158,6 +198,15 @@ struct SortLayout {
         return bytes;
     }
 
+    // A run block's estimated bytes, as a merge holds it once loaded.
+    [[nodiscard]] size_t BlockBytes(const std::vector<ColumnBuffer>& block, size_t rows) const {
+        size_t bytes = rows * row_bytes;
+        for (const size_t c : string_columns) {
+            for (const StringRef& s : block[c].str) bytes += s.size;
+        }
+        return bytes;
+    }
+
     // A worker's two stores as one set of columns.
     [[nodiscard]] SortColumns Columns(const ColumnStore& keys, const ColumnStore& kept) const {
         return {keys.columns.data(), kept.columns.data(), key_types.size()};
@@ -195,7 +244,31 @@ struct RunBlock {
 struct Run {
     const TempFile* file{nullptr};
     std::vector<RunBlock> blocks;
+    size_t largest{0};  // its biggest block's bytes by the row estimate, as a merge holds it
+
+    // Adds a written block of this many estimated bytes.
+    void Add(RunBlock block, size_t bytes) {
+        blocks.push_back(block);
+        largest = std::max(largest, bytes);
+    }
 };
+
+// A merge's room for one block of a run: its biggest block, at least kRunBlockBytes.
+size_t SlotBytes(const Run& run) {
+    return std::max(kRunBlockBytes, run.largest);
+}
+
+// How many runs, starting at first, one merge reads whose slots fit room bytes.
+// Up to most runs; at least two, as a merge needs two, unless fewer remain.
+size_t RunsThatFit(const std::vector<const Run*>& runs, size_t first, size_t room, size_t most) {
+    size_t n = 0;
+    for (size_t bytes = 0; first + n < runs.size() && n < most; ++n) {
+        const size_t slot = SlotBytes(*runs[first + n]);
+        if (n >= 2 && bytes + slot > room) break;
+        bytes += slot;
+    }
+    return n;
+}
 
 // Writes rows in this order as one run, in blocks of about kRunBlockBytes at most.
 Run WriteRunBlocks(const SortLayout& layout, const SortColumns& cols, const std::vector<uint32_t>& order, TempFile& file) {
@@ -207,13 +280,14 @@ Run WriteRunBlocks(const SortLayout& layout, const SortColumns& cols, const std:
 
     for (size_t at = 0; at < order.size();) {
         size_t end = at;
-        for (size_t bytes = 0; end < order.size(); ++end) {
+        size_t bytes = 0;
+        for (; end < order.size(); ++end) {
             const size_t row = layout.RowBytes(cols, order[end]);
             if (end > at && bytes + row > kRunBlockBytes) break;
             bytes += row;
         }
         for (size_t c = 0; c < block.size(); ++c) GatherRows(cols[c], layout.arrays[c], order.data() + at, end - at, block[c]);
-        run.blocks.push_back(RunBlock{file.WriteBlock(parts, layout.arrays, 0, end - at), static_cast<uint32_t>(end - at)});
+        run.Add(RunBlock{file.WriteBlock(parts, layout.arrays, 0, end - at), static_cast<uint32_t>(end - at)}, bytes);
         at = end;
     }
     return run;
@@ -238,9 +312,9 @@ struct Pick {
 // A pick points into a loaded block, valid until the next call to Next.
 class RunMerge {
 public:
-    // Reads each run's first block. Blocks are counted in the caller's slots;
-    // an oversized block's excess goes in reservation when the budget allows.
-    RunMerge(const SortLayout& layout, const std::vector<const Run*>& runs, MemoryReservation& reservation) : layout_(layout), reservation_(reservation), cursors_(runs.size()) {
+    // Reads each run's first block. counted is what the caller's budget holds for the blocks:
+    // each run's slot, or less only when the merge reads just two runs.
+    RunMerge(const SortLayout& layout, const std::vector<const Run*>& runs, size_t counted) : layout_(layout), cursors_(runs.size()), counted_(counted) {
         for (size_t i = 0; i < runs.size(); ++i) {
             Cursor& c = cursors_[i];
             c.run = runs[i];
@@ -250,11 +324,7 @@ public:
             heap_.push_back(static_cast<uint32_t>(i));
         }
         std::make_heap(heap_.begin(), heap_.end(), [this](uint32_t a, uint32_t b) { return After(a, b); });
-    }
-
-    // Gives back what oversized blocks counted.
-    ~RunMerge() {
-        for (Cursor& c : cursors_) Drop(c);
+        Report();
     }
 
     RunMerge(const RunMerge&) = delete;
@@ -300,14 +370,14 @@ private:
         StringArena arena;                // the block's strings
         uint32_t row{0};
         uint32_t rows{0};
-        size_t extra{0};  // bytes past its slot, counted for an oversized row
+        size_t bytes{0};  // the loaded block's bytes by the row estimate
     };
 
     // Reads the cursor's next block over its last one.
     void Load(Cursor& c) {
         for (ColumnBuffer& b : c.block) ClearBuffer(b);
         c.arena.Clear();
-        if (c.extra > 0) reservation_.Shrink(std::exchange(c.extra, 0));
+        loaded_ -= std::exchange(c.bytes, 0);
         const RunBlock& block = c.run->blocks[c.next_block++];
         uint64_t offset = block.offset;
 
@@ -317,15 +387,15 @@ private:
         }
         c.row = 0;
         c.rows = block.rows;
-        const size_t bytes = c.rows * layout_.row_bytes + c.arena.BytesUsed();
-        if (bytes > kRunBlockBytes && reservation_.Grow(bytes - kRunBlockBytes)) c.extra = bytes - kRunBlockBytes;
+        c.bytes = c.rows * layout_.row_bytes + c.arena.BytesUsed();
+        loaded_ += c.bytes;
     }
 
-    // Frees a cursor's block and what it counted.
+    // Frees a cursor's block.
     void Drop(Cursor& c) {
         c.block = std::vector<ColumnBuffer>();
         c.arena = StringArena();
-        if (c.extra > 0) reservation_.Shrink(std::exchange(c.extra, 0));
+        loaded_ -= std::exchange(c.bytes, 0);
     }
 
     // Loads the next block of each cursor emptied on the last call, or drops it.
@@ -341,6 +411,13 @@ private:
             std::push_heap(heap_.begin(), heap_.end(), [this](uint32_t a, uint32_t b) { return After(a, b); });
         }
         exhausted_.clear();
+        Report();
+    }
+
+    // Past two runs the loaded blocks fit what was counted; a test may watch.
+    void Report() const {
+        assert((cursors_.size() <= 2 || loaded_ <= counted_) && "a merge's blocks outgrew their slots");
+        if (test_merge_hook) test_merge_hook(SortMergeState{cursors_.size(), loaded_, counted_});
     }
 
     // The heap's order: true when cursor a's row comes after cursor b's.
@@ -351,10 +428,11 @@ private:
     }
 
     const SortLayout& layout_;
-    MemoryReservation& reservation_;
     std::vector<Cursor> cursors_;
     std::vector<uint32_t> heap_;       // cursors with rows left, earliest row on top
     std::vector<uint32_t> exhausted_;  // cursors whose block ran out on the last call
+    size_t counted_;                   // what the budget holds for the blocks
+    size_t loaded_{0};                 // every loaded block's bytes by the row estimate
 };
 
 // out's rows 0..n-1 = column c of each pick; strings stay in the merge's blocks.
@@ -442,7 +520,7 @@ public:
     }
 
     // Evaluates the keys, copies keys and kept columns for the active rows, and counts them.
-    // Over budget: a top n trims first, then what won't fit becomes a run.
+    // Over budget: a top n trims if its copy fits, else rows become a run.
     void Consume(Batch& in, LocalState& local) const override {
         auto& l = static_cast<SortLocal&>(local);
         for (size_t i = 0; i < spec_.keys.size(); ++i) spec_.keys[i]->Evaluate(in, in.sel, l.key_values[i], l.scratch);
@@ -463,16 +541,10 @@ public:
         }
         if (Recount(l)) {
             // Trimming past n + max(n, a batch) rows keeps the cost per row low.
-            if (limit && l.kept.rows >= *limit + std::max<size_t>(*limit, kBatchSize)) {
-                Trim(l);
-                (void)Recount(l);  // only shrinks
-            }
+            if (limit && l.kept.rows >= *limit + std::max<size_t>(*limit, kBatchSize) && Trim(l)) (void)Recount(l);  // only shrinks
             return;
         }
-        if (limit && l.kept.rows > *limit) {
-            Trim(l);
-            if (Recount(l)) return;
-        }
+        if (limit && l.kept.rows > *limit && Trim(l) && Recount(l)) return;
         WriteRun(l);
     }
 
@@ -525,30 +597,35 @@ private:
     }
 
     // Sorts what the worker holds and writes it as one run, cut at the limit.
-    // Its memory is uncounted before the writing starts.
+    // The rows stay counted until they're freed.
     void WriteRun(SortLocal& l) const {
-        const SortColumns cols = layout_->Columns(l.keys, l.kept);
-        const std::vector<uint32_t> order = SortedOrder(*layout_, cols, l.kept.rows);
-        l.reservation.Shrink(l.reservation.Bytes());
-        if (!order.empty()) {
-            if (!l.file) l.file = l.place.Open();
-            l.runs.push_back(WriteRunBlocks(*layout_, cols, order, *l.file));
+        {
+            const SortColumns cols = layout_->Columns(l.keys, l.kept);
+            const std::vector<uint32_t> order = SortedOrder(*layout_, cols, l.kept.rows);
+            if (!order.empty()) {
+                if (!l.file) l.file = l.place.Open();
+                l.runs.push_back(WriteRunBlocks(*layout_, cols, order, *l.file));
+            }
         }
         l.keys = ColumnStore(layout_->key_types.size());
         l.kept = ColumnStore(layout_->kept_types.size());
+        l.reservation.Shrink(l.reservation.Bytes());
     }
 
     // Cuts a worker's rows to its top n, copying their strings into fresh arenas.
-    void Trim(SortLocal& l) const {
-        const std::vector<uint32_t> keep = SortedOrder(*layout_, layout_->Columns(l.keys, l.kept), l.kept.rows);
-        ColumnStore keys(l.keys.columns.size());
-        ColumnStore kept(l.kept.columns.size());
-        for (size_t i = 0; i < keys.columns.size(); ++i) CopyRows(l.keys.columns[i], layout_->key_types[i], keep, keys.columns[i], keys.arena);
-        for (size_t k = 0; k < kept.columns.size(); ++k) CopyRows(l.kept.columns[k], layout_->kept_types[k], keep, kept.columns[k], kept.arena);
-        keys.rows = keep.size();
-        kept.rows = keep.size();
-        l.keys = std::move(keys);
-        l.kept = std::move(kept);
+    // The copy is counted first; false, with nothing changed, when the budget refuses it.
+    [[nodiscard]] bool Trim(SortLocal& l) const {
+        const SortColumns cols = layout_->Columns(l.keys, l.kept);
+        const std::vector<uint32_t> keep = SortedOrder(*layout_, cols, l.kept.rows);
+        size_t bytes = 0;
+        for (const uint32_t row : keep) bytes += layout_->RowBytes(cols, row);
+        if (!l.reservation.Grow(bytes)) return false;
+
+        // The old rows' count goes back in the caller's Recount.
+        const ValueArray* arrays = layout_->arrays.data();
+        l.keys = CopyStore(l.keys, arrays, keep);
+        l.kept = CopyStore(l.kept, arrays + layout_->key_types.size(), keep);
+        return true;
     }
 
     // Every part's remainder becomes a run too, so the source merges runs alone.
@@ -567,18 +644,22 @@ private:
     }
 
     // Joins every worker's rows and sorts them; the reservations move with the rows.
+    // The joined columns are sized once, and each part's go as they're copied in.
     // The key values and their strings go once the order is known.
     void SortInMemory() {
         SortedRows& out = out_.Mutable();
-        out.kept = ColumnStore(layout_->kept_types.size());
+        size_t rows = 0;
+        for (size_t i = 0; i < parts_.size(); ++i) rows += Part(i).kept.rows;
+        const size_t key_count = layout_->key_types.size();
+        out.kept = SizedStore(layout_->arrays.data() + key_count, layout_->kept_types.size(), rows);
         std::vector<size_t> key_bytes;
         {
-            ColumnStore keys(layout_->key_types.size());
+            ColumnStore keys = SizedStore(layout_->arrays.data(), key_count, rows);
             for (size_t i = 0; i < parts_.size(); ++i) {
                 SortLocal& p = Part(i);
                 key_bytes.push_back(p.keys.rows * layout_->key_bytes + p.keys.arena.BytesUsed());
-                keys.Absorb(std::move(p.keys));
-                out.kept.Absorb(std::move(p.kept));
+                MoveRows(keys, p.keys);
+                MoveRows(out.kept, p.kept);
                 out.reservations.push_back(std::move(p.reservation));
             }
             out.order = SortedOrder(*layout_, layout_->Columns(keys, out.kept), out.kept.rows);
@@ -601,8 +682,7 @@ struct MergedRuns {
 // Where the source is: a place in the in-memory order, or a merge of runs.
 struct SortSourceLocal : LocalState {
     size_t next{0};                      // in memory: the next place in the order
-    MemoryReservation reservation;       // the merge's blocks, kRunBlockBytes per slot
-    size_t slots{0};                     // blocks the reservation holds room for
+    MemoryReservation reservation;       // room for the merges' blocks, one slot per run read
     SpillPlace place;
     std::unique_ptr<MergedRuns> merged;  // the newest merge pass, if runs were merged down
     std::unique_ptr<RunMerge> merge;     // the final merge; declared after what it reads
@@ -672,7 +752,6 @@ private:
             l.merge.reset();
             l.merged.reset();
             l.reservation = MemoryReservation();
-            l.slots = 0;
             return false;
         }
         
@@ -684,41 +763,60 @@ private:
         return true;
     }
 
-    // Reserves a block slot per run, up to the fan-in, merging down any extra runs.
-    // With under 2 slots it still reads 2 runs at once, uncounted.
+    // Counts room for the runs' slots, then merges runs down until one merge fits it.
+    // A merge still reads two runs when two slots don't fit, uncounted past the room.
     void StartMerge(SortSourceLocal& l) const {
         std::vector<const Run*> runs;
         for (const Run& run : rows_->runs) runs.push_back(&run);
-        const size_t want = std::min(fan_in_, runs.size());
-        while (l.slots < want && l.reservation.Grow(kRunBlockBytes)) ++l.slots;
-        while (runs.size() > std::max<size_t>(2, l.slots)) runs = MergePass(l, runs);
-        l.merge = std::make_unique<RunMerge>(*layout_, runs, l.reservation);
+        GrowRoom(l, runs);
+        while (RunsThatFit(runs, 0, l.reservation.Bytes(), fan_in_) < runs.size()) runs = MergePass(l, runs);
+        l.merge = std::make_unique<RunMerge>(*layout_, runs, l.reservation.Bytes());
     }
 
-    // Merges each group of runs into one new run, all in a new file.
+    // Room for the fan-in's biggest slots, a block at a time until the budget refuses.
+    // Taken in full, it fits any fan-in of runs; merging never makes a slot bigger.
+    void GrowRoom(SortSourceLocal& l, const std::vector<const Run*>& runs) const {
+        std::vector<size_t> slots;
+        for (const Run* run : runs) slots.push_back(SlotBytes(*run));
+        const auto want = static_cast<std::ptrdiff_t>(std::min(fan_in_, slots.size()));
+        std::partial_sort(slots.begin(), slots.begin() + want, slots.end(), std::greater<>());
+        const size_t target = std::accumulate(slots.begin(), slots.begin() + want, size_t{0});
+        for (size_t room = 0; room < target;) {
+            const size_t step = std::min(kRunBlockBytes, target - room);
+            if (!l.reservation.Grow(step)) break;
+            room += step;
+        }
+    }
+
+    // Merges groups of runs that fit the room into new runs, in a new file.
     // One slot holds the output block. The last pass's file goes, all its runs read.
     std::vector<const Run*> MergePass(SortSourceLocal& l, const std::vector<const Run*>& runs) const {
-        const size_t group = l.slots >= 3 ? l.slots - 1 : 2;
-        const size_t groups = (runs.size() + group - 1) / group;
+        const size_t room = l.reservation.Bytes() - std::min(l.reservation.Bytes(), kRunBlockBytes);
+        const size_t most = std::max<size_t>(2, fan_in_ - 1);
         auto pass = std::make_unique<MergedRuns>();
         pass->file = l.place.Open();
         std::vector<ColumnBuffer> block(layout_->arrays.size());
         std::vector<const ColumnBuffer*> parts;
         for (const ColumnBuffer& b : block) parts.push_back(&b);
-        for (size_t g = 0; g < groups; ++g) {
-            // Group sizes differ by at most one run.
-            const auto first = runs.begin() + static_cast<std::ptrdiff_t>(runs.size() * g / groups);
-            const auto last = runs.begin() + static_cast<std::ptrdiff_t>(runs.size() * (g + 1) / groups);
-            RunMerge merge(*layout_, std::vector<const Run*>(first, last), l.reservation);
+
+        for (size_t first = 0; first < runs.size();) {
+            size_t n = RunsThatFit(runs, first, room, most);
+            // Two runs make a better last group than one, when they fit.
+            if (n > 2 && runs.size() - first - n == 1 && SlotBytes(*runs[first + n - 1]) + SlotBytes(*runs.back()) <= room) --n;
+            const auto begin = runs.begin() + static_cast<std::ptrdiff_t>(first);
+            RunMerge merge(*layout_, std::vector<const Run*>(begin, begin + static_cast<std::ptrdiff_t>(n)), room);
+            first += n;
+
             Run run;
             run.file = pass->file.get();
             // A top n's run needs only its first n rows.
             for (size_t left = RowsWanted(); left > 0; left -= l.picks.size()) {
                 merge.Next(left, kRunBlockBytes, l.picks);
                 if (l.picks.empty()) break;
+                const size_t rows = l.picks.size();
                 for (size_t c = 0; c < block.size(); ++c) GatherPicks(merge, c, layout_->arrays[c], l.picks, block[c]);
-                const uint64_t offset = pass->file->WriteBlock(parts, layout_->arrays, 0, l.picks.size());
-                run.blocks.push_back(RunBlock{offset, static_cast<uint32_t>(l.picks.size())});
+                const uint64_t offset = pass->file->WriteBlock(parts, layout_->arrays, 0, rows);
+                run.Add(RunBlock{offset, static_cast<uint32_t>(rows)}, layout_->BlockBytes(block, rows));
             }
             pass->runs.push_back(std::move(run));
         }
@@ -748,6 +846,11 @@ std::pair<std::unique_ptr<Sink>, std::unique_ptr<Source>> MakeSort(SortSpec spec
 // Read once per sort, by its source's Prepare.
 void SetSortFanInForTest(size_t most) {
     test_fan_in = most;
+}
+
+// Called by merges on whatever worker runs them.
+void SetSortMergeHookForTest(std::function<void(const SortMergeState&)> hook) {
+    test_merge_hook = std::move(hook);
 }
 
 }  // namespace shilmandb::parallel

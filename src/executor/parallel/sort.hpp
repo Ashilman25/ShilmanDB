@@ -2,7 +2,9 @@
 #include "executor/parallel/expression.hpp"
 #include "executor/parallel/pipeline.hpp"
 #include "executor/parallel/vector.hpp"
+#include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <utility>
@@ -32,5 +34,16 @@ struct SortSpec {
 // For tests: caps a merge's fan-in, at least 2; 0 turns the cap off.
 // Read when a sort's source is prepared, on the calling thread.
 void SetSortFanInForTest(size_t most);
+
+// What a sort merge holds after it loads blocks, for tests.
+struct SortMergeState {
+    size_t runs{0};           // runs the merge reads at once
+    size_t loaded_bytes{0};   // its loaded blocks, by the row estimate
+    size_t counted_bytes{0};  // what the budget counts for those blocks
+};
+
+// For tests: called by a merge each time it loads blocks; empty turns it off.
+// Set only while no sort runs.
+void SetSortMergeHookForTest(std::function<void(const SortMergeState&)> hook);
 
 }  // namespace shilmandb::parallel
