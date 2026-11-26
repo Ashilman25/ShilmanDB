@@ -68,6 +68,9 @@ void Extend(ColumnBuffer& to, ColumnBuffer&& from);
 // Appends from's rows[0..n), in that order, to `to`; strings are copied into arena.
 void CopyRows(const ColumnBuffer& from, ValueArray a, const uint32_t* rows, size_t n, ColumnBuffer& to, StringArena& arena);
 
+// Room for n values in the array a's values sit in.
+void Reserve(ColumnBuffer& b, ValueArray a, size_t n);
+
 // Rows kept past their batches: one buffer per column. New strings go into arena;
 // arenas taken from other stores keep those stores' strings valid.
 struct ColumnStore {
@@ -82,5 +85,9 @@ struct ColumnStore {
     // Moves other's rows after these; its arenas come along, so its strings stay valid.
     void Absorb(ColumnStore&& other);
 };
+
+// Moves each store's rows after to's, in order, arenas and all.
+// Sizes each column once, frees each copy as it goes; a lone store moves whole.
+void AbsorbAll(ColumnStore& to, const std::vector<ValueArray>& arrays, const std::vector<ColumnStore*>& from);
 
 }  // namespace shilmandb::parallel

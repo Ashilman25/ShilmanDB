@@ -49,6 +49,7 @@ struct HashJoinInfo {
     size_t splits{0};              // pieces the spill phase split at the next level
     size_t chunked_pieces{0};      // pieces whose build rows loaded in chunks
     size_t loads{0};               // build tables the spill phase loaded: one per piece or chunk
+    int deepest_level{0};          // the deepest split level a piece of the spill phase reached
 };
 
 // For tests: a hash join probe operator's info; nullopt for any other operator.

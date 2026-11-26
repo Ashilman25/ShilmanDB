@@ -15,6 +15,7 @@
 #include <cmath>
 #include <cstddef>
 #include <limits>
+#include <numeric>
 #include <optional>
 #include <string>
 #include <utility>
@@ -431,41 +432,25 @@ public:
             }
             SortByPartition(l);
         }
-        AppendPartitioned(in, l, n);
+        // Rows held for newly marked partitions go out before the batch's rows of them.
+        const uint64_t marked = marked_.load(std::memory_order_relaxed);
+        SpillMarked(l, marked);
+        AppendPartitioned(in, l, n, marked);
         SpillUntilCounted(l);
     }
 
     // Keeps the worker's rows, arena and all, until Finalize.
     void Combine(std::unique_ptr<LocalState> local) override { parts_.push_back(std::move(local)); }
 
-    // Each part spills marked partitions and leaves its floor, marking more as needed, in rounds
-    // until every part saw every mark. The rest builds by hash partition, as before.
+    // Spills what can't leave the floors, then builds by hash partition, as before.
+    // Rows join the table in worker order, then each part's arrival or partition order.
     void Finalize(QueryContext& ctx) override {
-        for (bool again = true; again;) {
-            // With nothing marked, a part in arrival order whose floor empties needs no task.
-            std::vector<size_t> busy;
-            for (size_t i = 0; i < parts_.size(); ++i) {
-                BuildLocal& p = Part(i);
-                const bool idle = marked_.load(std::memory_order_relaxed) == 0 && !p.Partitioned() && p.reservation.LeaveFloor() == 0;
-                if (!idle) busy.push_back(i);
-            }
-
-            ForEachTask(ctx, busy.size(), [this, &busy](size_t i) { LeaveFloorOrSpill(Part(busy[i])); });
-            const uint64_t marked = marked_.load(std::memory_order_relaxed);
-
-            again = marked != 0 && std::any_of(parts_.begin(), parts_.end(), [&](const std::unique_ptr<LocalState>& part) {
-                const auto& p = static_cast<const BuildLocal&>(*part);
-                if (!p.Partitioned()) return p.store.rows > 0;
-                for (size_t q = 0; q < kSpillPartitions; ++q) {
-                    if ((marked >> q & 1) != 0 && p.parts[q].store.rows > 0) return true;
-                }
-                return false;
-            });
-        }
+        LeaveFloors(ctx);
 
         BuildTable& t = table_.Mutable();
         t.store = ColumnStore(arrays_.size());
-        std::vector<size_t> kept;  // per part, its rows in the table
+        std::vector<ColumnStore*> stores;  // every part's rows, in table order
+        std::vector<size_t> kept;          // per part, its rows in the table
         for (size_t i = 0; i < parts_.size(); ++i) {
             BuildLocal& p = Part(i);
             if (p.writer) {
@@ -474,14 +459,17 @@ public:
                 if (file) t.files.push_back(std::move(*file));
             }
 
-            const size_t before = t.store.rows;
-            if (p.store.rows > 0) t.store.Absorb(std::move(p.store));
-            for (HeldRows& rows : p.parts) {
-                if (rows.store.rows > 0) t.store.Absorb(std::move(rows.store));
+            size_t rows = p.store.rows;
+            if (p.store.rows > 0) stores.push_back(&p.store);
+            for (HeldRows& held : p.parts) {
+                if (held.store.rows == 0) continue;
+                stores.push_back(&held.store);
+                rows += held.store.rows;
             }
-            kept.push_back(t.store.rows - before);
+            kept.push_back(rows);
             t.reservations.push_back(std::move(p.reservation));
         }
+        AbsorbAll(t.store, arrays_, stores);
         parts_.clear();
         // A marked partition with no rows on disk has nothing to join: not spilled.
         for (size_t q = 0; q < kSpillPartitions; ++q) {
@@ -576,8 +564,8 @@ private:
         from = ColumnStore();
     }
 
-    // The batch's valid rows by spill partition: kept, or written out when marked.
-    void AppendPartitioned(const Batch& in, BuildLocal& l, uint32_t n) const {
+    // The batch's valid rows by spill partition: kept, or written out when in marked.
+    void AppendPartitioned(const Batch& in, BuildLocal& l, uint32_t n, uint64_t marked) const {
         std::array<uint32_t, kSpillPartitions + 1> offsets{};
         for (uint32_t k = 0; k < n; ++k) {
             if (!l.keys.Valid(k)) continue;
@@ -593,7 +581,6 @@ private:
             if (l.keys.Valid(k)) l.order[next[l.part_of[k]]++] = k;
         }
 
-        const uint64_t marked = marked_.load(std::memory_order_relaxed);
         for (size_t q = 0; q < kSpillPartitions; ++q) {
             const uint32_t count = offsets[q + 1] - offsets[q];
             if (count == 0) continue;
@@ -656,10 +643,9 @@ private:
         return true;
     }
 
-    // Writes out and frees this worker's rows of every marked partition, then the writer's buffers.
+    // Writes and frees this worker's rows of the partitions in marked, then flushes the writer.
     // Each partition is uncounted first, so the writer finds room.
-    void SpillMarked(BuildLocal& l) const {
-        const uint64_t marked = marked_.load(std::memory_order_relaxed);
+    void SpillMarked(BuildLocal& l, uint64_t marked) const {
         bool wrote = false;
         for (size_t q = 0; q < kSpillPartitions; ++q) {
             HeldRows& part = l.parts[q];
@@ -676,23 +662,113 @@ private:
         if (wrote) l.writer->Flush();
     }
 
+    // The same for every partition marked now.
+    void SpillMarked(BuildLocal& l) const { SpillMarked(l, marked_.load(std::memory_order_relaxed)); }
+
     // Writes out the marked partitions, then marks the largest until what's left is counted.
     void SpillUntilCounted(BuildLocal& l) const {
         SpillMarked(l);
         while (!Recount(l) && MarkLargest(l)) SpillMarked(l);
     }
 
-    // The part's rows outlive this pipeline: what stays on its worker's floor is spilled,
-    // largest partition first, sorting rows by partition only once that's needed.
-    void LeaveFloorOrSpill(BuildLocal& p) const {
-        if (!p.Partitioned() && marked_.load(std::memory_order_relaxed) != 0 && p.store.rows > 0) SortByPartition(p);
-        if (p.Partitioned()) SpillUntilCounted(p);
-        if (p.writer) p.writer->Flush();  // its buffers aren't the table's floor bytes
-        for (size_t left = p.reservation.LeaveFloor(); left > 0; left = p.reservation.LeaveFloor()) {
-            if (!p.Partitioned()) SortByPartition(p);
-            if (!MarkLargest(p)) break;
-            SpillUntilCounted(p);
+    // The rows outlive this pipeline, so they leave the floors. Parts write marked partitions in
+    // parallel rounds; between rounds this thread marks more, largest across parts, to cover what's stuck.
+    void LeaveFloors(QueryContext& ctx) {
+        std::vector<size_t> stuck(parts_.size(), 0);  // per part: bytes that can't leave its floor
+        const auto round = [&](const std::vector<size_t>& busy) {
+            ForEachTask(ctx, busy.size(), [&](size_t k) { stuck[busy[k]] = WriteMarked(Part(busy[k])); });
+            // A part may have finished before another made room, so each stuck one tries again.
+            for (size_t i = 0; i < parts_.size(); ++i) {
+                if (stuck[i] > 0) stuck[i] = Stuck(Part(i));
+            }
+        };
+
+        // With nothing marked, a part in arrival order needs no task: the unspilled path.
+        std::vector<size_t> busy;
+        const bool any_marked = marked_.load(std::memory_order_relaxed) != 0;
+        for (size_t i = 0; i < parts_.size(); ++i) {
+            if (any_marked || Part(i).Partitioned()) {
+                busy.push_back(i);
+            } else {
+                stuck[i] = Stuck(Part(i));
+            }
         }
+        if (!busy.empty()) round(busy);
+
+        while (std::any_of(stuck.begin(), stuck.end(), [](size_t s) { return s > 0; })) {
+            // Rows still in arrival order sort by partition, so each partition's bytes are known.
+            std::vector<size_t> arrival;
+            for (size_t i = 0; i < parts_.size(); ++i) {
+                if (!Part(i).Partitioned() && Part(i).store.rows > 0) arrival.push_back(i);
+            }
+            ForEachTask(ctx, arrival.size(), [&](size_t k) {
+                SortByPartition(Part(arrival[k]));
+                stuck[arrival[k]] = Stuck(Part(arrival[k]));
+            });
+            if (!MarkAcross(std::accumulate(stuck.begin(), stuck.end(), size_t{0}))) break;
+            busy.clear();
+            for (size_t i = 0; i < parts_.size(); ++i) {
+                if (HoldsMarked(Part(i))) busy.push_back(i);
+            }
+            round(busy);
+        }
+        assert(std::none_of(parts_.begin(), parts_.end(), [this](const std::unique_ptr<LocalState>& p) { return HoldsMarked(static_cast<const BuildLocal&>(*p)); }) &&
+               "every marked partition's rows are on disk");
+    }
+
+    // Writes the part's rows of marked partitions, sorting arrival-order rows by partition
+    // first. Returns the bytes it can't take off its floor.
+    [[nodiscard]] size_t WriteMarked(BuildLocal& p) const {
+        if (!p.Partitioned() && p.store.rows > 0 && marked_.load(std::memory_order_relaxed) != 0) SortByPartition(p);
+        if (p.Partitioned()) SpillMarked(p);
+        if (p.writer) p.writer->Flush();  // its buffers aren't the table's floor bytes
+        return Stuck(p);
+    }
+
+    // Floor bytes the part can't move to the shared pool, plus rows it doesn't count.
+    // Recounts first, since sorting by partition can make the rows bigger.
+    [[nodiscard]] static size_t Stuck(BuildLocal& p) {
+        (void)Recount(p);
+        const size_t uncounted = p.held > p.counted ? p.held - p.counted : 0;
+        return p.reservation.LeaveFloor() + uncounted;
+    }
+
+    // Marks unmarked partitions, largest by bytes summed across parts, until they cover need.
+    // False when there's none left to mark.
+    [[nodiscard]] bool MarkAcross(size_t need) {
+        std::array<size_t, kSpillPartitions> bytes{};
+        for (size_t i = 0; i < parts_.size(); ++i) {
+            const BuildLocal& p = Part(i);
+            if (!p.Partitioned()) continue;
+            for (size_t q = 0; q < kSpillPartitions; ++q) {
+                if (p.parts[q].store.rows > 0) bytes[q] += p.parts[q].bytes;
+            }
+        }
+        uint64_t marked = marked_.load(std::memory_order_relaxed);
+        bool any = false;
+        for (size_t covered = 0; covered < need;) {
+            size_t largest = kSpillPartitions;
+            for (size_t q = 0; q < kSpillPartitions; ++q) {
+                if ((marked >> q & 1) != 0 || bytes[q] == 0) continue;
+                if (largest == kSpillPartitions || bytes[q] > bytes[largest]) largest = q;
+            }
+            if (largest == kSpillPartitions) break;
+            marked |= uint64_t{1} << largest;
+            covered += bytes[largest];
+            any = true;
+        }
+        marked_.store(marked, std::memory_order_relaxed);
+        return any;
+    }
+
+    // True when the part still holds rows of a marked partition.
+    [[nodiscard]] bool HoldsMarked(const BuildLocal& p) const {
+        const uint64_t marked = marked_.load(std::memory_order_relaxed);
+        if (!p.Partitioned()) return marked != 0 && p.store.rows > 0;
+        for (size_t q = 0; q < kSpillPartitions; ++q) {
+            if ((marked >> q & 1) != 0 && p.parts[q].store.rows > 0) return true;
+        }
+        return false;
     }
 
     std::unique_ptr<CompiledExpr> key_;
@@ -915,6 +991,7 @@ public:
         info.splits = splits_.load(std::memory_order_relaxed);
         info.chunked_pieces = chunked_pieces_.load(std::memory_order_relaxed);
         info.loads = loads_.load(std::memory_order_relaxed);
+        info.deepest_level = deepest_level_.load(std::memory_order_relaxed);
         return info;
     }
 
@@ -1060,6 +1137,10 @@ private:
     void StartPiece(SpillPiece piece, ProbeLocal& l) const {
         l.piece = std::move(piece);
         const size_t q = l.piece.partition;
+        // Raises the deepest level seen to this piece's.
+        for (int seen = deepest_level_.load(std::memory_order_relaxed); seen < l.piece.level;) {
+            if (deepest_level_.compare_exchange_weak(seen, l.piece.level, std::memory_order_relaxed)) break;
+        }
         uint64_t rows = 0;
         uint64_t bytes = 0;
         for (const SpillFile* f : l.piece.build) {
@@ -1093,15 +1174,7 @@ private:
     // Every build block of the piece, into a table sized for them.
     void LoadWhole(ProbeLocal& l, uint64_t rows) const {
         l.table.assign(build_arrays_.size(), ColumnBuffer{});
-        for (size_t c = 0; c < build_arrays_.size(); ++c) {
-            ColumnBuffer& col = l.table[c];
-            switch (build_arrays_[c]) {
-                case ValueArray::I64: col.i64.reserve(rows); break;
-                case ValueArray::I128: col.i128.reserve(rows); break;
-                case ValueArray::F64: col.f64.reserve(rows); break;
-                case ValueArray::STR: col.str.reserve(rows); break;
-            }
-        }
+        for (size_t c = 0; c < build_arrays_.size(); ++c) Reserve(l.table[c], build_arrays_[c], rows);
         BlockCursor at;
         while (NextBlock(l.piece.build, l.piece.partition, at) != nullptr) ReadNext(l.piece.build, l.piece.partition, at, l.table, l.table_arena);
         assert(l.table[kHashColumn].i64.size() == rows && "a piece loads every row its files recorded");
@@ -1282,6 +1355,7 @@ private:
     mutable std::atomic<size_t> splits_{0};
     mutable std::atomic<size_t> chunked_pieces_{0};
     mutable std::atomic<size_t> loads_{0};
+    mutable std::atomic<int> deepest_level_{0};
 };
 
 }  // namespace

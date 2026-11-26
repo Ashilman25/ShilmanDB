@@ -36,6 +36,13 @@ void MoveAfter(std::vector<T>& to, std::vector<T>& from) {
     from.clear();
 }
 
+// Appends from's items after to's, then frees from's memory.
+template <typename T>
+void AppendAndFree(std::vector<T>& to, std::vector<T>& from) {
+    to.insert(to.end(), from.begin(), from.end());
+    std::vector<T>().swap(from);
+}
+
 }  // namespace
 
 // Clears every array; a buffer uses only one, but this needn't know which.
@@ -127,6 +134,16 @@ void CopyRows(const ColumnBuffer& from, ValueArray a, const uint32_t* rows, size
     }
 }
 
+// Only the array the type uses gets room.
+void Reserve(ColumnBuffer& b, ValueArray a, size_t n) {
+    switch (a) {
+        case ValueArray::I64: b.i64.reserve(n); break;
+        case ValueArray::I128: b.i128.reserve(n); break;
+        case ValueArray::F64: b.f64.reserve(n); break;
+        case ValueArray::STR: b.str.reserve(n); break;
+    }
+}
+
 // Signs, then NaN bits, break the ties that < leaves.
 int TotalOrder(double a, double b) {
     const auto order = [](auto x, auto y) { return x < y ? -1 : (y < x ? 1 : 0); };
@@ -154,6 +171,37 @@ void ColumnStore::Absorb(ColumnStore&& other) {
     other.absorbed.clear();
     rows += other.rows;
     other.rows = 0;
+}
+
+// A column at a time, so at most one store's column is held twice.
+void AbsorbAll(ColumnStore& to, const std::vector<ValueArray>& arrays, const std::vector<ColumnStore*>& from) {
+    assert(arrays.size() == to.columns.size() && "absorbing with another row layout");
+    if (from.size() == 1 && to.rows == 0) {
+        to.Absorb(std::move(*from[0]));
+        return;
+    }
+    
+    size_t total = to.rows;
+    for (const ColumnStore* s : from) total += s->rows;
+    for (size_t c = 0; c < arrays.size(); ++c) {
+        ColumnBuffer& out = to.columns[c];
+        Reserve(out, arrays[c], total);
+        for (ColumnStore* s : from) {
+            assert(s->columns.size() == to.columns.size() && "absorbing a store with other columns");
+            ColumnBuffer& in = s->columns[c];
+            AppendAndFree(out.i64, in.i64);
+            AppendAndFree(out.i128, in.i128);
+            AppendAndFree(out.f64, in.f64);
+            AppendAndFree(out.str, in.str);
+        }
+    }
+    for (ColumnStore* s : from) {
+        to.absorbed.push_back(std::move(s->arena));
+        for (StringArena& a : s->absorbed) to.absorbed.push_back(std::move(a));
+        s->absorbed.clear();
+        to.rows += s->rows;
+        s->rows = 0;
+    }
 }
 
 }  // namespace shilmandb::parallel
