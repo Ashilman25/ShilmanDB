@@ -160,7 +160,11 @@ private:
 }  // namespace
 
 // The sink and operator share the right rows, so neither outlives what it reads.
+// The sizes are checked before the right side's types are cut from the list.
 std::pair<std::unique_ptr<Sink>, std::unique_ptr<Operator>> MakeNestedLoopJoin(NestedLoopSpec spec) {
+    const bool sizes_match = spec.types.size() == spec.left_slots.size() + spec.right_slots.size();
+    assert(sizes_match && "one type per candidate slot");
+    if (!sizes_match) throw DatabaseException("the parallel executor's nested-loop join spec has mismatched lists");
     SharedOutput<RightRows> right;
     std::shared_ptr<const RightRows> reader = right.Reader();
     const std::vector<VType> right_types(spec.types.begin() + static_cast<std::ptrdiff_t>(spec.left_slots.size()), spec.types.end());

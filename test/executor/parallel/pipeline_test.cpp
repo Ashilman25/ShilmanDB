@@ -3,18 +3,23 @@
 #include "executor/parallel/batch.hpp"
 #include "executor/parallel/compiler.hpp"
 #include "executor/parallel/expression.hpp"
+#include "executor/parallel/hash_aggregate.hpp"
 #include "executor/parallel/hash_join.hpp"
 #include "executor/parallel/memory_budget.hpp"
 #include "executor/parallel/parallel_executor.hpp"
 #include "executor/parallel/pipeline.hpp"
+#include "executor/parallel/sort.hpp"
 #include "executor/parallel/vector.hpp"
 #include "executor/parallel/worker_pool.hpp"
 #include "parser/ast.hpp"
+#include <unistd.h>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <numeric>
@@ -387,6 +392,92 @@ std::vector<unsigned> Parts(const std::vector<std::pair<unsigned, int>>& log) {
     return out;
 }
 
+// Descriptors this process has open, counted from /dev/fd.
+size_t OpenDescriptors() {
+    std::error_code ec;
+    size_t n = 0;
+    for (std::filesystem::directory_iterator it("/dev/fd", ec), end; !ec && it != end; it.increment(ec)) ++n;
+    return n;
+}
+
+// A breaker's sink and the source that reads what it kept.
+using Breaker = std::pair<std::unique_ptr<Sink>, std::unique_ptr<Source>>;
+
+// What a breaker held between its two pipelines, and right after the second.
+struct HeldAcross {
+    size_t bytes_between{0};
+    size_t bytes_after{0};
+    size_t descriptors_before{0};
+    size_t descriptors_between{0};
+    size_t descriptors_after{0};
+    std::vector<int64_t> values;  // slot 0 of what the source handed out
+};
+
+// A temp directory for spills, unique to this process.
+std::string SpillDir() {
+    return (std::filesystem::temp_directory_path() / ("shilmandb_parallel_pipeline_test_" + std::to_string(::getpid()))).string();
+}
+
+// Feeds FakeSource(5, 3) through a breaker on one thread, as a query would.
+// Notes what's held while the breaker is still alive, then destroys it before its budget.
+HeldAcross RunBreaker(const std::function<Breaker()>& make, bool spill_everything) {
+    const std::string dir = SpillDir();
+    std::filesystem::remove_all(dir);
+    HeldAcross held;
+    held.descriptors_before = OpenDescriptors();
+    {
+        MemoryBudget budget(kWorkerMinimumBytes + 2 * kGrantBytes, 1);
+        SpillCounters counters;
+        std::atomic<int> clock{0};
+        Breaker made = make();
+        FakeSource input(5, 3);
+        ValueSink out(clock);
+        QueryContext ctx = NoDatabase();
+        ctx.budget = &budget;
+        ctx.spill = &counters;
+        ctx.temp_dir = &dir;
+        ctx.spill_everything = spill_everything;
+
+        Pipeline in{&input, {}, made.first.get(), {}};
+        RunPipeline(in, ctx);
+        held.bytes_between = budget.HeldBytes();
+        held.descriptors_between = OpenDescriptors();
+
+        Pipeline read{made.second.get(), {}, &out, {0}};
+        RunPipeline(read, ctx);
+        held.bytes_after = budget.HeldBytes();
+        held.descriptors_after = OpenDescriptors();
+        held.values = std::move(out.values);
+        EXPECT_EQ(spill_everything, counters.files.load() > 0);
+        made.first.reset();
+        made.second.reset();
+    }
+    std::filesystem::remove_all(dir);
+    return held;
+}
+
+// GROUP BY slot 0 with a COUNT(*).
+Breaker CountByKey() {
+    const InputLayout one = OneInt();
+    AggregateSpec spec;
+    spec.keys.push_back(Col(0, one));
+    spec.funcs = {Aggregate::Func::COUNT};
+    spec.args.push_back(nullptr);
+    spec.out_types = {spec.keys[0]->Type(), AggregateOutputType(Aggregate::Func::COUNT, nullptr)};
+    return MakeHashAggregate(std::move(spec));
+}
+
+// ORDER BY slot 0, keeping it.
+Breaker SortByKey() {
+    const InputLayout one = OneInt();
+    SortSpec spec;
+    spec.keys.push_back(Col(0, one));
+    spec.ascending = {true};
+    spec.columns = {0};
+    spec.types = {VType{}};
+    return MakeSort(std::move(spec));
+}
+
 }  // namespace
 
 TEST(ParallelPipelineTest, RunPipelineVisitsEveryMorselOnce) {
@@ -620,11 +711,11 @@ TEST(ParallelPipelineTest, SpillPhasesRunAfterTheMorsels) {
         EXPECT_EQ(static_cast<size_t>(before_first_phase), workers);
         EXPECT_GT(*std::min_element(second_starts.begin(), second_starts.end()), *std::max_element(second_finishes.begin(), second_finishes.end()));
 
-        // PipelineDone once per operator, after Finalize.
+        // PipelineDone once per operator, before Finalize, so its memory is back for the sink.
         ASSERT_EQ(first.done_at.size(), 1u);
         ASSERT_EQ(second.done_at.size(), 1u);
-        EXPECT_GT(first.done_at[0], sink.finalized_at);
-        EXPECT_GT(second.done_at[0], sink.finalized_at);
+        EXPECT_LT(first.done_at[0], sink.finalized_at);
+        EXPECT_LT(second.done_at[0], sink.finalized_at);
     }
 }
 
@@ -664,6 +755,86 @@ TEST(ParallelPipelineTest, FinishedBuildFreedWhenItsProbeEnds) {
         EXPECT_EQ(info->spilled_partitions, 0u);
     }
     EXPECT_EQ(budget.HeldBytes(), 0u);
+}
+
+TEST(ParallelPipelineTest, FinishedGroupsFreedWhenTheirSourceEnds) {
+    // In memory, the merged groups keep their counts until they're read.
+    const HeldAcross merged = RunBreaker(CountByKey, false);
+    EXPECT_GT(merged.bytes_between, 0u) << "the merged groups keep their memory until they're read";
+    EXPECT_EQ(merged.bytes_after, 0u) << "the groups go once their source's pipeline ends";
+    EXPECT_EQ(merged.descriptors_after, merged.descriptors_before);
+    EXPECT_EQ(Sorted(merged.values), SourceValues(5, 3));
+
+    // Spilled, the workers' run files stay open until the source's merges read them.
+    const HeldAcross spilled = RunBreaker(CountByKey, true);
+    EXPECT_GT(spilled.descriptors_between, spilled.descriptors_before) << "the run files wait for the source";
+    EXPECT_EQ(spilled.descriptors_after, spilled.descriptors_before) << "the run files go once the source's pipeline ends";
+    EXPECT_EQ(spilled.bytes_after, 0u);
+    EXPECT_EQ(Sorted(spilled.values), SourceValues(5, 3));
+}
+
+TEST(ParallelPipelineTest, FinishedSortFreedWhenItsSourceEnds) {
+    // In memory, the sorted rows keep their counts until they're read.
+    const HeldAcross sorted = RunBreaker(SortByKey, false);
+    EXPECT_GT(sorted.bytes_between, 0u) << "the sorted rows keep their memory until they're read";
+    EXPECT_EQ(sorted.bytes_after, 0u) << "the rows go once their source's pipeline ends";
+    EXPECT_EQ(sorted.descriptors_after, sorted.descriptors_before);
+    EXPECT_EQ(sorted.values, SourceValues(5, 3));
+
+    // Spilled, the run files stay open until the source's merge reads them.
+    const HeldAcross spilled = RunBreaker(SortByKey, true);
+    EXPECT_GT(spilled.descriptors_between, spilled.descriptors_before) << "the run files wait for the source";
+    EXPECT_EQ(spilled.descriptors_after, spilled.descriptors_before) << "the run files go once the source's pipeline ends";
+    EXPECT_EQ(spilled.bytes_after, 0u);
+    EXPECT_EQ(spilled.values, SourceValues(5, 3));
+}
+
+TEST(ParallelPipelineTest, FreedBuildReachesTheNextSinksFinalize) {
+    // One worker: a floor of two grants and one shared grant, which the finished build takes.
+    MemoryBudget budget(kWorkerMinimumBytes + kGrantBytes, 1);
+    const std::string dir = SpillDir();
+    std::filesystem::remove_all(dir);
+    {
+        const InputLayout one = OneInt();
+        JoinSpec spec;
+        spec.build_key = Col(0, one);
+        spec.probe_key = Col(0, one);
+        spec.build_payload = {0};
+        spec.probe_slots = {0};
+        spec.types = {VType{}, VType{}};
+        auto join = MakeHashJoin(std::move(spec));
+        Breaker groups = CountByKey();
+
+        // Build keys 0..99, probe keys 0..199: keys 0..99 match once each.
+        FakeSource build(1, 1);
+        FakeSource probe(1, 2);
+        std::atomic<int> clock{0};
+        ValueSink out(clock);
+        SpillCounters counters;
+        QueryContext ctx = NoDatabase();
+        ctx.budget = &budget;
+        ctx.spill = &counters;
+        ctx.temp_dir = &dir;
+
+        Pipeline build_side{&build, {}, join.first.get(), {}};
+        RunPipeline(build_side, ctx);
+        ASSERT_GT(budget.HeldBytes(), 0u) << "the finished table holds the shared grant";
+
+        // The aggregate's part can leave its floor only once the table's grant is back.
+        Pipeline probe_side{&probe, {join.second.get()}, groups.first.get(), {0}};
+        RunPipeline(probe_side, ctx);
+        EXPECT_EQ(counters.files.load(), 0u) << "the probe's table was still counted when the aggregate finalized";
+
+        Pipeline read{groups.second.get(), {}, &out, {1}};
+        RunPipeline(read, ctx);
+        EXPECT_EQ(Sorted(out.values), SourceValues(1, 1));
+        join.first.reset();
+        join.second.reset();
+        groups.first.reset();
+        groups.second.reset();
+    }
+    EXPECT_EQ(budget.HeldBytes(), 0u);
+    std::filesystem::remove_all(dir);
 }
 
 }  // namespace shilmandb::parallel

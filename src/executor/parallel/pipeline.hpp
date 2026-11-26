@@ -90,6 +90,9 @@ public:
     // For analyze: rows read before a fused filter, once the pipeline is done.
     // None means the rows handed up.
     [[nodiscard]] virtual std::optional<uint64_t> RowsRead() const { return std::nullopt; }
+
+    // After Combine, before the sink's Finalize: frees what the source still holds (a sort's rows).
+    virtual void PipelineDone();
 };
 
 // A streaming step between a source and a sink, shared by every worker.
@@ -118,11 +121,11 @@ public:
     [[nodiscard]] virtual size_t SpilledPartitionCount() const;
 
     // Joins partition p for this worker; NextSpilledBatch then hands out its output batches.
-    // Strings in a batch stay valid until the next NextSpilledBatch call.
+    // Strings in a batch stay valid until this worker's next NextSpilledBatch or StartSpilledPartition.
     virtual void StartSpilledPartition(size_t p, LocalState* local) const;
     virtual bool NextSpilledBatch(LocalState* local, Batch& out) const;
 
-    // Once the pipeline's sink is finalized: frees what the operator still holds (a build table).
+    // After Combine, before the sink's Finalize: frees what the operator still holds (a build table).
     virtual void PipelineDone();
 };
 
@@ -143,7 +146,8 @@ public:
     // Once per worker, on the calling thread, after the last morsel.
     virtual void Combine(std::unique_ptr<LocalState> local) = 0;
 
-    // On the calling thread; may run parallel work.
+    // On the calling thread; may run parallel work. The source and operators
+    // have freed their state, so Consume must copy whatever is kept.
     virtual void Finalize(QueryContext& ctx) = 0;
 
     // True once a limit is reached, so workers stop taking morsels.
@@ -168,7 +172,7 @@ struct Pipeline {
 void ShapeBatch(Batch& batch, const std::vector<VType>& types);
 
 // Runs one pipeline: morsels through the operators into the sink, then each spilled operator's
-// partitions, then Combine, Finalize and every operator's PipelineDone.
+// partitions, then Combine, the source's and every operator's PipelineDone, then Finalize.
 // Several workers run with a pool, 2+ threads and 2+ morsels or spilled partitions; the
 // buffer pool is concurrent only while they run. With ctx.op_stats set, steps charge their nodes.
 void RunPipeline(Pipeline& p, QueryContext& ctx);
@@ -179,7 +183,8 @@ void RunPipeline(Pipeline& p, QueryContext& ctx);
 void ForEachTask(QueryContext& ctx, size_t count, const std::function<void(size_t)>& task);
 
 // The same, also passing the worker running task i: below ctx.threads, 0 when serial.
-// One worker index runs on one thread at a time, so state indexed by it needs no lock.
+// One worker index runs on one thread at a time,
+// so state indexed by it needs no lock.
 void ForEachTask(QueryContext& ctx, size_t count, const std::function<void(size_t, unsigned)>& task);
 
 }  // namespace shilmandb::parallel

@@ -290,6 +290,9 @@ bool Operator::NextSpilledBatch(LocalState*, Batch&) const {
 // Most operators hold nothing past their pipeline.
 void Operator::PipelineDone() {}
 
+// Most sources hold nothing past their pipeline.
+void Source::PipelineDone() {}
+
 // Batches are reused across morsels, so this rebuilds at most a few times per worker.
 void ShapeBatch(Batch& batch, const std::vector<VType>& types) {
     bool same = batch.slots.size() == types.size();
@@ -348,12 +351,17 @@ void RunPipeline(Pipeline& p, QueryContext& ctx) {
     for (Worker& w : locals) p.sink->Combine(std::move(w.sink));
     if (stats != nullptr) ChargeTime(*stats, p.sink_node, Clock::now() - start);
 
+    // The sink copied what it keeps, so the rest is freed before its Finalize.
+    // The workers' locals may point into what the hooks free, so they go first.
+    locals.clear();
+    p.source->PipelineDone();
+    for (Operator* op : p.operators) op->PipelineDone();
+
     // Pool tasks inside Finalize add their thread time beyond the caller's wall time.
     ctx.task_extra = nanoseconds{0};
     start = NowIf(stats != nullptr);
     p.sink->Finalize(ctx);
     if (stats != nullptr) ChargeTime(*stats, p.sink_node, Clock::now() - start + ctx.task_extra);
-    for (Operator* op : p.operators) op->PipelineDone();
 }
 
 // Tasks that don't need the worker index.

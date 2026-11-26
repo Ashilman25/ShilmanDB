@@ -568,6 +568,7 @@ public:
             SortInMemory();
         }
         parts_.clear();
+        SharedOutput<SortedRows> done = std::move(out_);  // the source's reference is the last
     }
 
 private:
@@ -725,6 +726,9 @@ public:
         auto& l = static_cast<SortSourceLocal&>(local);
         return rows_->runs.empty() ? NextInMemory(l, out) : NextMerged(l, out);
     }
+
+    // The pipeline is done: the sorted rows, their counts and run files go.
+    void PipelineDone() override { rows_.reset(); }
 
 private:
     // How many rows to hand out in all.

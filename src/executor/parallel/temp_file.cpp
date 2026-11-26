@@ -117,6 +117,7 @@ TempFile::Descriptor& TempFile::Descriptor::operator=(Descriptor&& other) noexce
 }
 
 // Opens a new file only this process can name, then unlinks it before any write.
+// If that fails, unlink is tried once more so no named file is left.
 TempFile::TempFile(const std::string& dir, SpillCounters* counters) : dir_(dir), counters_(counters) {
     MakeDirectory(dir_);
     std::string path;
@@ -130,10 +131,15 @@ TempFile::TempFile(const std::string& dir, SpillCounters* counters) : dir_(dir),
         if (!retry) ThrowNoSpace(dir_, error_number);
     }
     fd_ = Descriptor(fd);
-    if (test_open_hook) test_open_hook(path);
-    if (::unlink(path.c_str()) != 0) {
-        const int error_number = errno;
-        ThrowNoSpace(dir_, error_number);
+    try {
+        if (test_open_hook) test_open_hook(path);
+        if (::unlink(path.c_str()) != 0) {
+            const int error_number = errno;
+            ThrowNoSpace(dir_, error_number);
+        }
+    } catch (...) {
+        (void)::unlink(path.c_str());
+        throw;
     }
     if (counters_ != nullptr) counters_->files.fetch_add(1, std::memory_order_relaxed);
 }

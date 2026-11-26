@@ -420,12 +420,51 @@ size_t Biggest(size_t n, SizeOf size_of) {
     return biggest;
 }
 
+// Room for n cells of type t in their array.
+void ReserveCells(ColumnBuffer& buf, const VType& t, size_t n) {
+    switch (ArrayOf(t)) {
+        case ValueArray::I64: buf.i64.reserve(n); break;
+        case ValueArray::I128: buf.i128.reserve(n); break;
+        case ValueArray::F64: buf.f64.reserve(n); break;
+        case ValueArray::STR: buf.str.reserve(n); break;
+    }
+}
+
+// Room for `groups` groups in every array the table keeps, so merging never regrows one.
+void ReserveGroups(GroupTable& t, const GroupShape& shape, size_t groups) {
+    for (size_t k = 0; k < shape.keys.size(); ++k) ReserveCells(t.keys[k], shape.keys[k], groups);
+    t.hashes.reserve(groups);
+    for (size_t a = 0; a < shape.aggs.size(); ++a) {
+        StateColumn& s = t.states[a];
+        switch (shape.aggs[a].kind) {
+            case StateKind::COUNT: s.count.reserve(groups); break;
+            case StateKind::SUM_EXACT: s.exact.reserve(groups); break;
+            case StateKind::SUM_DOUBLE: s.real.reserve(groups); break;
+            case StateKind::AVG_EXACT:
+                s.exact.reserve(groups);
+                s.count.reserve(groups);
+                break;
+            case StateKind::AVG_DOUBLE:
+                s.real.reserve(groups);
+                s.count.reserve(groups);
+                break;
+            case StateKind::MIN:
+            case StateKind::MAX:
+                ReserveCells(s.extreme, shape.aggs[a].arg, groups);
+                s.seen.reserve(groups);
+                break;
+            case StateKind::NOT_NUMERIC: break;
+        }
+    }
+}
+
 // Every table merged into the biggest, which keeps its own arena.
 GroupTable MergeIntoOne(std::vector<GroupTable>& tables, size_t biggest, const GroupShape& shape) {
     GroupTable base = std::move(tables[biggest]);
     size_t total = base.size;
     for (size_t i = 0; i < tables.size(); ++i) total += i == biggest ? 0 : tables[i].size;
     Reserve(base, total);
+    ReserveGroups(base, shape, total);
     for (size_t i = 0; i < tables.size(); ++i) {
         if (i == biggest) continue;
         for (uint32_t g = 0; g < tables[i].size; ++g) MergeGroup(base, shape, tables[i], g);
@@ -470,6 +509,7 @@ GroupTable MergePartition(const std::vector<GroupTable>& tables, const std::vect
     size_t total = 0;
     for (const Buckets& b : buckets) total += b.offsets[p + 1] - b.offsets[p];
     Reserve(out, total);
+    ReserveGroups(out, shape, total);
     for (size_t i = 0; i < tables.size(); ++i) {
         const Buckets& b = buckets[i];
         for (size_t at = b.offsets[p]; at < b.offsets[p + 1]; ++at) MergeGroup(out, shape, tables[i], b.order[at]);
@@ -734,6 +774,7 @@ public:
         const bool spilled = std::any_of(parts_.begin(), parts_.end(), [](const std::unique_ptr<LocalState>& part) {
             return static_cast<const AggLocal&>(*part).writer != nullptr;
         });
+
         if (!spilled) {
             size_t summed = 0;
             for (size_t i = 0; i < parts_.size(); ++i) summed += Part(i).table.size;
@@ -742,11 +783,13 @@ public:
             MemoryReservation merge(ctx.budget, 0);
             if (merge.Grow(MergeBytes(summed, partitions)) && merge.LeaveFloor() == 0) {
                 MergeInMemory(ctx, partitions, std::move(merge));
+                SharedOutput<MergedGroups> done = std::move(out_);  // the source's reference is the last
                 return;
             }
         }
         FinishSpilled(ctx);
         parts_.clear();
+        SharedOutput<MergedGroups> done = std::move(out_);  // the source's reference is the last
     }
 
     // Tests only: what Finalize adds to every COUNT.
@@ -772,7 +815,6 @@ private:
     // one at a time, largest first; the rest retry after each spill frees room.
     void LeaveFloors(QueryContext& ctx) {
         std::vector<size_t> left(parts_.size());
-        // Each task writes only its own slot.
         ForEachTask(ctx, parts_.size(), [&](size_t i) { left[i] = Part(i).reservation.LeaveFloor(); });
         std::vector<size_t> stuck;
         for (size_t i = 0; i < parts_.size(); ++i) {
@@ -792,15 +834,16 @@ private:
         }
     }
 
-    // What merging the parts in memory adds by the table estimate, at most: new groups,
-    // bigger indexes, and a merge by partition's buckets. Strings stay in the workers' arenas.
+    // What merging the parts in memory adds by the table estimate, at most: arrays for
+    // every summed group, bigger indexes, a merge by partition's buckets. No strings are copied.
     [[nodiscard]] size_t MergeBytes(size_t summed, size_t partitions) {
         const GroupShape& shape = *shape_;
         if (shape.global) return shape.group_bytes;
         if (parts_.empty()) return 0;
         if (partitions == 1) {
+            // The base's arrays are copied once into arrays sized for every group.
             const GroupTable& base = Part(Biggest(parts_.size(), [this](size_t i) { return Part(i).table.size; })).table;
-            return (summed - base.size) * shape.group_bytes + (SlotsFor(summed, base.index.size()) - base.index.size()) * sizeof(uint32_t);
+            return summed * shape.group_bytes + (SlotsFor(summed, base.index.size()) - base.index.size()) * sizeof(uint32_t);
         }
         // A partition's index holds at most max(kMinIndexSlots, 4 x its groups) slots.
         const size_t index = (partitions * kMinIndexSlots + 4 * summed) * sizeof(uint32_t);
@@ -826,8 +869,12 @@ private:
         }
         parts_.clear();
         out.tables.clear();
+        size_t summed = 0;
+        for (const GroupTable& t : tables) summed += t.size;
 
-        size_t merged = 0;  // what merge counts once the merge is done
+        // What merge counts once the merge is done. The merged arrays are reserved
+        // for every summed group, so they're counted as reserved, used or not.
+        size_t merged = 0;
         if (shape.global) {
             GroupTable one = MakeTable(shape);
             AddGlobalGroup(one, shape);
@@ -839,7 +886,7 @@ private:
             const size_t before = FixedBytes(tables[biggest], shape);
             keep[biggest] = counted[biggest];
             out.tables.push_back(MergeIntoOne(tables, biggest, shape));
-            merged = FixedBytes(out.tables[0], shape) - before;
+            merged = summed * shape.group_bytes + out.tables[0].index.size() * sizeof(uint32_t) - before;
         } else if (!tables.empty()) {
             const int bits = __builtin_ctzll(partitions);
             std::vector<Buckets> buckets;
@@ -847,7 +894,8 @@ private:
             // Each task writes only its own slot, so partitions merge at once.
             out.tables.resize(partitions);
             ForEachTask(ctx, partitions, [&](size_t p) { out.tables[p] = MergePartition(tables, buckets, p, shape); });
-            for (const GroupTable& t : out.tables) merged += FixedBytes(t, shape);
+            merged = summed * shape.group_bytes;
+            for (const GroupTable& t : out.tables) merged += t.index.size() * sizeof(uint32_t);
         }
         if (count_offset_ != 0) {
             for (GroupTable& t : out.tables) AddToCounts(t, shape, count_offset_);
@@ -1107,7 +1155,11 @@ public:
         }
     }
 
-    [[nodiscard]] size_t MorselCount() const override { return groups_->spilled ? groups_->morsels.size() : ranges_.size(); }
+    // After PipelineDone, the count the pipeline had, so tests can still ask.
+    [[nodiscard]] size_t MorselCount() const override {
+        if (groups_ == nullptr) return done_morsels_;
+        return groups_->spilled ? groups_->morsels.size() : ranges_.size();
+    }
 
     // Room for a batch of row ids; a merge after a spill goes uncounted.
     [[nodiscard]] std::unique_ptr<LocalState> MakeLocal() const override { return NewLocal(); }
@@ -1141,6 +1193,13 @@ public:
         l.done = true;
         FillBatch(groups_->tables[l.range.table], l.range.first, l.range.count, l.rows.data(), out);
         return true;
+    }
+
+    // The pipeline is done: the groups, their counts, arenas and run files go.
+    void PipelineDone() override {
+        done_morsels_ = MorselCount();
+        groups_.reset();
+        ranges_ = std::vector<GroupRange>();
     }
 
 private:
@@ -1358,7 +1417,8 @@ private:
     std::shared_ptr<const MergedGroups> groups_;
     std::vector<VType> types_;
     std::vector<GroupRange> ranges_;
-    size_t merge_cap_{0};  // set by Prepare
+    size_t merge_cap_{0};     // set by Prepare
+    size_t done_morsels_{0};  // set by PipelineDone
 };
 
 }  // namespace

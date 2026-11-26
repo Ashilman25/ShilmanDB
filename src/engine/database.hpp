@@ -76,6 +76,8 @@ struct ParallelQueryStats {
     uint64_t spill_bytes_written{0};
     uint64_t spill_bytes_read{0};
     uint64_t spill_files{0};
+    // Summed over breakers: each hash join's level-0 partitions with rows on disk,
+    // each aggregate's level-0 partitions with runs. Sorts add nothing.
     uint64_t spill_partitions{0};
     std::chrono::nanoseconds spill_time{0}; // writing and reading spill files, summed over workers
 };
@@ -136,7 +138,8 @@ public:
     // Set when a parallel query finishes; an error keeps the last value.
     [[nodiscard]] const ParallelQueryStats& LastParallelStats() const { return last_parallel_stats_; }
 
-    // The memory limit a parallel query gets when its options set none. Starts at a quarter of memory.
+    // The memory limit a parallel query gets when its options set none.
+    // Starts at a quarter of memory.
     void SetDefaultMemoryLimit(size_t bytes) { default_memory_limit_ = bytes; }
     [[nodiscard]] size_t GetDefaultMemoryLimit() const { return default_memory_limit_; }
 

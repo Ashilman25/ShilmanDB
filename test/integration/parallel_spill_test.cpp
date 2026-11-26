@@ -12,6 +12,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <ostream>
 #include <string>
@@ -364,30 +365,47 @@ TEST_F(ParallelSpillTest, FailureMidSpillLeavesNothing) {
         RecordProperty(tag + "_runs_that_threw", threw);
     }
 
-    // A block damaged once written: Q3 on one thread, so the first file opened
-    // (the first join's build) is finished when the second one opens.
+    // A block damaged once its file is finished, read in Q3's spill phase,
+    // at 1 thread and at 18. Q3's first pipeline (the first join's build) runs
+    // on one worker, so it opens one file, finished once a later pipeline
+    // opens the next. Every file opened so far is damaged then.
     const std::string q3 = tpch::FindQuery("Q3")->sql;
-    RunSettings one;
-    one.threads = 1;
-    const QueryResult want = RunParallel(*db, q3, one);
-    one.spill_everything = true;
-    const size_t descriptors = OpenDescriptors();
-    int first_fd = -1;
-    int opened = 0;
-    std::string error;
-    {
-        OpenHookScope hook([&first_fd, &opened](const std::string& path) {
-            if (++opened == 1) first_fd = ::open(path.c_str(), O_RDWR | O_CLOEXEC);
-            if (opened == 2 && first_fd >= 0) DamageEveryBlock(first_fd);
-        });
-        error = RunCaught(*db, q3, one);
+    for (const unsigned threads : {1u, kFailureThreads}) {
+        const std::string label = "SF=" + sf + " Q3, damaged block, " + std::to_string(threads) + " threads";
+        RunSettings settings;
+        settings.threads = threads;
+        const QueryResult want = RunParallel(*db, q3, settings);
+        settings.spill_everything = true;
+        const size_t descriptors = OpenDescriptors();
+        BufferPoolManager* bpm = db->GetBufferPoolManager();
+        std::mutex mutex;
+        std::vector<int> kept;  // a second descriptor on each file opened before the damage
+        int opened = 0;
+        bool first_serial = false;
+        std::string error;
+        {
+            OpenHookScope hook([&](const std::string& path) {
+                const std::lock_guard<std::mutex> lock(mutex);
+                if (++opened == 1) {
+                    first_serial = !bpm->IsConcurrent();
+                    kept.push_back(::open(path.c_str(), O_RDWR | O_CLOEXEC));
+                } else if (opened == 2) {
+                    for (const int fd : kept) {
+                        if (fd >= 0) DamageEveryBlock(fd);
+                    }
+                }
+            });
+            error = RunCaught(*db, q3, settings);
+        }
+        ASSERT_EQ(kept.size(), 1u) << label;
+        ASSERT_GE(kept[0], 0) << label << ": couldn't open the first temp file";
+        ::close(kept[0]);
+        EXPECT_TRUE(first_serial) << label << ": the first pipeline ran on several workers, so its file may not be finished";
+        EXPECT_GE(opened, 2) << label;
+        EXPECT_EQ(error, "damaged temp file: checksum mismatch") << label;
+        ExpectNothingLeft(*db, descriptors, label);
+        EXPECT_EQ(ExactDifference(RunParallel(*db, q3, settings), want), "") << label << ": after the damaged block";
     }
-    ASSERT_GE(first_fd, 0) << "couldn't open the first temp file";
-    ::close(first_fd);
-    EXPECT_GE(opened, 2);
-    EXPECT_EQ(error, "damaged temp file: checksum mismatch");
-    ExpectNothingLeft(*db, descriptors, "damaged block");
-    EXPECT_EQ(ExactDifference(RunParallel(*db, q3, one), want), "") << "after the damaged block";
 }
 
 }  // namespace

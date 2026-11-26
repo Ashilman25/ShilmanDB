@@ -302,6 +302,29 @@ TEST_F(ParallelTempFileTest, NothingLeftOnDisk) {
     EXPECT_EQ(EntriesIn(dir_), 0u);
 }
 
+TEST_F(ParallelTempFileTest, FailedOpenLeavesNoFile) {
+    // Throws from the open hook, after the file is made and before it's unlinked.
+    struct ThrowOnOpen {
+        ThrowOnOpen() { TempFile::SetOpenHookForTest([](const std::string&) { throw DatabaseException("the open hook failed"); }); }
+        ~ThrowOnOpen() { TempFile::SetOpenHookForTest(nullptr); }
+        ThrowOnOpen(const ThrowOnOpen&) = delete;
+        ThrowOnOpen& operator=(const ThrowOnOpen&) = delete;
+    };
+    SpillCounters counters;
+    {
+        const ThrowOnOpen hook;
+        EXPECT_EQ(ErrorOf([&] { TempFile f(dir_, &counters); }), "the open hook failed");
+        EXPECT_EQ(ErrorOf([&] { TempFile f(dir_, &counters); }), "the open hook failed");
+    }
+    EXPECT_EQ(EntriesIn(dir_), 0u) << "a failed open leaves its named file behind";
+    EXPECT_EQ(counters.files.load(), 0u);
+
+    // Opens work again once the hook is gone.
+    TempFile f(dir_, &counters);
+    EXPECT_NO_THROW(WriteSome(f));
+    EXPECT_EQ(EntriesIn(dir_), 0u);
+}
+
 TEST_F(ParallelTempFileTest, WorkersMakeTheDirectoryTogether) {
     std::vector<std::thread> threads;
     std::vector<std::string> errors(8);
