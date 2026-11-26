@@ -36,6 +36,9 @@ constexpr size_t kGroupsPerPartition = 65536;
 // The most partitions a merge splits into.
 constexpr size_t kMaxPartitions = 1024;
 
+// The most a partitioned writer's buffers take: one per spill partition, and the file's.
+constexpr size_t kWriterBytes = kSpillPartitions * PartitionedWriter::kPartitionBufferBytes + TempFile::kWriteBufferBytes;
+
 // Set only by tests, on the calling thread.
 // A merge of spilled groups splits past this many groups; 0 means no cap.
 size_t test_merge_groups = 0;
@@ -305,10 +308,16 @@ void Place(GroupTable& t, uint32_t g) {
     t.index[slot] = g + 1;
 }
 
+// What Reserve grows an index of `slots` slots to, for `groups` groups.
+size_t SlotsFor(size_t groups, size_t slots) {
+    slots = std::max(kMinIndexSlots, slots);
+    while (groups * 2 > slots) slots *= 2;
+    return slots;
+}
+
 // Sizes the index so `groups` groups fill at most half of it.
 void Reserve(GroupTable& t, size_t groups) {
-    size_t slots = std::max(kMinIndexSlots, t.index.size());
-    while (groups * 2 > slots) slots *= 2;
+    const size_t slots = SlotsFor(groups, t.index.size());
     if (slots == t.index.size()) return;
     t.index.assign(slots, 0);
     for (uint32_t g = 0; g < t.size; ++g) Place(t, g);
@@ -401,12 +410,18 @@ void MergeGroup(GroupTable& t, const GroupShape& shape, const GroupTable& from, 
     MergeStates(t, into, shape, from, g);
 }
 
-// Every table merged into the biggest, which keeps its own arena.
-GroupTable MergeIntoOne(std::vector<GroupTable>& tables, const GroupShape& shape) {
+// The first of n tables with the most groups; size_of(i) is table i's groups.
+template <typename SizeOf>
+size_t Biggest(size_t n, SizeOf size_of) {
     size_t biggest = 0;
-    for (size_t i = 1; i < tables.size(); ++i) {
-        if (tables[i].size > tables[biggest].size) biggest = i;
+    for (size_t i = 1; i < n; ++i) {
+        if (size_of(i) > size_of(biggest)) biggest = i;
     }
+    return biggest;
+}
+
+// Every table merged into the biggest, which keeps its own arena.
+GroupTable MergeIntoOne(std::vector<GroupTable>& tables, size_t biggest, const GroupShape& shape) {
     GroupTable base = std::move(tables[biggest]);
     size_t total = base.size;
     for (size_t i = 0; i < tables.size(); ++i) total += i == biggest ? 0 : tables[i].size;
@@ -501,10 +516,22 @@ void FillSpillLayout(GroupShape& shape) {
     shape.group_bytes = bytes;
 }
 
-// A table's bytes by the estimate: fixed bytes per group, index slots, copied strings.
+// A table's fixed bytes by the estimate: its groups and index slots.
+size_t FixedBytes(const GroupTable& t, const GroupShape& shape) {
+    return t.size * shape.group_bytes + t.index.size() * sizeof(uint32_t);
+}
+
+// A table's bytes by the estimate: fixed bytes, then copied strings.
 // Vectors' spare capacity isn't counted.
 size_t TableBytes(const GroupTable& t, const GroupShape& shape) {
-    return t.size * shape.group_bytes + t.index.size() * sizeof(uint32_t) + t.arena.BytesUsed();
+    return FixedBytes(t, shape) + t.arena.BytesUsed();
+}
+
+// Lowers a reservation from `held` counted bytes to `keep`, leaving no spare grant.
+// Only for a reservation already off its worker's floor.
+void ShrinkTo(MemoryReservation& r, size_t held, size_t keep) {
+    if (held > keep) r.Shrink(held - keep);
+    (void)r.LeaveFloor();  // frees the spare grant Shrink keeps; nothing is on the floor
 }
 
 // Appends group g as a spilled row: keys, hash, then each state's fields as kept.
@@ -607,7 +634,7 @@ GroupTable ReadGroups(const SpillFile& file, uint64_t at, const GroupShape& shap
 struct MergedGroups {
     std::vector<GroupTable> tables;               // one per partition, or one in all
     std::vector<StringArena> arenas;              // the workers' arenas their strings point into
-    std::vector<MemoryReservation> reservations;  // the workers' counts, kept with their groups
+    std::vector<MemoryReservation> reservations;  // counts kept with the groups: the merge's, the workers'
     bool spilled{false};
     std::vector<GroupTable> parts;   // after a spill: each worker's groups still in memory
     std::vector<Buckets> buckets;    // each part's groups by level 0 spill partition
@@ -698,59 +725,28 @@ public:
     // Keeps the worker's table, arena and all, until Finalize.
     void Combine(std::unique_ptr<LocalState> local) override { parts_.push_back(std::move(local)); }
 
-    // The tables outlive this pipeline, so each part leaves its worker's floor, spilling what
-    // must stay there. With no spill anywhere they merge as before: into one up to
-    // kMergeIntoOneMaxGroups summed groups, else by hash partition on the pool.
-    // After a spill the source merges them with the runs, one spill partition per morsel.
+    // The tables outlive this pipeline, so the parts leave their workers' floors, spilling what
+    // must stay there. With no spill and room for the merge, they merge in memory:
+    // into one up to kMergeIntoOneMaxGroups summed groups, else by hash partition on the pool.
+    // Otherwise the source merges them with any runs, one spill partition per morsel.
     void Finalize(QueryContext& ctx) override {
-        ForEachTask(ctx, parts_.size(), [this](size_t i) {
-            AggLocal& p = Part(i);
-            for (size_t left = p.reservation.LeaveFloor(); left > 0; left = p.reservation.LeaveFloor()) SpillTable(p, false);
-        });
+        LeaveFloors(ctx);
         const bool spilled = std::any_of(parts_.begin(), parts_.end(), [](const std::unique_ptr<LocalState>& part) {
             return static_cast<const AggLocal&>(*part).writer != nullptr;
         });
-        if (spilled) {
-            FinishSpilled(ctx);
-            parts_.clear();
-            return;
-        }
-
-        MergedGroups& out = out_.Mutable();
-        std::vector<GroupTable> tables;
-        for (auto& part : parts_) {
-            AggLocal& p = static_cast<AggLocal&>(*part);
-            tables.push_back(std::move(p.table));
-            out.reservations.push_back(std::move(p.reservation));
-        }
-        parts_.clear();
-        out.tables.clear();
-
-        const GroupShape& shape = *shape_;
-        if (shape.global) {
-            GroupTable merged = MakeTable(shape);
-            AddGlobalGroup(merged, shape);
-            for (const GroupTable& t : tables) MergeStates(merged, 0, shape, t, 0);
-            out.tables.push_back(std::move(merged));
-        } else if (!tables.empty()) {
+        if (!spilled) {
             size_t summed = 0;
-            for (const GroupTable& t : tables) summed += t.size;
-            const size_t partitions = MergePartitionCount(summed, ctx.threads);
-            if (partitions == 1) {
-                out.tables.push_back(MergeIntoOne(tables, shape));
-            } else {
-                const int bits = __builtin_ctzll(partitions);
-                std::vector<Buckets> buckets;
-                for (const GroupTable& t : tables) buckets.push_back(BucketByPartition(t, partitions, bits));
-                // Each task writes only its own slot, so partitions merge at once.
-                out.tables.resize(partitions);
-                ForEachTask(ctx, partitions, [&](size_t p) { out.tables[p] = MergePartition(tables, buckets, p, shape); });
+            for (size_t i = 0; i < parts_.size(); ++i) summed += Part(i).table.size;
+            const size_t partitions = shape_->global ? 1 : MergePartitionCount(summed, ctx.threads);
+            // Counted before it's built, and off the floor the next pipeline needs.
+            MemoryReservation merge(ctx.budget, 0);
+            if (merge.Grow(MergeBytes(summed, partitions)) && merge.LeaveFloor() == 0) {
+                MergeInMemory(ctx, partitions, std::move(merge));
+                return;
             }
         }
-        if (count_offset_ != 0) {
-            for (GroupTable& t : out.tables) AddToCounts(t, shape, count_offset_);
-        }
-        for (GroupTable& t : tables) out.arenas.push_back(std::move(t.arena));
+        FinishSpilled(ctx);
+        parts_.clear();
     }
 
     // Tests only: what Finalize adds to every COUNT.
@@ -772,6 +768,102 @@ private:
     // Combined part i.
     [[nodiscard]] AggLocal& Part(size_t i) { return static_cast<AggLocal&>(*parts_[i]); }
 
+    // Every part tries to leave its worker's floor at once. Those that can't are spilled
+    // one at a time, largest first; the rest retry after each spill frees room.
+    void LeaveFloors(QueryContext& ctx) {
+        std::vector<size_t> left(parts_.size());
+        // Each task writes only its own slot.
+        ForEachTask(ctx, parts_.size(), [&](size_t i) { left[i] = Part(i).reservation.LeaveFloor(); });
+        std::vector<size_t> stuck;
+        for (size_t i = 0; i < parts_.size(); ++i) {
+            if (left[i] > 0) stuck.push_back(i);
+        }
+        std::stable_sort(stuck.begin(), stuck.end(), [this](size_t a, size_t b) { return Part(a).reservation.Bytes() > Part(b).reservation.Bytes(); });
+        for (size_t next = 0; next < stuck.size(); ++next) {
+            AggLocal& p = Part(stuck[next]);
+            for (size_t floor = left[stuck[next]]; floor > 0; floor = p.reservation.LeaveFloor()) SpillTable(p, false);
+            size_t kept = next + 1;
+            for (size_t at = next + 1; at < stuck.size(); ++at) {
+                const size_t i = stuck[at];
+                left[i] = Part(i).reservation.LeaveFloor();
+                if (left[i] > 0) stuck[kept++] = i;
+            }
+            stuck.resize(kept);
+        }
+    }
+
+    // What merging the parts in memory adds by the table estimate, at most: new groups,
+    // bigger indexes, and a merge by partition's buckets. Strings stay in the workers' arenas.
+    [[nodiscard]] size_t MergeBytes(size_t summed, size_t partitions) {
+        const GroupShape& shape = *shape_;
+        if (shape.global) return shape.group_bytes;
+        if (parts_.empty()) return 0;
+        if (partitions == 1) {
+            const GroupTable& base = Part(Biggest(parts_.size(), [this](size_t i) { return Part(i).table.size; })).table;
+            return (summed - base.size) * shape.group_bytes + (SlotsFor(summed, base.index.size()) - base.index.size()) * sizeof(uint32_t);
+        }
+        // A partition's index holds at most max(kMinIndexSlots, 4 x its groups) slots.
+        const size_t index = (partitions * kMinIndexSlots + 4 * summed) * sizeof(uint32_t);
+        const size_t buckets = summed * sizeof(uint32_t) + (parts_.size() + 1) * (partitions + 1) * sizeof(size_t);
+        return summed * shape.group_bytes + index + buckets;
+    }
+
+    // Merges every part's table in memory; merge counts what the merge adds.
+    // Then each part counts only its arena; the table merged into keeps its whole count.
+    void MergeInMemory(QueryContext& ctx, size_t partitions, MemoryReservation merge) {
+        MergedGroups& out = out_.Mutable();
+        const GroupShape& shape = *shape_;
+        std::vector<GroupTable> tables;
+        std::vector<MemoryReservation> counts;
+        std::vector<size_t> counted;  // each part's table bytes, all its reservation holds
+        std::vector<size_t> keep;     // what each part counts after the merge
+        for (size_t i = 0; i < parts_.size(); ++i) {
+            AggLocal& p = Part(i);
+            counted.push_back(p.counted);
+            keep.push_back(std::min(p.counted, p.table.arena.BytesUsed()));
+            tables.push_back(std::move(p.table));
+            counts.push_back(std::move(p.reservation));
+        }
+        parts_.clear();
+        out.tables.clear();
+
+        size_t merged = 0;  // what merge counts once the merge is done
+        if (shape.global) {
+            GroupTable one = MakeTable(shape);
+            AddGlobalGroup(one, shape);
+            for (const GroupTable& t : tables) MergeStates(one, 0, shape, t, 0);
+            out.tables.push_back(std::move(one));
+            merged = shape.group_bytes;
+        } else if (!tables.empty() && partitions == 1) {
+            const size_t biggest = Biggest(tables.size(), [&tables](size_t i) { return tables[i].size; });
+            const size_t before = FixedBytes(tables[biggest], shape);
+            keep[biggest] = counted[biggest];
+            out.tables.push_back(MergeIntoOne(tables, biggest, shape));
+            merged = FixedBytes(out.tables[0], shape) - before;
+        } else if (!tables.empty()) {
+            const int bits = __builtin_ctzll(partitions);
+            std::vector<Buckets> buckets;
+            for (const GroupTable& t : tables) buckets.push_back(BucketByPartition(t, partitions, bits));
+            // Each task writes only its own slot, so partitions merge at once.
+            out.tables.resize(partitions);
+            ForEachTask(ctx, partitions, [&](size_t p) { out.tables[p] = MergePartition(tables, buckets, p, shape); });
+            for (const GroupTable& t : out.tables) merged += FixedBytes(t, shape);
+        }
+        if (count_offset_ != 0) {
+            for (GroupTable& t : out.tables) AddToCounts(t, shape, count_offset_);
+        }
+        for (GroupTable& t : tables) out.arenas.push_back(std::move(t.arena));
+        tables.clear();
+
+        assert(merged <= merge.Bytes() && "the merge passed its estimate");
+        ShrinkTo(merge, merge.Bytes(), merged);
+        out.reservations.push_back(std::move(merge));
+        for (size_t i = 0; i < counts.size(); ++i) {
+            ShrinkTo(counts[i], counted[i], keep[i]);
+            out.reservations.push_back(std::move(counts[i]));
+        }
+    }
+
     // Brings the table's share of the reservation to its bytes; false when the budget refuses.
     [[nodiscard]] bool Recount(AggLocal& l) const {
         const size_t held = TableBytes(l.table, *shape_);
@@ -786,16 +878,19 @@ private:
 
     // Writes every group to disk by spill partition, then starts a fresh table; refill gives
     // a global table its one group back, counted from the next batch.
-    // The table is uncounted first, so the writer finds room.
+    // The table stays counted until it's freed, less the room the writer's buffers take.
     void SpillTable(AggLocal& l, bool refill) const {
         const GroupShape& shape = *shape_;
-        if (l.counted > 0) l.reservation.Shrink(std::exchange(l.counted, 0));
         if (l.table.size > 0) {
+            const size_t room = std::min(l.counted, kWriterBytes);
+            if (room > 0) l.reservation.Shrink(room);
+            l.counted -= room;
             if (!l.writer) l.writer = std::make_unique<PartitionedWriter>(shape.spill_arrays, SpillDirectory(l.temp_dir), l.counters, &l.reservation);
             WriteGroups(l.table, shape, l.table.size, [](size_t g) { return static_cast<uint32_t>(g); }, 0, *l.writer);
             l.writer->Flush();
         }
         l.table = MakeTable(shape);
+        if (l.counted > 0) l.reservation.Shrink(std::exchange(l.counted, 0));
         if (refill && shape.global) AddGlobalGroup(l.table, shape);
     }
 
@@ -963,6 +1058,13 @@ struct MergeInput {
     bool forced{false};  // merged even past the budget
 };
 
+// A split's file, kept while pieces at `depth` or past it still read it.
+// Emitted strings live in the merge's arena, never in a file.
+struct SplitFile {
+    std::unique_ptr<SpillFile> file;
+    size_t depth{0};
+};
+
 // Which range a worker emits next, and the row ids to gather.
 // After a spill: the partition this worker merges and emits, piece by piece.
 struct AggSourceLocal : LocalState {
@@ -972,8 +1074,8 @@ struct AggSourceLocal : LocalState {
     MemoryReservation reservation;  // the piece being merged, or a split's buffers
     const std::string* temp_dir{nullptr};
     SpillCounters* counters{nullptr};
-    std::vector<MergeInput> pending;                // pieces of this morsel not merged yet
-    std::vector<std::unique_ptr<SpillFile>> files;  // this morsel's splits
+    std::vector<MergeInput> pending;                // pieces of this morsel not merged yet, the next one last
+    std::vector<SplitFile> splits;                  // the splits those pieces read, the newest last
     GroupTable piece;                               // merged groups being emitted
     StringArena arena;                              // strings read from runs, which piece points into
     size_t counted{0};                              // what the reservation holds for piece and arena
@@ -1063,7 +1165,7 @@ private:
     void StartPartition(size_t p, AggSourceLocal& l) const {
         ResetPiece(l);
         l.pending.clear();
-        l.files.clear();
+        l.splits.clear();
         l.pending.push_back(MergeInput{nullptr, p, 0, shape_->global});
     }
 
@@ -1071,6 +1173,8 @@ private:
     // so strings (in the workers' tables and this arena) stay valid until the next call.
     bool NextMerged(AggSourceLocal& l, Batch& out) const {
         while (l.next >= l.piece.size) {
+            // Pieces merge newest first, so a split whose pieces all merged is the newest.
+            while (!l.splits.empty() && l.splits.back().depth >= l.pending.size()) l.splits.pop_back();
             if (l.pending.empty()) return false;
             const MergeInput in = l.pending.back();
             l.pending.pop_back();
@@ -1185,8 +1289,8 @@ private:
             written = writer.TakeFile();
         }
         if (!written) return;
-        l.files.push_back(std::make_unique<SpillFile>(std::move(*written)));
-        const SpillFile& file = *l.files.back();
+        l.splits.push_back(SplitFile{std::make_unique<SpillFile>(std::move(*written)), l.pending.size()});
+        const SpillFile& file = *l.splits.back().file;
         const auto parts = std::count_if(file.rows.begin(), file.rows.end(), [](uint64_t rows) { return rows > 0; });
         for (size_t q = 0; q < kSpillPartitions; ++q) {
             if (file.rows[q] > 0) l.pending.push_back(MergeInput{&file, q, level, parts == 1 || level >= kMaxSpillLevel});

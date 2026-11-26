@@ -23,6 +23,7 @@
 #include <sstream>
 #include <string>
 #include <system_error>
+#include <thread>
 #include <tuple>
 #include <unordered_map>
 #include <utility>
@@ -1699,6 +1700,8 @@ struct AggSpillConfig {
     int fail_writes{0};           // errno every temp write fails with; 0 for none
     bool expect_error{false};     // the run should throw even without failing writes
     int64_t count_offset{0};      // added to every COUNT, through OffsetCountsForTest
+    std::function<void(MemoryBudget*, const std::string&)> on_open;  // told of each new temp file
+    std::function<void()> on_done;                                   // after the run, before the checks
 };
 
 // No budget at all.
@@ -1749,6 +1752,15 @@ public:
     ~FailWritesScope() { TempFile::FailWritesForTest(0); }
     FailWritesScope(const FailWritesScope&) = delete;
     FailWritesScope& operator=(const FailWritesScope&) = delete;
+};
+
+// Passes each new temp file's path to hook while alive.
+class OpenHookScope {
+public:
+    explicit OpenHookScope(std::function<void(const std::string&)> hook) { TempFile::SetOpenHookForTest(std::move(hook)); }
+    ~OpenHookScope() { TempFile::SetOpenHookForTest(nullptr); }
+    OpenHookScope(const OpenHookScope&) = delete;
+    OpenHookScope& operator=(const OpenHookScope&) = delete;
 };
 
 // Forwards to a sink, running a hook just before its Finalize.
@@ -1823,6 +1835,122 @@ private:
     std::vector<int> fds_;
 };
 
+// Flips CRC bits in every block of a finished temp file; returns the blocks damaged.
+size_t DamageEveryBlock(int fd) {
+    const off_t size = ::lseek(fd, 0, SEEK_END);
+    size_t damaged = 0;
+    for (off_t at = 0; at + static_cast<off_t>(sizeof(TempBlockHeader)) <= size;) {
+        TempBlockHeader h{};
+        if (::pread(fd, &h, sizeof(h), at) != static_cast<ssize_t>(sizeof(h))) break;
+        h.crc ^= 0xFFu;
+        if (::pwrite(fd, &h, sizeof(h), at) == static_cast<ssize_t>(sizeof(h))) ++damaged;
+        at += static_cast<off_t>(sizeof(TempBlockHeader) + h.payload_bytes);
+    }
+    return damaged;
+}
+
+// Keeps a second descriptor on every new temp file, and damages files already finished:
+// the sink's at the first open after the sink,
+// or a thread's earlier splits at that thread's next open.
+class MergeReadDamage {
+public:
+    enum class Target { SINK_FILES, SPLIT_FILES };
+
+    explicit MergeReadDamage(Target target) : target_(target) {}
+    ~MergeReadDamage() { Close(); }
+    MergeReadDamage(const MergeReadDamage&) = delete;
+    MergeReadDamage& operator=(const MergeReadDamage&) = delete;
+
+    // From the open hook, on any thread. A thread writes one split at a time,
+    // so its earlier splits are finished.
+    void Opened(const std::string& path) {
+        const int fd = ::open(path.c_str(), O_RDWR | O_CLOEXEC);
+        const std::thread::id self = std::this_thread::get_id();
+        const std::lock_guard<std::mutex> lock(mutex_);
+        if (sink_done_) {
+            for (Kept& k : kept_) {
+                const bool hit = target_ == Target::SINK_FILES ? k.in_sink : !k.in_sink && k.thread == self;
+                if (!hit || k.fd < 0) continue;
+                damaged_ += DamageEveryBlock(k.fd);
+                ::close(k.fd);
+                k.fd = -1;
+            }
+        }
+        kept_.push_back(Kept{fd, self, !sink_done_});
+    }
+
+    // Files opened from now on are the source's splits.
+    void SinkDone() {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        sink_done_ = true;
+    }
+
+    // Blocks damaged so far.
+    [[nodiscard]] size_t Damaged() {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        return damaged_;
+    }
+
+    // Closes every descriptor still kept.
+    void Close() {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        for (Kept& k : kept_) {
+            if (k.fd >= 0) ::close(k.fd);
+            k.fd = -1;
+        }
+    }
+
+private:
+    struct Kept {
+        int fd;
+        std::thread::id thread;
+        bool in_sink;
+    };
+
+    Target target_;
+    std::mutex mutex_;
+    std::vector<Kept> kept_;
+    bool sink_done_{false};
+    size_t damaged_{0};
+};
+
+// One row with key k: cents from k and a salt, nothing else set.
+AggRow KeyRow(int64_t k, int64_t salt) {
+    AggRow r;
+    r.k = k;
+    r.cents = (k * 7919 + salt * 104729) % 2000001 - 1000000;
+    return r;
+}
+
+// GROUP BY k with COUNT(*) and SUM(m), exactly, as the aggregate's bytes.
+std::vector<OutRow> CountSumReference(const std::vector<std::vector<AggRow>>& parts) {
+    std::map<int64_t, std::pair<int64_t, __int128>> ref;
+    for (const auto& rows : parts) {
+        for (const AggRow& r : rows) {
+            auto& e = ref[r.k];
+            ++e.first;
+            e.second += r.cents;
+        }
+    }
+    std::vector<OutRow> want;
+    for (const auto& [k, e] : ref) {
+        OutRow row;
+        AppendRaw(row.exact, &k, sizeof(k));
+        AppendRaw(row.exact, &e.first, sizeof(int64_t));
+        AppendRaw(row.exact, &e.second, sizeof(__int128));
+        want.push_back(std::move(row));
+    }
+    return want;
+}
+
+// What a hand-fed run gave.
+struct DrivenAgg {
+    std::vector<OutRow> rows;
+    uint64_t files{0};
+    size_t peak{0};     // the budget's peak, read right after Finalize
+    size_t morsels{0};  // the source's morsels
+};
+
 // The spill partition of a lone INTEGER key at one level.
 size_t KeyPartition(int64_t k, int level) {
     return SpillPartitionOf(detail::FoldKey(0, static_cast<uint64_t>(k)), level);
@@ -1889,12 +2017,15 @@ protected:
         try {
             std::optional<FailWritesScope> fail;
             if (cfg.fail_writes != 0) fail.emplace(cfg.fail_writes);
+            std::optional<OpenHookScope> opens;
+            if (cfg.on_open) opens.emplace([&cfg, b](const std::string& path) { cfg.on_open(b, path); });
             RunPipeline(group_in, ctx);
             if (after_sink) after_sink(b);
             RunPipeline(group_out, ctx);
         } catch (const std::exception& e) {
             error = e.what();
         }
+        if (cfg.on_done) cfg.on_done();
 
         made.first.reset();
         made.second.reset();
@@ -1915,6 +2046,61 @@ protected:
         options.threads = threads;
         options.spill_everything = spill_everything;
         return db.ExecuteSQL(sql, options);
+    }
+
+    // Feeds parts[w] to worker w's counted local by hand, so each worker's table is known,
+    // then finalizes and reads the groups through a pipeline. Afterwards nothing is left.
+    DrivenAgg DriveAgg(const AggCase& c, const std::vector<std::vector<AggRow>>& parts, size_t limit, bool pooled,
+                       const std::function<void(MemoryBudget&)>& before_finalize = {}) {
+        const auto threads = static_cast<unsigned>(parts.size());
+        const size_t descriptors = OpenDescriptors();
+        DrivenAgg got;
+        {
+            MemoryBudget budget(limit, threads);
+            SpillCounters counters;
+            auto made = MakeHashAggregate(SpecOf(c));
+            QueryContext ctx{nullptr, nullptr, threads, pooled ? pool_.get() : nullptr};
+            ctx.budget = &budget;
+            ctx.spill = &counters;
+            ctx.temp_dir = &temp_dir_;
+            Sink& sink = *made.first;
+            for (unsigned w = 0; w < threads; ++w) {
+                auto local = sink.MakeWorkerLocal(ctx, w);
+                Batch b;
+                for (size_t at = 0; at < parts[w].size(); at += kBatchSize) {
+                    const auto n = static_cast<uint32_t>(std::min<size_t>(kBatchSize, parts[w].size() - at));
+                    ShapeBatch(b, AggLayout().slot_types);
+                    b.Reset(n);
+                    for (uint32_t i = 0; i < n; ++i) {
+                        const AggRow& r = parts[w][at + i];
+                        b.slots[0].I64()[i] = r.k;
+                        b.slots[1].Str()[i] = StringRef{r.s.data(), static_cast<uint32_t>(r.s.size())};
+                        b.slots[2].I64()[i] = r.cents;
+                        b.slots[3].F64()[i] = r.f;
+                        b.slots[4].I128()[i] = r.w;
+                        b.slots[5].I64()[i] = r.d;
+                    }
+                    sink.Consume(b, *local);
+                }
+                sink.Combine(std::move(local));
+            }
+            if (before_finalize) before_finalize(budget);
+            sink.Finalize(ctx);
+            got.peak = budget.PeakBytes();
+
+            GroupSink out(ApproxSlots(c));
+            Pipeline read{made.second.get(), {}, &out, {0}};
+            RunPipeline(read, ctx);
+            got.morsels = made.second->MorselCount();
+            got.rows = std::move(out.rows);
+            got.files = counters.files.load();
+            made.first.reset();
+            made.second.reset();
+            EXPECT_EQ(budget.HeldBytes(), 0u);
+        }
+        EXPECT_TRUE(TempDirEmpty());
+        EXPECT_EQ(OpenDescriptors(), descriptors);
+        return got;
     }
 };
 
@@ -2531,6 +2717,170 @@ TEST_F(ParallelHashAggregateSpillTest, TpchQueriesMatchSpilled) {
             EXPECT_GT(tpch.LastParallelStats().spill_bytes_written, 0u) << q;
             EXPECT_GT(tpch.LastParallelStats().spill_partitions, 0u) << q;
             EXPECT_TRUE(TempDirEmpty()) << q;
+        }
+    }
+}
+
+TEST_F(ParallelHashAggregateSpillTest, TableStaysCountedWhileWritten) {
+    // One worker, two grants of shared room: its table fills all four grants, then spills.
+    // That spill's file opens while the table is being written, and it's still counted.
+    constexpr uint32_t kRows = 350000;
+    const AggRowMaker make = [](uint32_t i) { return KeyRow(i, 0); };
+    const AggCase c{{0}, {{Func::COUNT, -1}, {Func::SUM, 2}}, "distinct keys"};
+    const AggData data{kRows, make};
+    const AggSpillResult want = RunAgg(c, data, Unspilled(1));
+    bool opened = false;
+    size_t held_at_open = 0;
+    AggSpillConfig cfg = FloorsOnly(1, 0);
+    cfg.limit = kWorkerMinimumBytes + 2 * kGrantBytes;
+    cfg.on_open = [&](MemoryBudget* budget, const std::string&) {
+        if (opened) return;
+        opened = true;
+        held_at_open = budget->HeldBytes();
+    };
+    const AggSpillResult got = RunAgg(c, data, cfg);
+    EXPECT_EQ(GroupDifference(got.rows, want.rows), "");
+    EXPECT_GT(got.files, 0u);
+    ASSERT_TRUE(opened);
+    // The writer's buffers alone never need more than two grants.
+    EXPECT_GT(held_at_open, 2 * kGrantBytes);
+}
+
+TEST_F(ParallelHashAggregateSpillTest, InMemoryMergeIsCountedOrSpills) {
+    // Four workers with their own keys, each table on one floor grant.
+    // With room, the merge is counted before it's built, so the shared peak
+    // passes the four tables' grants.
+    // With room only for the tables, the source merges them, one spill partition per morsel.
+    const size_t floors = kSpillThreads * kWorkerMinimumBytes;
+    const AggCase c{{0}, {{Func::COUNT, -1}, {Func::SUM, 2}}, "own keys"};
+    // 80,000 groups merge into one table; 160,000 merge by partition.
+    for (const int64_t per : {20000, 40000}) {
+        std::vector<std::vector<AggRow>> parts(kSpillThreads);
+        std::set<size_t> partitions;
+        for (int64_t w = 0; w < static_cast<int64_t>(kSpillThreads); ++w) {
+            for (int64_t j = 0; j < per; ++j) {
+                parts[w].push_back(KeyRow(w * per + j, w));
+                partitions.insert(KeyPartition(w * per + j, 0));
+            }
+        }
+        const std::vector<OutRow> want = CountSumReference(parts);
+        const auto four_grants = [](MemoryBudget& budget) { EXPECT_EQ(budget.HeldBytes(), 4 * kGrantBytes) << "one grant per table"; };
+
+        const DrivenAgg roomy = DriveAgg(c, parts, floors + 8 * kGrantBytes, true, four_grants);
+        EXPECT_EQ(GroupDifference(roomy.rows, want), "") << per;
+        EXPECT_EQ(roomy.files, 0u) << per;
+        EXPECT_GT(roomy.peak, floors + 4 * kGrantBytes) << per << ": the merge was counted";
+
+        const DrivenAgg tight = DriveAgg(c, parts, floors + 4 * kGrantBytes, true, four_grants);
+        EXPECT_EQ(GroupDifference(tight.rows, want), "") << per;
+        EXPECT_EQ(tight.files, 0u) << per << ": each spill partition fits a worker's floor";
+        EXPECT_EQ(tight.morsels, partitions.size()) << per << ": merged by spill partition";
+    }
+}
+
+TEST_F(ParallelHashAggregateSpillTest, FinalizeSpillsTheLargestStuckPartFirst) {
+    // Workers 0 to 2 hold 20,000 groups on one floor grant each. Worker 3 holds
+    // 340,000 on two floor grants and every shared grant: at Finalize no part can move.
+    // Spilling worker 3 first frees the shared room the others need: only it is written.
+    // Spilling each part that fails to move would write all four.
+    std::vector<std::vector<AggRow>> parts(kSpillThreads);
+    for (int64_t w = 0; w < 3; ++w) {
+        for (int64_t j = 0; j < 20000; ++j) parts[w].push_back(KeyRow(100000 * w + j, w));
+    }
+    for (int64_t k = 0; k < 340000; ++k) parts[3].push_back(KeyRow(k, 3));
+    const std::vector<OutRow> want = CountSumReference(parts);
+    const AggCase c{{0}, {{Func::COUNT, -1}, {Func::SUM, 2}}, "one big part"};
+    const size_t limit = kSpillThreads * kWorkerMinimumBytes + 3 * kGrantBytes;
+    for (const bool pooled : {false, true}) {
+        const DrivenAgg got = DriveAgg(c, parts, limit, pooled, [](MemoryBudget& budget) {
+            EXPECT_EQ(budget.HeldBytes(), 8 * kGrantBytes) << "a grant each for workers 0 to 2, five for worker 3";
+        });
+        EXPECT_EQ(GroupDifference(got.rows, want), "") << "pooled " << pooled;
+        EXPECT_EQ(got.files, 1u) << "pooled " << pooled << ": only worker 3's table is written";
+    }
+}
+
+TEST_F(ParallelHashAggregateSpillTest, SplitFilesCloseOnceMerged) {
+    // 20,000 keys, about 312 per spill partition, and a merge cap of one group:
+    // pieces split down the levels. A split's file closes once its pieces have merged,
+    // so a worker holds at most one split file per level.
+    const AggRowMaker make = [](uint32_t i) { return KeyRow(i % 20000, i); };
+    const AggCase c{{0}, {{Func::COUNT, -1}, {Func::SUM, 2}}, "deep splits"};
+    const AggData data{40000, make};
+    const AggSpillResult want = RunAgg(c, data, Unspilled(1));
+    const MergeCapScope cap(1);
+    for (const unsigned threads : {1u, kSpillThreads}) {
+        std::mutex mutex;
+        size_t most = 0;
+        const size_t before = OpenDescriptors();
+        AggSpillConfig cfg = Everything(threads);
+        cfg.on_open = [&](MemoryBudget*, const std::string&) {
+            const std::lock_guard<std::mutex> lock(mutex);
+            most = std::max(most, OpenDescriptors());
+        };
+        const AggSpillResult got = RunAgg(c, data, cfg);
+        EXPECT_EQ(GroupDifference(got.rows, want.rows), "") << threads << " threads";
+        EXPECT_GT(got.files, threads + kSpillPartitions) << threads << " threads: every partition splits";
+        // Each worker's sink file, then per worker a split file per level.
+        EXPECT_LE(most, before + threads * (1 + kMaxSpillLevel)) << threads << " threads";
+    }
+}
+
+TEST_F(ParallelHashAggregateSpillTest, DamagedMergeReadLeavesNothing) {
+    // 20,000 keys and a merge cap of one group: every partition splits down the levels.
+    // Files are damaged at a later open: the sink's when the first split opens,
+    // or a thread's earlier splits when it opens another.
+    // With short rows the next read is a merge's. One 70,000-byte MIN(s) is written
+    // alone, opening a split's file mid-split, so a split's own next read fails.
+    // Its key is in spill partition 0 (the first morsel), and in the last
+    // level-1 piece that splits, so that piece splits first.
+    constexpr int64_t kKeys = 20000;
+    std::map<size_t, std::vector<int64_t>> level1;  // partition 0's keys by level-1 partition
+    for (int64_t k = 0; k < kKeys; ++k) {
+        if (KeyPartition(k, 0) == 0) level1[KeyPartition(k, 1)].push_back(k);
+    }
+    auto last = level1.rbegin();
+    while (last != level1.rend() && last->second.size() < 2) ++last;
+    ASSERT_NE(last, level1.rend());
+    const int64_t big_key = last->second.back();
+    for (auto it = level1.rbegin(); it != last; ++it) ASSERT_EQ(it->second.size(), 1u) << "a later piece would split first";
+
+    const auto row = [](int64_t i) {
+        AggRow r = KeyRow(i % kKeys, i);
+        r.s = "s" + std::to_string(i % 7);
+        return r;
+    };
+    const std::vector<AggData> inputs = {
+        {2 * kKeys, [row](uint32_t i) { return row(i); }},
+        {2 * kKeys, [row, big_key](uint32_t i) {
+             AggRow r = row(i);
+             if (i == big_key) r.s = std::string(70000, 'q');
+             return r;
+         }},
+    };
+    const AggCase c{{0}, {{Func::COUNT, -1}, {Func::SUM, 2}, {Func::MIN, 1}}, "damaged merge"};
+    const MergeCapScope cap(1);
+    for (size_t input = 0; input < inputs.size(); ++input) {
+        const AggData& data = inputs[input];
+        const AggSpillResult want = RunAgg(c, data, Unspilled(1));
+        for (const unsigned threads : {1u, kSpillThreads}) {
+            for (const auto target : {MergeReadDamage::Target::SINK_FILES, MergeReadDamage::Target::SPLIT_FILES}) {
+                const std::string label = std::string(input == 0 ? "short rows, " : "one big value, ") + std::to_string(threads) +
+                                          " threads, " + (target == MergeReadDamage::Target::SINK_FILES ? "sink files" : "split files");
+                MergeReadDamage damage(target);
+                AggSpillConfig cfg = Everything(threads);
+                cfg.expect_error = true;
+                cfg.on_open = [&damage](MemoryBudget*, const std::string& path) { damage.Opened(path); };
+                cfg.on_done = [&damage] { damage.Close(); };
+                const AggSpillResult failed = RunAgg(c, data, cfg, [&damage](MemoryBudget*) { damage.SinkDone(); });
+                EXPECT_GT(damage.Damaged(), 0u) << label;
+                EXPECT_EQ(failed.error, "damaged temp file: checksum mismatch") << label;
+
+                // The next aggregate, on fresh objects, answers.
+                const AggSpillResult next = RunAgg(c, data, Everything(threads));
+                EXPECT_EQ(GroupDifference(next.rows, want.rows), "") << label;
+                EXPECT_GT(next.files, 0u) << label;
+            }
         }
     }
 }
