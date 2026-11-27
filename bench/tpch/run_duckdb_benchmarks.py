@@ -39,7 +39,14 @@ def _load_common() -> ModuleType:
 
 common = _load_common()
 
-CONFIGS: Dict[str, List[str]] = {"duckdb": [], "duckdb_1thread": ["SET threads = 1"]}
+CONFIGS: Dict[str, List[str]] = {
+    "duckdb": [],
+    "duckdb_1thread": ["SET threads = 1"],
+    # ShilmanDB's SF=100 memory: a 16 GiB pool plus a 4 GiB limit.
+    # Runs only when named.
+    "duckdb_20g": ["SET memory_limit = '20GiB'"],
+}
+DEFAULT_CONFIGS: List[str] = ["duckdb", "duckdb_1thread"]
 DEFAULT_DB_DIR = common.DEFAULT_OUTPUT_DIR / "tpch_duckdb"
 MARKER_TABLE = "_baseline_load"
 
@@ -152,7 +159,7 @@ def parse_args(argv: Optional[Sequence[str]]) -> argparse.Namespace:
         description="Run the TPC-H queries on DuckDB for the ShilmanDB baseline.",
         epilog=f"Needs {DUCKDB_PIN} in .venv (.venv/bin/pip install {DUCKDB_PIN}).",
     )
-    common.add_baseline_args(parser, CONFIGS)
+    common.add_baseline_args(parser, CONFIGS, DEFAULT_CONFIGS)
     parser.add_argument("--db-dir", type=Path, default=DEFAULT_DB_DIR, help="where the .duckdb files live (default: bench/results/tpch_duckdb)")
     parser.add_argument("--reload", action="store_true", help="rebuild the database files even if they match")
     return parser.parse_args(argv)
@@ -171,12 +178,12 @@ resolve_scale_factors = common.resolve_scale_factors
 
 
 def resolve_configs(names: Optional[List[str]]) -> Optional[List[str]]:
-    return common.resolve_configs(names, CONFIGS)
+    return common.resolve_configs(names, CONFIGS, DEFAULT_CONFIGS)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
-    resolved = common.resolve_run_args(args, CONFIGS)
+    resolved = common.resolve_run_args(args, CONFIGS, DEFAULT_CONFIGS)
     if resolved is None:
         return 1
     scale_factors, configs = resolved

@@ -5,7 +5,7 @@ import csv
 import importlib.util
 import sys
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional, Sequence
 
 import pytest
 
@@ -22,9 +22,9 @@ BAR_HEADER = ["query", "P", "P1", "D", "D1", "PG", "PG1", "P_over_PG", "P_over_D
               "ours_speedup", "duckdb_speedup", "check", "P_over_PG1", "P1_over_PG1"]
 
 
-# One latencies.csv row as run_benchmarks writes it (only the median matters here).
-def _ours(sf: str, query: str, config: str, ms: float) -> str:
-    return f"{sf},{query},{config},{ms:.4f},1,,,,,,,,,8192,0,false,lru\n"
+# One latencies.csv row as run_benchmarks writes it (the median, and the pool at SF=100).
+def _ours(sf: str, query: str, config: str, ms: float, pool: int = 8192) -> str:
+    return f"{sf},{query},{config},{ms:.4f},1,,,,,,,,,{pool},0,false,lru\n"
 
 
 # Per-run rows as the DuckDB and Postgres runners write them: sf,query,config,run,latency_ms.
@@ -169,3 +169,283 @@ def test_zero_median_exits_2(tmp_path: Path, capsys: pytest.CaptureFixture, conf
     assert mod.main(["--results-dir", str(tmp_path), "--sf", "10"]) == 2
     assert f"zero median for {config} for {query}" in capsys.readouterr().err
     assert not (tmp_path / "bar_sf10.csv").exists()
+
+
+# SF=100: the spill, direct and duckdb_20g columns, the memory table and the answer check
+SPILL, DIRECT, SWEEP2 = "columnar+parallel_spill", "columnar+parallel_direct", "columnar+parallel_2thread"
+EXTRA_HEADER = ["PS", "PS_over_P", "PS_spill_bytes", "PD", "PD_over_P", "D20", "P_over_D20"]
+MEMORY_HEADER = ["config", "pool_size", "memory_limit", "peak_rss_bytes", "spill_bytes_max"]
+STATS_HEADER = ("query,run,threads,morsels,latch_wait_ms,memory_limit,peak_tracked_bytes,"
+                "spill_bytes_written,spill_bytes_read,spill_files,spill_partitions,spill_ms\n")
+POOL_100 = 2097152
+LIMIT_4G, LIMIT_256M = 4 << 30, 256 << 20
+
+# Made-up medians per config and query
+OURS_100 = {
+    "columnar+parallel": {"Q1": 1000.0, "Q6": 400.0},
+    "columnar+parallel_1thread": {"Q1": 12000.0, "Q6": 3000.0},
+    SWEEP2: {"Q1": 6000.0, "Q6": 1600.0},
+    SPILL: {"Q1": 1300.0, "Q6": 520.0},
+    DIRECT: {"Q1": 1500.0, "Q6": 700.0},
+}
+ENGINES_100 = {
+    "duckdb": {"Q1": 250.0, "Q6": 100.0},
+    "duckdb_1thread": {"Q1": 2500.0, "Q6": 1200.0},
+    "duckdb_20g": {"Q1": 260.0, "Q6": 125.0},
+    "postgres": {"Q1": 20000.0, "Q6": 8000.0},
+    "postgres_1worker": {"Q1": 50000.0, "Q6": 9000.0},
+}
+# spill_bytes_written per timed run; Q6 has an even count on purpose
+SPILLS_100 = {
+    "columnar+parallel": {"Q1": [0, 0, 0], "Q6": [0, 0, 0]},
+    "columnar+parallel_1thread": {"Q1": [0, 0, 0], "Q6": [0, 0, 0]},
+    SPILL: {"Q1": [4096, 1024, 2048], "Q6": [300, 100, 200, 400]},
+    DIRECT: {"Q1": [0, 0, 0], "Q6": [0, 0, 0]},
+}
+PEAK_RSS_100 = {"columnar+parallel": 6000000000, "columnar+parallel_1thread": 5000000000,
+                SWEEP2: 5500000000, SPILL: 1500000000, DIRECT: 6100000000}
+# Every engine's answer, so each check passes; Q1's big sum can drift
+ANSWERS = {"Q1": ["l_returnflag,sum_charge", "A,1000000000000.00", "N,2500.50"],
+           "Q6": ["revenue", "123456789.12"]}
+
+
+# One answer file per query in folder, as the runners name them.
+def _write_answers(folder: Path, sf: str, answers: Dict[str, List[str]] = ANSWERS) -> None:
+    folder.mkdir(parents=True, exist_ok=True)
+    for query, lines in answers.items():
+        (folder / f"{query}_sf{sf}.csv").write_text("\n".join(lines) + "\n")
+
+
+# A parallel_stats file: one row per timed run.
+def _stats(spills: Dict[str, List[int]], limit: int) -> str:
+    text = STATS_HEADER
+    for query, values in spills.items():
+        for run, spilled in enumerate(values):
+            text += f"{query},{run},18,100,1.000,{limit},{1 << 20},{spilled},{spilled},0,0,0.000\n"
+    return text
+
+
+# A results folder at SF=100 as the runner leaves it. skip leaves configs out entirely.
+def _write_sf100(folder: Path, skip: Sequence[str] = ()) -> None:
+    sf = "100"
+    ours = LATENCIES_HEADER
+    for query in ("Q1", "Q6"):
+        for config, medians in OURS_100.items():
+            if config not in skip:
+                ours += _ours(sf, query, config, medians[query], pool=POOL_100)
+        # The runner adds the engines' medians too; they are not ShilmanDB configs
+        ours += f"{sf},{query},duckdb,{ENGINES_100['duckdb'][query]:.4f},,,,,,,,,,,,,\n"
+    (folder / "latencies.csv").write_text(ours)
+
+    for engine in ("duckdb", "postgres"):
+        text = "sf,query,config,run,latency_ms\n"
+        for config, medians in ENGINES_100.items():
+            if config.startswith(engine) and config not in skip:
+                text += "".join(_runs(sf, query, config, [ms]) for query, ms in medians.items())
+        (folder / f"{engine}_latencies.csv").write_text(text)
+
+    for config in OURS_100:
+        if config in skip:
+            continue
+        results = folder / "shilmandb_results" / config
+        _write_answers(results, sf)
+        limit = LIMIT_256M if config == SPILL else LIMIT_4G
+        (results / f"run_info_sf{sf}.csv").write_text(
+            f"key,value\nsf,{sf}\npool_size,{POOL_100}\nexecution_mode,parallel\n"
+            f"peak_rss_bytes,{PEAK_RSS_100[config]}\nmemory_limit,{limit}\n")
+        if config in SPILLS_100:
+            (folder / f"parallel_stats_{config}_sf{sf}.csv").write_text(_stats(SPILLS_100[config], limit))
+
+    for config in ("duckdb", "duckdb_20g"):
+        if config not in skip:
+            _write_answers(folder / "duckdb_results" / config, sf)
+    _write_answers(folder / "postgres_results" / "postgres", sf)
+
+
+def test_bar_sf100_has_spill_direct_and_20g(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    _write_sf100(tmp_path)
+    assert mod.main(["--results-dir", str(tmp_path), "--sf", "100"]) == 0
+
+    out = tmp_path / "bar_sf100.csv"
+    with out.open(newline="") as f:
+        assert next(csv.reader(f)) == BAR_HEADER + ["P2"] + EXTRA_HEADER
+    rows = _read_bar(out)
+    assert [r["query"] for r in rows] == ["Q1", "Q6"]
+    q6 = rows[1]
+    assert (q6["P"], q6["P1"], q6["P2"]) == ("400.0000", "3000.0000", "1600.0000")
+    assert (q6["D"], q6["PG1"]) == ("100.0000", "9000.0000")
+    assert q6["PS"] == "520.0000"
+    assert q6["PS_over_P"] == f"{520.0 / 400.0:.6f}"
+    # The lower middle of four runs, so the count stays a whole number
+    assert q6["PS_spill_bytes"] == "200"
+    assert q6["PD"] == "700.0000"
+    assert q6["PD_over_P"] == f"{700.0 / 400.0:.6f}"
+    assert q6["D20"] == "125.0000"
+    assert q6["P_over_D20"] == f"{400.0 / 125.0:.6f}"
+    q1 = rows[0]
+    assert (q1["PS_spill_bytes"], q1["PS_over_P"], q1["P_over_D20"]) == ("2048", "1.300000", f"{1000.0 / 260.0:.6f}")
+    # The SF=10 columns are unchanged
+    assert q6["P_over_D"] == f"{400.0 / 100.0:.6f}"
+    assert q6["check"] == q6["P_over_D"]
+    captured = capsys.readouterr()
+    assert "PS_spill_bytes" in captured.out
+    assert captured.err == ""
+
+
+def test_bar_reports_peak_rss_and_limit(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    _write_sf100(tmp_path)
+    # A config with no stats file and one with no run info leave those cells empty
+    (tmp_path / "parallel_stats_columnar+parallel_1thread_sf100.csv").unlink()
+    (tmp_path / "shilmandb_results" / DIRECT / "run_info_sf100.csv").unlink()
+    assert mod.main(["--results-dir", str(tmp_path), "--sf", "100"]) == 0
+
+    memory = tmp_path / "bar_sf100_memory.csv"
+    with memory.open(newline="") as f:
+        assert list(csv.reader(f)) == [
+            MEMORY_HEADER,
+            ["columnar+parallel", str(POOL_100), str(LIMIT_4G), "6000000000", "0"],
+            ["columnar+parallel_1thread", str(POOL_100), str(LIMIT_4G), "5000000000", ""],
+            [SWEEP2, str(POOL_100), str(LIMIT_4G), "5500000000", ""],
+            [SPILL, str(POOL_100), str(LIMIT_256M), "1500000000", "4096"],
+            [DIRECT, str(POOL_100), "", "", "0"],
+        ]
+    printed = capsys.readouterr().out
+    # Printed after the bar table
+    assert printed.index("peak_rss_bytes") > printed.index("PS_spill_bytes")
+    assert "1500000000" in printed and str(LIMIT_256M) in printed
+
+
+def test_bar_sf100_memory_file_follows_out(tmp_path: Path) -> None:
+    _write_sf100(tmp_path)
+    target = tmp_path / "elsewhere" / "bar.csv"
+    assert mod.main(["--results-dir", str(tmp_path), "--sf", "100", "--out", str(target)]) == 0
+    assert target.exists() and (tmp_path / "elsewhere" / "bar_memory.csv").exists()
+    assert not (tmp_path / "bar_sf100.csv").exists()
+    assert not (tmp_path / "bar_sf100_memory.csv").exists()
+
+
+def test_bar_sf100_optional_configs_leave_empty_cells(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    _write_sf100(tmp_path, skip=(SPILL, DIRECT, "duckdb_20g"))
+    assert mod.main(["--results-dir", str(tmp_path), "--sf", "100"]) == 0
+    for row in _read_bar(tmp_path / "bar_sf100.csv"):
+        assert [row[name] for name in EXTRA_HEADER] == [""] * len(EXTRA_HEADER)
+        assert row["P"] != ""
+    err = capsys.readouterr().err
+    for config in (SPILL, DIRECT, "duckdb_20g"):
+        assert f"no {config} at SF=100" in err
+
+
+def test_bar_sf100_spill_missing_for_one_query(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    _write_sf100(tmp_path)
+    lines = (tmp_path / "latencies.csv").read_text().splitlines(keepends=True)
+    (tmp_path / "latencies.csv").write_text("".join(l for l in lines if not l.startswith(f"100,Q1,{SPILL},")))
+    assert mod.main(["--results-dir", str(tmp_path), "--sf", "100"]) == 0
+    q1, q6 = _read_bar(tmp_path / "bar_sf100.csv")
+    assert (q1["PS"], q1["PS_over_P"], q1["PS_spill_bytes"]) == ("", "", "")
+    assert q6["PS"] == "520.0000"
+    assert f"no {SPILL} for Q1" in capsys.readouterr().err
+
+
+def test_bar_sf100_still_needs_the_six_configs(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    _write_sf100(tmp_path, skip=("postgres_1worker",))
+    assert mod.main(["--results-dir", str(tmp_path), "--sf", "100"]) == 2
+    assert "postgres_1worker for Q1" in capsys.readouterr().err
+    assert not (tmp_path / "bar_sf100.csv").exists()
+    assert not (tmp_path / "bar_sf100_memory.csv").exists()
+
+
+def test_bar_sf100_zero_median_of_an_optional_config_exits_2(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    _write_sf100(tmp_path)
+    text = (tmp_path / "duckdb_latencies.csv").read_text()
+    (tmp_path / "duckdb_latencies.csv").write_text(text.replace("100,Q6,duckdb_20g,1,125.0000", "100,Q6,duckdb_20g,1,0.0000"))
+    assert mod.main(["--results-dir", str(tmp_path), "--sf", "100"]) == 2
+    assert "zero median for duckdb_20g for Q6" in capsys.readouterr().err
+
+
+# Wrong answers to put in a candidate or reference file.
+WRONG_Q1 = ["l_returnflag,sum_charge", "A,1000000000001.00", "N,2500.50"]   # 1e-12 relative: drift
+WRONG_Q6 = ["revenue", "123456790.12"]                                    # off by 1: FAIL
+
+
+@pytest.mark.parametrize("folder,query,lines,expect", [
+    ("shilmandb_results/columnar+parallel", "Q6", WRONG_Q6,
+     ["Q6 columnar+parallel against DuckDB: FAIL", "Q6 columnar+parallel against Postgres: FAIL"]),
+    # Drift is not allowed at SF=100
+    ("shilmandb_results/columnar+parallel_1thread", "Q1", WRONG_Q1,
+     ["Q1 columnar+parallel_1thread against DuckDB: FAIL", "max rel 1e-12"]),
+    ("shilmandb_results/columnar+parallel_2thread", "Q6", WRONG_Q6, ["Q6 columnar+parallel_2thread against DuckDB: FAIL"]),
+    (f"shilmandb_results/{SPILL}", "Q6", None, [f"Q6 {SPILL} against DuckDB: SKIP", f"Q6 {SPILL} against Postgres: SKIP"]),
+    # An empty file is named, whether it is the candidate or the reference
+    (f"shilmandb_results/{DIRECT}", "Q1", [], [f"Q1 {DIRECT} against DuckDB: FAIL (couldn't read {{path}}: it's empty)"]),
+    ("duckdb_results/duckdb", "Q1", [], ["Q1 columnar+parallel against DuckDB: FAIL (couldn't read {path}: it's empty)",
+                                          "Q1 duckdb against Postgres: FAIL (couldn't read {path}: it's empty)"]),
+    ("duckdb_results/duckdb_20g", "Q6", WRONG_Q6, ["Q6 duckdb_20g against Postgres: FAIL"]),
+    ("duckdb_results/duckdb", "Q6", WRONG_Q6, ["Q6 duckdb against Postgres: FAIL"]),
+    # A wrong reference fails every config checked against it
+    ("postgres_results/postgres", "Q6", WRONG_Q6, ["Q6 columnar+parallel against Postgres: FAIL", "Q6 duckdb against Postgres: FAIL"]),
+])
+def test_bar_sf100_refuses_an_answer_that_is_not_pass(tmp_path: Path, capsys: pytest.CaptureFixture, folder: str,
+                                                     query: str, lines: Optional[List[str]], expect: List[str]) -> None:
+    _write_sf100(tmp_path)
+    path = tmp_path / folder / f"{query}_sf100.csv"
+    if lines is None:
+        path.unlink()                               # a missing file of a reported config
+    else:
+        path.write_text("\n".join(lines) + "\n" if lines else "")   # [] = an empty file
+    assert mod.main(["--results-dir", str(tmp_path), "--sf", "100"]) == 1
+    captured = capsys.readouterr()
+    for text in expect:
+        assert text.replace("{path}", str(path)) in captured.err
+    assert "nothing was written" in captured.err
+    assert captured.out == ""
+    assert not (tmp_path / "bar_sf100.csv").exists()
+    assert not (tmp_path / "bar_sf100_memory.csv").exists()
+
+
+def test_bar_sf100_skips_checks_of_configs_it_does_not_report(tmp_path: Path) -> None:
+    _write_sf100(tmp_path, skip=(SPILL,))
+    # Answers left from another run of an unreported config are not checked
+    _write_answers(tmp_path / "shilmandb_results" / SPILL, "100", {"Q6": WRONG_Q6})
+    _write_answers(tmp_path / "duckdb_results" / "duckdb_1thread", "100", {"Q6": WRONG_Q6})
+    assert mod.main(["--results-dir", str(tmp_path), "--sf", "100"]) == 0
+
+
+# What the report printed and wrote for _write_sf10_extras before SF=100 existed.
+SF10_BAR_CSV = (
+    "query,P,P1,D,D1,PG,PG1,P_over_PG,P_over_D,P1_over_D1,ours_speedup,duckdb_speedup,check,P_over_PG1,P1_over_PG1,P2\r\n"
+    "Q1,100.0000,900.0000,34.2000,393.0000,2857.4000,7153.6000,0.034997,2.923977,2.290076,9.000000,11.491228,"
+    "2.923977,0.013979,0.125811,480.0000\r\n"
+    "Q6,40.0000,300.0000,10.4000,112.8000,1127.4000,1312.3000,0.035480,3.846154,2.659574,7.500000,10.846154,"
+    "3.846154,0.030481,0.228606,160.0000\r\n")
+SF10_STDOUT = (
+    "query         P        P1        D        D1         PG        PG1  P_over_PG  P_over_D  P1_over_D1  "
+    "ours_speedup  duckdb_speedup     check  P_over_PG1  P1_over_PG1        P2\n"
+    "   Q1  100.0000  900.0000  34.2000  393.0000  2857.4000  7153.6000   0.034997  2.923977    2.290076      "
+    "9.000000       11.491228  2.923977    0.013979     0.125811  480.0000\n"
+    "   Q6   40.0000  300.0000  10.4000  112.8000  1127.4000  1312.3000   0.035480  3.846154    2.659574      "
+    "7.500000       10.846154  3.846154    0.030481     0.228606  160.0000\n"
+    "  -> {OUT}\n")
+
+
+# The SF=10 fixture plus SF=100-style files, and answers that disagree.
+def _write_sf10_extras(folder: Path) -> None:
+    _write_fixture(folder)
+    with (folder / "latencies.csv").open("a") as f:
+        f.write(_ours("10", "Q1", SPILL, 130.0) + _ours("10", "Q6", DIRECT, 70.0))
+    with (folder / "duckdb_latencies.csv").open("a") as f:
+        f.write(_runs("10", "Q6", "duckdb_20g", [12.5]))
+    _write_answers(folder / "shilmandb_results" / "columnar+parallel", "10", {"Q6": WRONG_Q6})
+    _write_answers(folder / "duckdb_results" / "duckdb", "10")
+    (folder / "shilmandb_results" / "columnar+parallel" / "run_info_sf10.csv").write_text(
+        "key,value\npeak_rss_bytes,123\nmemory_limit,0\n")
+    (folder / f"parallel_stats_{SPILL}_sf10.csv").write_text(_stats({"Q1": [5, 6, 7]}, LIMIT_256M))
+
+
+def test_bar_sf10_output_is_unchanged(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    _write_sf10_extras(tmp_path)
+    assert mod.main(["--results-dir", str(tmp_path), "--sf", "10"]) == 0
+    assert (tmp_path / "bar_sf10.csv").read_bytes() == SF10_BAR_CSV.encode()
+    captured = capsys.readouterr()
+    assert captured.out == SF10_STDOUT.replace("{OUT}", str(tmp_path / "bar_sf10.csv"))
+    assert captured.err == ""
+    assert sorted(p.name for p in tmp_path.glob("bar_*")) == ["bar_sf10.csv"]

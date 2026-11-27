@@ -41,7 +41,12 @@ def run_main(data_dir: Path, out: Path, db_dir: Path, *extra: str) -> int:
 
 
 def test_configs() -> None:
-    assert mod.CONFIGS == {"duckdb": [], "duckdb_1thread": ["SET threads = 1"]}
+    assert mod.CONFIGS == {"duckdb": [], "duckdb_1thread": ["SET threads = 1"],
+                           "duckdb_20g": ["SET memory_limit = '20GiB'"]}
+    # duckdb_20g runs only when named
+    assert mod.DEFAULT_CONFIGS == ["duckdb", "duckdb_1thread"]
+    assert mod.resolve_configs(None) == ["duckdb", "duckdb_1thread"]
+    assert mod.resolve_configs(["duckdb,duckdb_1thread,duckdb_20g"]) == ["duckdb", "duckdb_1thread", "duckdb_20g"]
 
 
 def test_duckdb_load_strips_trailing_pipe(tmp_path: Path) -> None:
@@ -72,7 +77,7 @@ def test_duckdb_runs_and_writes_layout(tmp_path: Path) -> None:
     out = tmp_path / "out"
     assert run_main(data_dir, out, tmp_path / "db") == 0
 
-    for config in mod.CONFIGS:
+    for config in mod.DEFAULT_CONFIGS:
         for tag in mod.common.QUERY_ORDER:
             path = out / "duckdb_results" / config / f"{tag}_sf0.01.csv"
             assert path.exists(), path
@@ -177,3 +182,23 @@ def test_duckdb_honors_warmup(tmp_path: Path, monkeypatch) -> None:
     seen.clear()
     assert run_main(data_dir, tmp_path / "out2", tmp_path / "db", "--configs", "duckdb") == 0
     assert seen == [(1, 1)] * len(mod.common.QUERY_ORDER)
+
+
+def test_duckdb_20g_sets_its_limit(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    write_tiny_tbl_files(data_dir / "sf0.01")
+    out = tmp_path / "out"
+    assert run_main(data_dir, out, tmp_path / "db", "--configs", "duckdb_20g") == 0
+
+    info = read_info(out / "duckdb_info.csv")
+    assert info["memory_limit_duckdb_20g"] == "20.0 GiB"
+    assert {row[2] for row in read_csv_rows(out / "duckdb_latencies.csv")[1:]} == {"duckdb_20g"}
+    assert (out / "duckdb_results" / "duckdb_20g" / "Q1_sf0.01.csv").exists()
+
+
+def test_help_shows_the_default_configs(capsys) -> None:
+    try:
+        mod.parse_args(["--help"])
+    except SystemExit:
+        pass
+    assert "(default: duckdb,duckdb_1thread)" in " ".join(capsys.readouterr().out.split())

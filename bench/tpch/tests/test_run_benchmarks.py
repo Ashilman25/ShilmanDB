@@ -5,6 +5,7 @@ import csv
 import importlib.util
 import sys
 from pathlib import Path
+from typing import Optional
 
 import pytest
 
@@ -250,7 +251,9 @@ def test_pool_for_fraction_sf10() -> None:
 
 
 def test_every_known_sf_has_db_pages() -> None:
-    assert set(mod.KNOWN_SCALE_FACTORS) <= set(mod.DB_PAGES)
+    # SF=100 runs only the parallel configs, which never use DB_PAGES
+    assert mod.PARALLEL_ONLY_SCALE_FACTORS == ["100"]
+    assert set(mod.KNOWN_SCALE_FACTORS) - set(mod.PARALLEL_ONLY_SCALE_FACTORS) <= set(mod.DB_PAGES)
 
 
 def test_pool_for_fraction_unknown_sf_needs_db_pages() -> None:
@@ -702,14 +705,17 @@ def _fake_shilmandb(calls: list):
 
 
 # Stands in for a runner subprocess: writes its latencies and info files, like the real one.
-def _fake_engine(calls: list, ok: bool = True):
-    def run(engine, scale_factors, data_dir, output_dir, timed_runs, warmup_runs):
+# configs_seen, when given, gets the configs each call asked for.
+def _fake_engine(calls: list, ok: bool = True, configs_seen: Optional[list] = None):
+    def run(engine, scale_factors, data_dir, output_dir, timed_runs, warmup_runs, configs=None):
         calls.append((engine, list(scale_factors), timed_runs, warmup_runs))
+        if configs_seen is not None:
+            configs_seen.append(list(configs) if configs is not None else None)
         if not ok:
             return False
         lines = ["sf,query,config,run,latency_ms"]
         for sf in scale_factors:
-            for config in mod.ENGINE_CONFIGS[engine]:
+            for config in configs or mod.ENGINE_CONFIGS[engine]:
                 lines += [f"{sf},{q},{config},{r},{r + 1.0}" for q in mod.QUERIES for r in (1, 2, 3)]
         (output_dir / f"{engine}_latencies.csv").write_text("\n".join(lines) + "\n")
         info = {"duckdb": "key,value\nduckdb_version,2.0.0\n",
@@ -1076,3 +1082,99 @@ def test_main_passes_warmup_to_engines(tmp_path: Path, monkeypatch: pytest.Monke
                                       "--warmup", "4", "--runs", "2", "--output-dir", str(tmp_path / "out")])
     assert mod.main() == 0
     assert engines == [("postgres", ["0.01"], 2, 4)]
+
+
+def test_references_run_after_shilmandb_postgres_last(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    events: list = []
+    shilmandb = _fake_shilmandb([])
+    engine = _fake_engine([])
+    monkeypatch.setattr(mod, "run_shilmandb_config", lambda **k: events.append("shilmandb") or shilmandb(**k))
+    monkeypatch.setattr(mod, "run_engine_benchmarks", lambda name, *a, **k: events.append(name) or engine(name, *a, **k))
+    monkeypatch.setattr(mod, "run_sqlite_benchmarks", lambda *a, **k: events.append("sqlite") or True)
+    monkeypatch.setattr(mod, "compare_output", _fake_compare({}, []))
+    monkeypatch.setattr(mod, "command_output", lambda cmd: "stub")
+    monkeypatch.setattr(mod, "POOL_SWEEP_SIZES", [128])
+    monkeypatch.setattr(sys, "argv", ["run_benchmarks.py", "--sf", "0.01", "--configs", "baseline,+index,sqlite_disk",
+                                      "--duckdb", "--postgres", "--pool-sweep", "--output-dir", str(tmp_path / "out")])
+    assert mod.main() == 0
+    # The pool sweep is ShilmanDB too
+    assert events == ["sqlite", "shilmandb", "shilmandb", "shilmandb", "duckdb", "postgres"]
+
+
+def test_duckdb_20g_needs_the_duckdb_flag(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    shilmandb, engines, compares, sqlite = [], [], [], []
+    _stub_main(monkeypatch, shilmandb, engines, compares, sqlite)
+    monkeypatch.setattr(sys, "argv", ["run_benchmarks.py", "--sf", "0.01", "--configs", "baseline,duckdb_20g",
+                                      "--output-dir", str(tmp_path / "out")])
+    with pytest.raises(SystemExit) as err:
+        mod.main()
+    assert "duckdb_20g" in str(err.value) and "--duckdb" in str(err.value)
+    assert shilmandb == [] and engines == []
+
+
+def test_duckdb_20g_runs_through_the_duckdb_runner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    out = tmp_path / "out"
+    shilmandb, engines, compares, sqlite, configs_seen = [], [], [], [], []
+    _stub_main(monkeypatch, shilmandb, engines, compares, sqlite)
+    monkeypatch.setattr(mod, "run_engine_benchmarks", _fake_engine(engines, configs_seen=configs_seen))
+    monkeypatch.setattr(sys, "argv", ["run_benchmarks.py", "--sf", "10", "--configs", "baseline,duckdb_20g",
+                                      "--duckdb", "--postgres", "--output-dir", str(out)])
+    assert mod.main() == 0
+    assert shilmandb == ["baseline"]
+    assert configs_seen == [["duckdb", "duckdb_1thread", "duckdb_20g"], ["postgres", "postgres_1worker"]]
+    assert {r["config"] for r in _read_dicts(out / "latencies.csv")} == {
+        "baseline", "duckdb", "duckdb_1thread", "duckdb_20g", "postgres", "postgres_1worker"}
+    assert mod.engine_of("duckdb_20g") == "duckdb"
+    # Checked against Postgres only, never its own engine
+    assert {name for cfg, name in compares if cfg == "duckdb_20g"} == {"Postgres"}
+    statuses = {r["config"]: r["status"] for r in _read_dicts(out / "correctness.csv")}
+    assert statuses["duckdb_20g"] == "PASS"
+
+
+def test_duckdb_flag_alone_asks_for_the_two_default_configs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    shilmandb, engines, compares, sqlite, configs_seen = [], [], [], [], []
+    _stub_main(monkeypatch, shilmandb, engines, compares, sqlite)
+    monkeypatch.setattr(mod, "run_engine_benchmarks", _fake_engine(engines, configs_seen=configs_seen))
+    monkeypatch.setattr(sys, "argv", ["run_benchmarks.py", "--sf", "0.01", "--configs", "none", "--duckdb",
+                                      "--output-dir", str(tmp_path / "out")])
+    assert mod.main() == 0
+    assert configs_seen == [["duckdb", "duckdb_1thread"]]
+
+
+def test_engine_runner_gets_configs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    commands: list = []
+    monkeypatch.setattr(mod.subprocess, "run", lambda cmd, **k: commands.append(cmd) or mod.subprocess.CompletedProcess(cmd, 0))
+    assert mod.run_engine_benchmarks("duckdb", ["10"], tmp_path, tmp_path, 3, 1,
+                                     configs=["duckdb", "duckdb_1thread", "duckdb_20g"]) is True
+    cmd = commands[0]
+    assert cmd[cmd.index("--configs") + 1] == "duckdb,duckdb_1thread,duckdb_20g"
+
+
+# compare_results.py gets --no-drift at SF=100, never at 10 or below
+def test_runner_passes_no_drift_at_sf100_only(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cmds: list = []
+    monkeypatch.setattr(mod, "compare_output", lambda cmd: cmds.append(cmd) or ("", ""))
+    mod.write_correctness_csv(tmp_path / "correctness.csv", ["0.01", "1.0", "10", "100"],
+                              ["columnar+parallel", "duckdb"], tmp_path, queries=["Q1"], duckdb=True, postgres=True)
+    flags: dict = {}
+    for cmd in cmds:
+        flags.setdefault(cmd[cmd.index("--sf") + 1], []).append(cmd.count("--no-drift"))
+    # SQLite checks both configs below 10; above, ours against two engines and DuckDB against Postgres
+    assert flags == {"0.01": [0, 0], "1.0": [0, 0], "10": [0, 0, 0], "100": [1, 1, 1]}
+
+
+# The real compare_results.py: the same 1e-12 difference is DRIFT at SF=10 and FAIL at SF=100.
+def test_real_compare_drift_is_fail_at_sf100(tmp_path: Path) -> None:
+    for sf in ("10", "100"):
+        for folder in ("duckdb_results/duckdb", "postgres_results/postgres"):
+            (tmp_path / folder).mkdir(parents=True, exist_ok=True)
+            (tmp_path / folder / f"Q1_sf{sf}.csv").write_text("sum_charge\n1000000000000.00\n")
+        (tmp_path / "shilmandb_results" / "columnar+parallel").mkdir(parents=True, exist_ok=True)
+        (tmp_path / "shilmandb_results" / "columnar+parallel" / f"Q1_sf{sf}.csv").write_text("sum_charge\n999999999999.00\n")
+    path, checks = tmp_path / "correctness.csv", tmp_path / "reference_checks.csv"
+    mod.write_correctness_csv(path, ["10", "100"], ["columnar+parallel"], tmp_path, queries=["Q1"],
+                              duckdb=True, postgres=True, checks_path=checks)
+    assert {r["sf"]: r["status"] for r in _read_dicts(path)} == {"10": "DRIFT", "100": "FAIL"}
+    got = {(r["sf"], r["reference"]): (r["status"], r["max_rel_diff"]) for r in _read_dicts(checks)}
+    assert got == {("10", "DuckDB"): ("DRIFT", "1e-12"), ("10", "Postgres"): ("DRIFT", "1e-12"),
+                   ("100", "DuckDB"): ("FAIL", ""), ("100", "Postgres"): ("FAIL", "")}

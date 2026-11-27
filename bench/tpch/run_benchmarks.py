@@ -12,9 +12,10 @@ emits three unified CSVs under bench/results/:
   direct_io, hit_rate, raw_hit_rate, improvement_over_lru, eviction)
 - correctness.csv: (sf, query, config, status)
 
-With --duckdb and --postgres it also runs those engines' runners and adds their configs to
-the three files, then writes reference_checks.csv (every config against every reference
-it is checked against) and environment.csv (machine, build and engine versions).
+With --duckdb and --postgres it also runs those engines' runners (after ShilmanDB,
+Postgres last) and adds their configs to the three files, then writes
+reference_checks.csv (every config against every reference it is checked against)
+and environment.csv (machine, build and engine versions).
 
 A config label is the config name plus a suffix for each non-default option,
 for example baseline_pen100, baseline_direct, baseline_frac0.25. Columns an
@@ -26,11 +27,12 @@ stream_correctness.csv (every workload item checked against SQLite). A
 workload label adds _<workload>_s<seed> after the config name, for example
 baseline_stream_s1. The three files above only cover the single workload.
 
-The columnar, columnar+index, columnar+vectorized, columnar+parallel and
-columnar+parallel_1thread configs run only when named. Within one call each
+The columnar and parallel configs run only when named. Within one call each
 columnar file is loaded once per scale factor and reused by later runs:
-columnar has its own, and the indexed configs share another. Every run that
-loads its tables leaves load_times_<label>_sf<sf>.csv in the output folder.
+columnar has its own, and the indexed configs share another. --columnar-dir
+keeps the files for later calls, reused while their markers match the data.
+Every run that loads its tables leaves load_times_<label>_sf<sf>.csv in the
+output folder. SF=100 runs only the parallel configs, with a 4 GiB memory limit.
 
 --parallel-threads 2,4 adds columnar+parallel_2thread and columnar+parallel_4thread
 after the named configs. Every parallel run leaves
@@ -45,6 +47,7 @@ import csv
 import datetime
 import importlib.metadata
 import importlib.util
+import json
 import os
 import re
 import shutil
@@ -69,7 +72,9 @@ DEFAULT_DATA_DIR = REPO_ROOT / "bench" / "tpch_data"
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "bench" / "results"
 
 ALL_SCALE_FACTORS: List[str] = ["0.01", "0.1", "1.0"]
-KNOWN_SCALE_FACTORS: List[str] = [*ALL_SCALE_FACTORS, "10"]  # 10 runs only when named
+KNOWN_SCALE_FACTORS: List[str] = [*ALL_SCALE_FACTORS, "10", "100"]  # 10 and 100 run only when named
+# Only the parallel configs have a memory limit, so nothing else runs at these
+PARALLEL_ONLY_SCALE_FACTORS: List[str] = ["100"]
 QUERIES: List[str] = ["Q1", "Q3", "Q5", "Q6", "Q10", "Q12", "Q14", "Q19"]
 
 POOL_SIZES: Dict[str, int] = {
@@ -77,7 +82,15 @@ POOL_SIZES: Dict[str, int] = {
     "0.1": 512,
     "1.0": 2048,
     "10": 8192,
+    "100": 2097152,     # 16 GiB of 8 KB pages
 }
+
+# --memory-limit in bytes for every parallel config at a scale factor,
+# unless the config sets its own
+MEMORY_LIMITS: Dict[str, int] = {"100": 4 << 30}
+
+# Scale factors where an answer may not drift: compare_results.py gets --no-drift
+NO_DRIFT_SCALE_FACTORS: List[str] = ["100"]
 
 # Pages in the tables alone (no indexes), measured by loading each scale factor.
 DB_PAGES: Dict[str, int] = {
@@ -104,6 +117,9 @@ POOL_SWEEP_SF: str = "0.1"
 JOIN_MODEL_PATH = "ml/join_optimizer/models/join_order_model.pt"
 EVICTION_V2_MODEL_PATH = "ml/eviction_policy/models/eviction_model_v2.pt"
 EVICTION_V1_MODEL_PATH = "ml/eviction_policy/models/eviction_model.pt"
+
+# The parallel executor on the indexed columnar file
+PARALLEL_FLAGS: List[str] = ["--create-indexes", "true", "--execution-mode", "parallel", "--storage", "columnar"]
 
 # Config name -> list of CLI flags to pass to load_tpch.
 PRIMARY_CONFIGS: Dict[str, List[str]] = {
@@ -144,18 +160,17 @@ PRIMARY_CONFIGS: Dict[str, List[str]] = {
         "--storage", "columnar",
     ],
     # The parallel executor on the indexed columnar file, on every core or one
-    "columnar+parallel": [
-        "--create-indexes", "true",
-        "--execution-mode", "parallel",
-        "--storage", "columnar",
-    ],
-    "columnar+parallel_1thread": [
-        "--create-indexes", "true",
-        "--execution-mode", "parallel",
-        "--storage", "columnar",
-        "--threads", "1",
-    ],
+    "columnar+parallel": [*PARALLEL_FLAGS],
+    "columnar+parallel_1thread": [*PARALLEL_FLAGS, "--threads", "1"],
+    # Spilling under a small limit, and cold reads around the file cache
+    "columnar+parallel_spill": [*PARALLEL_FLAGS, "--memory-limit", str(256 << 20)],
+    "columnar+parallel_direct": [*PARALLEL_FLAGS, "--direct-io"],
+    # SF=100's settings at any scale factor (its pool is in POOL_OVERRIDES)
+    "columnar+parallel_20g": [*PARALLEL_FLAGS, "--memory-limit", str(4 << 30)],
 }
+
+# Configs whose pool is the same at every scale factor, beating POOL_SIZES.
+POOL_OVERRIDES: Dict[str, int] = {"columnar+parallel_20g": 2097152}
 
 # The most threads one parallel query may use (kMaxThreads in the engine).
 MAX_PARALLEL_THREADS: int = 256
@@ -163,11 +178,21 @@ _SWEEP_CONFIG_RE = re.compile(r"columnar\+parallel_(\d+)thread")
 
 # What --configs all runs. The columnar configs run only when named.
 SHILMANDB_CONFIG_NAMES: List[str] = ["baseline", "+index", "+learned", "+vectorized"]
-COLUMNAR_CONFIG_NAMES: List[str] = ["columnar", "columnar+index", "columnar+vectorized",
-                                     "columnar+parallel", "columnar+parallel_1thread"]
+PARALLEL_CONFIG_NAMES: List[str] = ["columnar+parallel", "columnar+parallel_1thread", "columnar+parallel_spill",
+                                     "columnar+parallel_direct", "columnar+parallel_20g"]
+COLUMNAR_CONFIG_NAMES: List[str] = ["columnar", "columnar+index", "columnar+vectorized", *PARALLEL_CONFIG_NAMES]
 SQLITE_CONFIG_NAMES: List[str] = ["sqlite_disk", "sqlite_memory"]
 ALL_CONFIG_NAMES: List[str] = SHILMANDB_CONFIG_NAMES + SQLITE_CONFIG_NAMES
-KNOWN_CONFIG_NAMES: List[str] = ALL_CONFIG_NAMES + COLUMNAR_CONFIG_NAMES
+
+# Other engines, added to a run only by --duckdb and --postgres. The named ones
+# run only when --configs names them, and only with their engine's flag.
+DUCKDB_CONFIG_NAMES: List[str] = ["duckdb", "duckdb_1thread"]
+POSTGRES_CONFIG_NAMES: List[str] = ["postgres", "postgres_1worker"]
+ENGINE_CONFIGS: Dict[str, List[str]] = {"duckdb": DUCKDB_CONFIG_NAMES, "postgres": POSTGRES_CONFIG_NAMES}
+NAMED_ENGINE_CONFIGS: Dict[str, List[str]] = {"duckdb": ["duckdb_20g"], "postgres": []}
+
+KNOWN_CONFIG_NAMES: List[str] = (ALL_CONFIG_NAMES + COLUMNAR_CONFIG_NAMES
+                                 + [c for names in NAMED_ENGINE_CONFIGS.values() for c in names])
 
 
 # The sweep config for n threads; 1 thread is the named columnar+parallel_1thread.
@@ -195,10 +220,27 @@ def is_columnar_config(config_name: str) -> bool:
     return config_name in COLUMNAR_CONFIG_NAMES or _SWEEP_CONFIG_RE.fullmatch(config_name) is not None
 
 
-# Other engines, added to a run only by --duckdb and --postgres.
-DUCKDB_CONFIG_NAMES: List[str] = ["duckdb", "duckdb_1thread"]
-POSTGRES_CONFIG_NAMES: List[str] = ["postgres", "postgres_1worker"]
-ENGINE_CONFIGS: Dict[str, List[str]] = {"duckdb": DUCKDB_CONFIG_NAMES, "postgres": POSTGRES_CONFIG_NAMES}
+# True for a config that runs the parallel executor, sweep configs included.
+def is_parallel_config(config_name: str) -> bool:
+    return config_name in PARALLEL_CONFIG_NAMES or _SWEEP_CONFIG_RE.fullmatch(config_name) is not None
+
+
+# --memory-limit for a parallel config at a scale factor in MEMORY_LIMITS,
+# unless its flags set one.
+def memory_limit_flags(sf: str, config_name: str) -> List[str]:
+    if sf not in MEMORY_LIMITS or not is_parallel_config(config_name) or "--memory-limit" in config_flags(config_name):
+        return []
+    return ["--memory-limit", str(MEMORY_LIMITS[sf])]
+
+
+# --cold for a parallel single-query run that reads around the file cache.
+# Workloads never get it: they start from an empty pool already.
+def cold_flags(config_name: str, direct_io: bool) -> List[str]:
+    if not is_parallel_config(config_name):
+        return []
+    return ["--cold"] if direct_io or "--direct-io" in config_flags(config_name) else []
+
+
 REFERENCE_NAMES: Dict[str, str] = {"sqlite": "SQLite", "duckdb": "DuckDB", "postgres": "Postgres"}
 RESULTS_DIRS: Dict[str, str] = {"shilmandb": "shilmandb_results", "duckdb": "duckdb_results", "postgres": "postgres_results"}
 
@@ -209,6 +251,22 @@ POSTGRES_SETTING_NAMES: List[str] = [
 ]
 
 #Helpers
+
+# Load a script next to this one by path, once per process.
+def load_sibling(name: str) -> ModuleType:
+    if name in sys.modules:
+        return sys.modules[name]
+    spec = importlib.util.spec_from_file_location(name, HERE / f"{name}.py")
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module      # its dataclasses look their module up here while it loads
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        del sys.modules[name]
+        raise
+    return module
+
 
 #format seconds as Hh Mm Ss / Mm Ss / Ss.S.
 def elapsed_str(seconds: float) -> str:
@@ -247,8 +305,10 @@ EVICTION_POLICIES: List[str] = ["lru", "clock", "lru2", "arc", "lirs"]
 
 
 # Config name, then _<workload>_s<seed> for a workload, then _<policy> unless it is lru,
-# then _frac, _pen and _direct when set.
+# then _frac, _pen and _direct when set. A config named ..._direct reads as direct I/O.
 def config_label(base: str, miss_penalty_us: int = 0, direct_io: bool = False, fraction: Optional[float] = None, workload: str = "single", seed: int = 1, eviction: str = "lru") -> str:
+    if base.endswith("_direct"):
+        base, direct_io = base.removesuffix("_direct"), True
     label = base
     if workload != "single":
         label += f"_{workload}_s{seed}"
@@ -345,8 +405,9 @@ def planned_runs(sfs: Sequence[str], configs: Sequence[str], workloads: Sequence
     for sf in sfs:
         for workload in workloads:
             for config in configs:
+                pool = POOL_OVERRIDES.get(config, POOL_SIZES[sf])
                 for eviction in (("lru",) if config == "+learned" else evictions):
-                    runs +=[RunSpec(sf, config, workload, POOL_SIZES[sf], penalty, None, eviction) for penalty in penalties]
+                    runs +=[RunSpec(sf, config, workload, pool, penalty, None, eviction) for penalty in penalties]
 
             for fraction in fractions:
                 for eviction in evictions:
@@ -591,6 +652,7 @@ def build_command(binary: Path, sf: str, config_name: str, data_dir: Path, resul
         "--no-verify",
     ]
     cmd += flags
+    cmd += memory_limit_flags(sf, config_name)
     if reuse_db:
         cmd.append("--reuse-db")
     cmd += extra_flags
@@ -608,12 +670,16 @@ def warn_on_db_pages_mismatch(info: Dict[str, str], sf: str) -> None:
                "pool fractions may be off")
 
 
-# The database files the columnar configs share in one runner call, all in one folder.
+# The database files the columnar configs share, all in one folder.
 # Per scale factor, columnar has a file and the indexed configs share another.
+# A kept folder (--columnar-dir) outlives the call: each file has a marker,
+# tpch_sf<sf>_<kind>.loaded, with the row counts it was loaded from.
 @dataclass
 class ColumnarFiles:
     root: Path
+    kept: bool = False                          # True: files are reused across calls through markers
     loaded: set = field(default_factory=set)    # files a run that exited 0 loaded
+    counts: Dict[Path, Dict[str, int]] = field(default_factory=dict)   # row counts per data folder
 
     # The file this config uses at this scale factor; None for a row config.
     def db_file(self, sf: str, config_name: str) -> Optional[Path]:
@@ -621,6 +687,44 @@ class ColumnarFiles:
             return None
         kind = "plain" if config_name == "columnar" else "indexed"
         return self.root / f"tpch_sf{sf}_{kind}.db"
+
+    # The marker beside a kept file.
+    @staticmethod
+    def marker(db_file: Path) -> Path:
+        return db_file.with_suffix(".loaded")
+
+    # The data folder's row counts, read once per call.
+    def row_counts(self, sf_data_dir: Path) -> Dict[str, int]:
+        if sf_data_dir not in self.counts:
+            self.counts[sf_data_dir] = load_sibling("baseline_common").tbl_row_counts(sf_data_dir)
+        return self.counts[sf_data_dir]
+
+    # True when a run can open the file instead of loading it.
+    # A kept file needs a marker saying it loaded (status 0) from today's row counts.
+    def can_reuse(self, db_file: Path, sf_data_dir: Path) -> bool:
+        if not self.kept:
+            return db_file in self.loaded
+        if not db_file.exists():
+            return False
+        try:
+            stored = json.loads(self.marker(db_file).read_text())
+            status, counts = stored["exit_status"], stored["row_counts"]
+        except (OSError, ValueError, TypeError, KeyError):
+            return False
+        expected = self.row_counts(sf_data_dir)
+        return status == 0 and bool(expected) and counts == expected
+
+    # Before a run loads the file: its old marker no longer holds.
+    def start_load(self, db_file: Path) -> None:
+        if self.kept:
+            self.marker(db_file).unlink(missing_ok=True)
+
+    # After a run that loaded the file exited 0.
+    def finish_load(self, db_file: Path, sf_data_dir: Path, exit_status: int) -> None:
+        self.loaded.add(db_file)
+        if self.kept:
+            marker = {"exit_status": exit_status, "row_counts": self.row_counts(sf_data_dir)}
+            self.marker(db_file).write_text(json.dumps(marker, indent=1) + "\n")
 
 
 # Copy a run's load_times.csv, when it wrote one, to <output>/load_times_<label>_sf<sf>.csv.
@@ -648,11 +752,14 @@ def load_tpch_run(binary: Path, sf: str, config_name: str, data_dir: Path, pool_
     with tempfile.TemporaryDirectory(prefix=f"shilmandb_{label}_sf{sf}_") as tmp:
         tmp_path = Path(tmp)
         db_file = tmp_path / f"tpch_sf{sf}.db"
+        sf_data_dir = data_dir / f"sf{sf}"
         shared_file = columnar_files.db_file(sf, config_name) if columnar_files else None
         reuse_db = False
         if shared_file is not None:
             db_file = shared_file
-            reuse_db = shared_file in columnar_files.loaded
+            reuse_db = columnar_files.can_reuse(shared_file, sf_data_dir)
+            if not reuse_db:
+                columnar_files.start_load(shared_file)
 
         cmd = build_command(
             binary=binary,
@@ -695,8 +802,8 @@ def load_tpch_run(binary: Path, sf: str, config_name: str, data_dir: Path, pool_
             yield None
             return
 
-        if shared_file is not None:
-            columnar_files.loaded.add(shared_file)
+        if shared_file is not None and not reuse_db:
+            columnar_files.finish_load(shared_file, sf_data_dir, proc.returncode)
         yield tmp_path
 
 
@@ -867,14 +974,16 @@ def engine_of(config: str) -> str:
         return "sqlite"
     
     for engine, names in ENGINE_CONFIGS.items():
-        if config in names:
+        if config in names or config in NAMED_ENGINE_CONFIGS[engine]:
             return engine
         
     return "shilmandb"
 
 
 # Run bench/tpch/run_<engine>_benchmarks.py as a subprocess. False if it failed (it says why).
-def run_engine_benchmarks(engine: str, scale_factors: Sequence[str], data_dir: Path, output_dir: Path, timed_runs: int, warmup_runs: int = 1) -> bool:
+# configs, when given, goes to it as --configs; else it runs its default configs.
+def run_engine_benchmarks(engine: str, scale_factors: Sequence[str], data_dir: Path, output_dir: Path, timed_runs: int, warmup_runs: int = 1,
+                          configs: Optional[Sequence[str]] = None) -> bool:
     subsection(f"{REFERENCE_NAMES[engine]} benchmarks (SFs: {', '.join(scale_factors)})")
     script = HERE / f"run_{engine}_benchmarks.py"
     cmd: List[str] = [
@@ -886,6 +995,8 @@ def run_engine_benchmarks(engine: str, scale_factors: Sequence[str], data_dir: P
     ]
     for sf in scale_factors:
         cmd += ["--sf", sf]
+    if configs:
+        cmd += ["--configs", ",".join(configs)]
 
     print(f"  $ {' '.join(cmd)}", flush=True)
     t0 = time.time()
@@ -1165,19 +1276,7 @@ def workload_query_rows(output_dir: Path, record: WorkloadStats) -> List[Workloa
 
 # Load bench/tpch/check_stream_results.py by path. It is only needed for workload runs.
 def load_stream_checker() -> ModuleType:
-    name = "check_stream_results"
-    if name in sys.modules:
-        return sys.modules[name]
-    spec = importlib.util.spec_from_file_location(name, HERE / f"{name}.py")
-    assert spec and spec.loader
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module      # its dataclasses look their module up here while it loads
-    try:
-        spec.loader.exec_module(module)
-    except Exception:
-        del sys.modules[name]
-        raise
-    return module
+    return load_sibling("check_stream_results")
 
 
 # Check every item of every workload run against SQLite, one SQLite copy per scale factor.
@@ -1280,6 +1379,7 @@ def references_for(sf: str, duckdb: bool, postgres: bool, output_dir: Path = DEF
 # correctness.csv gets the worst status per query; checks_path, when given, gets every check.
 # SQLite configs, configs of a failed engine and configs left with no reference are SKIP.
 # A query with no line from a compare that crashed is FAIL, else SKIP.
+# At SF=100 a cell that would be DRIFT is FAIL (NO_DRIFT_SCALE_FACTORS).
 def write_correctness_csv(path: Path, sfs: Sequence[str], configs: Sequence[str], output_dir: Path,
                           queries: Sequence[str] = tuple(QUERIES), duckdb: bool = False, postgres: bool = False,
                           failed_engines: Sequence[str] = (), checks_path: Optional[Path] = None) -> None:
@@ -1316,6 +1416,8 @@ def write_correctness_csv(path: Path, sfs: Sequence[str], configs: Sequence[str]
                         "--sf", sf,
                         "--configs", cfg,
                     ] + (["--reference-config", ref_config] if ref_config else [])
+                    if sf in NO_DRIFT_SCALE_FACTORS:
+                        cmd.append("--no-drift")
                     stdout, stderr = compare_output(cmd)
                     seen = parse_compare_output(stdout)
                     missing = "FAIL" if stderr.strip() else "SKIP"
@@ -1493,22 +1595,45 @@ def stream_length_value(text: str) -> int:
     return _int_at_least(text, 1, "--stream-length")
 
 
+# Why these arguments can't run together, or None. Checked before anything runs.
+def argument_refusal(sfs: Sequence[str], configs: Sequence[str], direct_io: bool, engines: Sequence[str],
+                     pool_fractions: Sequence[float], v1_eviction: bool, workloads: Sequence[str]) -> Optional[str]:
+    for config in configs:
+        engine = engine_of(config)
+        if engine in ENGINE_CONFIGS and engine not in engines:
+            return f"{config} runs only with --{engine}"
+    if direct_io and "columnar+parallel_direct" in configs:
+        return "columnar+parallel_direct already reads with direct I/O; drop --direct-io or the config"
+
+    big = [sf for sf in sfs if sf in PARALLEL_ONLY_SCALE_FACTORS]
+    if not big:
+        return None
+    # Nothing but the parallel executor has a memory limit, so the rest would swap
+    refused = [c for c in configs if engine_of(c) in ("shilmandb", "sqlite") and not is_parallel_config(c)]
+    refused += ["--pool-fractions"] if pool_fractions else []
+    refused += ["--v1-eviction"] if v1_eviction else []
+    refused += [f"--workloads {w}" for w in workloads if w != "single"]
+    if refused:
+        return f"only the parallel configs run at SF={big[0]}; refused: {', '.join(refused)}"
+    return None
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="TPC-H benchmark runner", epilog="Exit 3: --duckdb or --postgres was asked for and its runner failed; every other output is still written.")
     p.add_argument("--binary", type=Path, default=DEFAULT_BINARY, help=f"Path to load_tpch binary (default: {DEFAULT_BINARY})")
     p.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR, help=f"TPC-H data dir (default: {DEFAULT_DATA_DIR})")
     p.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR, help=f"Output dir (default: {DEFAULT_OUTPUT_DIR})")
     p.add_argument("--sf", action="append", choices=KNOWN_SCALE_FACTORS + ["all"], help="Scale factor(s). Repeat flag or use 'all'. Default: 'all'.")
-    p.add_argument("--configs", default="all", help=("Comma-separated configs. Accepts 'all' (" + ",".join(ALL_CONFIG_NAMES) + "), 'none' (no ShilmanDB or SQLite config) or a subset of: " + ",".join(KNOWN_CONFIG_NAMES) + ". The columnar configs run only when named; columnar+index loads an indexed file that later columnar+vectorized, columnar+parallel and columnar+parallel_1thread runs (and the --parallel-threads sweep) reuse"))
+    p.add_argument("--configs", default="all", help=("Comma-separated configs. Accepts 'all' (" + ",".join(ALL_CONFIG_NAMES) + "), 'none' (no ShilmanDB or SQLite config) or a subset of: " + ",".join(KNOWN_CONFIG_NAMES) + ". The columnar configs run only when named; columnar+index loads an indexed file that later columnar+vectorized and parallel runs (and the --parallel-threads sweep) reuse. duckdb_20g runs only with --duckdb. At SF=100 only the parallel configs run"))
     p.add_argument("--parallel-threads", type=parallel_threads_list, default=[], help=f"Comma list of thread counts (1 to {MAX_PARALLEL_THREADS}); each adds columnar+parallel_<N>thread (columnar+parallel with --threads N) after the named configs. 1 is columnar+parallel_1thread")
-    p.add_argument("--duckdb", action="store_true", help="Also run DuckDB (duckdb, duckdb_1thread) through run_duckdb_benchmarks.py; exit 3 if it fails")
-    p.add_argument("--postgres", action="store_true", help="Also run Postgres (postgres, postgres_1worker) through run_postgres_benchmarks.py; needs the server on port 5434; exit 3 if it fails")
+    p.add_argument("--duckdb", action="store_true", help="Also run DuckDB (duckdb, duckdb_1thread, and duckdb_20g when --configs names it) through run_duckdb_benchmarks.py, after ShilmanDB; exit 3 if it fails")
+    p.add_argument("--postgres", action="store_true", help="Also run Postgres (postgres, postgres_1worker) through run_postgres_benchmarks.py, last; needs the server on port 5434; exit 3 if it fails")
     p.add_argument("--warmup", type=int, default=1, help="Warmup runs per query, DuckDB and Postgres included (default 1)")
     p.add_argument("--runs", type=int, default=5, help="Timed runs per query (default 5)")
     p.add_argument("--pool-sweep", action="store_true", help=f"Also run baseline pool-size sweep at SF={POOL_SWEEP_SF}")
     p.add_argument("--v1-eviction", action="store_true", help="Also run +learned with V1 eviction model per SF")
     p.add_argument("--miss-penalty-us", type=penalty_list, default=[0], help="Comma list of simulated per-read delays in microseconds; every ShilmanDB config runs once per value (default 0)")
-    p.add_argument("--direct-io", action="store_true", help="Read pages around the OS file cache (adds _direct to labels)")
+    p.add_argument("--direct-io", action="store_true", help="Read pages around the OS file cache (adds _direct to labels); parallel single-query runs also get --cold. Not with the columnar+parallel_direct config, which does the same")
     p.add_argument("--pool-fractions", type=fraction_list, default=[], help="Comma list of pool sizes as fractions of the tables' pages (0 to 1]; runs baseline once per fraction per SF (+index for the lookup and mixed workloads)")
     p.add_argument("--policy-timing", action="store_true", help="Also time the eviction policy per query (fills policy_ms)")
     p.add_argument("--eviction-policies", type=eviction_policy_list, default=["lru"], help=f"Comma list of eviction policies from {','.join(EVICTION_POLICIES)}; every ShilmanDB config runs once per policy (default lru). +learned is V2 eviction, so it runs once, not once per policy. single runs start from the pool the load left (warm); the other workloads start from an empty pool (cold)")
@@ -1518,6 +1643,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--skip-sqlite", action="store_true", help="Skip the SQLite benchmark invocation (reuse existing output)")
     p.add_argument("--skip-correctness", action="store_true", help="Skip the correctness comparison step")
     p.add_argument("--timeout", type=int, default=None, help="Per-config subprocess timeout in seconds (default: none)")
+    p.add_argument("--columnar-dir", type=Path, default=None, help="Keep the shared columnar files here (made if missing, never deleted); a later call reuses a file whose .loaded marker matches the data's row counts (default: a temp folder for this call)")
     return p.parse_args()
 
 
@@ -1546,6 +1672,10 @@ def main() -> int:
     args = parse_args()
     sfs = resolve_sfs(args.sf)
     configs = resolve_configs(args.configs)
+    engines = [e for e, on in (("duckdb", args.duckdb), ("postgres", args.postgres)) if on]
+    refusal = argument_refusal(sfs, configs, args.direct_io, engines, args.pool_fractions, args.v1_eviction, args.workloads)
+    if refusal is not None:
+        raise SystemExit(f"Error: {refusal}")
 
     output_dir: Path = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1561,7 +1691,6 @@ def main() -> int:
     has_workloads = any(w != "single" for w in args.workloads)
     if has_workloads:
         print(f"  workloads={args.workloads}, seed={args.seed}, stream_length={args.stream_length}")
-    engines = [e for e, on in (("duckdb", args.duckdb), ("postgres", args.postgres)) if on]
     if engines:
         print(f"  engines={engines}")
 
@@ -1588,7 +1717,8 @@ def main() -> int:
     all_records: Dict[Tuple[str, str, str], QueryStats] = {}
     pool_sizes_by_config: Dict[Tuple[str, str], int] = {}
 
-    # DuckDB and Postgres: a runner that fails is reported, and its configs show SKIP.
+    # DuckDB and Postgres run after ShilmanDB, Postgres last.
+    # A runner that fails is reported, and its configs show SKIP.
     # A call without the single workload skips them, as if their flags were off.
     tried_engines = engines if runs_single else []
     engine_configs: List[str] = []
@@ -1596,16 +1726,6 @@ def main() -> int:
     engine_infos: Dict[str, Dict[str, str]] = {}          # only engines that ran in this call
     if engines and not runs_single:
         print("  (skip: DuckDB and Postgres only run with the single workload)")
-    for engine in tried_engines:
-        engine_configs += ENGINE_CONFIGS[engine]
-        if not run_engine_benchmarks(engine, sfs, args.data_dir, output_dir, args.runs, args.warmup):
-            eprint(f"! {engine} benchmarks failed - continuing without its rows")
-            failed_engines.append(engine)
-            continue
-        engine_infos[engine] = read_run_info(output_dir / f"{engine}_info.csv")
-        for key, qs in parse_engine_latencies(output_dir / f"{engine}_latencies.csv", sfs).items():
-            all_records[key] = qs
-            pool_sizes_by_config[(key[0], key[1])] = ""  # type: ignore[assignment]
 
     ran_labels: List[str] = []      # every single-query ShilmanDB label that was run, for the correctness check
     workload_records: List[WorkloadStats] = []
@@ -1618,7 +1738,7 @@ def main() -> int:
             data_dir=args.data_dir, output_dir=output_dir,
             pool_size=spec.pool, warmup_runs=args.warmup, timed_runs=args.runs,
             timeout_seconds=args.timeout, label=label,
-            extra_flags=option_flags(spec.penalty, args.direct_io, args.policy_timing, spec.eviction),
+            extra_flags=option_flags(spec.penalty, args.direct_io, args.policy_timing, spec.eviction) + cold_flags(spec.base, args.direct_io),
             columnar_files=columnar_files,
         )
         pool_sizes_by_config[(spec.sf, label)] = spec.pool
@@ -1645,10 +1765,16 @@ def main() -> int:
             return
         workload_records.append(stats)
 
-    # Columnar files last this call only; removed at the end, even on error
+    # Columnar files last this call only, removed at the end even on error,
+    # unless --columnar-dir keeps them
     uses_columnar = any(is_columnar_config(c) for c in shilmandb_configs)
-    with (tempfile.TemporaryDirectory(prefix="shilmandb_columnar_") if uses_columnar else nullcontext()) as shared_dir:
-        columnar_files = ColumnarFiles(Path(shared_dir)) if shared_dir else None
+    kept = uses_columnar and args.columnar_dir is not None
+    if kept:
+        args.columnar_dir.mkdir(parents=True, exist_ok=True)
+    shared = (nullcontext(str(args.columnar_dir)) if kept else
+              tempfile.TemporaryDirectory(prefix="shilmandb_columnar_") if uses_columnar else nullcontext())
+    with shared as shared_dir:
+        columnar_files = ColumnarFiles(Path(shared_dir), kept=kept) if shared_dir else None
         for spec in planned_runs(sfs, shilmandb_configs, args.workloads, args.miss_penalty_us, args.pool_fractions, args.eviction_policies):
             (run_single if spec.workload == "single" else run_workload)(spec, columnar_files)
 
@@ -1670,6 +1796,18 @@ def main() -> int:
         all_records.update(v1_records)
         for (sf, cfg, _q) in v1_records:
             pool_sizes_by_config[(sf, cfg)] = POOL_SIZES[sf]
+
+    for engine in tried_engines:
+        names = ENGINE_CONFIGS[engine] + [c for c in NAMED_ENGINE_CONFIGS[engine] if c in configs]
+        engine_configs += names
+        if not run_engine_benchmarks(engine, sfs, args.data_dir, output_dir, args.runs, args.warmup, names):
+            eprint(f"! {engine} benchmarks failed - continuing without its rows")
+            failed_engines.append(engine)
+            continue
+        engine_infos[engine] = read_run_info(output_dir / f"{engine}_info.csv")
+        for key, qs in parse_engine_latencies(output_dir / f"{engine}_latencies.csv", sfs).items():
+            all_records[key] = qs
+            pool_sizes_by_config[(key[0], key[1])] = ""  # type: ignore[assignment]
 
     if need_sqlite:
         sqlite_records = parse_sqlite_latencies(output_dir, sfs)

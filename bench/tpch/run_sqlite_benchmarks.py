@@ -10,7 +10,9 @@ import time
 from typing import Dict, List, Tuple
 
 ALL_SCALE_FACTORS: List[str] = ["0.01", "0.1", "1.0"]
-KNOWN_SCALE_FACTORS: List[str] = [*ALL_SCALE_FACTORS, "10"]  # 10 runs only when named
+KNOWN_SCALE_FACTORS: List[str] = [*ALL_SCALE_FACTORS, "10", "100"]  # 10 and 100 run only when named
+# Known so the DuckDB and Postgres runners take it, but too big for SQLite here
+NO_SQLITE_SCALE_FACTORS: List[str] = ["100"]
 
 TABLE_SCHEMAS: Dict[str, List[Tuple[str, str]]] = {
     "lineitem": [
@@ -452,6 +454,9 @@ def main() -> None:
         for sf in args.sf:
             if sf not in KNOWN_SCALE_FACTORS:
                 print(f"Error: unknown scale factor '{sf}'. Choose from {KNOWN_SCALE_FACTORS} or 'all'.")
+                sys.exit(1)
+            if sf in NO_SQLITE_SCALE_FACTORS:
+                print(f"Error: SQLite doesn't run at SF={sf}; DuckDB and Postgres are the references there.")
                 sys.exit(1)
             scale_factors.append(sf)
 

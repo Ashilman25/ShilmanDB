@@ -63,6 +63,7 @@ struct Args {
     std::string eviction_model_path;
     std::string dump_page_owners;  // write the page-owner map to this path, then exit
     bool keep_load_pool{false};  // a workload starts with the pool the load left, not an empty one
+    bool cold{false};            // single only: empty the pool before every timed run
     StorageKind storage{StorageKind::ROW};
     unsigned load_threads{1};    // columnar loader threads; one per core unless --load-threads
     bool reuse_db{false};        // open the columnar file a run left instead of loading
@@ -79,7 +80,7 @@ static void PrintUsage(const char* prog) {
               << " [--results-dir <path>]"
               << " [--execution-mode <tuple|vectorized|parallel> [--threads <N>] [--memory-limit <bytes>[K|M|G]] [--temp-dir <path>]]"
               << " [--miss-penalty-us <N>] [--direct-io] [--policy-timing] [--planner-read-us <X>]"
-              << " [--workload <single|stream|lookup|mixed>] [--stream-length <N>] [--seed <S>] [--keep-load-pool]"
+              << " [--workload <single|stream|lookup|mixed>] [--stream-length <N>] [--seed <S>] [--keep-load-pool] [--cold]"
               << " [--dump-page-owners <path>]"
               << " [--storage <row|columnar>] [--load-threads <N>] [--reuse-db]"
               << " [--eviction-policy <lru|clock|lru2|arc|lirs|learned-v2|learned-v1>] [--eviction-model-path <path>]"
@@ -261,6 +262,8 @@ static Args ParseArgs(int argc, char* argv[]) {
             args.trace_collapse = true;
         } else if (arg == "--keep-load-pool") {
             args.keep_load_pool = true;
+        } else if (arg == "--cold") {
+            args.cold = true;
         } else if (arg == "--storage" && i + 1 < argc) {
             const std::string val = argv[++i];
             if (val == "row") {
@@ -343,6 +346,7 @@ static Args ParseArgs(int argc, char* argv[]) {
     if (single && args.stream_length) ExitWithError("--stream-length needs --workload stream, lookup or mixed");
     if (single && seed_given) ExitWithError("--seed needs --workload stream, lookup or mixed");
     if (single && args.keep_load_pool) ExitWithError("--keep-load-pool needs --workload stream, lookup or mixed");
+    if (!single && args.cold) ExitWithError("--cold needs --workload single (the other workloads start from an empty pool already)");
     if (args.trace_collapse && args.trace_path.empty()) ExitWithError("--trace-collapse needs --enable-tracing <path>");
     const bool columnar = args.storage == StorageKind::COLUMNAR;
     if (load_threads_given && !columnar) ExitWithError("--load-threads needs --storage columnar");
@@ -1125,6 +1129,7 @@ int main(int argc, char* argv[]) {
         }
 
         std::cout << "\n--- Timed runs (" << args.timed_runs << ") ---\n";
+        if (args.cold) std::cout << "  (--cold: the pool is emptied before every timed run)\n";
         int passed = 0;
         for (const auto& q : queries) {
             std::cout << "\n  " << q.name << " ...\n";
@@ -1132,6 +1137,15 @@ int main(int argc, char* argv[]) {
             for (int run = 0; run < args.timed_runs; ++run) {
                 bpm->ResetStats();
                 disk->ResetReadStats();
+                // Outside the timed region, so every timed run reads its pages from the file
+                if (args.cold) {
+                    try {
+                        bpm->DropAllPages();
+                    } catch (const std::exception& e) {
+                        std::cerr << "Error: could not empty the pool: " << e.what() << "\n";
+                        return 1;
+                    }
+                }
                 auto start = std::chrono::steady_clock::now();
                 try {
                     auto result = db.ExecuteSQL(q.sql, options);
@@ -1257,6 +1271,7 @@ int main(int argc, char* argv[]) {
                 ofs << "key,value\n";
                 WriteRunInfo(ofs, args, run_info, ReadStats{total_reads, total_read_time});
                 if (args.trace_collapse) ofs << "trace_collapse,true\n";
+                ofs << "cold," << BoolText(args.cold) << "\n";
                 WriteStorageInfo(ofs, args);
                 WriteMemoryInfo(ofs, run_info);
                 std::cout << "Run info written to " << info_path.string() << "\n";

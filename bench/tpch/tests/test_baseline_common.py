@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import csv
 import importlib.util
+import os
 import re
 import sys
 from pathlib import Path
@@ -195,3 +196,74 @@ def test_run_queries_passes_warmup(tmp_path: Path, monkeypatch) -> None:
 
 def test_header_names_duckdb() -> None:
     assert (TPCH_DIR / "baseline_common.py").read_text().splitlines()[1] == "# DuckDB and Postgres TPC-H baseline runners"
+
+
+# The 7 query tables plus partsupp, each with `rows` lines, and a row_counts.csv saying `saved`.
+def _data_with_saved_counts(tmp_path: Path, rows: int, saved: dict) -> Path:
+    data = tmp_path / "sf"
+    data.mkdir()
+    for table in [*common.TABLE_LOAD_ORDER, "partsupp"]:
+        (data / f"{table}.tbl").write_text("1|a|\n" * rows)
+        os.utime(data / f"{table}.tbl", ns=(1_000_000_000, 1_000_000_000))
+    lines = ["table,rows"] + [f"{t},{n}" for t, n in saved.items()]
+    (data / "row_counts.csv").write_text("\n".join(lines) + "\n")
+    os.utime(data / "row_counts.csv", ns=(2_000_000_000, 2_000_000_000))
+    return data
+
+
+def test_row_counts_csv_used_when_newer(tmp_path: Path) -> None:
+    saved = {t: 1000 + i for i, t in enumerate(["customer", "lineitem", "nation", "orders",
+                                                 "part", "partsupp", "region", "supplier"])}
+    data = _data_with_saved_counts(tmp_path, 2, saved)
+    # The file's numbers, for the same tables counting returns
+    assert common.tbl_row_counts(data) == {t: saved[t] for t in common.TABLE_LOAD_ORDER}
+
+    # Any .tbl at least as new as the file, partsupp included: counted again
+    for table in ("lineitem", "partsupp"):
+        os.utime(data / f"{table}.tbl", ns=(2_000_000_000, 2_000_000_000))
+        assert common.tbl_row_counts(data) == {t: 2 for t in common.TABLE_LOAD_ORDER}
+        os.utime(data / f"{table}.tbl", ns=(1_000_000_000, 1_000_000_000))
+    assert common.tbl_row_counts(data) == {t: saved[t] for t in common.TABLE_LOAD_ORDER}
+
+
+def test_row_counts_csv_needs_every_table(tmp_path: Path) -> None:
+    data = _data_with_saved_counts(tmp_path, 3, {t: 7 for t in common.TABLE_LOAD_ORDER if t != "orders"})
+    assert common.tbl_row_counts(data) == {t: 3 for t in common.TABLE_LOAD_ORDER}
+
+
+def test_row_counts_csv_with_a_bad_count_is_ignored(tmp_path: Path) -> None:
+    for bad in ("-4", "x", "", "1.5"):
+        folder = tmp_path / f"case{bad or 'empty'}"
+        folder.mkdir()
+        saved = {t: 7 for t in common.TABLE_LOAD_ORDER}
+        data = _data_with_saved_counts(folder, 3, saved)
+        text = (data / "row_counts.csv").read_text().replace("lineitem,7", f"lineitem,{bad}")
+        stat = (data / "row_counts.csv").stat()
+        (data / "row_counts.csv").write_text(text)
+        os.utime(data / "row_counts.csv", ns=(stat.st_atime_ns, stat.st_mtime_ns))
+        assert common.tbl_row_counts(data) == {t: 3 for t in common.TABLE_LOAD_ORDER}, bad
+
+
+def test_row_counts_csv_covers_only_present_tables(tmp_path: Path) -> None:
+    data = _data_with_saved_counts(tmp_path, 1, {t: 9 for t in common.TABLE_LOAD_ORDER})
+    (data / "region.tbl").unlink()
+    expected = {t: 9 for t in common.TABLE_LOAD_ORDER if t != "region"}
+    assert common.tbl_row_counts(data) == expected
+
+
+def test_sf_help_lists_every_known_scale_factor(capsys) -> None:
+    import argparse
+    parser = argparse.ArgumentParser()
+    common.add_baseline_args(parser, {"a": [], "b": []}, default=["a"])
+    help_text = " ".join(parser.format_help().split())
+    assert "0.01, 0.1, 1.0, 10, 100, or 'all'" in help_text
+    assert "(default: a)" in help_text
+
+
+def test_row_counts_csv_that_cant_be_decoded_is_ignored(tmp_path: Path) -> None:
+    data = _data_with_saved_counts(tmp_path, 3, {t: 7 for t in common.TABLE_LOAD_ORDER})
+    stat = (data / "row_counts.csv").stat()
+    (data / "row_counts.csv").write_bytes(b"table,rows\nlineitem,7\xff\n")
+    os.utime(data / "row_counts.csv", ns=(stat.st_atime_ns, stat.st_mtime_ns))
+    assert common.saved_row_counts(data) is None
+    assert common.tbl_row_counts(data) == {t: 3 for t in common.TABLE_LOAD_ORDER}

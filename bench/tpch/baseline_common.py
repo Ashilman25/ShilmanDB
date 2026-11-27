@@ -10,12 +10,14 @@ import sys
 import time
 from pathlib import Path
 from types import ModuleType
-from typing import Callable, Dict, Iterator, List, Optional, Tuple
+from typing import Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 
 HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parents[1]
 DEFAULT_DATA_DIR = REPO_ROOT / "bench" / "tpch_data"
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "bench" / "results"
+# Written by generate_tpch_data.sh beside the .tbl files: table,rows
+ROW_COUNTS_FILE = "row_counts.csv"
 
 
 # Load a script next to this one by path, once per process.
@@ -98,15 +100,37 @@ def stripped_lines(tbl_path: Path) -> Iterator[str]:
                 yield line
 
 
-# Non-blank lines per .tbl file, for the tables the queries use.
+# Non-blank lines per .tbl file, for the tables the queries use. The data script's
+# row_counts.csv stands in for counting when it is current and covers every one.
 def tbl_row_counts(data_dir: Path) -> Dict[str, int]:
+    data_dir = Path(data_dir)
+    present = [table for table in TABLE_LOAD_ORDER if (data_dir / f"{table}.tbl").exists()]
+    saved = saved_row_counts(data_dir)
+    if saved is not None and all(table in saved for table in present):
+        return {table: saved[table] for table in present}
+    
     counts = {}
-    for table in TABLE_LOAD_ORDER:
-        path = Path(data_dir) / f"{table}.tbl"
-        if path.exists():
-            with open(path, "rb") as f:
-                counts[table] = sum(1 for line in f if line.strip())
+    for table in present:
+        with open(data_dir / f"{table}.tbl", "rb") as f:
+            counts[table] = sum(1 for line in f if line.strip())
     return counts
+
+
+# row_counts.csv's valid counts when it is newer than every .tbl in the folder, else None.
+def saved_row_counts(data_dir: Path) -> Optional[Dict[str, int]]:
+    path = Path(data_dir) / ROW_COUNTS_FILE
+    try:
+        saved_at = path.stat().st_mtime_ns
+        if any(tbl.stat().st_mtime_ns >= saved_at for tbl in Path(data_dir).glob("*.tbl")):
+            return None
+        with open(path, newline="") as f:
+            rows = list(csv.reader(f))
+    except (OSError, ValueError, csv.Error):     # ValueError covers bytes that don't decode
+        return None
+    
+    if not rows or rows[0] != ["table", "rows"]:
+        return None
+    return {row[0]: int(row[1]) for row in rows[1:] if len(row) == 2 and row[1].isascii() and row[1].isdigit()}
 
 
 # `warmup` untimed calls, then `runs` timed calls (execute + fetch).
@@ -149,13 +173,15 @@ def marker_matches(stored: Dict[str, int], expected: Dict[str, int]) -> bool:
 
 
 # The flags every engine runner takes.
-def add_baseline_args(parser: argparse.ArgumentParser, configs: Dict[str, List[str]]) -> None:
+# default: the configs run when none are named (all of them if None).
+def add_baseline_args(parser: argparse.ArgumentParser, configs: Dict[str, List[str]], default: Optional[Sequence[str]] = None) -> None:
+    known = ", ".join(KNOWN_SCALE_FACTORS)
     parser.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR, help="folder holding sf<SF>/*.tbl (default: bench/tpch_data)")
-    parser.add_argument("--sf", action="extend", nargs="+", default=None, help="scale factors, space or comma separated: 0.01, 0.1, 1.0, 10, or 'all' (0.01, 0.1, 1.0; the default)")
+    parser.add_argument("--sf", action="extend", nargs="+", default=None, help=f"scale factors, space or comma separated: {known}, or 'all' ({', '.join(ALL_SCALE_FACTORS)}; the default)")
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR, help="where results go (default: bench/results)")
     parser.add_argument("--runs", type=int, default=5, help="timed runs per query (default: 5)")
     parser.add_argument("--warmup", type=int, default=1, help="untimed runs per query before the timed ones (default: 1)")
-    parser.add_argument("--configs", action="extend", nargs="+", default=None, help=f"configs to run, space or comma separated (default: {','.join(configs)})")
+    parser.add_argument("--configs", action="extend", nargs="+", default=None, help=f"configs to run, space or comma separated, from {', '.join(configs)} (default: {','.join(default or configs)})")
 
 
 def _split_commas(names: List[str]) -> List[str]:
@@ -174,9 +200,9 @@ def resolve_scale_factors(names: Optional[List[str]]) -> Optional[List[str]]:
     return list(dict.fromkeys(names))
 
 
-def resolve_configs(names: Optional[List[str]], configs: Dict[str, List[str]]) -> Optional[List[str]]:
+def resolve_configs(names: Optional[List[str]], configs: Dict[str, List[str]], default: Optional[Sequence[str]] = None) -> Optional[List[str]]:
     if not names:
-        return list(configs)
+        return list(default or configs)
     
     chosen = _split_commas(names)
     for config in chosen:
@@ -187,7 +213,7 @@ def resolve_configs(names: Optional[List[str]], configs: Dict[str, List[str]]) -
 
 
 # The checked --runs, --warmup, scale factors and configs; None after printing what's wrong.
-def resolve_run_args(args: argparse.Namespace, configs: Dict[str, List[str]]) -> Optional[Tuple[List[str], List[str]]]:
+def resolve_run_args(args: argparse.Namespace, configs: Dict[str, List[str]], default: Optional[Sequence[str]] = None) -> Optional[Tuple[List[str], List[str]]]:
     if args.runs < 1:
         print("Error: --runs must be at least 1.")
         return None
@@ -196,7 +222,7 @@ def resolve_run_args(args: argparse.Namespace, configs: Dict[str, List[str]]) ->
         return None
     
     scale_factors = resolve_scale_factors(args.sf)
-    chosen = resolve_configs(args.configs, configs)
+    chosen = resolve_configs(args.configs, configs, default)
     if scale_factors is None or chosen is None:
         return None
     return scale_factors, chosen

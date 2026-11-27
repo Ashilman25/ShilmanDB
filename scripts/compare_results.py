@@ -12,7 +12,7 @@ from typing import List, Optional, Tuple
 
 
 ALL_SCALE_FACTORS = ["0.01", "0.1", "1.0"]
-KNOWN_SCALE_FACTORS = [*ALL_SCALE_FACTORS, "10"]  # 10 runs only when named
+KNOWN_SCALE_FACTORS = [*ALL_SCALE_FACTORS, "10", "100"]  # 10 and 100 run only when named
 ALL_QUERIES = ["Q1", "Q3", "Q5", "Q6", "Q10", "Q12", "Q14", "Q19"]
 
 DEFAULT_SHILMANDB_DIR = "bench/results/shilmandb_results"
@@ -113,8 +113,10 @@ class ComparisonResult:
         return self.status == "PASS"
 
 
+# Compares one answer file with its reference. no_drift counts a would-be DRIFT cell as FAIL.
 def compare_one(reference_path: str, candidate_path: str, config: str, sf: str, query: str,
-                tolerance: float, reference_name: str = DEFAULT_REFERENCE_NAME) -> ComparisonResult:
+                tolerance: float, reference_name: str = DEFAULT_REFERENCE_NAME,
+                no_drift: bool = False) -> ComparisonResult:
     result = ComparisonResult(config, sf, query)
 
     if not os.path.exists(reference_path):
@@ -173,10 +175,14 @@ def compare_one(reference_path: str, candidate_path: str, config: str, sf: str, 
                 f"  row {row_idx}, col '{col_name}': "
                 f"expected={ref_val!r}  actual={cand_val!r}"
             )
+            if status == "DRIFT":
+                detail += f"  (abs {abs_diff:.3g}, rel {rel_diff:.3g})"
+                if no_drift:
+                    status = "FAIL"
             if status == "FAIL":
                 result.mismatches.append(detail)
             else:
-                result.drifts.append(f"{detail}  (abs {abs_diff:.3g}, rel {rel_diff:.3g})")
+                result.drifts.append(detail)
             result.max_abs_diff = max(result.max_abs_diff, abs_diff)
             result.max_rel_diff = max(result.max_rel_diff, rel_diff)
             worst = max(worst, status, key=STATUS_RANK.__getitem__)
@@ -200,7 +206,7 @@ def discover_configs(shilmandb_dir: str) -> List[str]:
 # Reference files sit in reference_dir, or in reference_dir/reference_config when one is given.
 def run_comparisons(shilmandb_dir: str, reference_dir: str, configs: List[str], scale_factors: List[str],
                     queries: List[str], tolerance: float, reference_config: Optional[str] = None,
-                    reference_name: str = DEFAULT_REFERENCE_NAME) -> List[ComparisonResult]:
+                    reference_name: str = DEFAULT_REFERENCE_NAME, no_drift: bool = False) -> List[ComparisonResult]:
     results: List[ComparisonResult] = []
     if reference_config:
         reference_dir = os.path.join(reference_dir, reference_config)
@@ -213,7 +219,7 @@ def run_comparisons(shilmandb_dir: str, reference_dir: str, configs: List[str], 
                 candidate_path = os.path.join(shilmandb_dir, config, filename)
 
                 cr = compare_one(
-                    reference_path, candidate_path, config, sf, query, tolerance, reference_name
+                    reference_path, candidate_path, config, sf, query, tolerance, reference_name, no_drift
                 )
                 results.append(cr)
 
@@ -296,7 +302,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--sf",
         nargs="+",
         default=["all"],
-        help="Scale factors: 0.01, 0.1, 1.0, 10, or 'all' = 0.01 0.1 1.0 (default: all)",
+        help="Scale factors: 0.01, 0.1, 1.0, 10, 100, or 'all' = 0.01 0.1 1.0 (default: all)",
     )
     parser.add_argument(
         "--queries",
@@ -315,6 +321,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         type=float,
         default=DEFAULT_TOLERANCE,
         help=f"Float comparison tolerance (default: {DEFAULT_TOLERANCE})",
+    )
+    parser.add_argument(
+        "--no-drift",
+        action="store_true",
+        help="Count a cell that would be DRIFT as FAIL (the runner passes this at SF=100)",
     )
     return parser.parse_args(argv)
 
@@ -366,12 +377,14 @@ def main(argv: Optional[List[str]] = None) -> None:
     print(f"  Scale factors: {scale_factors}")
     print(f"  Queries:       {queries}")
     print(f"  Tolerance:     {args.tolerance}")
+    if args.no_drift:
+        print("  No drift:      on (a cell that would be DRIFT is FAIL)")
     print()
 
     results = run_comparisons(
         args.shilmandb_dir, args.reference_dir,
         configs, scale_factors, queries, args.tolerance,
-        args.reference_config, args.reference_name,
+        args.reference_config, args.reference_name, args.no_drift,
     )
 
     failures = print_results(results)

@@ -175,4 +175,83 @@ def test_header_mismatch_prints_fail_line(tmp_path: Path, capsys: pytest.Capture
 
 def test_sf_all_keeps_three_scale_factors() -> None:
     assert mod.ALL_SCALE_FACTORS == ["0.01", "0.1", "1.0"]
-    assert mod.KNOWN_SCALE_FACTORS == ["0.01", "0.1", "1.0", "10"]
+    assert mod.KNOWN_SCALE_FACTORS == ["0.01", "0.1", "1.0", "10", "100"]
+
+
+# --no-drift: a cell that would be DRIFT is FAIL; nothing else changes
+NO_DRIFT_DETAIL = ("         row 0, col 'sum_charge': expected='1000000000000.00'  "
+                   "actual='999999999999.00'  (abs 1, rel 1e-12)")
+
+
+def test_no_drift_turns_drift_into_fail(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    # 1e-12 relative: DRIFT by default, FAIL with the rule
+    ref = write_csv(tmp_path / "ref" / "Q1_sf100.csv", ["name,sum_charge", "a,1000000000000.00"])
+    cand = write_csv(tmp_path / "cand" / "p" / "Q1_sf100.csv", ["name,sum_charge", "a,999999999999.00"])
+    assert mod.compare_one(str(ref), str(cand), "p", "100", "Q1", 0.01).status == "DRIFT"
+    result = mod.compare_one(str(ref), str(cand), "p", "100", "Q1", 0.01, no_drift=True)
+    assert result.status == "FAIL"
+    assert result.drifts == []
+    assert result.mismatches == [NO_DRIFT_DETAIL[7:]]
+    assert result.max_abs_diff == pytest.approx(1.0)
+    assert result.max_rel_diff == pytest.approx(1e-12, rel=1e-6)
+
+    common = ["--shilmandb-dir", str(tmp_path / "cand"), "--reference-dir", str(tmp_path / "ref"),
+              "--sf", "100", "--queries", "Q1", "--configs", "p"]
+    code, out = run_main(common, capsys)
+    assert code == 0
+    assert any(line.startswith("  DRIFT [p] Q1 SF=100  (max abs 1, max rel 1e-12)") for line in out.splitlines())
+
+    code, out = run_main(common + ["--no-drift"], capsys)
+    lines = out.splitlines()
+    assert code == 1
+    index = lines.index("  FAIL  [p] Q1 SF=100  (1 mismatch(es))")
+    assert lines[index + 1] == NO_DRIFT_DETAIL
+    assert "  0/1 comparisons passed  (1 failed)" in lines
+
+
+def test_no_drift_lists_drift_cells_with_the_mismatches(tmp_path: Path) -> None:
+    ref = write_csv(tmp_path / "ref.csv", ["n,big", "1,1000000000000.00", "2,5.00"])
+    cand = write_csv(tmp_path / "cand.csv", ["n,big", "1,999999999999.00", "2,7.00"])
+    result = mod.compare_one(str(ref), str(cand), "p", "100", "Q1", 0.01, no_drift=True)
+    assert result.status == "FAIL"
+    assert result.mismatches == [
+        "  row 0, col 'big': expected='1000000000000.00'  actual='999999999999.00'  (abs 1, rel 1e-12)",
+        "  row 1, col 'big': expected='5.00'  actual='7.00'",
+    ]
+
+
+def test_no_drift_keeps_pass_fail_and_skip(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    write_csv(tmp_path / "ref" / "Q1_sf100.csv", ["total", "5.00"])
+    write_csv(tmp_path / "ref" / "Q3_sf100.csv", ["total", "5.00"])
+    write_csv(tmp_path / "cand" / "p" / "Q1_sf100.csv", ["total", "5.009"])       # within the tolerance
+    write_csv(tmp_path / "cand" / "p" / "Q3_sf100.csv", ["total", "5.00", "6.00"])  # row count
+    common = ["--shilmandb-dir", str(tmp_path / "cand"), "--reference-dir", str(tmp_path / "ref"),
+              "--sf", "100", "--queries", "Q1", "Q3", "Q5", "--configs", "p"]
+    code, out = run_main(common, capsys)
+    flag_code, flag_out = run_main(common + ["--no-drift"], capsys)
+    assert code == flag_code == 1
+    # Only the header says the rule is on
+    extra = [line for line in flag_out.splitlines() if line not in out.splitlines()]
+    assert extra == ["  No drift:      on (a cell that would be DRIFT is FAIL)"]
+    assert [line for line in flag_out.splitlines() if line not in extra] == out.splitlines()
+    assert "  PASS  [p] Q1 SF=100" in out.splitlines()
+    assert "  FAIL  [p] Q3 SF=100" in out.splitlines()
+    assert "  SKIP  [p] Q5 SF=100" in out.splitlines()
+
+
+def test_without_no_drift_the_header_is_unchanged(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    write_csv(tmp_path / "ref" / "Q1_sf10.csv", ["total", "5.00"])
+    write_csv(tmp_path / "cand" / "p" / "Q1_sf10.csv", ["total", "5.00"])
+    _, out = run_main(["--shilmandb-dir", str(tmp_path / "cand"), "--reference-dir", str(tmp_path / "ref"),
+                       "--sf", "10", "--queries", "Q1", "--configs", "p"], capsys)
+    assert out.splitlines()[:9] == [
+        "ShilmanDB vs SQLite Result Comparison",
+        f"  ShilmanDB dir: {tmp_path / 'cand'}",
+        f"  SQLite dir:    {tmp_path / 'ref'}",
+        "  Configs:       ['p']",
+        "  Scale factors: ['10']",
+        "  Queries:       ['Q1']",
+        "  Tolerance:     0.01",
+        "",
+        "  PASS  [p] Q1 SF=10",
+    ]
