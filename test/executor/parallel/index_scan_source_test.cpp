@@ -8,8 +8,10 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <optional>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "buffer/buffer_pool_manager.hpp"
@@ -18,6 +20,8 @@
 #include "executor/parallel/batch.hpp"
 #include "executor/parallel/pipeline.hpp"
 #include "executor/parallel/scan_source.hpp"
+#include "executor/parallel/worker_pool.hpp"
+#include "index/btree_index.hpp"
 #include "parser/parser.hpp"
 #include "planner/plan_node.hpp"
 #include "planner/planner.hpp"
@@ -150,7 +154,7 @@ protected:
         db_.reset();
         tpch_.reset();
         std::filesystem::remove(file_);
-        std::filesystem::remove(file_ + "_tpch");
+        for (const char* other : {"_tpch", "_dup", "_dup.tbl", "_damaged", "_damaged.tbl"}) std::filesystem::remove(file_ + other);
     }
 
     // ix, indexed on k and p, 20 row groups.
@@ -228,6 +232,55 @@ protected:
             rows.push_back(pos.row_group * kGroupRows + pos.offset);
         }
         return rows;
+    }
+
+    // Fetches and misses of an index scan's walk on this many threads, from an empty pool:
+    // the iterator's walk without cuts, else each piece SplitKeys cuts, leaf by leaf.
+    static std::pair<uint64_t, uint64_t> WalkCost(const std::string& index, const std::optional<Value>& low, const std::optional<Value>& high,
+                                                  unsigned threads) {
+        BufferPoolManager* bpm = Db().GetBufferPoolManager();
+        BTreeIndex& tree = *Db().GetCatalog()->GetIndex(index)->index;
+        bpm->DropAllPages();
+        bpm->ResetStats();
+        std::vector<Value> cuts;
+        if (threads > 1) cuts = tree.SplitKeys(low.value_or(Value()), high.value_or(Value()), threads);
+        if (cuts.empty()) (void)WalkIndex(index, low, high);
+        for (size_t i = 0; !cuts.empty() && i <= cuts.size(); ++i) {
+            const Value* until = i < cuts.size() ? &cuts[i] : nullptr;
+            tree.ForEachEntry(i == 0 ? low.value_or(Value()) : cuts[i - 1], [&](const Value& key, const RID&) {
+                return until != nullptr ? key < *until : !high || key <= *high;
+            });
+        }
+        return {bpm->GetHitCount() + bpm->GetMissCount(), bpm->GetMissCount()};
+    }
+
+    // Every morsel's column 0 after Prepare in this context.
+    // Column 0 holds the row number, so these are the positions.
+    static std::vector<std::vector<uint32_t>> MorselRows(const std::string& table, const std::string& index, const std::optional<Value>& low,
+                                                         const std::optional<Value>& high, QueryContext& ctx) {
+        ScanSpec spec;
+        spec.table = table;
+        spec.columns = {0};
+        auto source = MakeIndexScanSource(std::move(spec), index, low, high);
+        source->Prepare(ctx);
+        std::vector<std::vector<uint32_t>> morsels(source->MorselCount());
+        auto local = source->MakeLocal();
+        Batch batch;
+        for (size_t m = 0; m < morsels.size(); ++m) {
+            source->StartMorsel(m, *local);
+            while (source->NextBatch(*local, batch)) {
+                for (uint32_t r = 0; r < batch.rows; ++r) morsels[m].push_back(static_cast<uint32_t>(batch.slots[0].I64()[r]));
+            }
+        }
+        return morsels;
+    }
+
+    // Expects every frame unpinned and the pool's concurrent mode off.
+    static void ExpectPoolIdle(const BufferPoolManager& bpm) {
+        for (size_t f = 0; f < bpm.GetPoolSize(); ++f) {
+            ASSERT_EQ(bpm.GetPage(static_cast<frame_id_t>(f)).GetPinCount(), 0) << "frame " << f << " stayed pinned";
+        }
+        EXPECT_FALSE(bpm.IsConcurrent());
     }
 
     // Pages of the listed columns of ix in the row groups holding these rows.
@@ -352,6 +405,7 @@ TEST_F(ParallelIndexScanSourceTest, MorselsStartFromTheirMatchesInPositionOrder)
 
 TEST_F(ParallelIndexScanSourceTest, EachPageAtMostOncePerColumn) {
     // Fetches count every page pinned, hit or miss, so a page read twice shows.
+    // The walk is the query's own, in pieces on several threads.
     // The source alone, after Prepare's walk: its morsels pin only chunk pages.
     Database& db = Db();
     BufferPoolManager* bpm = db.GetBufferPoolManager();
@@ -373,12 +427,8 @@ TEST_F(ParallelIndexScanSourceTest, EachPageAtMostOncePerColumn) {
             SCOPED_TRACE(sql + " on " + std::to_string(threads) + " threads");
             ASSERT_NE(FindNode(*ParallelPlan(db, sql), PlanNodeType::INDEX_SCAN), nullptr);
 
-            bpm->DropAllPages();
-            bpm->ResetStats();
-            const std::vector<uint32_t> matches = WalkIndex(c.index, c.low, c.high);
-            const uint64_t walk_fetches = bpm->GetHitCount() + bpm->GetMissCount();
-            const uint64_t walk_misses = bpm->GetMissCount();
-            const uint64_t chunk_pages = ChunkPagesOf(read, matches);
+            const auto [walk_fetches, walk_misses] = WalkCost(c.index, c.low, c.high, threads);
+            const uint64_t chunk_pages = ChunkPagesOf(read, WalkIndex(c.index, c.low, c.high));
             ASSERT_GT(chunk_pages, 0u);
 
             bpm->DropAllPages();
@@ -454,6 +504,129 @@ TEST_F(ParallelIndexScanSourceTest, Q14AndQ10WithIndexes) {
         ASSERT_GT(want.tuples.size(), 0u);
         for (unsigned threads : kThreads) EXPECT_TRUE(tpch::SameResult(Run(*tpch, sql, ExecutionMode::PARALLEL, threads), want)) << threads << " threads";
     }
+}
+
+TEST_F(ParallelIndexScanSourceTest, SplitWalkFindsTheSamePositions) {
+    // dup: 70,000 rows in 2 row groups; each g has 1,750 copies spread over several leaves.
+    const std::string file = file_ + "_dup";
+    const std::string tbl = file + ".tbl";
+    std::filesystem::remove(file);
+    {
+        std::string rows;
+        for (int r = 0; r < 70000; ++r) rows += std::to_string(r) + "|" + std::to_string(r % 40) + "\n";
+        std::ofstream(tbl, std::ios::binary) << rows;
+    }
+    auto dup = std::make_unique<Database>(file, 2048);
+    LoadOptions options;
+    options.storage = StorageKind::COLUMNAR;
+    dup->LoadTable("dup", Schema({Column("k", ColumnType::Integer()), Column("g", ColumnType::Integer())}), tbl, options);
+    std::filesystem::remove(tbl);
+    (void)dup->GetCatalog()->CreateIndex("dup_g", "dup", "g");
+
+    struct Case {
+        std::string name;
+        Database* db;
+        std::string table;
+        std::string index;
+        std::optional<Value> low;
+        std::optional<Value> high;
+        size_t rows;
+        bool split;  // whether 4 threads cut the range into pieces
+    };
+    const auto v = [](int32_t x) { return std::optional<Value>(Value(x)); };
+    Database* ix = &Db();
+    const std::vector<Case> cases = {
+        {"inside one leaf", ix, "ix", "ix_k", v(70000), v(70009), 10, false},
+        {"across many leaves", ix, "ix", "ix_k", v(1000), v(900000), 899001, true},
+        {"scattered positions", ix, "ix", "ix_p", v(1000), v(41000), 40001, true},
+        {"open low", ix, "ix", "ix_p", std::nullopt, v(300000), 300001, true},
+        {"open high", ix, "ix", "ix_k", v(1100000), std::nullopt, kRows - 1100000, true},
+        {"empty, low past high", ix, "ix", "ix_k", v(10), v(5), 0, false},
+        {"empty, past the end", ix, "ix", "ix_p", v(2000000), std::nullopt, 0, false},
+        {"the whole tree", ix, "ix", "ix_k", std::nullopt, std::nullopt, kRows, true},
+        {"copies across leaf splits", dup.get(), "dup", "dup_g", v(5), v(30), 26 * 1750, true},
+        {"one key's copies", dup.get(), "dup", "dup_g", v(7), v(7), 1750, false},
+        {"all of g", dup.get(), "dup", "dup_g", std::nullopt, std::nullopt, 70000, true},
+    };
+
+    WorkerPool pool(4);
+    for (const Case& c : cases) {
+        SCOPED_TRACE(c.name);
+        Catalog* catalog = c.db->GetCatalog();
+        BufferPoolManager* bpm = c.db->GetBufferPoolManager();
+        BTreeIndex& tree = *catalog->GetIndex(c.index)->index;
+        EXPECT_EQ(!tree.SplitKeys(c.low.value_or(Value()), c.high.value_or(Value()), 4).empty(), c.split);
+
+        QueryContext serial{bpm, catalog};
+        const auto want = MorselRows(c.table, c.index, c.low, c.high, serial);
+        QueryContext split{bpm, catalog};
+        split.threads = 4;
+        split.pool = &pool;
+        const auto got = MorselRows(c.table, c.index, c.low, c.high, split);
+        ExpectPoolIdle(*bpm);
+
+        ASSERT_EQ(got.size(), want.size()) << "morsels";
+        size_t rows = 0;
+        for (size_t m = 0; m < want.size(); ++m) {
+            EXPECT_EQ(got[m], want[m]) << "morsel " << m;
+            EXPECT_TRUE(std::is_sorted(got[m].begin(), got[m].end())) << "morsel " << m;
+            rows += got[m].size();
+        }
+        EXPECT_EQ(rows, c.rows);
+    }
+    dup.reset();
+    std::filesystem::remove(file);
+}
+
+TEST_F(ParallelIndexScanSourceTest, SplitWalkRefusesADamagedIndex) {
+    // A small table of its own, one row group; one extra index entry points at row group 5.
+    const std::string file = file_ + "_damaged";
+    const std::string tbl = file + ".tbl";
+    std::filesystem::remove(file);
+    {
+        std::string rows;
+        for (int r = 0; r < 20000; ++r) rows += std::to_string(r) + "|" + std::to_string(r % 97) + "\n";
+        std::ofstream(tbl, std::ios::binary) << rows;
+    }
+    {
+        Database db(file, 1024);
+        LoadOptions options;
+        options.storage = StorageKind::COLUMNAR;
+        db.LoadTable("dmg", Schema({Column("k", ColumnType::Integer()), Column("v", ColumnType::Integer())}), tbl, options);
+        Catalog* catalog = db.GetCatalog();
+        (void)catalog->CreateIndex("dmg_k", "dmg", "k");
+        catalog->UpdateTableStats("dmg");
+        db.SetColumnarScanCosts(ForceIndex());
+        BTreeIndex& tree = *catalog->GetIndex("dmg_k")->index;
+        tree.Insert(Value(int32_t(15000)), ToRid(RowPosition{5, 0}));
+        const Value low(int32_t(0));
+        const Value high(int32_t(19999));
+        ASSERT_FALSE(tree.SplitKeys(low, high, 4).empty()) << "the walk isn't cut into pieces";
+
+        const std::string text = "damaged index: dmg_k points past table dmg";
+        BufferPoolManager* bpm = db.GetBufferPoolManager();
+        WorkerPool pool(4);
+        for (const unsigned threads : {1u, 4u}) {
+            SCOPED_TRACE(std::to_string(threads) + " threads");
+            ScanSpec spec;
+            spec.table = "dmg";
+            spec.columns = {0};
+            auto source = MakeIndexScanSource(std::move(spec), "dmg_k", low, high);
+            QueryContext ctx{bpm, catalog};
+            ctx.threads = threads;
+            ctx.pool = threads > 1 ? &pool : nullptr;
+            EXPECT_EQ(ErrorOf([&] { source->Prepare(ctx); }), text);
+            ExpectPoolIdle(*bpm);
+
+            // The whole query, through the database's own pool.
+            EXPECT_EQ(ErrorOf([&] { (void)Run(db, "SELECT k, v FROM dmg WHERE k >= 0 AND k <= 19999", ExecutionMode::PARALLEL, threads); }), text);
+            ExpectPoolIdle(*bpm);
+            EXPECT_NO_THROW(bpm->DropAllPages());
+            EXPECT_EQ(Run(db, "SELECT k FROM dmg WHERE k >= 100 AND k <= 14000", ExecutionMode::PARALLEL, threads).tuples.size(), 13901u);
+        }
+    }
+    std::filesystem::remove(file);
+    std::filesystem::remove(tbl);
 }
 
 }  // namespace

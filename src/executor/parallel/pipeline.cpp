@@ -306,10 +306,12 @@ void ShapeBatch(Batch& batch, const std::vector<VType>& types) {
 // Morsels, then each spilled operator's partitions, shared by atomic counters; a phase
 // starts once every worker finishes the last. Combine goes in worker order, as before.
 void RunPipeline(Pipeline& p, QueryContext& ctx) {
+    // Pool tasks inside Prepare (an index walk) add thread time beyond the caller's wall time.
     OperatorStatsMap* stats = ctx.op_stats;
+    ctx.task_extra = nanoseconds{0};
     auto start = NowIf(stats != nullptr);
     p.source->Prepare(ctx);
-    if (stats != nullptr) ChargeTime(*stats, p.source_node, Clock::now() - start);
+    if (stats != nullptr) ChargeTime(*stats, p.source_node, Clock::now() - start + ctx.task_extra);
 
     // Spilled partitions are known up front, so the workers are sized once for both.
     const size_t morsels = p.source->MorselCount();
@@ -399,6 +401,16 @@ void ForEachTask(QueryContext& ctx, size_t count, const std::function<void(size_
     nanoseconds total{0};
     for (nanoseconds b : busy) total += b;
     ctx.task_extra += total - (Clock::now() - start);
+}
+
+// The mode switches on the calling thread, before the first task and after the last;
+// the pool's Run returns only once every worker has.
+void ForEachPoolTask(QueryContext& ctx, size_t count, const std::function<void(size_t, unsigned)>& task) {
+    assert((ctx.bpm == nullptr || !ctx.bpm->IsConcurrent()) && "ForEachPoolTask inside a running pipeline");
+    const unsigned workers = WorkersFor(ctx, count);
+    std::optional<ConcurrentScope> concurrent;
+    if (workers > 1) concurrent.emplace(ctx.bpm, workers);
+    ForEachTask(ctx, count, task);
 }
 
 }  // namespace shilmandb::parallel

@@ -1,4 +1,6 @@
 #include <gtest/gtest.h>
+#include "buffer/buffer_pool_manager.hpp"
+#include "buffer/lru_eviction_policy.hpp"
 #include "common/exception.hpp"
 #include "executor/parallel/batch.hpp"
 #include "executor/parallel/compiler.hpp"
@@ -12,6 +14,7 @@
 #include "executor/parallel/vector.hpp"
 #include "executor/parallel/worker_pool.hpp"
 #include "parser/ast.hpp"
+#include "storage/disk_manager.hpp"
 #include <unistd.h>
 #include <algorithm>
 #include <atomic>
@@ -634,6 +637,104 @@ TEST(ParallelPipelineTest, ForEachTaskPassesTheWorker) {
     for (const auto& u : used) workers_used += u.load() > 0 ? 1 : 0;
     EXPECT_GT(workers_used, 1) << "the pool ran the tasks";
 }
+
+TEST(ParallelPipelineTest, ForEachPoolTaskTurnsTheLatchOnWhileTasksRun) {
+    const std::string file = (std::filesystem::temp_directory_path() / ("shilmandb_parallel_pipeline_pool_task_" + std::to_string(::getpid()) + ".db")).string();
+    std::filesystem::remove(file);
+    {
+        constexpr size_t kFrames = 32;
+        constexpr page_id_t kPages = 8;
+        DiskManager disk(file);
+        BufferPoolManager bpm(kFrames, &disk, std::make_unique<LRUEvictionPolicy>(kFrames));
+        for (page_id_t i = 0; i < kPages; ++i) {
+            page_id_t id = INVALID_PAGE_ID;
+            ASSERT_NE(bpm.NewPage(&id), nullptr);
+            (void)bpm.UnpinPage(id, true);
+        }
+        constexpr unsigned kThreads = 4;
+        WorkerPool pool(kThreads);
+        QueryContext ctx{&bpm, nullptr};
+        ctx.threads = kThreads;
+        ctx.pool = &pool;
+        const std::thread::id caller = std::this_thread::get_id();
+
+        // Tasks that pin pages from several threads, each seeing the mode on for the workers that run.
+        for (const size_t count : {size_t{64}, size_t{2}}) {
+            const unsigned workers = static_cast<unsigned>(std::min<size_t>(count, kThreads));
+            std::atomic<int> ran{0};
+            std::atomic<int> off{0};
+            ForEachPoolTask(ctx, count, [&](size_t i, unsigned) {
+                if (!bpm.IsConcurrent() || bpm.ConcurrentWorkers() != workers) off.fetch_add(1);
+                const auto id = static_cast<page_id_t>(i % kPages);
+                if (bpm.FetchPage(id) == nullptr) {
+                    off.fetch_add(1);
+                    return;
+                }
+                std::this_thread::sleep_for(std::chrono::microseconds(100));
+                (void)bpm.UnpinPage(id, false);
+                ran.fetch_add(1);
+            });
+            EXPECT_EQ(ran.load(), static_cast<int>(count));
+            EXPECT_EQ(off.load(), 0) << count << " tasks";
+            EXPECT_FALSE(bpm.IsConcurrent()) << "left on after " << count << " tasks";
+            EXPECT_EQ(bpm.ConcurrentWorkers(), 1u);
+        }
+
+        // A failed task reaches the caller, and the mode is off again.
+        std::atomic<int> started{0};
+        try {
+            ForEachPoolTask(ctx, 64, [&](size_t i, unsigned) {
+                started.fetch_add(1);
+                if (i == 5) throw DatabaseException("task 5 failed");
+            });
+            ADD_FAILURE() << "no throw";
+        } catch (const DatabaseException& e) {
+            EXPECT_STREQ(e.what(), "task 5 failed");
+        }
+        EXPECT_GT(started.load(), 0);
+        EXPECT_FALSE(bpm.IsConcurrent()) << "left on after a failed task";
+
+        // One worker (no pool, or one task): the caller runs it as worker 0 with the mode off.
+        for (const bool pooled : {false, true}) {
+            QueryContext one{&bpm, nullptr};
+            one.threads = pooled ? kThreads : 1;
+            one.pool = pooled ? &pool : nullptr;
+            const size_t count = pooled ? 1 : 5;
+            size_t ran = 0;
+            ForEachPoolTask(one, count, [&](size_t i, unsigned worker) {
+                EXPECT_FALSE(bpm.IsConcurrent());
+                EXPECT_EQ(worker, 0u);
+                EXPECT_EQ(std::this_thread::get_id(), caller);
+                const auto id = static_cast<page_id_t>(i % kPages);
+                ASSERT_NE(bpm.FetchPage(id), nullptr);
+                (void)bpm.UnpinPage(id, false);
+                ++ran;
+            });
+            EXPECT_EQ(ran, count) << (pooled ? "one task" : "no pool");
+        }
+
+        for (size_t f = 0; f < bpm.GetPoolSize(); ++f) EXPECT_EQ(bpm.GetPage(static_cast<frame_id_t>(f)).GetPinCount(), 0) << "frame " << f;
+        EXPECT_NO_THROW(bpm.DropAllPages());
+    }
+    std::filesystem::remove(file);
+}
+
+#ifndef NDEBUG
+TEST(ParallelPipelineDeathTest, ForEachPoolTaskInsideARunningPipelineAsserts) {
+    // A nested call would switch the mode off under the outer scope's workers.
+    const std::string file = (std::filesystem::temp_directory_path() / ("shilmandb_parallel_pipeline_nested_" + std::to_string(::getpid()) + ".db")).string();
+    std::filesystem::remove(file);
+    {
+        DiskManager disk(file);
+        BufferPoolManager bpm(8, &disk, std::make_unique<LRUEvictionPolicy>(8));
+        QueryContext ctx{&bpm, nullptr};
+        bpm.SetConcurrent(true, 2);
+        EXPECT_DEATH(ForEachPoolTask(ctx, 4, [](size_t, unsigned) {}), "ForEachPoolTask inside a running pipeline");
+        bpm.SetConcurrent(false);
+    }
+    std::filesystem::remove(file);
+}
+#endif
 
 TEST(ParallelPipelineTest, LocalsKnowTheirWorkerAndContext) {
     constexpr unsigned kThreads = 4;

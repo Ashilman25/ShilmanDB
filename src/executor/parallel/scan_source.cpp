@@ -225,22 +225,48 @@ void ScanSource::Prepare(QueryContext& ctx) {
 }
 
 // Walks as today's index scan does: from low, stopping at the first key past high.
+// With 2+ threads the range is cut into pieces, each walked by one pool task.
 // Positions sort as (group, offset), so each group's pages are read in file order.
 void ScanSource::FindMatches(QueryContext& ctx) {
     const IndexInfo* index = ctx.catalog->GetIndex(bounds_->index);
     if (index == nullptr) throw DatabaseException("IndexScanExecutor: index not found: " + bounds_->index);
     if (index->table_name != spec_.table) throw DatabaseException("index " + bounds_->index + " is not on table " + spec_.table);
-
-    std::vector<uint64_t> found;  // group in the high bits, offset in the low 32
     BTreeIndex& tree = *index->index;
-    for (auto it = bounds_->low ? tree.Begin(*bounds_->low) : tree.Begin(); !it.IsEnd(); ++it) {
-        const auto entry = *it;
-        if (bounds_->high && entry.first > *bounds_->high) break;
-        const RowPosition pos = FromRid(entry.second);
+
+    // Keeps an entry's position, group in the high bits and offset in the low 32.
+    const auto keep = [&](const RID& rid, std::vector<uint64_t>& out) {
+        const RowPosition pos = FromRid(rid);
         if (pos.row_group >= table_->RowGroupCount() || pos.offset >= table_->RowGroupRows(pos.row_group)) {
             throw DatabaseException("damaged index: " + bounds_->index + " points past table " + spec_.table);
         }
-        found.push_back((static_cast<uint64_t>(pos.row_group) << 32) | pos.offset);
+        out.push_back((static_cast<uint64_t>(pos.row_group) << 32) | pos.offset);
+    };
+
+    std::vector<Value> cuts;
+    if (ctx.threads > 1 && ctx.pool != nullptr) cuts = tree.SplitKeys(bounds_->low.value_or(Value()), bounds_->high.value_or(Value()), ctx.threads);
+
+    std::vector<uint64_t> found;
+    if (cuts.empty()) {
+        for (auto it = bounds_->low ? tree.Begin(*bounds_->low) : tree.Begin(); !it.IsEnd(); ++it) {
+            const auto entry = *it;
+            if (bounds_->high && entry.first > *bounds_->high) break;
+            keep(entry.second, found);
+        }
+    } else {
+        std::vector<std::vector<uint64_t>> pieces(cuts.size() + 1);
+        ForEachPoolTask(ctx, pieces.size(), [&](size_t i, unsigned) {
+            const Value& from = i == 0 ? bounds_->low.value_or(Value()) : cuts[i - 1];
+            const Value* until = i < cuts.size() ? &cuts[i] : nullptr;
+            tree.ForEachEntry(from, [&](const Value& key, const RID& rid) {
+                if (until != nullptr ? key >= *until : bounds_->high && key > *bounds_->high) return false;
+                keep(rid, pieces[i]);
+                return true;
+            });
+        });
+        size_t total = 0;
+        for (const auto& piece : pieces) total += piece.size();
+        found.reserve(total);
+        for (const auto& piece : pieces) found.insert(found.end(), piece.begin(), piece.end());
     }
     std::sort(found.begin(), found.end());
     found.erase(std::unique(found.begin(), found.end()), found.end());

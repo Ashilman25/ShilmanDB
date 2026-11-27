@@ -69,7 +69,7 @@ class Source {
 public:
     virtual ~Source() = default;
 
-    // Runs on the calling thread, before any worker.
+    // Runs on the calling thread, before any morsel; it may run pool tasks.
     virtual void Prepare(QueryContext& ctx) = 0;
 
     // How many morsels Prepare found.
@@ -186,5 +186,9 @@ void ForEachTask(QueryContext& ctx, size_t count, const std::function<void(size_
 // One worker index runs on one thread at a time,
 // so state indexed by it needs no lock.
 void ForEachTask(QueryContext& ctx, size_t count, const std::function<void(size_t, unsigned)>& task);
+
+// As ForEachTask, for tasks that read pages: with 2+ workers the buffer pool
+// is concurrent while they run, off again on every exit
+void ForEachPoolTask(QueryContext& ctx, size_t count, const std::function<void(size_t, unsigned)>& task);
 
 }  // namespace shilmandb::parallel

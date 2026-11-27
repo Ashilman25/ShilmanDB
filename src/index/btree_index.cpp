@@ -1,6 +1,7 @@
 #include "index/btree_index.hpp"
 #include "common/exception.hpp"
 #include "storage/slotted_page.hpp"
+#include <algorithm>
 #include <cassert>
 #include <string>
 
@@ -51,6 +52,27 @@ private:
 // Builds and throws the error for a descent that never reaches a leaf.
 [[noreturn]] __attribute__((cold, noinline)) void ThrowTooDeep() {
     throw DatabaseException("damaged index: descent deeper than " + std::to_string(kMaxDepth) + " levels");
+}
+
+// Builds and throws the error for more internal page visits than the file has pages.
+[[noreturn]] __attribute__((cold, noinline)) void ThrowTooManyVisits(page_id_t pages) {
+    throw DatabaseException("damaged index: internal pages visited more than the file's " + std::to_string(pages) + " pages");
+}
+
+// Separators on an internal page below key, or at most key when or_equal.
+uint16_t CountSeparators(const char* data, const Value& key, TypeId key_type, bool or_equal) {
+    uint16_t lo = 0;
+    uint16_t hi = BTreeInternalPage::GetNumKeys(data);
+    while (lo < hi) {
+        const uint16_t mid = lo + (hi - lo) / 2;
+        const Value separator = BTreeInternalPage::GetKey(data, mid, key_type);
+        if (or_equal ? separator <= key : separator < key) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
 }
 
 // Throws unless an internal page's child pointer names a page the file has.
@@ -405,6 +427,83 @@ BTreeIndex::Iterator BTreeIndex::Begin(const Value& low_key) {
 
 BTreeIndex::Iterator BTreeIndex::End() {
     return Iterator(bpm_, key_type_, INVALID_PAGE_ID, 0);
+}
+
+// Starts where Begin(from) does, with the same checks per leaf as the iterator.
+void BTreeIndex::ForEachEntry(const Value& from, const std::function<bool(const Value&, const RID&)>& fn) {
+    if (root_page_id_ == INVALID_PAGE_ID) return;
+    page_id_t leaf = from.IsNull() ? FindLeftmostLeaf() : FindLeftmostLeaf(from);
+    uint64_t walked = 0;
+    for (bool first = true; leaf != INVALID_PAGE_ID; first = false) {
+        StepToLeaf(leaf, walked, *bpm_);
+        const PagePin pin(bpm_, leaf);
+        const char* data = pin.Data();
+        BTreeLeafPage::CheckKeyCount(data, key_type_);
+        const uint16_t n = BTreeLeafPage::GetNumKeys(data);
+        for (uint16_t slot = first && !from.IsNull() ? BTreeLeafPage::LowerBound(data, from, key_type_) : 0; slot < n; ++slot) {
+            if (!fn(BTreeLeafPage::GetKey(data, slot, key_type_), BTreeLeafPage::GetRID(data, slot, key_type_))) return;
+        }
+        leaf = BTreeLeafPage::GetNextLeafPageId(data);
+    }
+}
+
+// Cuts are leaf boundaries: the level above the leaves, plus keys its splits moved up.
+// Piece j starts near leaf j * leaves / pieces; equal cuts merge.
+std::vector<Value> BTreeIndex::SplitKeys(const Value& low, const Value& high, size_t pieces) {
+    if (pieces < 2 || root_page_id_ == INVALID_PAGE_ID) return {};
+    std::vector<page_id_t> path;  // the internal pages down to the leftmost leaf
+    (void)Descend(nullptr, false, &path);
+    if (path.empty()) return {};
+
+    std::vector<Value> separators;
+    uint64_t visited = 0;
+    CollectSeparators(root_page_id_, path.size() - 1, low, high, separators, visited);
+
+    std::vector<Value> keys;
+    const size_t leaves = separators.size() + 1;
+    if (pieces >= leaves) {
+        keys = std::move(separators);
+    } else {
+        for (size_t j = 1; j < pieces; ++j) keys.push_back(separators[j * leaves / pieces - 1]);
+    }
+    std::sort(keys.begin(), keys.end());
+    keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+    return keys;
+}
+
+// Child i holds keys from separator i - 1 to separator i, both included:
+// copies of a key can sit on both sides. Separator i splits two leaves.
+void BTreeIndex::CollectSeparators(page_id_t page, size_t below, const Value& low, const Value& high, std::vector<Value>& out, uint64_t& visited) {
+    const page_id_t pages = bpm_->GetNumPages();
+    if (++visited > pages) ThrowTooManyVisits(pages);
+    std::vector<page_id_t> children;
+    std::vector<Value> between;  // separator k sits between children k and k + 1
+    {
+        const PagePin pin(bpm_, page);
+        const char* data = pin.Data();
+        if (IsLeafPage(data)) return;
+        BTreeInternalPage::CheckKeyCount(data, key_type_);
+        const uint16_t n = BTreeInternalPage::GetNumKeys(data);
+        const uint16_t first = low.IsNull() ? 0 : CountSeparators(data, low, key_type_, false);
+        const uint16_t last = high.IsNull() ? n : CountSeparators(data, high, key_type_, true);
+        for (uint16_t i = first; i < last; ++i) between.push_back(BTreeInternalPage::GetKey(data, i, key_type_));
+        if (below > 0) {
+            for (uint16_t i = first; i <= last; ++i) children.push_back(BTreeInternalPage::GetChild(data, i, key_type_));
+        }
+    }
+
+    const auto inside = [&](const Value& key) { return (low.IsNull() || key > low) && (high.IsNull() || key < high); };
+    if (below == 0) {
+        for (Value& key : between) {
+            if (inside(key)) out.push_back(std::move(key));
+        }
+        return;
+    }
+    for (size_t k = 0; k < children.size(); ++k) {
+        CheckChild(page, children[k], bpm_->GetNumPages());
+        CollectSeparators(children[k], below - 1, low, high, out, visited);
+        if (k < between.size() && inside(between[k])) out.push_back(std::move(between[k]));
+    }
 }
 
 }  // namespace shilmandb

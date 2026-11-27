@@ -5,6 +5,7 @@
 #include "types/value.hpp"
 #include "common/rid.hpp"
 #include "common/config.hpp"
+#include <functional>
 #include <vector>
 #include <utility>
 
@@ -40,6 +41,14 @@ public:
     [[nodiscard]] Iterator Begin(const Value& low_key);
     [[nodiscard]] Iterator End();
 
+    // Calls fn(key, rid) in key order from the first key >= from (Value(): the start)
+    // until it returns false. One pin per leaf, so fn must not use the pool.
+    void ForEachEntry(const Value& from, const std::function<bool(const Value&, const RID&)>& fn);
+
+    // Up to pieces - 1 sorted, distinct keys strictly between low and high,
+    // cutting the range into pieces of about equal leaves. Value() leaves an end open.
+    [[nodiscard]] std::vector<Value> SplitKeys(const Value& low, const Value& high, size_t pieces);
+
 private:
     BufferPoolManager* bpm_;
     page_id_t root_page_id_;
@@ -52,6 +61,9 @@ private:
     // Walks down to a leaf by key, or by child 0 when key is null.
     // Throws "damaged index" instead of looping or reading past a page.
     page_id_t Descend(const Value* key, bool go_right_on_equal, std::vector<page_id_t>* path);
+    // Adds, in key order, each separator strictly inside the bounds that splits two leaves.
+    // Reads only internal pages whose keys can fall in [low, high].
+    void CollectSeparators(page_id_t page, size_t below, const Value& low, const Value& high, std::vector<Value>& out, uint64_t& visited);
 
     void SplitLeaf(page_id_t leaf_id, std::vector<page_id_t>& path);
     void InsertIntoParent(std::vector<page_id_t>& path, page_id_t left_child, const Value& key, page_id_t right_child);
