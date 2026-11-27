@@ -171,6 +171,32 @@ StringRef Ref(const std::string& s) {
     return StringRef{s.data(), static_cast<uint32_t>(s.size())};
 }
 
+// How a hand-fed batch holds its strings: plain, one dictionary entry per row,
+// or shared entries (each distinct string once, after one no row uses).
+enum class Coding { PLAIN, ENTRY_PER_ROW, SHARED_ENTRIES };
+
+// Points slot's rows at strs in the given coding; entries backs a dictionary.
+void FillStrings(Vector& slot, const std::vector<std::string>& strs, Coding coding, std::vector<StringRef>& entries) {
+    entries.clear();
+    if (coding == Coding::PLAIN) {
+        for (size_t i = 0; i < strs.size(); ++i) slot.Str()[i] = Ref(strs[i]);
+        return;
+    }
+    if (coding == Coding::SHARED_ENTRIES) entries.push_back(StringRef{"never used", 10});
+    std::map<std::string, uint32_t> code_of;
+    for (size_t i = 0; i < strs.size(); ++i) {
+        const auto found = code_of.find(strs[i]);
+        if (coding == Coding::SHARED_ENTRIES && found != code_of.end()) {
+            slot.Codes()[i] = found->second;
+            continue;
+        }
+        code_of[strs[i]] = static_cast<uint32_t>(entries.size());
+        slot.Codes()[i] = static_cast<uint32_t>(entries.size());
+        entries.push_back(Ref(strs[i]));
+    }
+    slot.SetDictionary(&entries);
+}
+
 // The topmost hash join of a plan, or nullptr.
 HashJoinPlanNode* TopHashJoin(PlanNode* node) {
     if (node->type == PlanNodeType::HASH_JOIN) return static_cast<HashJoinPlanNode*>(node);
@@ -1020,6 +1046,133 @@ TEST_F(ParallelHashJoinTest, DictionaryProbeKeys) {
     }
     std::sort(got.begin(), got.end());
     EXPECT_EQ(got, (std::vector<std::tuple<std::string, int64_t, int64_t>>{{"", 4, 102}, {"alpha", 3, 100}, {"épée", 0, 101}, {"épée", 5, 101}}));
+}
+
+// Slot 0 behind an expression, never read in place:
+// CASE WHEN c1 = c1 THEN c0 ELSE c0 END.
+std::unique_ptr<CompiledExpr> ComputedStringKey(const InputLayout& in) {
+    const auto ref = [](uint32_t c) {
+        auto r = std::make_unique<ColumnRef>();
+        r->column_name = "c" + std::to_string(c);
+        r->bound_index = c;
+        return r;
+    };
+    auto same = std::make_unique<BinaryOp>();
+    same->op = BinaryOp::Op::EQ;
+    same->left = ref(1);
+    same->right = ref(1);
+    CaseExpression pick;
+    pick.when_clauses.emplace_back(std::move(same), ref(0));
+    pick.else_clause = ref(0);
+    return CompiledExpr::Compile(pick, in);
+}
+
+TEST_F(ParallelHashJoinTest, DictionaryAndPlainKeysPairAlike) {
+    // Key m as text: long, empty and multibyte ones among them.
+    const auto key = [](uint32_t m) -> std::string {
+        if (m == 5) return std::string(300, 'x') + "-5";
+        if (m == 7) return "";
+        if (m == 11) return "épée";
+        return "k-" + std::to_string(m);
+    };
+    constexpr uint32_t kBuildRows = 3000;
+    constexpr uint32_t kProbeRows = 2500;
+    constexpr uint32_t kBuildBatch = 500;
+    constexpr uint32_t kProbeBatch = 400;
+    const Coding cycle[] = {Coding::PLAIN, Coding::SHARED_ENTRIES, Coding::ENTRY_PER_ROW, Coding::SHARED_ENTRIES};
+    using Pick = std::function<Coding(size_t)>;
+    const Pick cycled = [&cycle](size_t b) { return cycle[b % 4]; };
+    const Pick shifted = [&cycle](size_t b) { return cycle[(b + 1) % 4]; };
+    const Pick shared = [](size_t) { return Coding::SHARED_ENTRIES; };
+    const Pick plain = [](size_t) { return Coding::PLAIN; };
+    // Each side's coding, and whether its key is computed rather than read in place.
+    struct Run {
+        Pick build;
+        Pick probe;
+        bool computed_build;
+        bool computed_probe;
+    };
+    const std::vector<Run> runs = {
+        {cycled, shifted, false, false},
+        {shared, plain, false, false},
+        {plain, shared, false, false},
+        {cycled, shifted, true, false},
+        {shifted, cycled, false, true},
+    };
+
+    // Build row x has key x % 37 and payload x;
+    // probe row j has key j % 45 and value j.
+    // Every fifth build row and every fourth probe row is inactive.
+    const InputLayout two = LayoutOf({kStr, kInt});
+    for (size_t r = 0; r < runs.size(); ++r) {
+        JoinSpec spec;
+        spec.build_key = runs[r].computed_build ? ComputedStringKey(two) : Col(0, two);
+        spec.probe_key = runs[r].computed_probe ? ComputedStringKey(two) : Col(0, two);
+        spec.build_payload = {1};
+        spec.probe_slots = {1};
+        spec.types = {kInt, kInt};
+        Batch shape;
+        ShapeBatch(shape, {kStr, kInt});
+        EXPECT_EQ(spec.build_key->Direct(shape) == nullptr, runs[r].computed_build) << "run " << r;
+        EXPECT_EQ(spec.probe_key->Direct(shape) == nullptr, runs[r].computed_probe) << "run " << r;
+        auto made = MakeHashJoin(std::move(spec));
+        QueryContext ctx{nullptr, nullptr};
+
+        auto w0 = made.first->MakeLocal();
+        auto w1 = made.first->MakeLocal();
+        for (uint32_t at = 0; at < kBuildRows; at += kBuildBatch) {
+            const size_t b = at / kBuildBatch;
+            std::vector<std::string> strs;
+            std::vector<StringRef> entries;
+            Batch build;
+            ShapeBatch(build, {kStr, kInt});
+            build.Reset(kBuildBatch);
+            uint32_t kept = 0;
+            for (uint32_t i = 0; i < kBuildBatch; ++i) {
+                strs.push_back(key((at + i) % 37));
+                build.slots[1].I64()[i] = at + i;
+                if ((at + i) % 5 != 4) build.sel.Data()[kept++] = static_cast<uint16_t>(i);
+            }
+            build.sel.Resize(kept);
+            FillStrings(build.slots[0], strs, runs[r].build(b), entries);
+            made.first->Consume(build, b % 2 == 0 ? *w0 : *w1);
+        }
+        made.first->Combine(std::move(w0));
+        made.first->Combine(std::move(w1));
+        made.first->Finalize(ctx);
+
+        auto local = made.second->MakeLocal();
+        std::vector<std::pair<int64_t, int64_t>> got;
+        std::vector<std::pair<int64_t, int64_t>> want;
+        for (uint32_t at = 0; at < kProbeRows; at += kProbeBatch) {
+            const uint32_t n = std::min(kProbeBatch, kProbeRows - at);
+            std::vector<std::string> strs;
+            std::vector<StringRef> entries;
+            Batch probe;
+            ShapeBatch(probe, {kStr, kInt});
+            probe.Reset(n);
+            uint32_t kept = 0;
+            for (uint32_t i = 0; i < n; ++i) {
+                const uint32_t j = at + i;
+                strs.push_back(key(j % 45));
+                probe.slots[1].I64()[i] = j;
+                if (i % 4 == 3) continue;
+                probe.sel.Data()[kept++] = static_cast<uint16_t>(i);
+                for (uint32_t x = j % 45; j % 45 < 37 && x < kBuildRows; x += 37) {
+                    if (x % 5 != 4) want.emplace_back(j, x);
+                }
+            }
+            probe.sel.Resize(kept);
+            FillStrings(probe.slots[0], strs, runs[r].probe(at / kProbeBatch), entries);
+            const auto pairs = Drain(*made.second, probe, local.get());
+            got.insert(got.end(), pairs.begin(), pairs.end());
+        }
+        std::sort(got.begin(), got.end());
+        std::sort(want.begin(), want.end());
+        EXPECT_GT(want.size(), 100000u);
+        EXPECT_EQ(got.size(), want.size()) << "run " << r;
+        EXPECT_TRUE(got == want) << "run " << r;
+    }
 }
 
 TEST_F(ParallelHashJoinTest, NanKeysNeverMatch) {

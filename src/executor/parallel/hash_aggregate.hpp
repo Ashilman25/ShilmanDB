@@ -43,6 +43,10 @@ struct AggregateSpec {
 // Throws when the sink isn't an aggregate's.
 void OffsetCountsForTest(Sink& aggregate_sink, int64_t offset);
 
+// Tests only: the bytes a sink's worker state counts for its table after a batch.
+// Throws when the state isn't an aggregate sink's.
+[[nodiscard]] size_t AggregateCountedBytesForTest(const LocalState& sink_local);
+
 // Tests only: a merge of spilled groups splits past `most` groups; 0 turns it off.
 // Read by the aggregate's source when it prepares.
 void SetAggregateMergeGroupsForTest(size_t most);

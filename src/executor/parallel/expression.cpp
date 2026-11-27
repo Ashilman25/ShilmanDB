@@ -478,9 +478,6 @@ public:
     // True when every child is a constant, so this node can fold.
     [[nodiscard]] virtual bool ChildrenConstant() const = 0;
 
-    // A column's own batch vector, read in place; nullptr for computed nodes.
-    [[nodiscard]] virtual const Vector* Direct(const Batch&) const { return nullptr; }
-
     // Evaluates, then keeps the rows whose value is a true INTEGER.
     void Select(const Batch& in, Selection& sel, EvalScratch& scratch) const override;
 
@@ -1849,6 +1846,17 @@ std::unique_ptr<CompiledExpr> CompiledExpr::CompileAnd(const std::vector<const E
     NodePtr tree = compiler.Build(*parts[0]);
     for (size_t i = 1; i < parts.size(); ++i) tree = Fold(std::make_unique<AndNode>(std::move(tree), compiler.Build(*parts[i])));
     return tree;
+}
+
+// A bare column's batch vector as is, else expr evaluated into out.
+const Vector& ValuesFor(const CompiledExpr& expr, const Batch& in, Vector& out, EvalScratch& scratch) {
+    if (const Vector* v = expr.Direct(in)) {
+        assert(v->Type().kind == expr.Type().kind && v->Type().scale == expr.Type().scale && v->Type().wide == expr.Type().wide &&
+               "a column's batch vector holds another type");
+        return *v;
+    }
+    expr.Evaluate(in, in.sel, out, scratch);
+    return out;
 }
 
 // Collects, then sorts and drops repeats across everything in out.

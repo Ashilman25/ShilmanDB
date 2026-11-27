@@ -1,10 +1,12 @@
 #pragma once
+#include "executor/parallel/vector.hpp"
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <limits>
 #include <string_view>
+#include <vector>
 
 namespace shilmandb::parallel {
 
@@ -55,6 +57,15 @@ inline constexpr uint64_t kKeySeed = 0x9e3779b97f4a7c15ULL;
     uint64_t bits = 0;
     std::memcpy(&bits, &d, sizeof(bits));
     return bits;
+}
+
+// Each entry's HashBytes, when v is a dictionary of at most n entries
+[[nodiscard]] inline bool HashEntries(const Vector& v, uint32_t n, std::vector<uint64_t>& out) {
+    if (!v.IsDictionary() || v.Entries().size() > n) return false;
+    const std::vector<StringRef>& entries = v.Entries();
+    out.resize(entries.size());
+    for (size_t e = 0; e < entries.size(); ++e) out[e] = HashBytes(View(entries[e]));
+    return true;
 }
 
 }  // namespace detail

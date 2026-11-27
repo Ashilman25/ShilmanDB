@@ -103,6 +103,7 @@ struct BatchKeys {
     std::vector<uint64_t> hashes;
     std::vector<uint8_t> valid;  // 0: the key equals nothing (a NaN, or past 38 digits once rescaled)
     bool all_valid{true};
+    std::vector<uint64_t> entry_hashes;  // a string key's dictionary entries, hashed
 
     // Room for a batch in the form's array.
     explicit BatchKeys(KeyForm form) : hashes(kBatchSize), valid(kBatchSize, 1) {
@@ -128,6 +129,7 @@ double AsDouble(const Vector& v, uint32_t i) {
 }
 
 // Moves v's active rows into the rule's form, hashed; position k is active row k.
+// A small dictionary's entries are hashed once each.
 void Normalize(const Vector& v, const Selection& sel, uint32_t n, const KeyRule& rule, BatchKeys& out) {
     out.all_valid = true;
     switch (rule.form) {
@@ -164,6 +166,15 @@ void Normalize(const Vector& v, const Selection& sel, uint32_t n, const KeyRule&
             }
             break;
         case KeyForm::STR:
+            if (detail::HashEntries(v, n, out.entry_hashes)) {
+                for (uint64_t& h : out.entry_hashes) h = FoldKey(0, h);
+                const uint32_t* codes = v.Codes();
+                for (uint32_t k = 0; k < n; ++k) {
+                    out.str[k] = v.StrAt(sel[k]);
+                    out.hashes[k] = out.entry_hashes[codes[sel[k]]];
+                }
+                break;
+            }
             for (uint32_t k = 0; k < n; ++k) {
                 out.str[k] = v.StrAt(sel[k]);
                 out.hashes[k] = FoldKey(0, HashBytes(View(out.str[k])));
@@ -361,7 +372,7 @@ struct BuildLocal : LocalState {
     ColumnStore store;                // arrival order: key, hash, payload; emptied once partitioned
     std::vector<HeldRows> parts;      // one per spill partition, once spilling starts
     ColumnStore marked_rows;          // a batch's rows of marked partitions, on their way to disk
-    Vector key_values;                // one batch's keys as evaluated
+    Vector key_values;                // one batch's keys, when the key isn't a bare column
     BatchKeys keys;
     Selection keep;                   // the batch's rows whose key can match
     std::vector<uint8_t> part_of;     // per active row: its spill partition
@@ -419,8 +430,7 @@ public:
         auto& l = static_cast<BuildLocal&>(local);
         const uint32_t n = in.Active();
         if (n == 0) return;
-        key_->Evaluate(in, in.sel, l.key_values, l.scratch);
-        Normalize(l.key_values, in.sel, n, rule_, l.keys);
+        Normalize(ValuesFor(*key_, in, l.key_values, l.scratch), in.sel, n, rule_, l.keys);
 
         if (!l.Partitioned()) {
             if (l.spill_everything && AnyValid(l.keys, n)) marked_.fetch_or(kAllPartitions, std::memory_order_relaxed);
@@ -836,7 +846,7 @@ struct BlockCursor {
 // A worker's place in its probe batch, and its scratch; in the spill phase,
 // the pieces left, the build rows loaded and the probe block streaming through them.
 struct ProbeLocal : LocalState {
-    Vector key_values;  // the batch's keys as evaluated
+    Vector key_values;  // the batch's keys, when the key isn't a bare column
     BatchKeys keys;
     std::vector<uint32_t> probe_rows;  // per pair: its row in the probe batch, or the probe block
     std::vector<uint32_t> build_rows;  // per pair: its build row id, or its loaded row
@@ -915,8 +925,7 @@ public:
                 out.Reset(0);
                 return OpResult::NEED_INPUT;
             }
-            key_->Evaluate(in, in.sel, l.key_values, l.scratch);
-            Normalize(l.key_values, in.sel, active, rule_, l.keys);
+            Normalize(ValuesFor(*key_, in, l.key_values, l.scratch), in.sel, active, rule_, l.keys);
             if (t.spilled_mask != 0) Divert(in, active, l);
             if (t.store.rows == 0) {
                 out.Reset(0);

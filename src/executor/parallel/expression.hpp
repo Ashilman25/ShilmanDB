@@ -48,7 +48,14 @@ public:
 
     // Narrows sel to the rows where this expression is true (a non-zero INTEGER).
     virtual void Select(const Batch& in, Selection& sel, EvalScratch& scratch) const = 0;
+
+    // A bare column's own batch vector, read in place; nullptr for computed expressions.
+    [[nodiscard]] virtual const Vector* Direct(const Batch&) const { return nullptr; }
 };
+
+// expr's values for in's active rows: a bare column's own batch vector, read in place
+// (strings may stay coded), else expr evaluated into out.
+[[nodiscard]] const Vector& ValuesFor(const CompiledExpr& expr, const Batch& in, Vector& out, EvalScratch& scratch);
 
 // Adds the columns (plan schema indexes) an expression reads to out, kept sorted and unique.
 void CollectColumns(const Expression& expr, std::vector<uint32_t>& out);

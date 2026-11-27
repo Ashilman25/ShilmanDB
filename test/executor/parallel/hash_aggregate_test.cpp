@@ -239,20 +239,57 @@ struct HandRow {
     double f;
 };
 
+// A bound reference to plan column c.
+std::unique_ptr<Expression> RefTo(uint32_t c) {
+    auto ref = std::make_unique<ColumnRef>();
+    ref->column_name = "c" + std::to_string(c);
+    ref->bound_index = c;
+    return ref;
+}
+
+// Hand column c behind an expression with the same values, never read in place:
+// c + 0, or for s a CASE that always gives s.
+std::unique_ptr<CompiledExpr> ComputedColumn(uint32_t c, const InputLayout& in) {
+    if (c != 1) {
+        BinaryOp add;
+        add.op = BinaryOp::Op::ADD;
+        add.left = RefTo(c);
+        auto zero = std::make_unique<Literal>();
+        zero->value = Value(int32_t{0});
+        add.right = std::move(zero);
+        return CompiledExpr::Compile(add, in);
+    }
+    auto same = std::make_unique<BinaryOp>();
+    same->op = BinaryOp::Op::EQ;
+    same->left = RefTo(0);
+    same->right = RefTo(0);
+    CaseExpression pick;
+    pick.when_clauses.emplace_back(std::move(same), RefTo(1));
+    pick.else_clause = RefTo(1);
+    return CompiledExpr::Compile(pick, in);
+}
+
 // The given keys, then COUNT(*), SUM(m), MIN(s), MAX(s), AVG(m), MIN(m), MAX(f).
-AggregateSpec HandSpec(const std::vector<uint32_t>& keys) {
+// computed puts each key behind an expression with the same values; bit i of
+// computed_args does the same for aggregate i's argument.
+AggregateSpec HandSpec(const std::vector<uint32_t>& keys, bool computed = false, uint32_t computed_args = 0) {
     const InputLayout in = HandLayout();
     AggregateSpec spec;
     for (uint32_t k : keys) {
-        spec.keys.push_back(Col(k, in));
-        spec.out_types.push_back(in.slot_types[k]);
+        spec.keys.push_back(computed ? ComputedColumn(k, in) : Col(k, in));
+        spec.out_types.push_back(spec.keys.back()->Type());
     }
     const std::vector<std::pair<Func, int>> aggs = {{Func::COUNT, -1}, {Func::SUM, 2}, {Func::MIN, 1}, {Func::MAX, 1},
                                                     {Func::AVG, 2},    {Func::MIN, 2}, {Func::MAX, 3}};
-    for (const auto& a : aggs) {
-        spec.funcs.push_back(a.first);
-        spec.args.push_back(a.second < 0 ? nullptr : Col(static_cast<uint32_t>(a.second), in));
-        spec.out_types.push_back(AggregateOutputType(a.first, spec.args.back().get()));
+    for (size_t i = 0; i < aggs.size(); ++i) {
+        const auto c = static_cast<uint32_t>(aggs[i].second);
+        spec.funcs.push_back(aggs[i].first);
+        if (aggs[i].second < 0) {
+            spec.args.push_back(nullptr);
+        } else {
+            spec.args.push_back((computed_args >> i & 1) != 0 ? ComputedColumn(c, in) : Col(c, in));
+        }
+        spec.out_types.push_back(AggregateOutputType(aggs[i].first, spec.args.back().get()));
     }
     spec.global = keys.empty();
     return spec;
@@ -271,24 +308,36 @@ struct HandGroup {
     double max_f{0.0};
 };
 
+// How a hand-fed batch holds its strings: plain, one dictionary entry per row,
+// or shared entries (each distinct string once, after one no row uses).
+enum class Coding { PLAIN, ENTRY_PER_ROW, SHARED_ENTRIES };
+
+// The coding of a worker's batch: (worker, batch) -> coding.
+using CodingOf = std::function<Coding(size_t, size_t)>;
+
 // Feeds each worker's rows to its own local in batches, then reads the groups.
 // After each Consume the batch's string bytes are overwritten, as the scan's next morsel would.
 std::vector<HandGroup> RunHand(const std::vector<uint32_t>& keys, const std::vector<std::vector<HandRow>>& workers, uint32_t batch,
-                               bool dictionary, unsigned threads = 1, size_t* morsels = nullptr) {
-    auto made = MakeHashAggregate(HandSpec(keys));
+                               const CodingOf& coding_of, unsigned threads = 1, size_t* morsels = nullptr, bool computed = false,
+                               uint32_t computed_args = 0) {
+    auto made = MakeHashAggregate(HandSpec(keys, computed, computed_args));
     Sink& sink = *made.first;
     Source& source = *made.second;
     QueryContext ctx{nullptr, nullptr};
     ctx.threads = threads;
 
-    for (const auto& rows : workers) {
+    for (size_t w = 0; w < workers.size(); ++w) {
+        const std::vector<HandRow>& rows = workers[w];
         auto local = sink.MakeLocal();
         Batch b;
         ShapeBatch(b, HandLayout().slot_types);
         for (size_t at = 0; at < rows.size(); at += batch) {
             const auto n = static_cast<uint32_t>(std::min<size_t>(batch, rows.size() - at));
+            const Coding coding = coding_of(w, at / batch);
             std::vector<std::string> bytes;  // the batch's strings, wiped after Consume
             std::vector<StringRef> entries;
+            std::map<std::string, uint32_t> code_of;
+            if (coding == Coding::SHARED_ENTRIES) entries.push_back(StringRef{"never used", 10});  // no row's code
             b.Reset(n);
             for (uint32_t i = 0; i < n; ++i) bytes.push_back(rows[at + i].s);
             for (uint32_t i = 0; i < n; ++i) {
@@ -297,14 +346,17 @@ std::vector<HandGroup> RunHand(const std::vector<uint32_t>& keys, const std::vec
                 b.slots[2].I64()[i] = r.cents;
                 b.slots[3].F64()[i] = r.f;
                 const StringRef ref{bytes[i].data(), static_cast<uint32_t>(bytes[i].size())};
-                if (dictionary) {
+                if (coding == Coding::PLAIN) {
+                    b.slots[1].Str()[i] = ref;
+                } else if (coding == Coding::ENTRY_PER_ROW || code_of.find(bytes[i]) == code_of.end()) {
+                    code_of[bytes[i]] = static_cast<uint32_t>(entries.size());
                     b.slots[1].Codes()[i] = static_cast<uint32_t>(entries.size());
                     entries.push_back(ref);
                 } else {
-                    b.slots[1].Str()[i] = ref;
+                    b.slots[1].Codes()[i] = code_of[bytes[i]];
                 }
             }
-            if (dictionary) b.slots[1].SetDictionary(&entries);
+            if (coding != Coding::PLAIN) b.slots[1].SetDictionary(&entries);
             // Every third row is inactive, so the selection matters.
             if (n > 2) {
                 uint32_t kept = 0;
@@ -350,6 +402,13 @@ std::vector<HandGroup> RunHand(const std::vector<uint32_t>& keys, const std::vec
         }
     }
     return out;
+}
+
+// The same with every batch plain, or every batch one dictionary entry per row.
+std::vector<HandGroup> RunHand(const std::vector<uint32_t>& keys, const std::vector<std::vector<HandRow>>& workers, uint32_t batch,
+                               bool dictionary, unsigned threads = 1, size_t* morsels = nullptr) {
+    const Coding coding = dictionary ? Coding::ENTRY_PER_ROW : Coding::PLAIN;
+    return RunHand(keys, workers, batch, [coding](size_t, size_t) { return coding; }, threads, morsels);
 }
 
 using HandKey = std::pair<int64_t, std::string>;
@@ -849,6 +908,104 @@ TEST_F(ParallelHashAggregateTest, SumPastInt64) {
     EXPECT_EQ(Run("SELECT MAX(zv), COUNT(*) FROM z", ExecutionMode::PARALLEL).tuples.size(), 1u);
 }
 
+TEST_F(ParallelHashAggregateTest, BatchSumsNearInt64MaxStayExact) {
+    // For n active rows, q = INT64_MAX / n is the largest value
+    // whose n copies fit 64 bits.
+    // Batches of q (just fits), q + 1 (just doesn't), their negatives and INT64_MIN.
+    constexpr int64_t kMax = std::numeric_limits<int64_t>::max();
+    constexpr int64_t kMin = std::numeric_limits<int64_t>::min();
+    InputLayout in;
+    in.slot_of_column = {0, 1};
+    in.slot_types = {kBig, kBig};
+    in.slot_precision = {0, 0};
+    AggregateSpec spec;
+    spec.keys.push_back(Col(0, in));
+    spec.out_types.push_back(kBig);
+    for (const Func f : {Func::SUM, Func::AVG, Func::COUNT}) {
+        spec.funcs.push_back(f);
+        spec.args.push_back(f == Func::COUNT ? nullptr : Col(1, in));
+        spec.out_types.push_back(AggregateOutputType(f, spec.args.back().get()));
+    }
+    auto made = MakeHashAggregate(std::move(spec));
+    QueryContext ctx{nullptr, nullptr};
+
+    // One batch: `rows` rows, every `skip`-th inactive (0: none), value of(i) in group group_of(i).
+    std::map<int64_t, std::pair<__int128, int64_t>> want;  // group -> (sum, count)
+    const auto feed = [&](LocalState& local, uint32_t rows, uint32_t skip, const std::function<int64_t(uint32_t)>& group_of,
+                          const std::function<int64_t(uint32_t, uint32_t)>& of) {
+        Batch batch;
+        ShapeBatch(batch, in.slot_types);
+        batch.Reset(rows);
+        uint32_t active = 0;
+        for (uint32_t i = 0; i < rows; ++i) active += skip == 0 || i % skip != skip - 1 ? 1 : 0;
+        uint32_t kept = 0;
+        for (uint32_t i = 0; i < rows; ++i) {
+            batch.slots[0].I64()[i] = group_of(i);
+            if (skip != 0 && i % skip == skip - 1) {
+                batch.slots[1].I64()[i] = kMax;  // inactive rows never count
+                continue;
+            }
+            batch.slots[1].I64()[i] = of(i, active);
+            batch.sel.Data()[kept++] = static_cast<uint16_t>(i);
+            auto& w = want[group_of(i)];
+            w.first += batch.slots[1].I64()[i];
+            ++w.second;
+        }
+        if (skip != 0) batch.sel.Resize(kept);
+        made.first->Consume(batch, local);
+    };
+    const auto just_fits = [](uint32_t, uint32_t n) { return kMax / static_cast<int64_t>(n); };
+    const auto just_over = [](uint32_t, uint32_t n) {
+        const int64_t q = kMax / static_cast<int64_t>(n);
+        return q == kMax ? kMin : q + 1;  // one row: only INT64_MIN is past the bound
+    };
+    const auto one = [](int64_t g) { return [g](uint32_t) { return g; }; };
+
+    auto w0 = made.first->MakeLocal();
+    auto w1 = made.first->MakeLocal();
+    for (const auto& shape : std::vector<std::pair<uint32_t, uint32_t>>{{kBatchSize, 0}, {kBatchSize, 3}, {1000, 7}, {7, 0}, {1, 0}}) {
+        const uint32_t rows = shape.first;
+        const uint32_t skip = shape.second;
+        feed(*w0, rows, skip, one(1), just_fits);
+        feed(*w0, rows, skip, one(1), just_over);
+        feed(*w0, rows, skip, one(2), [](uint32_t, uint32_t n) { return -(kMax / static_cast<int64_t>(n)); });
+        feed(*w0, rows, skip, one(2), [](uint32_t, uint32_t n) { return -(kMax / static_cast<int64_t>(n)) - 1; });
+        // Three groups at once, signs alternating; one batch with INT64_MIN among them.
+        feed(*w1, rows, skip, [](uint32_t i) { return int64_t{3} + i % 3; }, [](uint32_t i, uint32_t n) { return (i % 2 == 0 ? 1 : -1) * (kMax / static_cast<int64_t>(n)); });
+        feed(*w1, rows, skip, [](uint32_t i) { return int64_t{3} + i % 3; }, [](uint32_t i, uint32_t n) { return i == 0 ? kMin : kMax / static_cast<int64_t>(n); });
+        feed(*w1, rows, skip, one(1), just_over);
+    }
+    made.first->Combine(std::move(w0));
+    made.first->Combine(std::move(w1));
+    made.first->Finalize(ctx);
+
+    made.second->Prepare(ctx);
+    std::map<int64_t, std::pair<__int128, int64_t>> got;
+    std::map<int64_t, double> got_avg;
+    auto out = made.second->MakeLocal();
+    Batch o;
+    for (size_t m = 0; m < made.second->MorselCount(); ++m) {
+        made.second->StartMorsel(m, *out);
+        while (made.second->NextBatch(*out, o)) {
+            for (uint32_t i = 0; i < o.Active(); ++i) {
+                const uint32_t r = o.sel[i];
+                got[o.slots[0].I64()[r]] = {o.slots[1].I128()[r], o.slots[3].I64()[r]};
+                got_avg[o.slots[0].I64()[r]] = o.slots[2].F64()[r];
+            }
+        }
+    }
+    ASSERT_EQ(got.size(), want.size());
+    for (const auto& w : want) {
+        const auto it = got.find(w.first);
+        ASSERT_NE(it, got.end()) << "group " << w.first;
+        EXPECT_EQ(Text(it->second.first), Text(w.second.first)) << "group " << w.first;
+        EXPECT_EQ(it->second.second, w.second.second) << "group " << w.first;
+        EXPECT_EQ(got_avg[w.first], DecimalToDouble(w.second.first, 0) / static_cast<double>(w.second.second)) << "group " << w.first;
+    }
+    EXPECT_GT(want[1].first, __int128{kMax});
+    EXPECT_LT(want[2].first, __int128{kMin});
+}
+
 //  AVG, MIN and MAX
 
 TEST_F(ParallelHashAggregateTest, AvgAndMinMaxMatchTupleMode) {
@@ -960,6 +1117,77 @@ TEST_F(ParallelHashAggregateTest, StringKeysOutliveMorsel) {
     for (const bool dictionary : {false, true}) {
         EXPECT_EQ(HandDifference(RunHand({0, 1}, workers, 1000, dictionary), ref), "") << dictionary;
         EXPECT_EQ(HandDifference(RunHand({1}, {workers[0]}, 1000, dictionary), by_s_ref), "") << dictionary;
+    }
+}
+
+TEST_F(ParallelHashAggregateTest, DictionaryAndPlainKeysGroupAlike) {
+    // A few strings, so a shared dictionary is far smaller than a batch.
+    const std::vector<std::vector<HandRow>> workers = {HandRows(6100, 40, 41), HandRows(4300, 40, 42), HandRows(6100, 40, 41)};
+    const Coding cycle[] = {Coding::PLAIN, Coding::SHARED_ENTRIES, Coding::ENTRY_PER_ROW, Coding::SHARED_ENTRIES};
+    const CodingOf mixed = [&cycle](size_t, size_t b) { return cycle[b % 4]; };
+    const CodingOf by_worker = [](size_t w, size_t) { return w == 1 ? Coding::PLAIN : Coding::SHARED_ENTRIES; };
+
+    // Every coding in one local; then plain and coded locals merging, keys in either order.
+    for (const std::vector<uint32_t>& keys : {std::vector<uint32_t>{1}, std::vector<uint32_t>{0, 1}, std::vector<uint32_t>{1, 0}}) {
+        const auto one_ref = HandReference({workers[0]}, 1000, keys);
+        const auto ref = HandReference(workers, 1000, keys);
+        EXPECT_EQ(HandDifference(RunHand(keys, {workers[0]}, 1000, mixed), one_ref), "") << keys.size() << " keys, first " << keys[0];
+        EXPECT_EQ(HandDifference(RunHand(keys, workers, 1000, mixed, 4), ref), "") << keys.size() << " keys, first " << keys[0];
+        EXPECT_EQ(HandDifference(RunHand(keys, workers, 1000, by_worker), ref), "") << keys.size() << " keys, first " << keys[0];
+        EXPECT_EQ(HandDifference(RunHand(keys, workers, 1000, by_worker, 16), ref), "") << keys.size() << " keys, first " << keys[0];
+    }
+}
+
+TEST_F(ParallelHashAggregateTest, ComputedKeysGroupLikeColumns) {
+    // Bare columns are read in place; a computed key is evaluated.
+    Batch b;
+    ShapeBatch(b, HandLayout().slot_types);
+    b.Reset(1);
+    const AggregateSpec plain = HandSpec({0, 1});
+    const AggregateSpec computed = HandSpec({0, 1}, true);
+    for (size_t k = 0; k < 2; ++k) {
+        EXPECT_EQ(plain.keys[k]->Direct(b), &b.slots[k]) << k;
+        EXPECT_EQ(computed.keys[k]->Direct(b), nullptr) << k;
+        EXPECT_EQ(ArrayOf(computed.keys[k]->Type()), ArrayOf(plain.keys[k]->Type())) << k;
+    }
+
+    // The same groups either way, plain and coded strings, keys in either order.
+    const std::vector<std::vector<HandRow>> workers = {HandRows(6100, 40, 43), HandRows(4300, 300, 44)};
+    const Coding cycle[] = {Coding::PLAIN, Coding::SHARED_ENTRIES, Coding::ENTRY_PER_ROW};
+    const CodingOf mixed = [&cycle](size_t, size_t batch) { return cycle[batch % 3]; };
+    for (const std::vector<uint32_t>& keys : {std::vector<uint32_t>{1}, std::vector<uint32_t>{0, 1}, std::vector<uint32_t>{1, 0}}) {
+        const auto ref = HandReference(workers, 1000, keys);
+        EXPECT_EQ(HandDifference(RunHand(keys, workers, 1000, mixed, 1, nullptr, true), ref), "") << keys.size() << " keys, first " << keys[0];
+        EXPECT_EQ(HandDifference(RunHand(keys, workers, 1000, mixed, 16, nullptr, true), ref), "") << keys.size() << " keys, first " << keys[0];
+    }
+}
+
+TEST_F(ParallelHashAggregateTest, ComputedArgumentsBesideBareOnes) {
+    // The mask makes the odd arguments computed and the rest bare columns.
+    Batch b;
+    ShapeBatch(b, HandLayout().slot_types);
+    b.Reset(1);
+    const AggregateSpec odd = HandSpec({1}, false, 0b0101010);
+    for (size_t a = 1; a < odd.args.size(); ++a) EXPECT_EQ(odd.args[a]->Direct(b) == nullptr, a % 2 == 1) << a;
+
+    // Money near NUMERIC(15,2)'s top, so each group's exact sum passes INT64_MAX.
+    std::vector<std::vector<HandRow>> workers = {HandRows(15000, 2, 51), HandRows(15000, 2, 52)};
+    std::mt19937 rng(53);
+    for (auto& rows : workers) {
+        for (HandRow& r : rows) r.cents = 999999999999999 - static_cast<int64_t>(rng() % 100000);
+    }
+    const Coding cycle[] = {Coding::PLAIN, Coding::SHARED_ENTRIES, Coding::ENTRY_PER_ROW};
+    const CodingOf mixed = [&cycle](size_t, size_t batch) { return cycle[batch % 3]; };
+
+    // Each argument computed in one spec and bare in another, beside the opposite kind.
+    for (const std::vector<uint32_t>& keys : {std::vector<uint32_t>{1}, std::vector<uint32_t>{0, 1}, std::vector<uint32_t>{}}) {
+        const auto ref = HandReference(workers, kBatchSize, keys);
+        for (const auto& group : ref) ASSERT_GT(group.second.sum, __int128{std::numeric_limits<int64_t>::max()});
+        for (const uint32_t mask : {0u, 0b0101010u, 0b1010100u, 0b1111110u}) {
+            const std::string at = std::to_string(keys.size()) + " keys, mask " + std::to_string(mask);
+            EXPECT_EQ(HandDifference(RunHand(keys, workers, kBatchSize, mixed, 1, nullptr, false, mask), ref), "") << at;
+            EXPECT_EQ(HandDifference(RunHand(keys, workers, kBatchSize, mixed, 16, nullptr, false, mask), ref), "") << at;
+        }
     }
 }
 
@@ -1217,6 +1445,110 @@ TEST_F(ParallelHashAggregateTest, DistinctKeysWithOneHashStayApart) {
         const std::map<Key, std::pair<int64_t, int64_t>> want = {{a, {3, a[1]}}, {b, {3, b[1]}}, {c, {2, c[1]}}};
         EXPECT_EQ(groups, want) << (reversed ? "reversed" : "in order");
     }
+}
+
+TEST_F(ParallelHashAggregateTest, GroupsNumberedInFirstSeenOrder) {
+    // a, b and c hash alike (as above);
+    // b and c meet a's group from an earlier batch.
+    using detail::FoldKey;
+    using detail::kKeySeed;
+    using Key = std::array<int64_t, 3>;
+    const auto solve = [](uint64_t before, uint64_t want_before, int64_t want_key) {
+        return static_cast<int64_t>((want_before ^ (static_cast<uint64_t>(want_key) + kKeySeed) ^ before) - kKeySeed);
+    };
+    const Key a{1, 2, 5};
+    const Key b{1, 7, solve(FoldKey(FoldKey(0, 1), 7), FoldKey(FoldKey(0, 1), 2), 5)};
+    const Key c{3, solve(FoldKey(0, 3), FoldKey(0, 1), 2), 5};
+    const auto plain = [](int64_t k) { return Key{k, -k, 0}; };
+
+    // Batch 2 adds past 1,024 groups, so the index grows partway through it.
+    std::vector<std::vector<Key>> batches(3);
+    batches[0].push_back(a);
+    for (int64_t k = 0; k < 1000; ++k) batches[0].push_back(plain(k));
+    batches[0].push_back(a);
+    batches[1] = {b, c, a};
+    for (int64_t k = 500; k < 1500; ++k) batches[1].push_back(plain(k));
+    batches[1].push_back(b);
+    batches[1].push_back(c);
+    for (int64_t k = 1500; k <= 2000; ++k) batches[1].push_back(plain(k));
+    batches[2] = {c, b, a, plain(3000), plain(3000), b, plain(7), plain(3001), a, plain(3002), c};
+    // 2,005 groups so far; 43 more fill the 4,096-slot index to half,
+    // then a known key comes.
+    batches.emplace_back();
+    for (int64_t k = 4000; k < 4043; ++k) batches[3].push_back(plain(k));
+    batches[3].push_back(a);
+
+    InputLayout in;
+    in.slot_of_column = {0, 1, 2};
+    in.slot_types = {kBig, kBig, kBig};
+    in.slot_precision = {0, 0, 0};
+    const auto count_by_key = [&in] {
+        AggregateSpec spec;
+        for (uint32_t k = 0; k < 3; ++k) spec.keys.push_back(Col(k, in));
+        spec.funcs = {Func::COUNT};
+        spec.args.push_back(nullptr);
+        spec.out_types = {kBig, kBig, kBig, kBig};
+        return MakeHashAggregate(std::move(spec));
+    };
+    auto made = count_by_key();
+    auto single = count_by_key();  // the same rows, one row per Consume
+    QueryContext ctx{nullptr, nullptr};
+
+    // Batch 3 skips every other row; the reference counts only the active ones.
+    std::vector<Key> order;
+    std::map<Key, int64_t> want;
+    auto local = made.first->MakeLocal();
+    auto one_local = single.first->MakeLocal();
+    for (size_t at = 0; at < batches.size(); ++at) {
+        const std::vector<Key>& rows = batches[at];
+        Batch batch;
+        ShapeBatch(batch, in.slot_types);
+        batch.Reset(static_cast<uint32_t>(rows.size()));
+        uint32_t kept = 0;
+        for (size_t i = 0; i < rows.size(); ++i) {
+            for (size_t k = 0; k < 3; ++k) batch.slots[k].I64()[i] = rows[i][k];
+            if (at == 2 && i % 2 == 1) continue;
+            batch.sel.Data()[kept++] = static_cast<uint16_t>(i);
+            if (want[rows[i]]++ == 0) order.push_back(rows[i]);
+            Batch one;
+            ShapeBatch(one, in.slot_types);
+            one.Reset(1);
+            for (size_t k = 0; k < 3; ++k) one.slots[k].I64()[0] = rows[i][k];
+            single.first->Consume(one, *one_local);
+        }
+        batch.sel.Resize(kept);
+        made.first->Consume(batch, *local);
+
+        // The table counts the same bytes (groups, index slots) as one row at a time,
+        // so it spills at the same batches. Batch 4 needs the end-of-batch grow.
+        EXPECT_EQ(AggregateCountedBytesForTest(*local), AggregateCountedBytesForTest(*one_local)) << "after batch " << at + 1;
+    }
+    made.first->Combine(std::move(local));
+    made.first->Finalize(ctx);
+
+    // One table, under the merge threshold: groups come out in the order first seen.
+    made.second->Prepare(ctx);
+    std::vector<Key> got_order;
+    std::map<Key, int64_t> got;
+    auto out_local = made.second->MakeLocal();
+    Batch o;
+    for (size_t m = 0; m < made.second->MorselCount(); ++m) {
+        made.second->StartMorsel(m, *out_local);
+        while (made.second->NextBatch(*out_local, o)) {
+            for (uint32_t i = 0; i < o.Active(); ++i) {
+                const uint32_t r = o.sel[i];
+                const Key key{o.slots[0].I64()[r], o.slots[1].I64()[r], o.slots[2].I64()[r]};
+                got_order.push_back(key);
+                got[key] += o.slots[3].I64()[r];
+            }
+        }
+    }
+    EXPECT_EQ(got, want);
+    EXPECT_TRUE(got_order == order) << got_order.size() << " groups, expected " << order.size();
+    EXPECT_EQ(want.size(), 2048u);
+    EXPECT_EQ(want[a], 6);
+    EXPECT_EQ(want[b], 2);
+    EXPECT_EQ(want[c], 4);
 }
 
 TEST_F(ParallelHashAggregateTest, DoubleMinMaxSameInAnyMergeOrder) {

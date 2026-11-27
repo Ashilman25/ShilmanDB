@@ -108,6 +108,12 @@ inline bool SameDouble(double a, double b) {
     return a == b || (std::isnan(a) && std::isnan(b));
 }
 
+// Group key equality for each value array; strings compare by bytes.
+inline bool SameKey(int64_t a, int64_t b) { return a == b; }
+inline bool SameKey(__int128 a, __int128 b) { return a == b; }
+inline bool SameKey(double a, double b) { return SameDouble(a, b); }
+inline bool SameKey(StringRef a, StringRef b) { return View(a) == View(b); }
+
 // Of two equal DOUBLE keys a group keeps the smaller in a total order:
 // -0.0 over +0.0, the NaN with the smallest bits. Any merge order agrees.
 inline void KeepSmallerKey(double& kept, double seen) {
@@ -115,7 +121,8 @@ inline void KeepSmallerKey(double& kept, double seen) {
 }
 
 // Folds key k of every active row into hashes[0..n).
-void HashKey(const Vector& v, const Selection& sel, uint32_t n, uint64_t* hashes) {
+// A small dictionary's entries are hashed once each.
+void HashKey(const Vector& v, const Selection& sel, uint32_t n, uint64_t* hashes, std::vector<uint64_t>& entry_hashes) {
     switch (ArrayOf(v.Type())) {
         case ValueArray::I64: {
             const int64_t* a = v.I64();
@@ -133,6 +140,11 @@ void HashKey(const Vector& v, const Selection& sel, uint32_t n, uint64_t* hashes
             break;
         }
         case ValueArray::STR:
+            if (detail::HashEntries(v, n, entry_hashes)) {
+                const uint32_t* codes = v.Codes();
+                for (uint32_t i = 0; i < n; ++i) hashes[i] = FoldKey(hashes[i], entry_hashes[codes[sel[i]]]);
+                break;
+            }
             for (uint32_t i = 0; i < n; ++i) hashes[i] = FoldKey(hashes[i], HashBytes(View(v.StrAt(sel[i]))));
             break;
     }
@@ -351,26 +363,80 @@ uint32_t FindOrAdd(GroupTable& t, uint64_t h, Equal equal, Add add, bool& added)
 }
 
 // True when t's group g has the keys of a batch row.
-bool KeysMatchRow(const GroupTable& t, uint32_t g, const std::vector<Vector>& keys, uint32_t row) {
+bool KeysMatchRow(const GroupTable& t, uint32_t g, const std::vector<const Vector*>& keys, uint32_t row) {
     for (size_t k = 0; k < keys.size(); ++k) {
         const ColumnBuffer& b = t.keys[k];
-        const Vector& v = keys[k];
+        const Vector& v = *keys[k];
         switch (ArrayOf(v.Type())) {
             case ValueArray::I64:
-                if (b.i64[g] != v.I64()[row]) return false;
+                if (!SameKey(b.i64[g], v.I64()[row])) return false;
                 break;
             case ValueArray::I128:
-                if (b.i128[g] != v.I128()[row]) return false;
+                if (!SameKey(b.i128[g], v.I128()[row])) return false;
                 break;
             case ValueArray::F64:
-                if (!SameDouble(b.f64[g], v.F64()[row])) return false;
+                if (!SameKey(b.f64[g], v.F64()[row])) return false;
                 break;
             case ValueArray::STR:
-                if (View(b.str[g]) != View(v.StrAt(row))) return false;
+                if (!SameKey(b.str[g], v.StrAt(row))) return false;
                 break;
         }
     }
     return true;
+}
+
+// A row whose group isn't known yet.
+constexpr uint32_t kNoGroup = std::numeric_limits<uint32_t>::max();
+
+// For each of n hashes, the first group in t with that hash, else kNoGroup.
+// Only reads t, so each row's walk is independent of the others.
+void FirstWithHash(const GroupTable& t, const uint64_t* hashes, uint32_t n, uint32_t* group) {
+    const size_t mask = t.index.size() - 1;
+    for (uint32_t i = 0; i < n; ++i) {
+        const uint64_t h = hashes[i];
+        uint32_t found = kNoGroup;
+        for (size_t slot = h & mask;; slot = (slot + 1) & mask) {
+            const uint32_t entry = t.index[slot];
+            if (entry == 0) break;
+            if (t.hashes[entry - 1] == h) {
+                found = entry - 1;
+                break;
+            }
+        }
+        group[i] = found;
+    }
+}
+
+// Sets group[i] to kNoGroup where same(group[i], i) is false.
+template <typename Same>
+void DropUnless(uint32_t n, uint32_t* group, Same same) {
+    for (uint32_t i = 0; i < n; ++i) {
+        if (group[i] != kNoGroup && !same(group[i], i)) group[i] = kNoGroup;
+    }
+}
+
+// Drops each row whose key in v differs from its group's key in b.
+void DropKeyMismatches(const ColumnBuffer& b, const Vector& v, const Selection& sel, uint32_t n, uint32_t* group) {
+    switch (ArrayOf(v.Type())) {
+        case ValueArray::I64: {
+            const int64_t* x = v.I64();
+            DropUnless(n, group, [&](uint32_t g, uint32_t i) { return SameKey(b.i64[g], x[sel[i]]); });
+            break;
+        }
+        case ValueArray::I128: {
+            const __int128* x = v.I128();
+            DropUnless(n, group, [&](uint32_t g, uint32_t i) { return SameKey(b.i128[g], x[sel[i]]); });
+            break;
+        }
+        case ValueArray::F64: {
+            const double* x = v.F64();
+            DropUnless(n, group, [&](uint32_t g, uint32_t i) { return SameKey(b.f64[g], x[sel[i]]); });
+            break;
+        }
+        case ValueArray::STR:
+            DropUnless(n, group, [&](uint32_t g, uint32_t i) { return SameKey(b.str[g], v.StrAt(sel[i])); });
+            break;
+    }
 }
 
 // True when t's group g and from's group h have the same keys.
@@ -380,16 +446,16 @@ bool KeysMatchGroup(const GroupTable& t, uint32_t g, const GroupTable& from, uin
         const ColumnBuffer& b = from.keys[k];
         switch (ArrayOf(shape.keys[k])) {
             case ValueArray::I64:
-                if (a.i64[g] != b.i64[h]) return false;
+                if (!SameKey(a.i64[g], b.i64[h])) return false;
                 break;
             case ValueArray::I128:
-                if (a.i128[g] != b.i128[h]) return false;
+                if (!SameKey(a.i128[g], b.i128[h])) return false;
                 break;
             case ValueArray::F64:
-                if (!SameDouble(a.f64[g], b.f64[h])) return false;
+                if (!SameKey(a.f64[g], b.f64[h])) return false;
                 break;
             case ValueArray::STR:
-                if (View(a.str[g]) != View(b.str[h])) return false;
+                if (!SameKey(a.str[g], b.str[h])) return false;
                 break;
         }
     }
@@ -689,9 +755,11 @@ struct MergedGroups {
 // One worker's groups and its scratch for a batch.
 struct AggLocal : LocalState {
     GroupTable table;
-    std::vector<Vector> key_values;  // one batch's keys
+    std::vector<Vector> key_values;  // one batch's keys, for keys that aren't bare columns
+    std::vector<const Vector*> key_vectors;  // per key: its batch vector, or its key_values
     std::vector<Vector> arg_values;  // one batch's arguments, per aggregate
     std::vector<uint64_t> hashes;    // per active row
+    std::vector<uint64_t> entry_hashes;  // a string key's dictionary entries, hashed
     std::vector<uint32_t> group_of;  // per active row
     std::vector<uint32_t> pending;   // groups holding a batch's MIN / MAX string
     EvalScratch scratch;
@@ -804,6 +872,7 @@ private:
         auto local = std::make_unique<AggLocal>();
         local->table = MakeTable(*shape_);
         for (const VType& t : shape_->keys) local->key_values.emplace_back(t);
+        local->key_vectors.assign(shape_->keys.size(), nullptr);
         for (size_t a = 0; a < shape_->aggs.size(); ++a) local->arg_values.emplace_back(spec_.args[a] ? spec_.args[a]->Type() : VType{});
         local->hashes.resize(kBatchSize);
         local->group_of.assign(kBatchSize, 0);
@@ -826,6 +895,7 @@ private:
         for (size_t i = 0; i < parts_.size(); ++i) {
             if (left[i] > 0) stuck.push_back(i);
         }
+        
         std::stable_sort(stuck.begin(), stuck.end(), [this](size_t a, size_t b) { return Part(a).reservation.Bytes() > Part(b).reservation.Bytes(); });
         for (size_t next = 0; next < stuck.size(); ++next) {
             // The last spill freed room, so the tables left may pool now.
@@ -1016,27 +1086,46 @@ private:
         if (ctx.spill != nullptr) ctx.spill->partitions += with_runs;
     }
 
-    // Evaluates the keys, hashes them, and finds or adds each active row's group.
+    // Finds each row's group a batch at a time; leftover rows go one by one,
+    // so groups are numbered, and the index grows, as one row at a time would.
     void AssignGroups(const Batch& in, AggLocal& l, uint32_t n) const {
-        for (size_t k = 0; k < spec_.keys.size(); ++k) spec_.keys[k]->Evaluate(in, in.sel, l.key_values[k], l.scratch);
+        for (size_t k = 0; k < spec_.keys.size(); ++k) l.key_vectors[k] = &ValuesFor(*spec_.keys[k], in, l.key_values[k], l.scratch);
         std::fill(l.hashes.begin(), l.hashes.begin() + n, 0);
-        for (const Vector& v : l.key_values) HashKey(v, in.sel, n, l.hashes.data());
+        for (const Vector* v : l.key_vectors) HashKey(*v, in.sel, n, l.hashes.data(), l.entry_hashes);
 
         GroupTable& t = l.table;
         const GroupShape& shape = *shape_;
+        uint32_t* group = l.group_of.data();
+        if ((t.size + 1) * 2 > t.index.size()) Reserve(t, t.size + 1);  // as the first row's FindOrAdd would
+        FirstWithHash(t, l.hashes.data(), n, group);
+        for (size_t k = 0; k < l.key_vectors.size(); ++k) DropKeyMismatches(t.keys[k], *l.key_vectors[k], in.sel, n, group);
+        for (size_t k : shape.double_keys) {
+            const double* x = l.key_vectors[k]->F64();
+            for (uint32_t i = 0; i < n; ++i) {
+                if (group[i] != kNoGroup) KeepSmallerKey(t.keys[k].f64[group[i]], x[in.sel[i]]);
+            }
+        }
+
+        uint32_t last_added = n;  // n while nothing was added
         for (uint32_t i = 0; i < n; ++i) {
+            if (group[i] != kNoGroup) continue;
             const uint32_t row = in.sel[i];
             bool added = false;
-            l.group_of[i] = FindOrAdd(
-                t, l.hashes[i], [&](uint32_t g) { return KeysMatchRow(t, g, l.key_values, row); },
+            group[i] = FindOrAdd(
+                t, l.hashes[i], [&](uint32_t g) { return KeysMatchRow(t, g, l.key_vectors, row); },
                 [&] {
-                    for (size_t k = 0; k < l.key_values.size(); ++k) PushRow(t.keys[k], l.key_values[k], row, t.arena);
+                    for (size_t k = 0; k < l.key_vectors.size(); ++k) PushRow(t.keys[k], *l.key_vectors[k], row, t.arena);
                     AddFreshStates(t, shape);
                 },
                 added);
-            if (added) continue;
-            for (size_t k : shape.double_keys) KeepSmallerKey(t.keys[k].f64[l.group_of[i]], l.key_values[k].F64()[row]);
+            if (added) {
+                last_added = i;
+                continue;
+            }
+            for (size_t k : shape.double_keys) KeepSmallerKey(t.keys[k].f64[group[i]], l.key_vectors[k]->F64()[row]);
         }
+        // A later row's FindOrAdd would grow the index after the last add.
+        if (last_added + 1 < n && (t.size + 1) * 2 > t.index.size()) Reserve(t, t.size + 1);
     }
 
     // Folds one batch into aggregate a's states.
@@ -1534,6 +1623,13 @@ void OffsetCountsForTest(Sink& aggregate_sink, int64_t offset) {
     auto* sink = dynamic_cast<AggregateSink*>(&aggregate_sink);
     if (sink == nullptr) throw DatabaseException("OffsetCountsForTest needs an aggregate's sink");
     sink->OffsetCounts(offset);
+}
+
+// What Recount left after the state's last batch.
+size_t AggregateCountedBytesForTest(const LocalState& sink_local) {
+    const auto* local = dynamic_cast<const AggLocal*>(&sink_local);
+    if (local == nullptr) throw DatabaseException("AggregateCountedBytesForTest needs an aggregate sink's state");
+    return local->counted;
 }
 
 // Read once per aggregate, by its source's Prepare.
