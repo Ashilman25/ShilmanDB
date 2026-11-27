@@ -556,21 +556,34 @@ size_t BufferPoolManager::FetchPagesConcurrent(const page_id_t* ids, size_t n, P
         throw;
     }
 
-    // Read the misses with the latch released, stopping at the first failure
+    // Read the misses with the latch released, each run of adjacent ids in one call.
+    // A failed run fails at its first page, and nothing after it is read.
     const size_t walked = pinned.size();
     size_t failed = walked;
     std::exception_ptr error;
     if (any_miss) {
         lock.unlock();
-        for (size_t i = 0; i < walked; ++i) {
-            if (!pinned[i].miss) continue;
-            try {
-                disk_manager_->ReadPage(ids[i], pages_[pinned[i].frame].GetData());
-            } catch (...) {
-                error = std::current_exception();
-                failed = i;
-                break;
+        // INVALID_PAGE_ID + 1 wraps to page 0, so a run never takes it in
+        auto follows = [&](size_t i) {
+            return pinned[i].miss && ids[i - 1] != INVALID_PAGE_ID && ids[i] != INVALID_PAGE_ID && ids[i] == ids[i - 1] + 1;
+        };
+        size_t i = 0;  // the run being read
+        try {
+            std::vector<char*> frames(walked);
+            for (size_t k = 0; k < walked; ++k) frames[k] = pages_[pinned[k].frame].GetData();
+            while (i < walked) {
+                if (!pinned[i].miss) {
+                    ++i;
+                    continue;
+                }
+                size_t end = i + 1;
+                while (end < walked && follows(end)) ++end;
+                disk_manager_->ReadPages(ids[i], end - i, &frames[i]);
+                i = end;
             }
+        } catch (...) {
+            error = std::current_exception();
+            failed = i;
         }
         lock = Latch();
     }

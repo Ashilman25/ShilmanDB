@@ -3,6 +3,7 @@
 #include <unistd.h>
 #include "storage/disk_manager.hpp"
 #include "common/exception.hpp"
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstring>
@@ -393,6 +394,115 @@ TEST_F(DiskManagerTest, ObserverSeesWritesAndSyncsInOrder) {
     dm.WritePage(2, buf.data());
     dm.Sync();
     EXPECT_EQ(observer.events, expected);
+}
+
+namespace {
+
+// The byte at offset i of page pid, different on every page
+char PatternByte(page_id_t pid, size_t i) {
+    return static_cast<char>((pid * 131u + i * 7u) & 0xFFu);
+}
+
+// Writes count pages, each filled with its own pattern
+void WritePatternPages(DiskManager& dm, page_id_t count) {
+    std::vector<char> page(PAGE_SIZE);
+    for (page_id_t pid = 0; pid < count; ++pid) {
+        for (size_t i = 0; i < PAGE_SIZE; ++i) page[i] = PatternByte(pid, i);
+        dm.WritePage(dm.AllocatePage(), page.data());
+    }
+}
+
+// Reads n pages from first with ReadPages, then checks each against ReadPage
+void ExpectReadPagesMatches(DiskManager& dm, page_id_t first, size_t n) {
+    SCOPED_TRACE("first " + std::to_string(first) + ", n " + std::to_string(n));
+    std::vector<std::vector<char>> frames(n, std::vector<char>(PAGE_SIZE, 0x7F));
+    std::vector<char*> ptrs;
+    for (auto& frame : frames) ptrs.push_back(frame.data());
+
+    const auto before = dm.GetReadStats();
+    const uint64_t batches_before = dm.GetBatchReadCount();
+    dm.ReadPages(first, n, ptrs.data());
+    EXPECT_EQ(dm.GetReadStats().reads - before.reads, n);
+    EXPECT_EQ(dm.GetBatchReadCount() - batches_before, 1u);
+
+    std::vector<char> one(PAGE_SIZE);
+    for (size_t i = 0; i < n; ++i) {
+        dm.ReadPage(first + static_cast<page_id_t>(i), one.data());
+        EXPECT_EQ(std::memcmp(frames[i].data(), one.data(), PAGE_SIZE), 0) << "page " << first + i;
+    }
+}
+
+}  // namespace
+
+TEST_F(DiskManagerTest, ReadPagesMatchesReadPage) {
+    constexpr page_id_t kPages = 40;
+    DiskManager dm(test_file_);
+    WritePatternPages(dm, kPages);
+
+    ExpectReadPagesMatches(dm, 3, 1);
+    ExpectReadPagesMatches(dm, 7, 2);
+    ExpectReadPagesMatches(dm, 20, 16);
+    EXPECT_GT(dm.GetReadStats().time, std::chrono::nanoseconds{0});
+
+    // A run past the end of the file reads zeros there
+    ExpectReadPagesMatches(dm, kPages - 2, 6);
+    std::vector<char> frame(PAGE_SIZE, 0x7F);
+    char* one_frame[] = {frame.data()};
+    dm.ReadPages(kPages + 3, 1, one_frame);
+    EXPECT_TRUE(std::all_of(frame.begin(), frame.end(), [](char c) { return c == 0; }));
+
+    // A last page cut in half reads its first half, then zeros
+    std::filesystem::resize_file(test_file_, (kPages - 1) * PAGE_SIZE + PAGE_SIZE / 2);
+    ExpectReadPagesMatches(dm, kPages - 3, 4);
+    std::vector<std::vector<char>> frames(2, std::vector<char>(PAGE_SIZE, 0x7F));
+    char* two_frames[] = {frames[0].data(), frames[1].data()};
+    dm.ReadPages(kPages - 1, 2, two_frames);
+    for (size_t i = 0; i < PAGE_SIZE; ++i) {
+        const char expected = i < PAGE_SIZE / 2 ? PatternByte(kPages - 1, i) : 0;
+        ASSERT_EQ(frames[0][i], expected) << "byte " << i;
+        ASSERT_EQ(frames[1][i], 0) << "byte " << i;
+    }
+
+    // INVALID_PAGE_ID throws, even as the end of a run; nothing is counted
+    const auto reads = dm.GetReadStats().reads;
+    const uint64_t batches = dm.GetBatchReadCount();
+    EXPECT_THROW(dm.ReadPages(INVALID_PAGE_ID, 1, one_frame), IOException);
+    EXPECT_THROW(dm.ReadPages(INVALID_PAGE_ID - 1, 2, two_frames), IOException);
+    EXPECT_EQ(dm.GetReadStats().reads, reads);
+    EXPECT_EQ(dm.GetBatchReadCount(), batches);
+
+    // No pages is nothing at all
+    dm.ReadPages(0, 0, nullptr);
+    EXPECT_EQ(dm.GetReadStats().reads, reads);
+    EXPECT_EQ(dm.GetBatchReadCount(), batches);
+
+    dm.ResetReadStats();
+    EXPECT_EQ(dm.GetBatchReadCount(), 0u);
+}
+
+TEST_F(DiskManagerTest, ReadPagesSplitsLongRuns) {
+    constexpr page_id_t kPages = 1030;  // more than IOV_MAX, 1024 on macOS and Linux
+    DiskManager dm(test_file_);
+    WritePatternPages(dm, kPages);
+    ExpectReadPagesMatches(dm, 0, kPages);
+}
+
+TEST_F(DiskManagerTest, ReadPagesPenaltyCoversEachPage) {
+    using namespace std::chrono_literals;
+    DiskManager dm(test_file_);
+    WritePatternPages(dm, 4);
+    dm.SetReadPenalty(200us);
+    dm.ResetReadStats();
+
+    std::vector<std::vector<char>> frames(4, std::vector<char>(PAGE_SIZE));
+    char* ptrs[] = {frames[0].data(), frames[1].data(), frames[2].data(), frames[3].data()};
+    const auto start = std::chrono::steady_clock::now();
+    dm.ReadPages(0, 4, ptrs);
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+
+    EXPECT_GE(elapsed, 800us);
+    EXPECT_GE(dm.GetReadStats().time, 800us);
+    EXPECT_EQ(dm.GetReadStats().reads, 4u);
 }
 
 TEST_F(DiskManagerTest, GetFileBytesCountsPartialPage) {

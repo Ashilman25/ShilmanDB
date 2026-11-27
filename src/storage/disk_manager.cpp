@@ -2,9 +2,12 @@
 #include "common/exception.hpp"
 #include <cerrno>
 #include <chrono>
+#include <climits>
 #include <cstring>
 #include <fcntl.h>
+#include <string>
 #include <sys/stat.h>
+#include <sys/uio.h>
 #include <unistd.h>
 
 namespace shilmandb {
@@ -13,6 +16,19 @@ namespace {
 
 constexpr off_t PageOffset(page_id_t page_id) {
     return static_cast<off_t>(page_id) * static_cast<off_t>(PAGE_SIZE);
+}
+
+// The most buffers one preadv takes
+#ifdef IOV_MAX
+constexpr int kMaxIov = IOV_MAX;
+#else
+constexpr int kMaxIov = 1024;
+#endif
+
+// "page 5" or "pages 5 to 20", for error messages
+std::string PageRange(page_id_t first, size_t n) {
+    if (n == 1) return "page " + std::to_string(first);
+    return "pages " + std::to_string(first) + " to " + std::to_string(first + static_cast<page_id_t>(n - 1));
 }
 
 }  // namespace
@@ -77,6 +93,63 @@ void DiskManager::ReadPage(page_id_t page_id, char* page_data) {
     const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start);
     read_count_.fetch_add(1, std::memory_order_relaxed);
     read_nanos_.fetch_add(static_cast<uint64_t>(elapsed.count()), std::memory_order_relaxed);
+}
+
+// Fills the frames in order; after a short read it carries on mid-page
+void DiskManager::ReadPages(page_id_t first, size_t n, char* const* frames) {
+    if (n == 0) {
+        return;
+    }
+    // INVALID_PAGE_ID + 1 wraps to page 0, so a run may not reach it
+    if (first == INVALID_PAGE_ID || n > static_cast<size_t>(INVALID_PAGE_ID - first)) {
+        throw IOException("Cannot read INVALID_PAGE_ID");
+    }
+
+    const auto start = std::chrono::steady_clock::now();
+    const size_t total = n * PAGE_SIZE;
+    size_t done = 0;  // bytes read so far, across every frame
+    iovec iov[kMaxIov];
+    while (done < total) {
+        size_t page = done / PAGE_SIZE;
+        size_t from = done % PAGE_SIZE;
+        int count = 0;
+        for (; page < n && count < kMaxIov; ++page, ++count) {
+            iov[count].iov_base = frames[page] + from;
+            iov[count].iov_len = PAGE_SIZE - from;
+            from = 0;
+        }
+
+        auto got = ::preadv(fd_, iov, count, PageOffset(first) + static_cast<off_t>(done));
+        if (got < 0 && errno == EINTR) {
+            continue;
+        }
+        if (got < 0) {
+            const int err = errno;
+            throw IOException("Failed to read " + PageRange(first, n) + ": " + std::strerror(err));
+        }
+        if (got == 0) {
+            break;  // end of file
+        }
+        done += static_cast<size_t>(got);
+    }
+
+    // anything past the end of the file reads as zeros
+    for (size_t page = done / PAGE_SIZE; page < n; ++page) {
+        const size_t from = page == done / PAGE_SIZE ? done % PAGE_SIZE : 0;
+        std::memset(frames[page] + from, 0, PAGE_SIZE - from);
+    }
+
+    // busy-wait so the call lasts at least the penalty for each page
+    if (read_penalty_ > std::chrono::microseconds{0}) {
+        const auto wait = read_penalty_ * static_cast<std::chrono::microseconds::rep>(n);
+        while (std::chrono::steady_clock::now() - start < wait) {
+        }
+    }
+
+    const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start);
+    read_count_.fetch_add(n, std::memory_order_relaxed);
+    read_nanos_.fetch_add(static_cast<uint64_t>(elapsed.count()), std::memory_order_relaxed);
+    batch_reads_.fetch_add(1, std::memory_order_relaxed);
 }
 
 void DiskManager::SetDirectIO(bool on) {

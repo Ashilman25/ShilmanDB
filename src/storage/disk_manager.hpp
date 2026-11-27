@@ -2,6 +2,7 @@
 #include "common/config.hpp"
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <string>
 
@@ -31,6 +32,11 @@ public:
     DiskManager& operator=(const DiskManager&) = delete;
 
     void ReadPage(page_id_t page_id, char* page_data);
+
+    // Reads pages first .. first + n - 1 into frames[0 .. n - 1] with preadv.
+    // Counts n reads; throws IOException as ReadPage does.
+    void ReadPages(page_id_t first, size_t n, char* const* frames);
+
     void WritePage(page_id_t page_id, const char* page_data);
     page_id_t AllocatePage();
     void DeallocatePage(page_id_t page_id);
@@ -61,7 +67,11 @@ public:
     void ResetReadStats() {
         read_count_.store(0, std::memory_order_relaxed);
         read_nanos_.store(0, std::memory_order_relaxed);
+        batch_reads_.store(0, std::memory_order_relaxed);
     }
+
+    // How many ReadPages calls succeeded; their pages are in GetReadStats too
+    [[nodiscard]] uint64_t GetBatchReadCount() const { return batch_reads_.load(std::memory_order_relaxed); }
 
     // Makes every read take at least this long, to stand in for slower storage. Zero is off.
     void SetReadPenalty(std::chrono::microseconds penalty) { read_penalty_ = penalty; }
@@ -81,6 +91,7 @@ private:
     std::atomic<page_id_t> next_page_id_{0};
     std::atomic<uint64_t> read_count_{0};
     std::atomic<uint64_t> read_nanos_{0};
+    std::atomic<uint64_t> batch_reads_{0};
     std::chrono::microseconds read_penalty_{0};
     bool direct_io_{false};
     WriteObserver* observer_{nullptr};

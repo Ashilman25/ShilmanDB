@@ -1021,6 +1021,101 @@ TEST_F(BufferPoolConcurrentTest, BatchHoldsPinsWhileWaiting) {
     }
 }
 
+// Each run of adjacent misses is one read, into the same frames as one-by-one
+TEST_F(BufferPoolConcurrentTest, AdjacentMissesReadTogether) {
+    constexpr size_t kFrames = 32;
+    WriteColumnarPages(db_file_, 64);
+
+    struct Case {
+        std::vector<page_id_t> warm;  // fetched and unpinned first, so hits in the batch
+        std::vector<page_id_t> ids;
+        uint64_t runs;
+    };
+    std::vector<page_id_t> sixteen;
+    for (page_id_t pid = 10; pid < 26; ++pid) sixteen.push_back(pid);
+    const Case cases[] = {
+        {{}, sixteen, 1},
+        // Runs 30-32, 35-36 and 40-42 around two hits and a gap, then a step back
+        {{33, 34}, {30, 31, 32, 33, 34, 35, 36, 40, 41, 42, 51, 50}, 5},
+    };
+
+    for (const auto kind : kKinds) {
+        for (const auto& c : cases) {
+            SCOPED_TRACE(std::string(EvictionPolicyKindName(kind)) + ", " + std::to_string(c.ids.size()) + " pages");
+            DiskManager dm(db_file_), twin_dm(db_file_);
+            BufferPoolManager bpm(kFrames, &dm, MakeEvictionPolicy(kind, kFrames));
+            BufferPoolManager twin(kFrames, &twin_dm, MakeEvictionPolicy(kind, kFrames));
+            bpm.SetConcurrent(true);
+            twin.SetConcurrent(true);
+            for (const page_id_t pid : c.warm) {
+                ASSERT_NE(bpm.FetchPage(pid), nullptr);
+                ASSERT_TRUE(bpm.UnpinPage(pid, false));
+                ASSERT_NE(twin.FetchPage(pid), nullptr);
+                ASSERT_TRUE(twin.UnpinPage(pid, false));
+            }
+            const uint64_t reads_before = dm.GetReadStats().reads;
+            const uint64_t batches_before = dm.GetBatchReadCount();
+
+            std::vector<Page*> pages(c.ids.size(), nullptr);
+            ASSERT_EQ(bpm.FetchPages(c.ids.data(), c.ids.size(), pages.data()), c.ids.size());
+            const uint64_t misses = c.ids.size() - c.warm.size();
+            EXPECT_EQ(dm.GetReadStats().reads - reads_before, misses);
+            EXPECT_EQ(dm.GetBatchReadCount() - batches_before, c.runs);
+
+            // The twin fetches one at a time, each miss its own ReadPage
+            for (size_t i = 0; i < c.ids.size(); ++i) {
+                const Page* one = twin.FetchPage(c.ids[i]);
+                ASSERT_NE(one, nullptr);
+                EXPECT_EQ(pages[i] - &bpm.GetPage(0), one - &twin.GetPage(0)) << "entry " << i;
+                EXPECT_EQ(std::memcmp(pages[i]->GetData(), one->GetData(), PAGE_SIZE), 0) << "entry " << i;
+                EXPECT_TRUE(ColumnarPageIs(pages[i]->GetData(), c.ids[i])) << "entry " << i;
+            }
+            EXPECT_EQ(twin_dm.GetBatchReadCount(), 0u);
+            EXPECT_EQ(bpm.GetMissCount(), twin.GetMissCount());
+            EXPECT_EQ(bpm.GetHitCount(), twin.GetHitCount());
+            EXPECT_EQ(bpm.GetVisitCount(), twin.GetVisitCount());
+
+            bpm.UnpinPages(c.ids.data(), c.ids.size());
+            twin.UnpinPages(c.ids.data(), c.ids.size());
+            bpm.SetConcurrent(false);
+            twin.SetConcurrent(false);
+        }
+    }
+}
+
+// A run never takes in INVALID_PAGE_ID, so the page before it is still kept
+TEST_F(BufferPoolConcurrentTest, BatchRunStopsAtInvalidPage) {
+    constexpr size_t kFrames = 8;
+    WritePlainPages(db_file_, 4);
+    for (const auto kind : {EvictionPolicyKind::LRU, EvictionPolicyKind::CLOCK}) {
+        for (const bool concurrent : {false, true}) {
+            SCOPED_TRACE(std::string(EvictionPolicyKindName(kind)) + (concurrent ? " on" : " off"));
+            DiskManager dm(db_file_);
+            BufferPoolManager bpm(kFrames, &dm, MakeEvictionPolicy(kind, kFrames));
+            bpm.SetConcurrent(concurrent);
+
+            // Page 0 follows INVALID_PAGE_ID when the ids wrap around
+            const page_id_t ids[] = {INVALID_PAGE_ID - 1, INVALID_PAGE_ID, 0};
+            Page* pages[3] = {};
+            EXPECT_THROW((void)bpm.FetchPages(ids, 3, pages), IOException);
+            EXPECT_EQ(bpm.GetMissCount(), 1u);
+            EXPECT_EQ(dm.GetReadStats().reads, 1u);
+
+            size_t resident = 0;
+            for (size_t f = 0; f < kFrames; ++f) {
+                const Page& page = bpm.GetPage(static_cast<frame_id_t>(f));
+                EXPECT_EQ(page.GetPinCount(), 0) << "frame " << f;
+                if (page.GetPageId() == INVALID_PAGE_ID) continue;
+                ++resident;
+                EXPECT_EQ(page.GetPageId(), INVALID_PAGE_ID - 1) << "frame " << f;
+            }
+            EXPECT_EQ(resident, 1u);
+            EXPECT_NO_THROW(bpm.DropAllPages());
+            bpm.SetConcurrent(false);
+        }
+    }
+}
+
 // The worker count given with the mode on is kept, and off resets it to 1
 TEST_F(BufferPoolConcurrentTest, ConcurrentWorkersFollowTheMode) {
     WritePlainPages(db_file_, 1);
