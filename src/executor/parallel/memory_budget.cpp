@@ -18,6 +18,22 @@ namespace {
 
 constexpr auto kRelaxed = std::memory_order_relaxed;
 
+// The whole grants that cover bytes.
+constexpr size_t RoundUpToGrants(size_t bytes) {
+    return (bytes / kGrantBytes + (bytes % kGrantBytes != 0 ? 1 : 0)) * kGrantBytes;
+}
+
+// The most bytes whole grants can cover without overflowing size_t.
+constexpr size_t kMostGranted = std::numeric_limits<size_t>::max() / kGrantBytes * kGrantBytes;
+
+// True when no reservation is listed twice.
+[[maybe_unused]] bool ListedOnce(const std::vector<PoolPart>& parts) {
+    std::vector<const MemoryReservation*> seen;
+    for (const PoolPart& p : parts) seen.push_back(p.from);
+    std::sort(seen.begin(), seen.end());
+    return std::adjacent_find(seen.begin(), seen.end()) == seen.end();
+}
+
 // Raises peak to at least value.
 void RaiseTo(std::atomic<size_t>& peak, size_t value) {
     size_t cur = peak.load(kRelaxed);
@@ -63,18 +79,22 @@ bool MemoryBudget::Take(unsigned worker, size_t bytes, size_t& from_floor, size_
     } while (take > 0 && !floor.compare_exchange_weak(used, used + take, kRelaxed));
 
     const size_t rest = bytes - take;
-    if (rest > 0) {
-        size_t shared = shared_used_.load(kRelaxed);
-        do {
-            if (rest > shared_capacity_ - shared) {
-                if (take > 0) floor.fetch_sub(take, kRelaxed);
-                return false;
-            }
-        } while (!shared_used_.compare_exchange_weak(shared, shared + rest, kRelaxed));
-        RaiseTo(shared_peak_, shared + rest);
+    if (rest > 0 && !TakeShared(rest)) {
+        if (take > 0) floor.fetch_sub(take, kRelaxed);
+        return false;
     }
     from_floor = take;
     from_shared = rest;
+    return true;
+}
+
+// Raises the shared count, or leaves it alone if that would pass its capacity.
+bool MemoryBudget::TakeShared(size_t bytes) {
+    size_t shared = shared_used_.load(kRelaxed);
+    do {
+        if (bytes > shared_capacity_ - shared) return false;
+    } while (!shared_used_.compare_exchange_weak(shared, shared + bytes, kRelaxed));
+    RaiseTo(shared_peak_, shared + bytes);
     return true;
 }
 
@@ -115,7 +135,8 @@ MemoryReservation::~MemoryReservation() {
 
 // Takes over other's grants; other is left holding nothing.
 MemoryReservation::MemoryReservation(MemoryReservation&& other) noexcept : budget_(std::exchange(other.budget_, nullptr)),
-      worker_(std::exchange(other.worker_, 0)), bytes_(std::exchange(other.bytes_, 0)), from_floor_(std::exchange(other.from_floor_, 0)), from_shared_(std::exchange(other.from_shared_, 0)), left_floor_(std::exchange(other.left_floor_, false)) {}
+      worker_(std::exchange(other.worker_, 0)), bytes_(std::exchange(other.bytes_, 0)), from_floor_(std::exchange(other.from_floor_, 0)), from_shared_(std::exchange(other.from_shared_, 0)), left_floor_(std::exchange(other.left_floor_, false)),
+      shared_only_(std::exchange(other.shared_only_, false)) {}
 
 // Returns what this held, then takes over other's bytes.
 MemoryReservation& MemoryReservation::operator=(MemoryReservation&& other) noexcept {
@@ -130,6 +151,7 @@ MemoryReservation& MemoryReservation::operator=(MemoryReservation&& other) noexc
     from_floor_ = std::exchange(other.from_floor_, 0);
     from_shared_ = std::exchange(other.from_shared_, 0);
     left_floor_ = std::exchange(other.left_floor_, false);
+    shared_only_ = std::exchange(other.shared_only_, false);
     return *this;
 }
 
@@ -148,11 +170,12 @@ bool MemoryReservation::Grow(size_t bytes) {
         return true;
     }
 
-    const size_t grants = total / kGrantBytes + (total % kGrantBytes != 0 ? 1 : 0);
-    if (grants > std::numeric_limits<size_t>::max() / kGrantBytes) return false;
+    if (total > kMostGranted) return false;
+    const size_t want = RoundUpToGrants(total) - held;
     size_t floor = 0;
-    size_t shared = 0;
-    if (!budget_->Take(worker_, grants * kGrantBytes - held, floor, shared)) return false;
+    size_t shared = want;  // all of it for a pooled reservation; Take splits it otherwise
+    const bool taken = shared_only_ ? budget_->TakeShared(want) : budget_->Take(worker_, want, floor, shared);
+    if (!taken) return false;
     from_floor_ += floor;
     from_shared_ += shared;
     bytes_ = total;
@@ -180,12 +203,56 @@ size_t MemoryReservation::LeaveFloor() {
     return bytes_ > from_shared_ ? bytes_ - from_shared_ : 0;
 }
 
+// Each part keeps the grants its other bytes need, shared first, and from now on
+// gives back floor grants first. The shared count rises before floor counts fall.
+bool MemoryReservation::Pool(const std::vector<PoolPart>& parts) {
+    assert(ListedOnce(parts) && "a part listed twice would count its shared grants twice");
+    size_t total = bytes_;
+    for (const PoolPart& p : parts) {
+        assert(p.from != this && p.from->budget_ == budget_ && "parts pool into another reservation of their budget");
+        assert(p.bytes <= p.from->bytes_ && "Pool past what a part holds");
+        total += p.bytes;
+    }
+    if (budget_ == nullptr) {
+        for (const PoolPart& p : parts) p.from->bytes_ -= p.bytes;
+        bytes_ = total;
+        return true;
+    }
+    assert(from_floor_ == 0 && "a pooling reservation holds no floor grants");
+
+    // Shared grants already here, and those the parts give up, count toward the need.
+    size_t have = from_shared_;
+    for (const PoolPart& p : parts) {
+        const MemoryReservation& r = *p.from;
+        have += r.from_shared_ - std::min(r.from_shared_, RoundUpToGrants(r.bytes_ - p.bytes));
+    }
+    const size_t need = RoundUpToGrants(total);
+    if (need > have && !budget_->TakeShared(need - have)) return false;
+
+    for (const PoolPart& p : parts) {
+        MemoryReservation& r = *p.from;
+        r.bytes_ -= p.bytes;
+        const size_t keep = RoundUpToGrants(r.bytes_);
+        const size_t keep_shared = std::min(r.from_shared_, keep);
+        const size_t keep_floor = keep - keep_shared;
+        assert(keep_floor <= r.from_floor_ && "a part held fewer grants than its bytes need");
+        budget_->Give(r.worker_, r.from_floor_ - keep_floor, 0);
+        r.from_floor_ = keep_floor;
+        r.from_shared_ = keep_shared;
+        r.left_floor_ = true;
+    }
+    if (have > need) budget_->Give(worker_, 0, have - need);
+    bytes_ = total;
+    from_shared_ = need;
+    shared_only_ = true;
+    return true;
+}
+
 // Keeps the grants bytes_ still needs. Shared grants go back first, for others,
 // except after LeaveFloor, when the floor must empty for the next pipeline.
 void MemoryReservation::ReleaseSlack(bool keep_spare) {
     if (budget_ == nullptr) return;
-    const size_t needed = (bytes_ / kGrantBytes + (bytes_ % kGrantBytes != 0 ? 1 : 0)) * kGrantBytes;
-    size_t excess = from_floor_ + from_shared_ - needed;
+    size_t excess = from_floor_ + from_shared_ - RoundUpToGrants(bytes_);
     size_t floor = 0;
     size_t shared = 0;
     

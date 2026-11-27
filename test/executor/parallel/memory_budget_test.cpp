@@ -293,6 +293,226 @@ TEST_F(ParallelMemoryBudgetTest, LeaveFloorOnPartialGrantsWithOneSharedGrant) {
     LeaveFloorOnPartialGrants(kGrantBytes, 2 * kMiB, kGrantBytes);
 }
 
+namespace {
+
+// One reservation per worker, each holding `bytes` on its floor.
+std::vector<MemoryReservation> PartsOnFloors(MemoryBudget& b, unsigned workers, size_t bytes) {
+    std::vector<MemoryReservation> parts;
+    for (unsigned w = 0; w < workers; ++w) {
+        parts.emplace_back(&b, w);
+        EXPECT_TRUE(parts.back().Grow(bytes));
+    }
+    return parts;
+}
+
+// Every byte of every part, for Pool.
+std::vector<PoolPart> AllOf(std::vector<MemoryReservation>& parts) {
+    std::vector<PoolPart> list;
+    for (MemoryReservation& p : parts) list.push_back(PoolPart{&p, p.Bytes()});
+    return list;
+}
+
+}  // namespace
+
+TEST_F(ParallelMemoryBudgetTest, PoolHoldsSmallPartsInOneGrant) {
+    // 18 workers hold 70 KB each on a floor grant; one grant of shared room.
+    constexpr unsigned kWorkers = 18;
+    constexpr size_t kPart = 70 * 1000;
+    MemoryBudget b(kWorkers * kWorkerMinimumBytes + kGrantBytes, kWorkers);
+    {
+        std::vector<MemoryReservation> parts = PartsOnFloors(b, kWorkers, kPart);
+        EXPECT_EQ(b.HeldBytes(), kWorkers * kGrantBytes);
+        MemoryReservation pooled(&b, 0);
+        ASSERT_TRUE(pooled.Pool(AllOf(parts)));
+        EXPECT_EQ(pooled.Bytes(), kWorkers * kPart);
+        EXPECT_EQ(b.HeldBytes(), kGrantBytes) << "rounded up once";
+        for (const MemoryReservation& p : parts) EXPECT_EQ(p.Bytes(), 0u);
+
+        // Every worker's next breaker gets its whole floor.
+        std::vector<MemoryReservation> next = PartsOnFloors(b, kWorkers, kWorkerMinimumBytes);
+        EXPECT_EQ(b.HeldBytes(), b.Limit());
+        EXPECT_LE(b.PeakBytes(), b.Limit());
+    }
+    EXPECT_EQ(b.HeldBytes(), 0u);
+}
+
+TEST_F(ParallelMemoryBudgetTest, PoolIsRefusedWithNoSharedRoom) {
+    // Just the floors: the parts can't leave them, and a refused Pool changes nothing.
+    constexpr unsigned kWorkers = 18;
+    constexpr size_t kPart = 70 * 1000;
+    MemoryBudget b(kWorkers * kWorkerMinimumBytes, kWorkers);
+    {
+        std::vector<MemoryReservation> parts = PartsOnFloors(b, kWorkers, kPart);
+        for (MemoryReservation& p : parts) EXPECT_EQ(p.LeaveFloor(), kPart);
+        const size_t held = b.HeldBytes();
+        const size_t peak = b.PeakBytes();
+        MemoryReservation pooled(&b, 0);
+        EXPECT_FALSE(pooled.Pool(AllOf(parts)));
+        EXPECT_EQ(pooled.Bytes(), 0u);
+        EXPECT_EQ(b.HeldBytes(), held);
+        EXPECT_EQ(b.PeakBytes(), peak);
+        for (unsigned w = 0; w < kWorkers; ++w) {
+            EXPECT_EQ(parts[w].Bytes(), kPart);
+            EXPECT_EQ(parts[w].LeaveFloor(), kPart) << "still on its floor";
+            MemoryReservation probe(&b, w);
+            EXPECT_TRUE(probe.Grow(kGrantBytes));
+            EXPECT_FALSE(probe.Grow(1)) << "worker " << w << "'s floor still has its part's grant";
+        }
+    }
+    EXPECT_EQ(b.HeldBytes(), 0u);
+}
+
+TEST_F(ParallelMemoryBudgetTest, PoolCountsTheSharedGrantsPartsGiveUp) {
+    // Workers 0 and 1 moved 1 MiB each to shared grants; worker 2 can't.
+    // Their two shared grants cover the one grant the three need; the other goes back.
+    MemoryBudget b(3 * kWorkerMinimumBytes + 2 * kGrantBytes, 3);
+    {
+        std::vector<MemoryReservation> parts = PartsOnFloors(b, 3, kMiB);
+        EXPECT_EQ(parts[0].LeaveFloor(), 0u);
+        EXPECT_EQ(parts[1].LeaveFloor(), 0u);
+        EXPECT_EQ(parts[2].LeaveFloor(), kMiB) << "no shared room left";
+        MemoryReservation pooled(&b, 0);
+        ASSERT_TRUE(pooled.Pool(AllOf(parts)));
+        EXPECT_EQ(pooled.Bytes(), 3 * kMiB);
+        EXPECT_EQ(b.HeldBytes(), kGrantBytes);
+        // Free now: every floor and one shared grant.
+        MemoryReservation other(&b, 2);
+        EXPECT_TRUE(other.Grow(kWorkerMinimumBytes + kGrantBytes));
+        EXPECT_FALSE(other.Grow(1));
+    }
+    EXPECT_EQ(b.HeldBytes(), 0u);
+
+    // One part on a shared grant, one on a floor: one more grant, not two.
+    for (const size_t room : {size_t{1}, size_t{2}}) {
+        MemoryBudget c(2 * kWorkerMinimumBytes + room * kGrantBytes, 2);
+        {
+            std::vector<MemoryReservation> parts = PartsOnFloors(c, 2, 5 * kMiB / 2);
+            EXPECT_EQ(parts[0].LeaveFloor(), 0u);
+            const size_t held = c.HeldBytes();
+            MemoryReservation pooled(&c, 0);
+            EXPECT_EQ(pooled.Pool(AllOf(parts)), room == 2) << room << " grants of room";
+            EXPECT_EQ(c.HeldBytes(), room == 2 ? 2 * kGrantBytes : held) << room << " grants of room";
+        }
+        EXPECT_EQ(c.HeldBytes(), 0u);
+    }
+}
+
+TEST_F(ParallelMemoryBudgetTest, PartsKeepWhatTheyHoldForSomethingElse) {
+    // 9 MiB on two floor grants and a shared one, 8 MiB of it pooled.
+    // The part keeps 1 MiB on its shared grant, so its floor empties.
+    MemoryBudget b(kWorkerMinimumBytes + 3 * kGrantBytes, 1);
+    {
+        MemoryReservation part(&b, 0);
+        ASSERT_TRUE(part.Grow(9 * kMiB));
+        MemoryReservation pooled(&b, 0);
+        ASSERT_TRUE(pooled.Pool({PoolPart{&part, 8 * kMiB}}));
+        EXPECT_EQ(part.Bytes(), kMiB);
+        EXPECT_EQ(pooled.Bytes(), 8 * kMiB);
+        EXPECT_EQ(b.HeldBytes(), 3 * kGrantBytes);
+        MemoryReservation next(&b, 0);
+        EXPECT_TRUE(next.Grow(kWorkerMinimumBytes)) << "the floor is free";
+        part.Shrink(kMiB);
+        EXPECT_EQ(part.LeaveFloor(), 0u);
+        EXPECT_EQ(b.HeldBytes(), b.Limit() - kGrantBytes) << "the part's grant went back";
+    }
+    EXPECT_EQ(b.HeldBytes(), 0u);
+}
+
+TEST_F(ParallelMemoryBudgetTest, PooledReservationGrowsFromTheSharedPoolOnly) {
+    // Four workers hold 1 MiB each on a floor; three grants of shared room.
+    MemoryBudget b(4 * kWorkerMinimumBytes + 3 * kGrantBytes, 4);
+    {
+        std::vector<MemoryReservation> parts = PartsOnFloors(b, 4, kMiB);
+        MemoryReservation pooled(&b, 0);
+        ASSERT_TRUE(pooled.Pool(AllOf(parts)));
+        EXPECT_EQ(b.HeldBytes(), kGrantBytes);
+
+        // Grows take shared grants; worker 0's free floor is never touched.
+        EXPECT_TRUE(pooled.Grow(8 * kMiB));
+        EXPECT_EQ(b.HeldBytes(), 3 * kGrantBytes);
+        EXPECT_FALSE(pooled.Grow(1)) << "the shared pool is full, and the floors aren't for it";
+        EXPECT_EQ(pooled.Bytes(), 12 * kMiB);
+        {
+            MemoryReservation floor(&b, 0);
+            EXPECT_TRUE(floor.Grow(kWorkerMinimumBytes)) << "worker 0's floor is whole";
+        }
+
+        // Shrink keeps one spare grant; LeaveFloor frees it and finds nothing on a floor.
+        pooled.Shrink(8 * kMiB);
+        EXPECT_EQ(b.HeldBytes(), 2 * kGrantBytes);
+        EXPECT_EQ(pooled.LeaveFloor(), 0u);
+        EXPECT_EQ(b.HeldBytes(), kGrantBytes);
+
+        // Moved and assigned, it still never takes a floor grant.
+        MemoryReservation moved(std::move(pooled));
+        EXPECT_EQ(moved.Bytes(), 4 * kMiB);
+        EXPECT_EQ(pooled.Bytes(), 0u);  // NOLINT: a moved-from reservation holds nothing
+        MemoryReservation assigned;
+        assigned = std::move(moved);
+        MemoryReservation hog(&b, 1);
+        ASSERT_TRUE(hog.Grow(kWorkerMinimumBytes + 2 * kGrantBytes));
+        EXPECT_FALSE(assigned.Grow(kGrantBytes)) << "the shared pool is full again";
+        hog = MemoryReservation();
+        EXPECT_TRUE(assigned.Grow(kGrantBytes));
+        EXPECT_EQ(b.HeldBytes(), 2 * kGrantBytes);
+
+        // Destroyed on another thread, it gives every grant back.
+        std::thread([&assigned] { MemoryReservation mine(std::move(assigned)); }).join();
+        EXPECT_EQ(b.HeldBytes(), 0u);
+    }
+    EXPECT_EQ(b.HeldBytes(), 0u);
+    EXPECT_LE(b.PeakBytes(), b.Limit());
+}
+
+TEST_F(ParallelMemoryBudgetTest, PoolWithoutABudgetSumsTheBytes) {
+    MemoryReservation a;
+    MemoryReservation c;
+    ASSERT_TRUE(a.Grow(5));
+    ASSERT_TRUE(c.Grow(7));
+    MemoryReservation pooled;
+    EXPECT_TRUE(pooled.Pool({PoolPart{&a, 5}, PoolPart{&c, 3}}));
+    EXPECT_EQ(pooled.Bytes(), 8u);
+    EXPECT_EQ(a.Bytes(), 0u);
+    EXPECT_EQ(c.Bytes(), 4u);
+    EXPECT_TRUE(pooled.Grow(std::numeric_limits<size_t>::max() / 2));
+}
+
+TEST_F(ParallelMemoryBudgetTest, PoolPartsPoolsEveryPartAndMarksIt) {
+    // Workers 0 and 1 each count 1 MiB. Worker 2 counts nothing
+    // but keeps a spare floor grant. Pooled, they share one shared grant,
+    // the spare goes back, and every floor is free.
+    struct Part {
+        MemoryReservation reservation;
+        size_t counted{0};
+        bool pooled{false};
+    };
+    MemoryBudget b(3 * kWorkerMinimumBytes + kGrantBytes, 3);
+    {
+        std::vector<Part> parts(3);
+        for (unsigned w = 0; w < 3; ++w) {
+            parts[w].reservation = MemoryReservation(&b, w);
+            ASSERT_TRUE(parts[w].reservation.Grow(kMiB));
+            parts[w].counted = kMiB;
+        }
+        parts[2].reservation.Shrink(kMiB);
+        parts[2].counted = 0;
+        EXPECT_EQ(b.HeldBytes(), 3 * kGrantBytes);
+        const auto part_at = [&parts](size_t i) -> Part& { return parts[i]; };
+        const auto counted = [](const Part& p) { return p.counted; };
+        EXPECT_FALSE(PoolParts(nullptr, parts.size(), part_at, counted).has_value()) << "nothing pools without a budget";
+        EXPECT_FALSE(parts[0].pooled);
+
+        std::optional<MemoryReservation> pooled = PoolParts(&b, parts.size(), part_at, counted);
+        ASSERT_TRUE(pooled.has_value());
+        EXPECT_EQ(pooled->Bytes(), 2 * kMiB);
+        for (const Part& p : parts) EXPECT_TRUE(p.pooled);
+        EXPECT_EQ(b.HeldBytes(), kGrantBytes) << "the spare floor grant went back too";
+        std::vector<MemoryReservation> next = PartsOnFloors(b, 3, kWorkerMinimumBytes);
+        EXPECT_EQ(b.HeldBytes(), b.Limit());
+    }
+    EXPECT_EQ(b.HeldBytes(), 0u);
+}
+
 TEST_F(ParallelMemoryBudgetTest, TooSmallForThreadsThrows) {
     EXPECT_THROW(MemoryBudget(18 * kWorkerMinimumBytes - 1, 18), DatabaseException);
     EXPECT_EQ(ErrorOf([] { MemoryBudget b(18 * kWorkerMinimumBytes - 1, 18); }),
@@ -464,6 +684,14 @@ TEST(ParallelMemoryBudgetDeathTest, ShrinkingMoreThanHeldAsserts) {
     MemoryReservation r(&b, 0);
     ASSERT_TRUE(r.Grow(10));
     EXPECT_DEATH(r.Shrink(11), "Shrink past what the reservation holds");
+}
+
+TEST(ParallelMemoryBudgetDeathTest, PoolingAPartTwiceAsserts) {
+    MemoryBudget b(64 * kMiB, 1);
+    MemoryReservation part(&b, 0);
+    ASSERT_TRUE(part.Grow(10));
+    MemoryReservation pooled(&b, 0);
+    EXPECT_DEATH((void)pooled.Pool({PoolPart{&part, 5}, PoolPart{&part, 5}}), "a part listed twice");
 }
 
 TEST(ParallelMemoryBudgetDeathTest, ReservationOutlivingItsBudgetAsserts) {

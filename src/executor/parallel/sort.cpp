@@ -13,6 +13,7 @@
 #include <iterator>
 #include <limits>
 #include <numeric>
+#include <optional>
 #include <string>
 #include <utility>
 
@@ -495,6 +496,7 @@ struct SortLocal : LocalState {
     std::vector<Vector> key_values;  // one batch's keys, before they're appended
     EvalScratch scratch;
     MemoryReservation reservation;   // the rows' estimated bytes, after every Consume
+    bool pooled{false};              // Finalize moved that count into one pooled reservation
     SpillPlace place;
     bool spill_everything{false};
     std::unique_ptr<TempFile> file;  // made on the first spill
@@ -551,21 +553,27 @@ public:
     // Keeps the worker's buffers, arena and all, until Finalize.
     void Combine(std::unique_ptr<LocalState> local) override { parts_.push_back(std::move(local)); }
 
-    // The rows outlive this pipeline, so each part leaves its worker's floor,
-    // spilling what must stay there. With no runs anywhere, the in-memory sort runs.
+    // The rows outlive this pipeline. With no run anywhere, every part's count pools
+    // into one reservation off the floors. Refused, or once a run exists, each part
+    // leaves its floor and what must stay there becomes a run.
+    // With no runs anywhere, the in-memory sort runs.
     void Finalize(QueryContext& ctx) override {
-        ForEachTask(ctx, parts_.size(), [this](size_t i) {
-            SortLocal& p = Part(i);
-            assert(p.reservation.Bytes() == HeldBytes(p) && "a part's count drifted from its rows");
-            for (size_t left = p.reservation.LeaveFloor(); left > 0; left = p.reservation.LeaveFloor()) WriteRun(p);
-        });
-        const bool spilled = std::any_of(parts_.begin(), parts_.end(), [](const std::unique_ptr<LocalState>& part) {
-            return !static_cast<const SortLocal&>(*part).runs.empty();
-        });
-        if (spilled) {
+        assert(std::all_of(parts_.begin(), parts_.end(), [this](const std::unique_ptr<LocalState>& part) {
+                   const auto& p = static_cast<const SortLocal&>(*part);
+                   return p.reservation.Bytes() == HeldBytes(p);
+               }) && "a part's count drifted from its rows");
+        std::optional<MemoryReservation> pooled;
+        if (!AnyRuns()) pooled = PoolRows(ctx);
+        if (!pooled) {
+            ForEachTask(ctx, parts_.size(), [this](size_t i) {
+                SortLocal& p = Part(i);
+                for (size_t left = p.reservation.LeaveFloor(); left > 0; left = p.reservation.LeaveFloor()) WriteRun(p);
+            });
+        }
+        if (AnyRuns()) {
             FinishRuns(ctx);
         } else {
-            SortInMemory();
+            SortInMemory(std::move(pooled));
         }
         parts_.clear();
         SharedOutput<SortedRows> done = std::move(out_);  // the source's reference is the last
@@ -584,6 +592,18 @@ private:
     // Combined part i.
     [[nodiscard]] SortLocal& Part(size_t i) { return static_cast<SortLocal&>(*parts_[i]); }
 
+    // True once any part has written a run.
+    [[nodiscard]] bool AnyRuns() const {
+        return std::any_of(parts_.begin(), parts_.end(), [](const std::unique_ptr<LocalState>& part) {
+            return !static_cast<const SortLocal&>(*part).runs.empty();
+        });
+    }
+
+    // Pools every part's row count; nullopt, with nothing changed, when refused.
+    [[nodiscard]] std::optional<MemoryReservation> PoolRows(QueryContext& ctx) {
+        return PoolParts(ctx.budget, parts_.size(), [this](size_t i) -> SortLocal& { return Part(i); }, [](const SortLocal& p) { return p.reservation.Bytes(); });
+    }
+
     // The worker's rows by the row estimate: fixed bytes per row plus every string's bytes.
     [[nodiscard]] size_t HeldBytes(const SortLocal& l) const {
         return l.kept.rows * layout_->row_bytes + l.keys.arena.BytesUsed() + l.kept.arena.BytesUsed();
@@ -600,6 +620,7 @@ private:
     // Sorts what the worker holds and writes it as one run, cut at the limit.
     // The rows stay counted until they're freed.
     void WriteRun(SortLocal& l) const {
+        assert(!l.pooled && "a pooled part's rows are counted in the pool");
         {
             const SortColumns cols = layout_->Columns(l.keys, l.kept);
             const std::vector<uint32_t> order = SortedOrder(*layout_, cols, l.kept.rows);
@@ -644,21 +665,24 @@ private:
         }
     }
 
-    // Joins every worker's rows and sorts them; the reservations move with the rows.
+    // Joins every worker's rows and sorts them; the reservations move with the rows, pooled included.
     // The joined columns are sized once, and each part's go as they're copied in.
     // The key values and their strings go once the order is known.
-    void SortInMemory() {
+    void SortInMemory(std::optional<MemoryReservation> pooled) {
         SortedRows& out = out_.Mutable();
         size_t rows = 0;
         for (size_t i = 0; i < parts_.size(); ++i) rows += Part(i).kept.rows;
         const size_t key_count = layout_->key_types.size();
         out.kept = SizedStore(layout_->arrays.data() + key_count, layout_->kept_types.size(), rows);
-        std::vector<size_t> key_bytes;
+        std::vector<size_t> key_bytes;  // per part, what its own reservation drops for the keys
+        size_t pooled_keys = 0;         // the same for the pooled parts, all from pooled
         {
             ColumnStore keys = SizedStore(layout_->arrays.data(), key_count, rows);
             for (size_t i = 0; i < parts_.size(); ++i) {
                 SortLocal& p = Part(i);
-                key_bytes.push_back(p.keys.rows * layout_->key_bytes + p.keys.arena.BytesUsed());
+                const size_t bytes = p.keys.rows * layout_->key_bytes + p.keys.arena.BytesUsed();
+                key_bytes.push_back(p.pooled ? 0 : bytes);
+                if (p.pooled) pooled_keys += bytes;
                 MoveRows(keys, p.keys);
                 MoveRows(out.kept, p.kept);
                 out.reservations.push_back(std::move(p.reservation));
@@ -666,6 +690,12 @@ private:
             out.order = SortedOrder(*layout_, layout_->Columns(keys, out.kept), out.kept.rows);
         }
         for (size_t i = 0; i < key_bytes.size(); ++i) out.reservations[i].Shrink(key_bytes[i]);
+        if (pooled) {
+            // The rows outlive this pipeline, so the pool drops its spare grant.
+            pooled->Shrink(pooled_keys);
+            (void)pooled->LeaveFloor();
+            out.reservations.push_back(std::move(*pooled));
+        }
     }
 
     SortSpec spec_;

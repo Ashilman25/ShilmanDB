@@ -372,6 +372,7 @@ struct BuildLocal : LocalState {
     MemoryReservation reservation;    // the held rows, and the writer's buffers while it writes
     size_t held{0};                   // the rows' estimated bytes
     size_t counted{0};                // the part of the reservation that counts them
+    bool pooled{false};               // Finalize moved that count into the table's pooled reservation
     const std::string* temp_dir{nullptr};
     SpillCounters* counters{nullptr};
     bool spill_everything{false};
@@ -442,15 +443,16 @@ public:
     // Keeps the worker's rows, arena and all, until Finalize.
     void Combine(std::unique_ptr<LocalState> local) override { parts_.push_back(std::move(local)); }
 
-    // Spills what can't leave the floors, then builds by hash partition, as before.
+    // Pools the rows, or leaves the floors and spills what can't, then builds by partition.
     // Rows join the table in worker order, then each part's arrival or partition order.
     void Finalize(QueryContext& ctx) override {
-        LeaveFloors(ctx);
+        std::optional<MemoryReservation> pooled = LeaveFloors(ctx);
 
         BuildTable& t = table_.Mutable();
         t.store = ColumnStore(arrays_.size());
         std::vector<ColumnStore*> stores;  // every part's rows, in table order
-        std::vector<size_t> kept;          // per part, its rows in the table
+        std::vector<size_t> kept;          // per reservation in t, the rows it counts
+        size_t pooled_rows = 0;
         for (size_t i = 0; i < parts_.size(); ++i) {
             BuildLocal& p = Part(i);
             if (p.writer) {
@@ -466,8 +468,13 @@ public:
                 stores.push_back(&held.store);
                 rows += held.store.rows;
             }
-            kept.push_back(rows);
+            kept.push_back(p.pooled ? 0 : rows);
+            if (p.pooled) pooled_rows += rows;
             t.reservations.push_back(std::move(p.reservation));
+        }
+        if (pooled) {
+            kept.push_back(pooled_rows);
+            t.reservations.push_back(std::move(*pooled));
         }
         AbsorbAll(t.store, arrays_, stores);
         parts_.clear();
@@ -621,6 +628,7 @@ private:
 
     // Brings the reservation to the held bytes; false when the budget refuses.
     [[nodiscard]] static bool Recount(BuildLocal& l) {
+        assert(!l.pooled && "pooled rows are counted in the table's reservation");
         if (l.held < l.counted) {
             l.reservation.Shrink(l.counted - l.held);
         } else if (l.held > l.counted && !l.reservation.Grow(l.held - l.counted)) {
@@ -671,9 +679,17 @@ private:
         while (!Recount(l) && MarkLargest(l)) SpillMarked(l);
     }
 
-    // The rows outlive this pipeline, so they leave the floors. Parts write marked partitions in
-    // parallel rounds; between rounds this thread marks more, largest across parts, to cover what's stuck.
-    void LeaveFloors(QueryContext& ctx) {
+    // The rows outlive this pipeline, so they leave the floors: this thread pools every part's
+    // rows into one reservation, once marked rows are on disk. Refused, each part leaves its
+    // floor; parts still stuck write marked partitions in parallel rounds, and after each
+    // round the rows pool again or more are marked, largest across parts. Returns the pool.
+    [[nodiscard]] std::optional<MemoryReservation> LeaveFloors(QueryContext& ctx) {
+        // With nothing marked there's nothing to write first, so the rows pool straight away.
+        const bool any_marked = marked_.load(std::memory_order_relaxed) != 0;
+        std::optional<MemoryReservation> pooled;
+        if (!any_marked) pooled = PoolRows(ctx);
+        if (pooled) return pooled;
+
         std::vector<size_t> stuck(parts_.size(), 0);  // per part: bytes that can't leave its floor
         const auto round = [&](const std::vector<size_t>& busy) {
             ForEachTask(ctx, busy.size(), [&](size_t k) { stuck[busy[k]] = WriteMarked(Part(busy[k])); });
@@ -683,9 +699,8 @@ private:
             }
         };
 
-        // With nothing marked, a part in arrival order needs no task: the unspilled path.
+        // With nothing marked, a part in arrival order needs no task.
         std::vector<size_t> busy;
-        const bool any_marked = marked_.load(std::memory_order_relaxed) != 0;
         for (size_t i = 0; i < parts_.size(); ++i) {
             if (any_marked || Part(i).Partitioned()) {
                 busy.push_back(i);
@@ -694,8 +709,10 @@ private:
             }
         }
         if (!busy.empty()) round(busy);
+        // The marked rows are on disk now, so the rest pools, stuck or not.
+        if (any_marked) pooled = PoolRows(ctx);
 
-        while (std::any_of(stuck.begin(), stuck.end(), [](size_t s) { return s > 0; })) {
+        while (!pooled && std::any_of(stuck.begin(), stuck.end(), [](size_t s) { return s > 0; })) {
             // Rows still in arrival order sort by partition, so each partition's bytes are known.
             std::vector<size_t> arrival;
             for (size_t i = 0; i < parts_.size(); ++i) {
@@ -711,9 +728,20 @@ private:
                 if (HoldsMarked(Part(i))) busy.push_back(i);
             }
             round(busy);
+            pooled = PoolRows(ctx);
         }
         assert(std::none_of(parts_.begin(), parts_.end(), [this](const std::unique_ptr<LocalState>& p) { return HoldsMarked(static_cast<const BuildLocal&>(*p)); }) &&
                "every marked partition's rows are on disk");
+        return pooled;
+    }
+
+    // Pools every part's counted rows; nullopt, with nothing changed, when refused or when
+    // a part holds rows it couldn't count. A writer's buffers stay with the part.
+    [[nodiscard]] std::optional<MemoryReservation> PoolRows(QueryContext& ctx) {
+        for (size_t i = 0; i < parts_.size(); ++i) {
+            if (Part(i).held > Part(i).counted) return std::nullopt;
+        }
+        return PoolParts(ctx.budget, parts_.size(), [this](size_t i) -> BuildLocal& { return Part(i); }, [](const BuildLocal& p) { return p.counted; });
     }
 
     // Writes the part's rows of marked partitions, sorting arrival-order rows by partition

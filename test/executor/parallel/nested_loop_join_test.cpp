@@ -573,5 +573,54 @@ TEST_F(ParallelNestedLoopJoinTest, RightSideOverTheBudgetThrows) {
     }
 }
 
+TEST_F(ParallelNestedLoopJoinTest, SmallRightPartsLeaveTheFloorsTogether) {
+    // Four workers keep 10 rows of 8,000-byte strings each, one floor grant apiece.
+    // With one grant of shared room, one part could move alone; pooled, they share it,
+    // so every floor is free for the next pipeline. With just floors, each part stays.
+    constexpr unsigned kWorkers = 4;
+    constexpr uint32_t kPerWorker = 10;
+    for (const size_t room : {kGrantBytes, size_t{0}}) {
+        MemoryBudget budget(kWorkers * kWorkerMinimumBytes + room, kWorkers);
+        {
+            NestedLoopSpec spec;
+            spec.left_slots = {0};
+            spec.right_slots = {0, 1};
+            spec.types = {kInt, kInt, kStr};
+            auto made = MakeNestedLoopJoin(std::move(spec));
+            QueryContext ctx{nullptr, nullptr, kWorkers};
+            ctx.budget = &budget;
+            const IntTextInput right(kWorkers * kPerWorker, kWorkers, 8000);
+            for (unsigned w = 0; w < kWorkers; ++w) {
+                auto local = made.first->MakeWorkerLocal(ctx, w);
+                auto in = right.MakeLocal();
+                right.StartMorsel(w, *in);
+                Batch b;
+                while (right.NextBatch(*in, b)) made.first->Consume(b, *local);
+                made.first->Combine(std::move(local));
+            }
+            made.first->Finalize(ctx);
+            if (room > 0) {
+                EXPECT_EQ(budget.HeldBytes(), kGrantBytes) << "one grant for every part's rows";
+                std::vector<MemoryReservation> next;
+                for (unsigned w = 0; w < kWorkers; ++w) {
+                    next.emplace_back(&budget, w);
+                    EXPECT_TRUE(next.back().Grow(kWorkerMinimumBytes)) << "worker " << w << "'s floor is free";
+                }
+            } else {
+                EXPECT_EQ(budget.HeldBytes(), kWorkers * kGrantBytes) << "each part keeps its floor grant";
+            }
+
+            // The join still pairs every right row.
+            CountSink out;
+            IntTextInput left(20, 2, 3);
+            Pipeline left_side{&left, {made.second.get()}, &out, {0}};
+            RunPipeline(left_side, ctx);
+            EXPECT_EQ(out.rows.load(), 20u * kWorkers * kPerWorker) << "room " << room;
+            EXPECT_EQ(budget.HeldBytes(), 0u) << "the right rows go once the join's pipeline ends";
+        }
+        EXPECT_EQ(budget.HeldBytes(), 0u);
+    }
+}
+
 }  // namespace
 }  // namespace shilmandb::parallel

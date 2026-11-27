@@ -1431,7 +1431,9 @@ struct JoinSpillResult {
     uint64_t written{0};
     uint64_t read{0};
     uint64_t partitions{0};
-    std::string error;  // what the run threw, if it did
+    size_t held_after_finalize{0};  // hand-fed runs: the budget's held bytes right after Finalize
+    bool floors_free{false};        // hand-fed runs: every worker could take its whole floor then
+    std::string error;              // what the run threw, if it did
 
     [[nodiscard]] const HashJoinInfo& Join() const { return joins.at(0); }
 };
@@ -1681,6 +1683,20 @@ protected:
         return spec;
     }
 
+    // True when a fresh reservation on every worker can take its whole floor.
+    // The shared pool is filled first, so a probe can't borrow shared room
+    // to cover a grant left on a floor.
+    static bool FloorsFree(MemoryBudget& budget, unsigned workers) {
+        MemoryReservation filler(&budget, 0);
+        if (!filler.Pool({})) return false;  // shared grants only from now on
+        while (filler.Grow(kGrantBytes)) {}
+        for (unsigned w = 0; w < workers; ++w) {
+            MemoryReservation probe(&budget, w);
+            if (!probe.Grow(kWorkerMinimumBytes)) return false;
+        }
+        return true;
+    }
+
     // Feeds one morsel of a side to a build worker's local.
     static void Feed(const Sink& sink, LocalState& local, const SideInput& in, size_t morsel) {
         auto source = in.MakeLocal();
@@ -1718,6 +1734,10 @@ protected:
                 made.first->Combine(std::move(local));
             }
             made.first->Finalize(ctx);
+            if (budget) {
+                result.held_after_finalize = budget->HeldBytes();
+                result.floors_free = FloorsFree(*budget, workers);
+            }
             result.rows = Probe(*made.second, probe, ctx);
             result.joins.push_back(*InspectHashJoin(*made.second));
         }
@@ -2347,10 +2367,11 @@ TEST_F(ParallelHashJoinSpillTest, FinishedTableHoldsNoSpareGrant) {
 }
 
 TEST_F(ParallelHashJoinSpillTest, FinalizeSpillsOnlyWhatTheFloorsNeed) {
-    // Four workers each keep 96,000 rows of 48 bytes, two grants, on their floors.
-    // Shared room holds three workers' grants, so about a quarter of the rows must go.
+    // Four workers each keep 160,000 rows of 48 bytes, two grants, on their floors.
+    // Shared room holds three workers' grants: pooled, the rows need eight, so they
+    // can't pool at first. A quarter of the rows go, then the rest pool.
     constexpr unsigned kWorkers = 4;
-    constexpr uint32_t kPerWorker = 96000;
+    constexpr uint32_t kPerWorker = 160000;
     const SideData build{kPerWorker * kWorkers, [](uint32_t i) { return PlainRow(i % 150000, i); }, false, kWorkers};
     const SideData probe{30000, [](uint32_t i) { return PlainRow(i * 7 % 200000, i); }};
     const JoinSpillResult want = HandFedJoin(build, probe, std::nullopt, kWorkers, nullptr);
@@ -2365,7 +2386,79 @@ TEST_F(ParallelHashJoinSpillTest, FinalizeSpillsOnlyWhatTheFloorsNeed) {
         EXPECT_GT(got.Join().spilled_partitions, 0u) << where;
         EXPECT_LT(got.Join().spilled_partitions, kSpillPartitions / 2) << where << ": only enough partitions to free the floors";
         EXPECT_EQ(got.partitions, got.Join().spilled_partitions) << where;
+        EXPECT_TRUE(got.floors_free) << where << ": every floor is free";
     }
+}
+
+TEST_F(ParallelHashJoinSpillTest, FinalizePoolsSmallPartsInsteadOfSpilling) {
+    // Each worker keeps 1,500 rows of 48 bytes, under one grant, on its floor.
+    // With one grant of shared room, one part could move alone; pooled, all fit.
+    for (const unsigned workers : {4u, 18u}) {
+        const SideData build{workers * 1500, [](uint32_t i) { return PlainRow(i % 5000, i); }, false, workers};
+        const SideData probe{6000, [](uint32_t i) { return PlainRow(i * 7 % 5500, i); }};
+        const JoinSpillResult want = HandFedJoin(build, probe, std::nullopt, workers, nullptr);
+        ASSERT_GT(want.rows.size(), 1000u);
+        const size_t floors = workers * kWorkerMinimumBytes;
+        for (WorkerPool* pool : {static_cast<WorkerPool*>(nullptr), pool_.get()}) {
+            const std::string where = std::to_string(workers) + " workers" + (pool != nullptr ? ", on the pool" : ", serial");
+            const JoinSpillResult got = HandFedJoin(build, probe, floors + kGrantBytes, workers, pool);
+            EXPECT_EQ(BytesDifference(got.rows, want.rows), "") << where;
+            EXPECT_EQ(got.files, 0u) << where;
+            EXPECT_EQ(got.written, 0u) << where;
+            EXPECT_EQ(got.partitions, 0u) << where;
+            EXPECT_EQ(got.Join().spilled_partitions, 0u) << where;
+            EXPECT_EQ(got.held_after_finalize, kGrantBytes) << where << ": the table holds one grant";
+            EXPECT_TRUE(got.floors_free) << where;
+        }
+
+        // Just the floors: no shared room to pool into, so the rows spill at Finalize.
+        const JoinSpillResult tight = HandFedJoin(build, probe, floors, workers, pool_.get());
+        EXPECT_EQ(BytesDifference(tight.rows, want.rows), "") << workers << " workers, floors only";
+        EXPECT_GT(tight.files, 0u) << workers << " workers, floors only";
+        EXPECT_GT(tight.Join().spilled_partitions, 0u) << workers << " workers, floors only";
+        EXPECT_EQ(tight.held_after_finalize, 0u) << workers << " workers, floors only";
+    }
+}
+
+TEST_F(ParallelHashJoinSpillTest, FinishedTablePoolsSoTheNextBreakerFindsRoom) {
+    // Four workers keep 1,500 rows each, one floor grant apiece. With a shared grant
+    // per worker, each part could leave its floor alone; pooled, they take one grant.
+    // A second build on worker 0 then needs two shared grants beside its floor,
+    // so it fits only if the first table left the room.
+    constexpr unsigned kWorkers = 4;
+    const SideData build{kWorkers * 1500, [](uint32_t i) { return PlainRow(i % 5000, i); }, false, kWorkers};
+    const SideData probe{6000, [](uint32_t i) { return PlainRow(i * 7 % 5500, i); }};
+    const JoinSpillResult want = HandFedJoin(build, probe, std::nullopt, kWorkers, nullptr);
+    MemoryBudget budget(kWorkers * (kWorkerMinimumBytes + kGrantBytes), kWorkers);
+    SpillCounters counters;
+    {
+        QueryContext ctx{nullptr, nullptr, kWorkers, pool_.get()};
+        ctx.budget = &budget;
+        ctx.spill = &counters;
+        ctx.temp_dir = &temp_dir_;
+        auto first = MakeHashJoin(NarrowSpec());
+        const SideInput small(build);
+        for (unsigned w = 0; w < kWorkers; ++w) {
+            auto local = first.first->MakeWorkerLocal(ctx, w);
+            Feed(*first.first, *local, small, w);
+            first.first->Combine(std::move(local));
+        }
+        first.first->Finalize(ctx);
+        EXPECT_EQ(budget.HeldBytes(), kGrantBytes) << "the first table holds one grant, not one per part";
+
+        // 300,000 rows of 48 bytes: two floor grants and two shared ones.
+        auto second = MakeHashJoin(NarrowSpec());
+        const SideInput big(SideData{300000, [](uint32_t i) { return PlainRow(i, i); }, false, 1});
+        auto local = second.first->MakeWorkerLocal(ctx, 0);
+        Feed(*second.first, *local, big, 0);
+        EXPECT_EQ(counters.files.load(), 0u) << "the second build found its shared grants";
+        EXPECT_EQ(budget.HeldBytes(), 5 * kGrantBytes);
+
+        // The first table still answers.
+        EXPECT_EQ(BytesDifference(Probe(*first.second, probe, ctx), want.rows), "");
+    }
+    EXPECT_EQ(budget.HeldBytes(), 0u);
+    EXPECT_TRUE(TempDirEmpty());
 }
 
 TEST_F(ParallelHashJoinSpillTest, SpilledRowsKeepArrivalOrder) {

@@ -1336,6 +1336,47 @@ protected:
         options.spill_everything = spill_everything;
         return db_->ExecuteSQL(sql, options);
     }
+
+    // Sorts WideRow 0..rows-1, morsel m fed to worker m % workers, then reads them
+    // through a pipeline; Finalize uses pool when set. Afterwards no grant or file is left.
+    // held gets the budget's held bytes right after Finalize.
+    SpillResult DriveSort(const SortCase& c, uint32_t rows, unsigned workers, size_t limit, WorkerPool* pool, size_t* held = nullptr) {
+        const size_t descriptors = OpenDescriptors();
+        SpillResult got;
+        {
+            MemoryBudget budget(limit, workers);
+            SpillCounters counters;
+            auto made = MakeSort(SpecFor(c));
+            QueryContext ctx{nullptr, nullptr, workers, pool};
+            ctx.budget = &budget;
+            ctx.spill = &counters;
+            ctx.temp_dir = &temp_dir_;
+            const SpillSource input(rows, workers, WideRow, false);
+            for (unsigned w = 0; w < workers; ++w) {
+                auto local = made.first->MakeWorkerLocal(ctx, w);
+                auto in = input.MakeLocal();
+                input.StartMorsel(w, *in);
+                Batch b;
+                while (input.NextBatch(*in, b)) made.first->Consume(b, *local);
+                made.first->Combine(std::move(local));
+            }
+            made.first->Finalize(ctx);
+            if (held != nullptr) *held = budget.HeldBytes();
+
+            ByteSink out;
+            Pipeline read{made.second.get(), {}, &out, {0}};
+            RunPipeline(read, ctx);
+            got.rows = std::move(out.rows);
+            got.files = counters.files.load();
+            got.written = counters.bytes_written.load();
+            made.first.reset();
+            made.second.reset();
+            EXPECT_EQ(budget.HeldBytes(), 0u);
+        }
+        EXPECT_TRUE(TempDirEmpty());
+        EXPECT_EQ(OpenDescriptors(), descriptors);
+        return got;
+    }
 };
 
 TEST_F(ParallelSortSpillTest, ManyRunsMergeToTheSameOrder) {
@@ -1596,6 +1637,31 @@ TEST_F(ParallelSortSpillTest, RowsStayInMemoryOffTheFloor) {
         const SpillResult got = RunSpill(c, kRows, kSpillMorsels, WideRow, false, roomy, moved);
         EXPECT_EQ(FirstDifference(got.rows, want.rows), "") << threads << " threads";
         EXPECT_EQ(got.files, 0u) << threads << " threads";
+    }
+}
+
+TEST_F(ParallelSortSpillTest, FinalizePoolsSmallPartsInsteadOfWritingRuns) {
+    // Each worker keeps 250 rows of about 300 bytes, under one grant, on its floor.
+    // With one grant of shared room, one part could move alone; pooled, all fit.
+    const SortCase c{{{0, true}, {1, false}}, {0, 1, 2, 3, 4}, std::nullopt, "k, s DESC"};
+    for (const unsigned workers : {4u, 18u}) {
+        const uint32_t rows = workers * 250;
+        const SpillResult want = RunSpill(c, rows, kSpillMorsels, WideRow, false, Unspilled(1));
+        const size_t floors = workers * kWorkerMinimumBytes;
+        for (WorkerPool* pool : {static_cast<WorkerPool*>(nullptr), pool_.get()}) {
+            const std::string where = std::to_string(workers) + " workers" + (pool != nullptr ? ", on the pool" : ", serial");
+            size_t held = 0;
+            const SpillResult got = DriveSort(c, rows, workers, floors + kGrantBytes, pool, &held);
+            EXPECT_EQ(FirstDifference(got.rows, want.rows), "") << where;
+            EXPECT_EQ(got.files, 0u) << where;
+            EXPECT_EQ(got.written, 0u) << where;
+            EXPECT_EQ(held, kGrantBytes) << where << ": the sorted rows hold one grant, off every floor";
+        }
+
+        // Just the floors: no shared room to pool into, so the parts become runs.
+        const SpillResult tight = DriveSort(c, rows, workers, floors, pool_.get());
+        EXPECT_EQ(FirstDifference(tight.rows, want.rows), "") << workers << " workers, floors only";
+        EXPECT_GT(tight.files, 0u) << workers << " workers, floors only";
     }
 }
 

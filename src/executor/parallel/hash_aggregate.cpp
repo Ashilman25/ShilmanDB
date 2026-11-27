@@ -16,6 +16,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 
 namespace shilmandb::parallel {
 
@@ -696,6 +697,7 @@ struct AggLocal : LocalState {
     EvalScratch scratch;
     MemoryReservation reservation;   // the table's estimated bytes, and the writer's buffers while it writes
     size_t counted{0};               // the part of the reservation that counts the table
+    bool pooled{false};              // Finalize moved that count into one pooled reservation
     const std::string* temp_dir{nullptr};
     SpillCounters* counters{nullptr};
     bool spill_everything{false};
@@ -765,12 +767,13 @@ public:
     // Keeps the worker's table, arena and all, until Finalize.
     void Combine(std::unique_ptr<LocalState> local) override { parts_.push_back(std::move(local)); }
 
-    // The tables outlive this pipeline, so the parts leave their workers' floors, spilling what
-    // must stay there. With no spill and room for the merge, they merge in memory:
-    // into one up to kMergeIntoOneMaxGroups summed groups, else by hash partition on the pool.
+    // The tables outlive this pipeline, so they pool off their workers' floors,
+    // or leave them part by part, spilling what must stay.
+    // With no spill and room, they merge in memory: into one up to kMergeIntoOneMaxGroups
+    // summed groups, else by hash partition on the pool.
     // Otherwise the source merges them with any runs, one spill partition per morsel.
     void Finalize(QueryContext& ctx) override {
-        LeaveFloors(ctx);
+        std::optional<MemoryReservation> pooled = LeaveFloors(ctx);
         const bool spilled = std::any_of(parts_.begin(), parts_.end(), [](const std::unique_ptr<LocalState>& part) {
             return static_cast<const AggLocal&>(*part).writer != nullptr;
         });
@@ -779,15 +782,15 @@ public:
             size_t summed = 0;
             for (size_t i = 0; i < parts_.size(); ++i) summed += Part(i).table.size;
             const size_t partitions = shape_->global ? 1 : MergePartitionCount(summed, ctx.threads);
-            // Counted before it's built, and off the floor the next pipeline needs.
-            MemoryReservation merge(ctx.budget, 0);
-            if (merge.Grow(MergeBytes(summed, partitions)) && merge.LeaveFloor() == 0) {
-                MergeInMemory(ctx, partitions, std::move(merge));
+            const size_t estimate = MergeBytes(summed, partitions);
+            std::optional<MemoryReservation> merge = CountMerge(ctx, pooled, estimate);
+            if (merge) {
+                MergeInMemory(ctx, partitions, std::move(*merge), estimate);
                 SharedOutput<MergedGroups> done = std::move(out_);  // the source's reference is the last
                 return;
             }
         }
-        FinishSpilled(ctx);
+        FinishSpilled(ctx, std::move(pooled));
         parts_.clear();
         SharedOutput<MergedGroups> done = std::move(out_);  // the source's reference is the last
     }
@@ -811,9 +814,12 @@ private:
     // Combined part i.
     [[nodiscard]] AggLocal& Part(size_t i) { return static_cast<AggLocal&>(*parts_[i]); }
 
-    // Every part tries to leave its worker's floor at once. Those that can't are spilled
-    // one at a time, largest first; the rest retry after each spill frees room.
-    void LeaveFloors(QueryContext& ctx) {
+    // Every table's count pools into one reservation. Refused, every part tries to leave
+    // its floor at once; stuck parts spill one at a time, largest first.
+    // After each spill the rest retry, then the pool. Returns the pool, if any.
+    [[nodiscard]] std::optional<MemoryReservation> LeaveFloors(QueryContext& ctx) {
+        std::optional<MemoryReservation> pooled = PoolTables(ctx);
+        if (pooled) return pooled;
         std::vector<size_t> left(parts_.size());
         ForEachTask(ctx, parts_.size(), [&](size_t i) { left[i] = Part(i).reservation.LeaveFloor(); });
         std::vector<size_t> stuck;
@@ -822,6 +828,9 @@ private:
         }
         std::stable_sort(stuck.begin(), stuck.end(), [this](size_t a, size_t b) { return Part(a).reservation.Bytes() > Part(b).reservation.Bytes(); });
         for (size_t next = 0; next < stuck.size(); ++next) {
+            // The last spill freed room, so the tables left may pool now.
+            if (next > 0) pooled = PoolTables(ctx);
+            if (pooled) return pooled;
             AggLocal& p = Part(stuck[next]);
             for (size_t floor = left[stuck[next]]; floor > 0; floor = p.reservation.LeaveFloor()) SpillTable(p, false);
             size_t kept = next + 1;
@@ -832,6 +841,26 @@ private:
             }
             stuck.resize(kept);
         }
+        return std::nullopt;
+    }
+
+    // Pools every part's table count; nullopt, with nothing changed, when refused.
+    // Writers are flushed after each spill, so the parts keep nothing else.
+    [[nodiscard]] std::optional<MemoryReservation> PoolTables(QueryContext& ctx) {
+        return PoolParts(ctx.budget, parts_.size(), [this](size_t i) -> AggLocal& { return Part(i); }, [](const AggLocal& p) { return p.counted; });
+    }
+
+    // Counts the merge before it's built, off the floor the next pipeline needs: in the
+    // pool, shared grants only, else in its own reservation. Moves the pool out on success.
+    // nullopt, with the pool as it was, when the budget refuses.
+    [[nodiscard]] static std::optional<MemoryReservation> CountMerge(QueryContext& ctx, std::optional<MemoryReservation>& pooled, size_t estimate) {
+        if (pooled) {
+            if (!pooled->Grow(estimate)) return std::nullopt;
+            return std::exchange(pooled, std::nullopt);
+        }
+        MemoryReservation own(ctx.budget, 0);
+        if (!own.Grow(estimate) || own.LeaveFloor() != 0) return std::nullopt;
+        return own;
     }
 
     // What merging the parts in memory adds by the table estimate, at most: arrays for
@@ -851,19 +880,22 @@ private:
         return summed * shape.group_bytes + index + buckets;
     }
 
-    // Merges every part's table in memory; merge counts what the merge adds.
-    // Then each part counts only its arena; the table merged into keeps its whole count.
-    void MergeInMemory(QueryContext& ctx, size_t partitions, MemoryReservation merge) {
+    // Merges every part's table in memory; merge counts what the merge adds, by the
+    // estimate, and the tables pooled into it. Then each table counts only its arena;
+    // the table merged into keeps its whole count.
+    void MergeInMemory(QueryContext& ctx, size_t partitions, MemoryReservation merge, [[maybe_unused]] size_t estimate) {
         MergedGroups& out = out_.Mutable();
         const GroupShape& shape = *shape_;
         std::vector<GroupTable> tables;
         std::vector<MemoryReservation> counts;
         std::vector<size_t> counted;  // each part's table bytes, all its reservation holds
         std::vector<size_t> keep;     // what each part counts after the merge
+        std::vector<uint8_t> pooled;  // per part: 1 when merge holds its count instead
         for (size_t i = 0; i < parts_.size(); ++i) {
             AggLocal& p = Part(i);
             counted.push_back(p.counted);
             keep.push_back(std::min(p.counted, p.table.arena.BytesUsed()));
+            pooled.push_back(p.pooled ? 1 : 0);
             tables.push_back(std::move(p.table));
             counts.push_back(std::move(p.reservation));
         }
@@ -903,8 +935,17 @@ private:
         for (GroupTable& t : tables) out.arenas.push_back(std::move(t.arena));
         tables.clear();
 
-        assert(merged <= merge.Bytes() && "the merge passed its estimate");
-        ShrinkTo(merge, merge.Bytes(), merged);
+        assert(merged <= estimate && "the merge passed its estimate");
+        // A pooled table's count, and what it keeps, are merge's.
+        [[maybe_unused]] size_t pooled_held = 0;
+        size_t pooled_keep = 0;
+        for (size_t i = 0; i < counts.size(); ++i) {
+            if (pooled[i] == 0) continue;
+            pooled_held += std::exchange(counted[i], 0);
+            pooled_keep += std::exchange(keep[i], 0);
+        }
+        assert(merge.Bytes() == estimate + pooled_held && "the merge counts its estimate and the pooled tables");
+        ShrinkTo(merge, merge.Bytes(), merged + pooled_keep);
         out.reservations.push_back(std::move(merge));
         for (size_t i = 0; i < counts.size(); ++i) {
             ShrinkTo(counts[i], counted[i], keep[i]);
@@ -914,6 +955,7 @@ private:
 
     // Brings the table's share of the reservation to its bytes; false when the budget refuses.
     [[nodiscard]] bool Recount(AggLocal& l) const {
+        assert(!l.pooled && "a pooled table is counted in the pooled reservation");
         const size_t held = TableBytes(l.table, *shape_);
         if (held < l.counted) {
             l.reservation.Shrink(l.counted - held);
@@ -942,10 +984,11 @@ private:
         if (refill && shape.global) AddGlobalGroup(l.table, shape);
     }
 
-    // Hands the source every worker's table, its spill file and its count, unmerged.
-    // Each spill partition with runs counts once in the query's spill totals.
-    void FinishSpilled(QueryContext& ctx) {
+    // Hands the source every worker's table, its spill file and its count, unmerged, and the
+    // pooled tables' count. Each spill partition with runs counts once in the query's spill totals.
+    void FinishSpilled(QueryContext& ctx, std::optional<MemoryReservation> pooled) {
         MergedGroups& out = out_.Mutable();
+        if (pooled) out.reservations.push_back(std::move(*pooled));
         out.spilled = true;
         out.count_offset = count_offset_;
         for (size_t i = 0; i < parts_.size(); ++i) {

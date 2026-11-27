@@ -2050,8 +2050,9 @@ protected:
 
     // Feeds parts[w] to worker w's counted local by hand, so each worker's table is known,
     // then finalizes and reads the groups through a pipeline. Afterwards nothing is left.
+    // The hooks run just before and just after Finalize.
     DrivenAgg DriveAgg(const AggCase& c, const std::vector<std::vector<AggRow>>& parts, size_t limit, bool pooled,
-                       const std::function<void(MemoryBudget&)>& before_finalize = {}) {
+                       const std::function<void(MemoryBudget&)>& before_finalize = {}, const std::function<void(MemoryBudget&)>& after_finalize = {}) {
         const auto threads = static_cast<unsigned>(parts.size());
         const size_t descriptors = OpenDescriptors();
         DrivenAgg got;
@@ -2087,6 +2088,7 @@ protected:
             if (before_finalize) before_finalize(budget);
             sink.Finalize(ctx);
             got.peak = budget.PeakBytes();
+            if (after_finalize) after_finalize(budget);
 
             GroupSink out(ApproxSlots(c));
             Pipeline read{made.second.get(), {}, &out, {0}};
@@ -2747,10 +2749,11 @@ TEST_F(ParallelHashAggregateSpillTest, TableStaysCountedWhileWritten) {
 }
 
 TEST_F(ParallelHashAggregateSpillTest, InMemoryMergeIsCountedOrSpills) {
-    // Four workers with their own keys, each table on one floor grant.
-    // With room, the merge is counted before it's built, so the shared peak
-    // passes the four tables' grants.
-    // With room only for the tables, the source merges them, one spill partition per morsel.
+    // Four workers with their own keys, each table on one floor grant. At Finalize
+    // the tables pool, and the merge is counted in the pool before it's built.
+    // 80,000 groups: tables and merge share two grants, so they merge in memory either way.
+    // 160,000: the merge grows the pool past four grants, so with room for only four
+    // the source merges them, one spill partition per morsel.
     const size_t floors = kSpillThreads * kWorkerMinimumBytes;
     const AggCase c{{0}, {{Func::COUNT, -1}, {Func::SUM, 2}}, "own keys"};
     // 80,000 groups merge into one table; 160,000 merge by partition.
@@ -2766,15 +2769,25 @@ TEST_F(ParallelHashAggregateSpillTest, InMemoryMergeIsCountedOrSpills) {
         const std::vector<OutRow> want = CountSumReference(parts);
         const auto four_grants = [](MemoryBudget& budget) { EXPECT_EQ(budget.HeldBytes(), 4 * kGrantBytes) << "one grant per table"; };
 
+        const bool into_one = per == 20000;
+
         const DrivenAgg roomy = DriveAgg(c, parts, floors + 8 * kGrantBytes, true, four_grants);
         EXPECT_EQ(GroupDifference(roomy.rows, want), "") << per;
         EXPECT_EQ(roomy.files, 0u) << per;
-        EXPECT_GT(roomy.peak, floors + 4 * kGrantBytes) << per << ": the merge was counted";
+        if (into_one) {
+            EXPECT_EQ(roomy.peak, floors + 2 * kGrantBytes) << per << ": the tables and the merge share two grants";
+        } else {
+            EXPECT_GT(roomy.peak, floors + 4 * kGrantBytes) << per << ": the merge grew the pool";
+        }
 
         const DrivenAgg tight = DriveAgg(c, parts, floors + 4 * kGrantBytes, true, four_grants);
         EXPECT_EQ(GroupDifference(tight.rows, want), "") << per;
         EXPECT_EQ(tight.files, 0u) << per << ": each spill partition fits a worker's floor";
-        EXPECT_EQ(tight.morsels, partitions.size()) << per << ": merged by spill partition";
+        if (into_one) {
+            EXPECT_EQ(tight.morsels, (kSpillThreads * per + kBatchSize - 1) / kBatchSize) << per << ": merged in memory";
+        } else {
+            EXPECT_EQ(tight.morsels, partitions.size()) << per << ": merged by spill partition";
+        }
     }
 }
 
@@ -2797,6 +2810,87 @@ TEST_F(ParallelHashAggregateSpillTest, FinalizeSpillsTheLargestStuckPartFirst) {
         });
         EXPECT_EQ(GroupDifference(got.rows, want), "") << "pooled " << pooled;
         EXPECT_EQ(got.files, 1u) << "pooled " << pooled << ": only worker 3's table is written";
+    }
+}
+
+TEST_F(ParallelHashAggregateSpillTest, FinalizePoolsSmallPartsInsteadOfSpilling) {
+    // Each worker groups 2,000 rows into the same 1,000 keys: a table under one grant,
+    // on its floor. With one grant of shared room only one table could move alone.
+    // Pooled, every table and the merge fit it, so they merge in memory: one batch.
+    const AggCase c{{0}, {{Func::COUNT, -1}, {Func::SUM, 2}}, "small parts"};
+    for (const unsigned workers : {4u, 18u}) {
+        std::vector<std::vector<AggRow>> parts(workers);
+        for (unsigned w = 0; w < workers; ++w) {
+            for (int64_t j = 0; j < 2000; ++j) parts[w].push_back(KeyRow(j % 1000, w * 2000 + j));
+        }
+        const std::vector<OutRow> want = CountSumReference(parts);
+        const size_t floors = workers * kWorkerMinimumBytes;
+        for (const bool pooled : {false, true}) {
+            const std::string where = std::to_string(workers) + " workers" + (pooled ? ", on the pool" : ", serial");
+            size_t held = 0;
+            const DrivenAgg got = DriveAgg(c, parts, floors + kGrantBytes, pooled, {}, [&held](MemoryBudget& b) { held = b.HeldBytes(); });
+            EXPECT_EQ(GroupDifference(got.rows, want), "") << where;
+            EXPECT_EQ(got.files, 0u) << where;
+            EXPECT_EQ(got.morsels, 1u) << where << ": merged in memory, with the merge counted in the pool";
+            EXPECT_EQ(held, kGrantBytes) << where << ": the merged groups hold one grant, off every floor";
+        }
+
+        // Just the floors: no shared room to pool into, so the tables spill at Finalize.
+        const DrivenAgg tight = DriveAgg(c, parts, floors, true);
+        EXPECT_EQ(GroupDifference(tight.rows, want), "") << workers << " workers, floors only";
+        EXPECT_GT(tight.files, 0u) << workers << " workers, floors only";
+    }
+}
+
+TEST_F(ParallelHashAggregateSpillTest, PooledTablesTheMergeDoesntFitStayUnmerged) {
+    // 18 workers group 3,000 keys of their own each. The tables pool into one grant,
+    // but the merge needs a second. With one grant of room the source merges them
+    // by spill partition, nothing written; with two, they merge in memory.
+    constexpr unsigned kWorkers = 18;
+    constexpr int64_t kPer = 3000;
+    std::vector<std::vector<AggRow>> parts(kWorkers);
+    std::set<size_t> partitions;
+    for (int64_t w = 0; w < static_cast<int64_t>(kWorkers); ++w) {
+        for (int64_t j = 0; j < kPer; ++j) {
+            parts[w].push_back(KeyRow(w * kPer + j, w));
+            partitions.insert(KeyPartition(w * kPer + j, 0));
+        }
+    }
+    const std::vector<OutRow> want = CountSumReference(parts);
+    const AggCase c{{0}, {{Func::COUNT, -1}, {Func::SUM, 2}}, "own keys"};
+    const size_t floors = kWorkers * kWorkerMinimumBytes;
+
+    const DrivenAgg unmerged = DriveAgg(c, parts, floors + kGrantBytes, true);
+    EXPECT_EQ(GroupDifference(unmerged.rows, want), "");
+    EXPECT_EQ(unmerged.files, 0u) << "pooled, nothing is written";
+    EXPECT_EQ(unmerged.morsels, partitions.size()) << "merged by spill partition";
+
+    const DrivenAgg merged = DriveAgg(c, parts, floors + 2 * kGrantBytes, true);
+    EXPECT_EQ(GroupDifference(merged.rows, want), "");
+    EXPECT_EQ(merged.files, 0u);
+    EXPECT_EQ(merged.morsels, (kWorkers * kPer + kBatchSize - 1) / kBatchSize) << "merged in memory";
+}
+
+TEST_F(ParallelHashAggregateSpillTest, PoolIsTriedAgainAfterEachSpill) {
+    // Workers 0 to 4 hold 20,000 groups on one floor grant each. Worker 5 holds
+    // 340,000 on two floor grants and every shared grant, so nothing pools at first.
+    // Spilling worker 5 frees three shared grants: three tables move, two stay stuck,
+    // and then all five pool.
+    constexpr unsigned kWorkers = 6;
+    std::vector<std::vector<AggRow>> parts(kWorkers);
+    for (int64_t w = 0; w < 5; ++w) {
+        for (int64_t j = 0; j < 20000; ++j) parts[w].push_back(KeyRow(100000 * w + j, w));
+    }
+    for (int64_t k = 0; k < 340000; ++k) parts[5].push_back(KeyRow(k, 5));
+    const std::vector<OutRow> want = CountSumReference(parts);
+    const AggCase c{{0}, {{Func::COUNT, -1}, {Func::SUM, 2}}, "one big part"};
+    const size_t limit = kWorkers * kWorkerMinimumBytes + 3 * kGrantBytes;
+    for (const bool pooled : {false, true}) {
+        const DrivenAgg got = DriveAgg(c, parts, limit, pooled, [](MemoryBudget& budget) {
+            EXPECT_EQ(budget.HeldBytes(), 10 * kGrantBytes) << "a grant each for workers 0 to 4, five for worker 5";
+        });
+        EXPECT_EQ(GroupDifference(got.rows, want), "") << "pooled " << pooled;
+        EXPECT_EQ(got.files, 1u) << "pooled " << pooled << ": only worker 5's table is written";
     }
 }
 

@@ -7,7 +7,10 @@
 #include <algorithm>
 #include <cassert>
 #include <limits>
+#include <optional>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace shilmandb::parallel {
 
@@ -25,7 +28,8 @@ struct RightRows {
 struct RightLocal : LocalState {
     ColumnStore store;
     MemoryReservation reservation;
-    size_t limit{0};  // the budget's limit, for the error
+    bool pooled{false};  // Finalize moved its count into one pooled reservation
+    size_t limit{0};     // the budget's limit, for the error
 };
 
 // Keeps the right side's kept slots, copying strings, since its morsels won't last.
@@ -66,14 +70,21 @@ public:
     // Keeps the worker's buffers, arena and all, until Finalize.
     void Combine(std::unique_ptr<LocalState> local) override { parts_.push_back(std::move(local)); }
 
-    // Joins every worker's rows into one set the operator reads. Each count leaves its floor
-    // as far as the shared pool allows; the operator then holds the only reference.
-    void Finalize(QueryContext&) override {
+    // Joins every worker's rows into one set the operator reads. Every count pools into one
+    // reservation off the floors; refused, each leaves its floor as far as the shared pool
+    // allows. The operator then holds the only reference.
+    void Finalize(QueryContext& ctx) override {
         RightRows& out = out_.Mutable();
         out.store = ColumnStore(slots_.size());
+        const auto part_at = [this](size_t i) -> RightLocal& { return static_cast<RightLocal&>(*parts_[i]); };
+        std::optional<MemoryReservation> pooled = PoolParts(ctx.budget, parts_.size(), part_at, [](const RightLocal& p) { return p.reservation.Bytes(); });
+        if (pooled) {
+            out.reservations.push_back(std::move(*pooled));
+        } else {
+            for (size_t i = 0; i < parts_.size(); ++i) (void)part_at(i).reservation.LeaveFloor();
+        }
         for (auto& part : parts_) {
             auto& p = static_cast<RightLocal&>(*part);
-            (void)p.reservation.LeaveFloor();
             out.store.Absorb(std::move(p.store));
             out.reservations.push_back(std::move(p.reservation));
         }

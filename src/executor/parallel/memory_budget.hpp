@@ -3,6 +3,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
+#include <vector>
 
 namespace shilmandb::parallel {
 
@@ -45,6 +47,9 @@ private:
     // Takes `bytes` (whole grants) for a worker, floor first; all or nothing.
     [[nodiscard]] bool Take(unsigned worker, size_t bytes, size_t& from_floor, size_t& from_shared);
 
+    // Takes `bytes` (whole grants) from the shared pool alone; all or nothing.
+    [[nodiscard]] bool TakeShared(size_t bytes);
+
     // Gives back what Take handed out.
     void Give(unsigned worker, size_t from_floor, size_t from_shared);
 
@@ -57,6 +62,14 @@ private:
     std::unique_ptr<std::atomic<size_t>[]> floor_used_;  // per worker, shared by its reservations
     std::atomic<size_t> shared_used_{0};
     std::atomic<size_t> shared_peak_{0};
+};
+
+class MemoryReservation;
+
+// Bytes one reservation hands over to MemoryReservation::Pool.
+struct PoolPart {
+    MemoryReservation* from{nullptr};
+    size_t bytes{0};
 };
 
 // What one worker holds for one breaker; returns everything when destroyed. Movable, not copyable.
@@ -83,6 +96,11 @@ public:
     // Returns floor bytes in use; loop spill, Shrink(spilled), LeaveFloor() until it returns 0.
     [[nodiscard]] size_t LeaveFloor();
 
+    // Moves the parts' bytes here, held in shared grants only and rounded up once.
+    // All or nothing: false, with nothing changed, when the shared pool can't hold them.
+    // Parts give up grants they no longer need. Afterwards this never takes floor grants.
+    [[nodiscard]] bool Pool(const std::vector<PoolPart>& parts);
+
 private:
     // Hands back whole grants this reservation no longer needs, past one spare if asked.
     // After LeaveFloor, floor grants go first and the spare is only ever a shared grant.
@@ -94,7 +112,23 @@ private:
     size_t from_floor_{0};   // grants taken from the worker's floor
     size_t from_shared_{0};  // grants taken beyond the floors
     bool left_floor_{false}; // LeaveFloor was called: give floor grants back first
+    bool shared_only_{false}; // holds pooled bytes: grows from the shared pool alone
 };
+
+// Pools every part's counted bytes, bytes_of(part), into one reservation of shared grants,
+// rounded once, and marks each part pooled. A part has `reservation` and `pooled` members.
+// nullopt, with nothing changed, without a budget or when the shared pool refuses.
+template <typename PartAt, typename BytesOf>
+[[nodiscard]] std::optional<MemoryReservation> PoolParts(MemoryBudget* budget, size_t count, PartAt part_at, BytesOf bytes_of) {
+    if (budget == nullptr) return std::nullopt;
+    std::vector<PoolPart> list;
+    list.reserve(count);
+    for (size_t i = 0; i < count; ++i) list.push_back(PoolPart{&part_at(i).reservation, bytes_of(part_at(i))});
+    MemoryReservation pooled(budget, 0);
+    if (!pooled.Pool(list)) return std::nullopt;
+    for (size_t i = 0; i < count; ++i) part_at(i).pooled = true;
+    return pooled;
+}
 
 [[nodiscard]] size_t DefaultMemoryLimit();  // physical memory / 4
 
