@@ -103,6 +103,36 @@ private:
     std::vector<PolicyCall> calls_;
 };
 
+// Records like RecordingPolicy, and can make one page's next RecordAccess sleep,
+// which the pool calls with its latch held
+class StallingPolicy : public RecordingPolicy {
+public:
+    using RecordingPolicy::RecordingPolicy;
+
+    void RecordAccess(frame_id_t frame_id, page_id_t page_id) override {
+        if (stall_page_.load() == page_id) {
+            stall_page_.store(INVALID_PAGE_ID);
+            stalled_.store(true);
+            std::this_thread::sleep_for(stall_for_);
+        }
+        RecordingPolicy::RecordAccess(frame_id, page_id);
+    }
+
+    // Set before the stalling thread starts
+    void StallNext(page_id_t page_id, std::chrono::milliseconds how_long) {
+        stall_for_ = how_long;
+        stall_page_.store(page_id);
+    }
+    void WaitUntilStalled() const {
+        while (!stalled_.load()) std::this_thread::yield();
+    }
+
+private:
+    std::atomic<page_id_t> stall_page_{INVALID_PAGE_ID};
+    std::atomic<bool> stalled_{false};
+    std::chrono::milliseconds stall_for_{0};
+};
+
 // Holds threads until all of them have arrived, then lets them go together
 class StartGate {
 public:
@@ -1113,6 +1143,51 @@ TEST_F(BufferPoolConcurrentTest, BatchRunStopsAtInvalidPage) {
             EXPECT_NO_THROW(bpm.DropAllPages());
             bpm.SetConcurrent(false);
         }
+    }
+}
+
+// A thread blocked behind a long latch hold has its whole wait counted
+TEST_F(BufferPoolConcurrentTest, LatchWaitCountsTheWholeWait) {
+    constexpr size_t kFrames = 8;
+    constexpr auto kHold = std::chrono::milliseconds(30);
+    WritePlainPages(db_file_, 4);
+    DiskManager dm(db_file_);
+    auto policy = std::make_unique<StallingPolicy>(MakeEvictionPolicy(EvictionPolicyKind::LRU, kFrames));
+    StallingPolicy* stalling = policy.get();
+    BufferPoolManager bpm(kFrames, &dm, std::move(policy));
+    ASSERT_NE(bpm.FetchPage(1), nullptr);
+    ASSERT_TRUE(bpm.UnpinPage(1, false));
+
+    std::chrono::nanoseconds waited{0}, counted{0};
+    {
+        Watchdog watchdog(std::chrono::seconds(30), "LatchWaitCountsTheWholeWait");
+        bpm.SetConcurrent(true, 2);
+        bpm.ResetStats();
+        stalling->StallNext(1, kHold);
+        std::atomic<bool> unpin{false};
+        std::thread holder([&] {
+            Page* page = bpm.FetchPage(1);  // a hit whose RecordAccess sleeps under the latch
+            while (!unpin.load()) std::this_thread::yield();
+            if (page != nullptr) (void)bpm.UnpinPage(1, false);
+        });
+
+        // Only this thread waits, so the count is exactly its wait
+        stalling->WaitUntilStalled();
+        const auto start = std::chrono::steady_clock::now();
+        (void)bpm.GetHitCount();
+        waited = std::chrono::steady_clock::now() - start;
+        counted = bpm.GetLatchWaitTime();
+        unpin.store(true);
+        holder.join();
+        bpm.SetConcurrent(false);
+    }
+
+    EXPECT_GE(counted, std::chrono::nanoseconds(std::chrono::milliseconds(5)));
+    EXPECT_LE(counted, waited);
+    EXPECT_GE(counted, waited - std::chrono::milliseconds(2));
+    EXPECT_EQ(bpm.GetHitCount(), 1u);
+    for (size_t f = 0; f < kFrames; ++f) {
+        EXPECT_EQ(bpm.GetPage(static_cast<frame_id_t>(f)).GetPinCount(), 0) << "frame " << f;
     }
 }
 

@@ -179,10 +179,10 @@ protected:
         return chunk.first_page + chunk.dict_page_count;
     }
 
-    // Short strings on dozens of data pages, with BigRows() between them.
+    // Short strings on over a hundred data pages, with BigRows() between them.
     // The 3 MiB value spans far more pages than the small pools hold.
     ColumnarTableMeta WriteBigChunk(std::vector<std::string>& values) {
-        values.assign(3000, "");
+        values.assign(12000, "");
         for (size_t i = 0; i < values.size(); ++i) values[i] = "row-" + std::to_string(i) + std::string(90, static_cast<char>('a' + i % 26));
         for (const auto& [row, bytes] : BigRows()) values[row] = BigText(bytes, row);
         ColumnVector col(ColumnType::Text());
@@ -450,8 +450,8 @@ TEST_F(ColumnarTableTest, BigValuesPinOnePageAtATime) {
     };
 
     // Two frames hold a data page and a big-value page;
-    // 34 hold a batch of 16 and one more.
-    for (const size_t frames : {size_t{2}, size_t{34}}) {
+    // 2 * kPinBatch + 2 hold a full batch and one more.
+    for (const size_t frames : {size_t{2}, 2 * kPinBatch + 2}) {
         SCOPED_TRACE("frames " + std::to_string(frames));
         auto bpm = MakePool(frames);
         const ColumnarTable table(bpm.get(), meta);
@@ -501,7 +501,7 @@ TEST_F(ColumnarTableTest, BigValuePagesNeverJoinABatch) {
     const page_id_t first_big = chunk.first_page + chunk.page_count - chunk.big_page_count;
     const page_id_t past_chunk = chunk.first_page + chunk.page_count;
 
-    // 64 frames, so data pages come in batches of kPinBatch.
+    // 64 frames, so data pages come in batches of half the pool.
     std::vector<PinEvent> log;
     BufferPoolManager bpm(64, disk_.get(), std::make_unique<PinWatcher>(64, &log));
     const ColumnarTable table(&bpm, meta);
@@ -543,6 +543,64 @@ TEST_F(ColumnarTableTest, BigValuePagesNeverJoinABatch) {
         EXPECT_GT(most_data, 1u);
         EXPECT_LE(most_data, kPinBatch);
         EXPECT_TRUE(data_pinned.empty());
+    }
+}
+
+// A reader pins kPinBatch pages at a time,
+// or its share of half the pool when that is less.
+TEST_F(ColumnarTableTest, BatchesKeepToTheirShareOfThePool) {
+    std::vector<std::string> values(6000);
+    for (size_t i = 0; i < values.size(); ++i) values[i] = "note-" + std::to_string(i) + BigText(200, i);
+    ColumnVector col(ColumnType::Text());
+    for (const std::string& v : values) col.AppendString(v);
+    ColumnarTableMeta meta;
+    meta.oid = 3;
+    meta.name = "notes";
+    meta.columns = {{"body", 1, ColumnType::Text(), false}};
+    RowGroupMeta group;
+    group.row_count = static_cast<uint32_t>(values.size());
+    group.chunks.push_back(WriteChunk(disk_.get(), col));
+    meta.row_count = group.row_count;
+    meta.row_groups.push_back(std::move(group));
+    const ChunkMeta& chunk = meta.row_groups[0].chunks[0];
+    ASSERT_EQ(chunk.big_page_count, 0u);
+    ASSERT_GT(chunk.page_count, 2 * kPinBatch);  // more than two full batches
+
+    struct Setup {
+        size_t frames;
+        unsigned workers;
+        size_t batch;  // the most pages the reader should hold at once
+    };
+    const Setup setups[] = {
+        {512, 1, kPinBatch},                       // room for full batches
+        {64, 1, std::min<size_t>(kPinBatch, 32)},  // half the pool
+        {64, 4, std::min<size_t>(kPinBatch, 8)},   // four workers share half the pool
+        {8, 16, 1},                                // under a page each still reads, a page at a time
+    };
+    for (const Setup& s : setups) {
+        SCOPED_TRACE(std::to_string(s.frames) + " frames, " + std::to_string(s.workers) + " workers");
+        std::vector<PinEvent> log;
+        BufferPoolManager bpm(s.frames, disk_.get(), std::make_unique<PinWatcher>(s.frames, &log));
+        bpm.SetConcurrent(s.workers > 1, s.workers);
+        const ColumnarTable table(&bpm, meta);
+        std::vector<StringRef> refs(values.size());
+        StringArena arena;
+        table.ReadRows(0, 0, nullptr, static_cast<uint32_t>(values.size()), refs.data(), arena);
+        bpm.SetConcurrent(false);
+        for (size_t i = 0; i < values.size(); ++i) ASSERT_EQ(View(refs[i]), values[i]) << "row " << i;
+
+        std::vector<page_id_t> pinned;
+        size_t most = 0;
+        for (const PinEvent& e : log) {
+            if (e.pinned) {
+                pinned.push_back(e.page);
+            } else {
+                pinned.erase(std::remove(pinned.begin(), pinned.end(), e.page), pinned.end());
+            }
+            most = std::max(most, pinned.size());
+        }
+        EXPECT_EQ(most, s.batch);
+        EXPECT_TRUE(pinned.empty());
     }
 }
 

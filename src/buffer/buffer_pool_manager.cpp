@@ -349,12 +349,21 @@ std::chrono::nanoseconds BufferPoolManager::GetLatchWaitTime() const {
     return latch_wait_;
 }
 
-// Takes the latch; only a blocked wait is timed
+// Tries before a waiter sleeps.
+// With a yield between, they last about as long as waking one costs.
+constexpr int kLatchSpins = 32;
+
+// Takes the latch; only a wait is timed, its spin included.
+// Holds are short, so a waiter spins briefly before it sleeps.
 std::unique_lock<std::mutex> BufferPoolManager::Latch() const {
     std::unique_lock<std::mutex> lock(latch_, std::try_to_lock);
     if (!lock.owns_lock()) {
         const auto start = std::chrono::steady_clock::now();
-        lock.lock();
+        for (int i = 0; i < kLatchSpins && !lock.owns_lock(); ++i) {
+            std::this_thread::yield();
+            (void)lock.try_lock();
+        }
+        if (!lock.owns_lock()) lock.lock();
         latch_wait_ += std::chrono::steady_clock::now() - start;
     }
     return lock;
